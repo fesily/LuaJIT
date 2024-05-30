@@ -47,8 +47,8 @@ LUA_DATA_API int (*lj_ferror)
 (FILE *_Stream) = ferror;
 
 #if LJ_TARGET_POSIX
-LUA_DATA_API int (*lj_fseeko)(FILE *__stream, __off_t __off, int __whence) = fseeko;
-LUA_DATA_API __off64_t (*lj_ftello)(FILE *_Stream) = ftello;
+LUA_DATA_API int (*lj_fseeko)(FILE *__stream, off_t __off, int __whence) = fseeko;
+LUA_DATA_API off_t (*lj_ftello)(FILE *_Stream) = ftello;
 #elif _MSC_VER >= 1400
 LUA_DATA_API int (*lj_fseeki64)(
     FILE *_Stream,
