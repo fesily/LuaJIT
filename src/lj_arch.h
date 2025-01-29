@@ -753,6 +753,10 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_STRING_DUMP_FIX LJ_DS
 #endif
 
+#ifndef LJ_DS_MATH_FIX 
+#define LJ_DS_MATH_FIX LJ_DS
+#endif
+
 #ifndef LJ_DS_MOD_GEMCORE_FIX
 #define LJ_DS_MOD_GEMCORE_FIX LJ_DS
 #endif

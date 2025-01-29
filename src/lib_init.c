@@ -91,6 +91,11 @@ LUALIB_API void luaL_openlibs(lua_State *L)
 "end\n";
   (luaL_loadstring(L, dump_fix) || lua_pcall(L, 0, 0, 0));
 #endif
+#ifdef LJ_DS_MATH_FIX
+ dump_fix = 
+ "math.mod = math.fmod";
+  (luaL_loadstring(L, dump_fix) || lua_pcall(L, 0, 0, 0));
+#endif
 #ifdef DO_LUA_INIT
   handle_luainit(L);
 #endif
