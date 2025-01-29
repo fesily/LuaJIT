@@ -367,13 +367,6 @@ static void rehashtab(lua_State *L, GCtab *t, cTValue *ek)
   lj_tab_resize(L, t, asize, hsize2hbits(total));
 }
 
-#if LJ_HASFFI
-void lj_tab_rehash(lua_State *L, GCtab *t)
-{
-  rehashtab(L, t, niltv(L));
-}
-#endif
-
 #if LJ_DS_PARSER_TABLE_PATCH
 void lj_tab_rehash_bykeys(lua_State *L, GCtab *t, GCtab *kt)
 {
