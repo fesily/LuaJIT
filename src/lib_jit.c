@@ -708,11 +708,19 @@ static uint32_t jit_cpudetect(void)
   return flags;
 }
 
+#if LJ_DS_JIT_DEFAULT_OPT_PATCH
+LUA_DATA_API uint32_t (*lj_jit_default_flags)() = 0;
+#endif
+
 /* Initialize JIT compiler. */
 static void jit_init(lua_State *L)
 {
   jit_State *J = L2J(L);
   J->flags = jit_cpudetect() | JIT_F_OPT_DEFAULT;
+#if LJ_DS_JIT_DEFAULT_OPT_PATCH
+  if (lj_jit_default_flags)
+    J->flags |= lj_jit_default_flags();
+#endif
   memcpy(J->param, jit_param_default, sizeof(J->param));
   lj_dispatch_update(G(L));
 }
