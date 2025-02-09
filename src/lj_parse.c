@@ -2069,6 +2069,9 @@ static void expr_simple(LexState *ls, ExpDesc *v)
     base = fs->freereg-1;
     expr_init(v, VCALL, bcemit_ABC(fs, BC_VARG, base, 2, fs->numparams));
     v->u.s.aux = base;
+#if LUA_COMPAT_VARARG
+    fs->need_vararg = 0; /* don't need 'arg' */
+#endif
     break;
   }
   case '{':  /* Table constructor. */
