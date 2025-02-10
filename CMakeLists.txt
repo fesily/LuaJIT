@@ -165,6 +165,10 @@ ENDIF()
 FILE(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/jit)
 FILE(GLOB jit_files ${LUAJIT_DIR}/src/jit/*.lua)
 FILE(COPY ${jit_files} DESTINATION ${CMAKE_BINARY_DIR}/jit)
+install(
+    DIRECTORY ${CMAKE_BINARY_DIR}/jit
+    DESTINATION ${TARGET_MOD_DIR}/scripts
+)
 
 SET(DASM_ARCH ${TARGET_LJARCH})
 SET(DASM_FLAGS)
@@ -351,6 +355,7 @@ SET(DEPS
   ${CMAKE_CURRENT_BINARY_DIR}/lj_folddef.h
   ${CMAKE_CURRENT_BINARY_DIR}/vmdef.lua
   )
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/vmdef.lua DESTINATION  ${TARGET_MOD_DIR}/scripts/jit)
 
 ## COMPILE
 include_directories(

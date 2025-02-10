@@ -38,7 +38,9 @@ return setmetatable({
     if zone then
       t[#t+1] = zone
     else
-      return (assert(remove(t), "empty zone stack"))
+      if t[1] then
+        return (assert(remove(t), "empty zone stack"))
+      end
     end
   end
 })
