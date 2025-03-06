@@ -809,4 +809,7 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_JIT_DEFAULT_OPT_PATCH LJ_DS
 #endif
 
+#ifndef LJ_DS_FULL_GC_HOOK
+#define LJ_DS_FULL_GC_HOOK LJ_DS
+#endif
 #endif
