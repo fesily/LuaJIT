@@ -812,4 +812,9 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #ifndef LJ_DS_FULL_GC_HOOK
 #define LJ_DS_FULL_GC_HOOK LJ_DS
 #endif
+
+#ifndef LJ_UNPACK_PATCH
+#define LJ_UNPACK_PATCH LJ_DS
+#endif
+
 #endif
