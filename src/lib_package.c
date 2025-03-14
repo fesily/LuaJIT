@@ -243,7 +243,9 @@ static int ll_loadfunc(lua_State *L, const char *path, const char *name, int r)
     return PACKAGE_ERR_LIB;
   }
   reg = ll_register(L, path);
+#ifdef LJ_NO_SYSTEM
   if (*reg == NULL) *reg = ll_load(L, path, (*name == '*'));
+#endif
   if (*reg == NULL) {
     return PACKAGE_ERR_LIB;  /* Unable to load library. */
   } else if (*name == '*') {  /* Only load library into global namespace. */
