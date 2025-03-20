@@ -243,7 +243,7 @@ static int ll_loadfunc(lua_State *L, const char *path, const char *name, int r)
     return PACKAGE_ERR_LIB;
   }
   reg = ll_register(L, path);
-#if LJ_NO_SYSTEM
+#if !LJ_NO_SYSTEM
   if (*reg == NULL) *reg = ll_load(L, path, (*name == '*'));
 #endif
   if (*reg == NULL) {
