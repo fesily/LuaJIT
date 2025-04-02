@@ -817,4 +817,12 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_UNPACK_PATCH LJ_DS
 #endif
 
+#ifndef LJ_DS_PATCH_READLINE
+#define LJ_DS_PATCH_READLINE LJ_DS
+#endif
+
+#ifndef LJ_DS_USE_GAME_IO
+#define LJ_DS_USE_GAME_IO LJ_DS
+#endif
+
 #endif

@@ -21,7 +21,9 @@ static const luaL_Reg lj_lib_load[] = {
   { "",			luaopen_base },
   { LUA_LOADLIBNAME,	luaopen_package },
   { LUA_TABLIBNAME,	luaopen_table },
+#if !LJ_DS_USE_GAME_IO
   { LUA_IOLIBNAME,	luaopen_io },
+#endif
   { LUA_OSLIBNAME,	luaopen_os },
   { LUA_STRLIBNAME,	luaopen_string },
   { LUA_MATHLIBNAME,	luaopen_math },
