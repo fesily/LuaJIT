@@ -822,7 +822,7 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #endif
 
 #ifndef LJ_DS_USE_GAME_IO
-#define LJ_DS_USE_GAME_IO LJ_DS
+#define LJ_DS_USE_GAME_IO 0
 #endif
 
 #endif
