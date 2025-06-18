@@ -69,7 +69,7 @@ LUALIB_API void luaL_openlibs(lua_State *L)
   }
   lua_pop(L, 1);
 #ifdef LJ_DS
-#ifdef LJ_DS_STRING_DUMP_FIX
+#if LJ_DS_STRING_DUMP_FIX
   const char* dump_fix = 
 "local util = require 'jit.util'\n"
 "local std_fns = {}\n"
@@ -93,12 +93,12 @@ LUALIB_API void luaL_openlibs(lua_State *L)
 "end\n";
   (luaL_loadstring(L, dump_fix) || lua_pcall(L, 0, 0, 0));
 #endif
-#ifdef LJ_DS_MATH_FIX
+#if LJ_DS_MATH_FIX
  dump_fix = 
  "math.mod = math.fmod";
   (luaL_loadstring(L, dump_fix) || lua_pcall(L, 0, 0, 0));
 #endif
-#ifdef DO_LUA_INIT
+#if DO_LUA_INIT
   handle_luainit(L);
 #endif
 #endif

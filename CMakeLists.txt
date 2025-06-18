@@ -404,6 +404,7 @@ ELSE()
   target_link_libraries(luajit ${LIBS})
   SET_TARGET_PROPERTIES(luajit PROPERTIES ENABLE_EXPORTS ON)
 ENDIF()
+target_compile_definitions(luajit PRIVATE -DLJ_DS_DEBUG_GETINFO_PATCH=0)
 
 MACRO(LUAJIT_add_custom_commands luajit_target)
   SET(target_srcs "")

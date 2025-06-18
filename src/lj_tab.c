@@ -696,7 +696,7 @@ MSize LJ_FASTCALL lj_tab_len(GCtab *t)
   return t->hmask ? tab_len_slow(t, hi) : (MSize)hi;
 }
 
-#ifdef LJ_UNPACK_PATCH
+#if LJ_UNPACK_PATCH
 MSize LJ_FASTCALL lj_tab_len_for_unpack(GCtab *t)
 {
   MSize j = (MSize)t->asize;

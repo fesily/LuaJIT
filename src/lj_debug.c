@@ -538,7 +538,7 @@ LUA_API int lua_getinfo(lua_State *L, const char *what, lua_Debug *ar)
   return lj_debug_getinfo(L, what, (lj_Debug *)ar, 0);
 }
 
-#ifdef LJ_DS_DEBUG_GETINFO_PATCH
+#if LJ_DS_DEBUG_GETINFO_PATCH
 // the api skip the @ path
 LUA_API int lua_getinfo_game(lua_State *L, const char *what, lua_Debug *ar)
 {

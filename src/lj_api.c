@@ -1271,7 +1271,7 @@ LUA_API int lua_resume(lua_State *L, int nargs)
 }
 
 /* -- GC and memory management -------------------------------------------- */
-#ifdef LJ_DS_FULL_GC_HOOK
+#if LJ_DS_FULL_GC_HOOK
 LUA_DATA_API void (*lj_gc_fullgc_external)(lua_State* L, void* oldfn) = 0;
 #endif
 
@@ -1287,7 +1287,7 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
     g->gc.threshold = data == -1 ? (g->gc.total/100)*g->gc.pause : g->gc.total;
     break;
   case LUA_GCCOLLECT:
-#ifdef LJ_DS_FULL_GC_HOOK
+#if LJ_DS_FULL_GC_HOOK
     if (lj_gc_fullgc_external) {
       lj_gc_fullgc_external(L, lj_gc_fullgc);
       break;
