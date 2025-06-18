@@ -1272,7 +1272,7 @@ LUA_API int lua_resume(lua_State *L, int nargs)
 
 /* -- GC and memory management -------------------------------------------- */
 #ifdef LJ_DS_FULL_GC_HOOK
-LUA_API void (*lj_gc_fullgc_external)(lua_State* L, void* oldfn) = 0;
+LUA_DATA_API void (*lj_gc_fullgc_external)(lua_State* L, void* oldfn) = 0;
 #endif
 
 LUA_API int lua_gc(lua_State *L, int what, int data)
