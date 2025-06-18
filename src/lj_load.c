@@ -180,7 +180,7 @@ LUALIB_API int luaL_loadbuffer(lua_State *L, const char *buf, size_t size,
 			       const char *name)
 {
 #if LJ_DS_LOADBUFFER_PATCH
-  if (buf != name && lj_need_transform_path()){
+  if (buf != name && lj_need_transform_path && lj_need_transform_path()){
     if (name[0] != '@'){
       if (strncmp(name, "scripts/", sizeof("scripts/") -1) == 0 || strncmp(name , "../mods/", sizeof("../mods/") - 1) == 0) {
         char path[260];
