@@ -770,7 +770,7 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #endif
 
 #ifndef LJ_NO_SYSTEM
-#define LJ_NO_SYSTEM LJ_DS
+#define LJ_NO_SYSTEM 0
 #endif
 
 #ifdef LJ_DS
@@ -823,6 +823,17 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 
 #ifndef LJ_DS_USE_GAME_IO
 #define LJ_DS_USE_GAME_IO 0
+#endif
+
+#ifndef LJ_DS_NEW_PROXY_PATCH
+#define LJ_DS_NEW_PROXY_PATCH LJ_DS
+#endif
+
+#ifndef LJ_DS_DISABLE_TAILCALL
+#define LJ_DS_DISABLE_TAILCALL LJ_DS
+#endif
+#if LJ_DS_DISABLE_TAILCALL
+#define LUAJIT_DISABLE_TAILCALL
 #endif
 
 #endif

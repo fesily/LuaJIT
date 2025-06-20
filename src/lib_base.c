@@ -570,8 +570,12 @@ LJLIB_CF(collectgarbage)
 }
 
 /* -- Base library: miscellaneous functions ------------------------------- */
-
+#if LJ_DS_NEW_PROXY_PATCH
 static int closure_func(lua_State *L) {
+  lj_assertL(L, lua_isfunction(L, lua_upvalueindex(1)),
+              "upvalue is not a function");
+  lj_assertL(L, lua_iscfunction(L, lua_upvalueindex(2)),
+              "upvalue is not a function");
   int n = lua_gettop(L);  // Get the number of arguments
   lua_pushvalue(L, lua_upvalueindex(1));  // Push the upvalue (Lua function)
   // Copy all arguments to the top of the stack
@@ -582,6 +586,7 @@ static int closure_func(lua_State *L) {
   int result_count = lua_gettop(L) - n;  // Calculate the number of results
   return result_count;  // Explicitly return the result count
 }
+#endif
 
 LJLIB_PUSH(top-2)  /* Upvalue holds weak table. */
 LJLIB_CF(newproxy)
@@ -595,13 +600,16 @@ LJLIB_CF(newproxy)
     lua_pushvalue(L, -1);
     lua_pushboolean(L, 1);
     lua_rawset(L, lua_upvalueindex(1));  /* Remember mt in weak table. */
+#if LJ_DS_NEW_PROXY_PATCH
   } else if (lua_isfunction(L, 1)) {
     if (lua_iscfunction(L, 1)) {
       lj_err_arg(L, 1, LJ_ERR_NOPROXY); 
     }
     lua_pushvalue(L, 1);
-    lua_pushcclosure(L, closure_func, 1);
+    lua_pushcfunction(L, lj_cf_newproxy);
+    lua_pushcclosure(L, closure_func, 2);
     return 1;
+#endif
   } else {  /* newproxy(proxy): inherit metatable. */
     int validproxy = 0;
     if (lua_getmetatable(L, 1)) {
@@ -616,6 +624,10 @@ LJLIB_CF(newproxy)
   lua_setmetatable(L, 2);
   return 1;
 }
+
+#if LJ_DS_NEW_PROXY_PATCH
+lua_CFunction lua_newproxy = lj_cf_newproxy;
+#endif
 
 LJLIB_PUSH("tostring")
 LJLIB_CF(print)
