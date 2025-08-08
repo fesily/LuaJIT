@@ -615,6 +615,9 @@ typedef struct GCState {
 #if LJ_64
   MRef lightudseg;	/* Upper bits of lightuserdata segments. */
 #endif
+#if LJ_DS_ENABLE_GC_STEP_TIME
+  MSize stepmultime; /* Time spent in each GC step (in nanoseconds). */
+#endif
 } GCState;
 
 /* String interning state. */
