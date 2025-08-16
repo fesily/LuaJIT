@@ -913,11 +913,11 @@ void *lj_mem_grow(lua_State *L, void *p, MSize *szp, MSize lim, MSize esz)
 int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
 {
   global_State *g = G(L);
-  uint64_t timelim = (uint64_t)g->gc.stepmultime;  /* base 1ms (1e6 ns) for mul=100 */
+  uint64_t timelim = (uint64_t)g->gc.stepmultime;  /* ns */
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
   if (timelim == 0)
-    timelim = (uint64_t)1e6;  /* large limit, e.g., 1 ms (1e6 ns) */
+    timelim = (uint64_t)1e5;  /* large limit, e.g., 100 us (1e5 ns) */
 
 #if defined(_WIN32)
   LJ_STATIC_ASSERT(sizeof(LARGE_INTEGER) == sizeof(uint64_t));
