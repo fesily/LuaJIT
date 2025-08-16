@@ -834,13 +834,6 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_NEW_PROXY_PATCH LJ_DS
 #endif
 
-#ifndef LJ_DS_DISABLE_TAILCALL
-#define LJ_DS_DISABLE_TAILCALL LJ_DS
-#endif
-#if LJ_DS_DISABLE_TAILCALL
-#define LUAJIT_DISABLE_TAILCALL
-#endif
-
 #ifndef LJ_DS_ENABLE_GC_STEP_TIME
 #define LJ_DS_ENABLE_GC_STEP_TIME LJ_DS
 #define LUA_GCSTEPTIME 10
