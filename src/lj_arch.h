@@ -842,4 +842,7 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 
 #define LJ_DS_DISABLE_GC_STEP LJ_DS_ENABLE_GC_STEP_TIME
 
+#ifndef LJ_DS_CUSTOM_OS_DATE
+#define LJ_DS_CUSTOM_OS_DATE LJ_DS
+#endif
 #endif

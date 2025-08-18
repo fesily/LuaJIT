@@ -167,6 +167,11 @@ static int getfield(lua_State *L, const char *key, int d)
   lua_pop(L, 1);
   return res;
 }
+#if LJ_DS_CUSTOM_OS_DATE
+LUA_DATA_API size_t (*lj_os_date_strftime)(char *_Buffer, size_t _SizeInBytes, const char *_Format, const struct tm *_Tm) = strftime;
+#else
+#define lj_os_date_strftime strftime
+#endif
 
 LJLIB_CF(os_date)
 {
@@ -212,7 +217,7 @@ LJLIB_CF(os_date)
     setsbufL(sb, L);
     while (retry--) {  /* Limit growth for invalid format or empty result. */
       char *buf = lj_buf_need(sb, sz);
-      size_t len = strftime(buf, sbufsz(sb), s, stm);
+      size_t len = lj_os_date_strftime(buf, sbufsz(sb), s, stm);
       if (len) {
 	setstrV(L, L->top++, lj_str_new(L, buf, len));
 	lj_gc_check(L);
