@@ -48,6 +48,15 @@ typedef struct VarInfo {
   uint8_t info;		/* Variable/goto/label info. */
 } VarInfo;
 
+#if LJ_DS_TAILCALL_WRAPPER
+typedef struct ParserTailWrapper {
+  const char *p;
+  const char *pe;
+  void *rdata;
+  lua_Reader rfunc;
+} ParserTailWrapper;
+#endif
+
 /* Lua lexer state. */
 typedef struct LexState {
   struct FuncState *fs;	/* Current FuncState. Defined in lj_parse.c. */
@@ -75,6 +84,9 @@ typedef struct LexState {
   uint32_t level;	/* Syntactical nesting level. */
   int endmark;		/* Trust bytecode end marker, even if not at EOF. */
   int fr2;		/* Generate bytecode for LJ_FR2 mode. */
+#if LJ_DS_TAILCALL_WRAPPER
+  ParserTailWrapper *tailcall_wrapper;
+#endif
 } LexState;
 
 LJ_FUNC int lj_lex_setup(lua_State *L, LexState *ls);

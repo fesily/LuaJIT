@@ -148,6 +148,21 @@ LJLIB_CF(jit_attach)
   return 0;
 }
 
+#if LJ_DS_DYNAMIC_DISABLE_TAILCALL
+LJLIB_CF(jit_disabletailcall)
+{
+  int en = 0;
+  if (L->base == L->top || tvisnil(L->base)) {
+    en = 0;
+  }
+  if (tvistrue(L->base)) {
+    en = 1;
+  }
+  G(L)->parser_disable_tailcall = en;
+  return 0;
+}
+#endif
+
 LJLIB_PUSH(top-5) LJLIB_SET(os)
 LJLIB_PUSH(top-4) LJLIB_SET(arch)
 LJLIB_PUSH(top-3) LJLIB_SET(version_num)
