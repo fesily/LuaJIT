@@ -24,6 +24,9 @@ typedef struct lj_Debug {
   /* Extended fields. Only valid if lj_debug_getinfo() is called with ext = 1.*/
   int nparams;
   int isvararg;
+#if LJ_DS_TAILCALL_WRAPPER
+  int tailcall;
+#endif
 } lj_Debug;
 
 LJ_FUNC cTValue *lj_debug_frame(lua_State *L, int level, int *size);

@@ -437,6 +437,9 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
   TValue *frame = NULL;
   TValue *nextframe = NULL;
   GCfunc *fn;
+#if LJ_DS_TAILCALL_WRAPPER
+  ar->name = NULL;
+#endif
   if (*what == '>') {
     TValue *func = L->top - 1;
     if (!tvisfunc(func)) return 0;
@@ -531,6 +534,22 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
     }
     incr_top(L);
   }
+#if LJ_DS_TAILCALL_WRAPPER
+  if (isluafunc(fn) && funcproto(fn)->eflags & PROTO_EFLAG_TAILCALL) {
+    ar->what = "tail";
+    ar->name = ar->namewhat = "";
+    ar->lastlinedefined = ar->linedefined = ar->currentline = -1;
+    ar->source = "(tail call)";
+    strncpy(ar->short_src, ar->source, LUA_IDSIZE);
+    ar->nups = 0;
+    ar->tailcall = 1;
+  } else {
+    if (ar->name && strcmp(ar->name, "___tailcall") == 0) {
+      ar->name = ar->namewhat = "";
+    }
+    ar->tailcall = 0;
+  }
+#endif
   return 1;  /* Ok. */
 }
 
@@ -543,10 +562,13 @@ LUA_API int lua_getinfo(lua_State *L, const char *what, lua_Debug *ar)
 // the api skip the @ path
 LUA_API int lua_getinfo_game(lua_State *L, const char *what, lua_Debug *ar)
 {
-  int res = lj_debug_getinfo(L, what, (lj_Debug *)ar, 0);
+  lj_Debug iar;
+  memcpy(&iar, ar, sizeof(lua_Debug));
+  int res = lj_debug_getinfo(L, what, &iar, 0);
   if (res) {
     ar->source = ar->source[0] == '@' ? ar->source + 1 : ar->source;
   }
+  memcpy(ar, &iar, sizeof(lua_Debug));
   return res;
 }
 #endif
@@ -678,23 +700,23 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
 {
   int top = (int)(L->top - L->base);
   int lim = TRACEBACK_LEVELS1;
-  lua_Debug ar;
+  lj_Debug ar;
   if (msg) lua_pushfstring(L, "%s\n", msg);
   lua_pushliteral(L, "stack traceback:");
-  while (lua_getstack(L1, level++, &ar)) {
+  while (lua_getstack(L1, level++, (lua_Debug*)&ar)) {
     GCfunc *fn;
     if (level > lim) {
-      if (!lua_getstack(L1, level + TRACEBACK_LEVELS2, &ar)) {
+      if (!lua_getstack(L1, level + TRACEBACK_LEVELS2, (lua_Debug*)&ar)) {
 	level--;
       } else {
 	lua_pushliteral(L, "\n\t...");
-	lua_getstack(L1, -10, &ar);
+	lua_getstack(L1, -10, (lua_Debug*)&ar);
 	level = ar.i_ci - TRACEBACK_LEVELS2;
       }
       lim = 2147483647;
       continue;
     }
-    lua_getinfo(L1, "Snlf", &ar);
+    lua_getinfo(L1, "Snlf", (lua_Debug*)&ar);
     fn = funcV(L1->top-1); L1->top--;
     if (isffunc(fn) && !*ar.namewhat)
       lua_pushfstring(L, "\n\t[builtin#%d]:", fn->c.ffid);
@@ -709,6 +731,10 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
 	lua_pushliteral(L, " in main chunk");
       } else if (*ar.what == 'C') {
 	lua_pushfstring(L, " at %p", fn->c.f);
+#if LJ_DS_TAILCALL_WRAPPER
+      } else if (ar.tailcall) {
+  lua_pushliteral(L, "?");
+#endif
       } else {
 	lua_pushfstring(L, " in function <%s:%d>",
 			ar.short_src, ar.linedefined);

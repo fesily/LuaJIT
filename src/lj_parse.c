@@ -146,6 +146,11 @@ typedef struct FuncState {
 #if LUA_COMPAT_VARARG
   uint8_t need_vararg;
 #endif
+#if LJ_DS_DYNAMIC_DISABLE_TAILCALL
+  uint8_t eflags;
+  #define FUNC_STATE_FLAG_DISABLE_TAILCALL	0x01
+  #define FUNC_STATE_FLAG_PROTO_TAILCALL		0x02
+#endif
 } FuncState;
 
 /* Binary and unary operators. ORDER OPR */
@@ -1618,7 +1623,12 @@ static GCproto *fs_finish(LexState *ls, BCLine line)
   lj_vmevent_send(L, BC,
     setprotoV(L, L->top++, pt);
   );
-
+#if LJ_DS_TAILCALL_WRAPPER
+  pt->eflags = 0;
+  if (fs->eflags & FUNC_STATE_FLAG_PROTO_TAILCALL) {
+    pt->eflags |= PROTO_EFLAG_TAILCALL;
+  }
+#endif
   L->top--;  /* Pop table of constants. */
   ls->vtop = fs->vbase;  /* Reset variable stack. */
   ls->fs = fs->prev;
@@ -1895,6 +1905,12 @@ static void parse_body(LexState *ls, ExpDesc *e, int needself, BCLine line)
   ptrdiff_t oldbase = pfs->bcbase - ls->bcstack;
   fs_init(ls, &fs);
   fscope_begin(&fs, &bl, 0);
+#if LJ_DS_TAILCALL_WRAPPER
+  fs.eflags = 0;
+  if (tvisstr(&ls->tokval) && strcmp(strVdata(&ls->tokval), "LJ_DS_tailcall") == 0) {
+    fs.eflags |= FUNC_STATE_FLAG_DISABLE_TAILCALL | FUNC_STATE_FLAG_PROTO_TAILCALL;
+  }
+#endif
   fs.linedefined = line;
   fs.numparams = (uint8_t)parse_params(ls, needself);
   fs.bcbase = pfs->bcbase + pfs->pc;
@@ -2375,6 +2391,37 @@ static void parse_return(LexState *ls)
 	BCIns *ip = bcptr(fs, &e);
 	/* It doesn't pay off to add BC_VARGT just for 'return ...'. */
 	if (bc_op(*ip) == BC_VARG) goto notailcall;
+#if LJ_DS_DYNAMIC_DISABLE_TAILCALL
+  if (G(ls->L)->parser_disable_tailcall)
+    goto notailcall;
+#if LJ_DS_TAILCALL_WRAPPER
+  if (fs->eflags & FUNC_STATE_FLAG_DISABLE_TAILCALL)
+    goto notailcall;
+  lj_assertX(e.u.s.info == fs->pc - 1, "assert failed by ip");
+  GCstr* name = lj_str_newlit(ls->L, "LJ_DS_tailcall");
+  ExpDesc wrapper;
+  if (var_lookup_(fs, name, &wrapper, 1) >= 0 && wrapper.k == VUPVAL) {
+    BCReg a = bc_a(*ip);
+    BCReg b = bc_b(*ip);
+    BCReg c = bc_c(*ip);
+    int ismultres = bc_op(*ip) == BC_CALLM;
+
+    expr_tonextreg(fs, &wrapper);
+    BCInsLine uget_lj_ds_tallcall = fs->bcbase[fs->pc - 1];
+    setbc_a(&uget_lj_ds_tallcall.ins, a);
+    fs->pc-=2;
+    int fr2 = ls->fr2 ? 1 : 0;
+    fr2 += 1;
+    for (int i = c - (ismultres ? 0 : 2); i >= 0; i--) {
+        bcemit_AD(fs, BC_MOV, a + i + fr2 + 1, a + i + fr2);
+    }
+    bcemit_AD(fs, BC_MOV, a + fr2, a);
+    bcemit_AD(fs, BC_UGET, a, bc_d(uget_lj_ds_tallcall.ins));
+    bcemit_ABC(fs, ismultres ? BC_CALLM : BC_CALL, a, b, c + 1);
+    ip = &fs->bcbase[fs->pc - 1].ins;
+  }
+#endif
+#endif
 	fs->pc--;
 	ins = BCINS_AD(bc_op(*ip)-BC_CALL+BC_CALLT, bc_a(*ip), bc_c(*ip));
 #endif
