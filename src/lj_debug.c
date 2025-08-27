@@ -439,6 +439,7 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
   GCfunc *fn;
 #if LJ_DS_TAILCALL_WRAPPER
   ar->name = NULL;
+#define istailcallfunc(fn) (isluafunc(fn) && funcproto(fn)->eflags & PROTO_EFLAG_TAILCALL)
 #endif
   if (*what == '>') {
     TValue *func = L->top - 1;
@@ -503,6 +504,10 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
       opt_f = 1;
     } else if (*what == 'L') {
       opt_L = 1;
+#if LJ_DS_TAILCALL_WRAPPER
+    } else if (*what == 't') {
+      /*unused, always do it*/
+#endif
     } else {
       return 0;  /* Bad option. */
     }
@@ -535,19 +540,19 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
     incr_top(L);
   }
 #if LJ_DS_TAILCALL_WRAPPER
-  if (isluafunc(fn) && funcproto(fn)->eflags & PROTO_EFLAG_TAILCALL) {
+  if (istailcallfunc(fn)) {
     ar->what = "tail";
     ar->name = ar->namewhat = "";
     ar->lastlinedefined = ar->linedefined = ar->currentline = -1;
     ar->source = "(tail call)";
     strncpy(ar->short_src, ar->source, LUA_IDSIZE);
     ar->nups = 0;
-    ar->tailcall = 1;
+    ar->istailcall = 1;
   } else {
     if (ar->name && strcmp(ar->name, "___tailcall") == 0) {
       ar->name = ar->namewhat = "";
     }
-    ar->tailcall = 0;
+    ar->istailcall = 0;
   }
 #endif
   return 1;  /* Ok. */
@@ -555,7 +560,11 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
 
 LUA_API int lua_getinfo(lua_State *L, const char *what, lua_Debug *ar)
 {
-  return lj_debug_getinfo(L, what, (lj_Debug *)ar, 0);
+  lj_Debug iar;
+  iar.i_ci = ar->i_ci;
+  int res = lj_debug_getinfo(L, what, &iar, 0);
+  memcpy(ar, &iar, sizeof(lua_Debug));
+  return res;
 }
 
 #if LJ_DS_DEBUG_GETINFO_PATCH
@@ -563,7 +572,7 @@ LUA_API int lua_getinfo(lua_State *L, const char *what, lua_Debug *ar)
 LUA_API int lua_getinfo_game(lua_State *L, const char *what, lua_Debug *ar)
 {
   lj_Debug iar;
-  memcpy(&iar, ar, sizeof(lua_Debug));
+  iar.i_ci = ar->i_ci;
   int res = lj_debug_getinfo(L, what, &iar, 0);
   if (res) {
     ar->source = ar->source[0] == '@' ? ar->source + 1 : ar->source;
@@ -716,7 +725,7 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
       lim = 2147483647;
       continue;
     }
-    lua_getinfo(L1, "Snlf", (lua_Debug*)&ar);
+    lj_debug_getinfo(L1, "Snlf", &ar, 0);
     fn = funcV(L1->top-1); L1->top--;
     if (isffunc(fn) && !*ar.namewhat)
       lua_pushfstring(L, "\n\t[builtin#%d]:", fn->c.ffid);
@@ -732,7 +741,7 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
       } else if (*ar.what == 'C') {
 	lua_pushfstring(L, " at %p", fn->c.f);
 #if LJ_DS_TAILCALL_WRAPPER
-      } else if (ar.tailcall) {
+      } else if (ar.istailcall) {
   lua_pushliteral(L, "?");
 #endif
       } else {

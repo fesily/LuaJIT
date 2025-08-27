@@ -99,19 +99,23 @@ static char lj_call_LJ_DS_dynamic_tailcall_cb(lua_State *L, lua_Reader reader, v
 		      const char *chunkname, const char *mode)
 {
   char tailcall = 0;
-  int top = lua_gettop(L);
   lua_getfield(L, LUA_REGISTRYINDEX, "LJ_DS_dynamic_tailcall_cb");
   if (lua_isfunction(L, -1)) {
     lua_pushlightuserdata(L, reader);
     lua_pushlightuserdata(L, data);
     lua_pushstring(L, chunkname);
     lua_pushstring(L, mode);
-    lua_pcall(L, 4, 0, 0);
-    if (lua_gettop(L) != top && lua_toboolean(L, -1)) {
-      tailcall = 1;
+    if (lua_pcall(L, 4, 3, 0)) {
+      lua_pop(L, 1);
+    } else {
+      // skip ret[3]
+      const char* msg = lua_tostring(L, -2);
+      tailcall = lua_toboolean(L, -3);
+      lua_pop(L, 3);
     }
+  } else {
+    lua_pop(L, 1);
   }
-  lua_settop(L, top);  
   return tailcall;
 }
 #endif
