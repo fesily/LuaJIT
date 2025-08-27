@@ -153,6 +153,11 @@ LJLIB_CF(debug_getinfo)
       break;
     case 'f': opt_f = 1; break;
     case 'L': opt_L = 1; break;
+#if LJ_DS_TAILCALL_WRAPPER
+    case 't':
+      settabsb(L, "istailcall", ar.istailcall);
+      break;
+#endif
     default: break;
     }
   }

@@ -25,7 +25,7 @@ typedef struct lj_Debug {
   int nparams;
   int isvararg;
 #if LJ_DS_TAILCALL_WRAPPER
-  int tailcall;
+  int istailcall;
 #endif
 } lj_Debug;
 
