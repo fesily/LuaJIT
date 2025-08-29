@@ -550,7 +550,8 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
     ar->istailcall = 1;
   } else {
     if (ar->name && strcmp(ar->name, "___tailcall") == 0) {
-      ar->name = ar->namewhat = "";
+      ar->name = NULL;
+      ar->namewhat = "";
     }
     ar->istailcall = 0;
   }
@@ -739,10 +740,14 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
       if (*ar.what == 'm') {
 	lua_pushliteral(L, " in main chunk");
       } else if (*ar.what == 'C') {
+#if !LJ_DS_DEBUG_TRACE_C_DISABLE_ADDRESS
 	lua_pushfstring(L, " at %p", fn->c.f);
+#else
+	lua_pushliteral(L, " ?");
+#endif
 #if LJ_DS_TAILCALL_WRAPPER
       } else if (ar.istailcall) {
-  lua_pushliteral(L, "?");
+  lua_pushliteral(L, " ?");
 #endif
       } else {
 	lua_pushfstring(L, " in function <%s:%d>",
