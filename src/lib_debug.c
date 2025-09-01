@@ -212,11 +212,11 @@ static int debug_getupvalue(lua_State *L, int get)
   lj_lib_checkfunc(L, 1);
 #if LJ_DS_NEW_PROXY_PATCH
   if (lua_iscfunction(L, 1)) {
-    TValue *val;
+    TValue *val = NULL;
     GCobj *o;
     int index = 2;
     name = lj_debug_uvnamev(index2adr(L, 1), (uint32_t)(index-1), &val, &o);
-    if ((!name || strlen(name) == 0) && tvisfunc(val)) {
+    if (val && tvisfunc(val) && (!name || strlen(name) == 0)) {
       GCfunc *fn = funcV(val);
       if (iscfunc(fn)) {
         if (fn->c.f == lua_newproxy)
