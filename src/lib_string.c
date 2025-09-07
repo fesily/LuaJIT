@@ -140,6 +140,11 @@ LJLIB_CF(string_dump)
   }
   sb = lj_buf_tmp_(L);  /* Assumes lj_bcwrite() doesn't use tmpbuf. */
   L->top = L->base+1;
+#if LJ_DS_STRING_DUMP_FIX
+  if (pt && pt->firstline == ~(BCLine)0) {
+    pt = NULL;  /* Disallow dumping this prototype. */
+  }
+#endif
   if (!pt || lj_bcwrite(L, pt, writer_buf, sb, flags))
     lj_err_caller(L, LJ_ERR_STRDUMP);
   setstrV(L, L->top-1, lj_buf_str(L, sb));

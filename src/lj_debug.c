@@ -344,7 +344,11 @@ void lj_debug_shortname(char *out, GCstr *str, BCLine line)
     size_t len;  /* Length, up to first control char. */
     for (len = 0; len < LUA_IDSIZE-12; len++)
       if (((const unsigned char *)src)[len] < ' ') break;
+#if !LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
     strcpy(out, line == ~(BCLine)0 ? "[builtin:" : "[string \""); out += 9;
+#else
+    strcpy(out, "[string \""); out += 9;
+#endif
     if (src[len] != '\0') {  /* Must truncate? */
       if (len > LUA_IDSIZE-15) len = LUA_IDSIZE-15;
       strncpy(out, src, len); out += len;
@@ -352,7 +356,11 @@ void lj_debug_shortname(char *out, GCstr *str, BCLine line)
     } else {
       strcpy(out, src); out += len;
     }
+#if !LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
     strcpy(out, line == ~(BCLine)0 ? "]" : "\"]");
+#else
+    strcpy(out, "\"]");
+#endif
   }
 }
 
@@ -464,6 +472,9 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
       if (isluafunc(fn)) {
 	GCproto *pt = funcproto(fn);
 	BCLine firstline = pt->firstline;
+#if LJ_DS_BUILTIN_FUNCTION_INFO_TO_C
+  if (firstline == ~(BCLine)0) goto wrapper_cfunction; /* builtin */
+#endif
 	GCstr *name = proto_chunkname(pt);
 	ar->source = strdata(name);
 	lj_debug_shortname(ar->short_src, name, pt->firstline);
@@ -471,6 +482,7 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
 	ar->lastlinedefined = (int)(firstline + pt->numline);
 	ar->what = (firstline || !pt->numline) ? "Lua" : "main";
       } else {
+wrapper_cfunction:
 	ar->source = "=[C]";
 	ar->short_src[0] = '[';
 	ar->short_src[1] = 'C';
@@ -485,7 +497,11 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
     } else if (*what == 'u') {
       ar->nups = fn->c.nupvalues;
       if (ext) {
+#if LJ_DS_BUILTIN_FUNCTION_INFO_TO_C
+	if (isluafunc(fn) && funcproto(fn)->firstline != ~(BCLine)0) {
+#else
 	if (isluafunc(fn)) {
+#endif
 	  GCproto *pt = funcproto(fn);
 	  ar->nparams = pt->numparams;
 	  ar->isvararg = !!(pt->flags & PROTO_VARARG);
@@ -728,9 +744,11 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
     }
     lj_debug_getinfo(L1, "Snlf", &ar, 0);
     fn = funcV(L1->top-1); L1->top--;
+#if !LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
     if (isffunc(fn) && !*ar.namewhat)
       lua_pushfstring(L, "\n\t[builtin#%d]:", fn->c.ffid);
     else
+#endif
       lua_pushfstring(L, "\n\t%s:", ar.short_src);
     if (ar.currentline > 0)
       lua_pushfstring(L, "%d:", ar.currentline);

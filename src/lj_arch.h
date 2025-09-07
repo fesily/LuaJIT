@@ -868,4 +868,13 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #ifndef LJ_DS_CUSTOM_OS_DATE
 #define LJ_DS_CUSTOM_OS_DATE LJ_DS
 #endif
+
+#ifndef LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
+#define LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO LJ_DS
+#endif
+
+#ifndef LJ_DS_BUILTIN_FUNCTION_INFO_TO_C
+#define LJ_DS_BUILTIN_FUNCTION_INFO_TO_C LJ_DS
+#endif
+
 #endif

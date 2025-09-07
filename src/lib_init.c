@@ -73,38 +73,16 @@ LUALIB_API void luaL_openlibs(lua_State *L)
   }
   lua_pop(L, 1);
 #ifdef LJ_DS
-#if LJ_DS_STRING_DUMP_FIX
-  const char* dump_fix = 
-"local util = require 'jit.util'\n"
-"local std_fns = {}\n"
-"for name, mod in pairs(package.loaded) do\n"
-"    if type(mod) == 'table' then\n"
-"        for fn_name, fn in pairs(mod) do\n"
-"            if type(fn) == 'function' then\n"
-"                if pcall(util.funck, fn, 0) then\n"
-"                    std_fns[fn] = true\n"
-"                end\n"
-"            end\n"
-"        end\n"
-"    end\n"
-"end\n"
-"local dump = string.dump\n"
-"string.dump = function (f, strip)\n"
-"    if std_fns[f] then\n"
-"        error('unable to dump given function', 2)\n"
-"    end\n"
-"    return dump(f, strip)\n"
-"end\n";
-  (luaL_loadstring(L, dump_fix) || lua_pcall(L, 0, 0, 0));
-#endif
+  const char* dump_fix = ""
 #if LJ_DS_MATH_FIX
- dump_fix = 
- "math.mod = math.fmod";
+ "math.mod = math.fmod\n"
+#endif
+;
   (luaL_loadstring(L, dump_fix) || lua_pcall(L, 0, 0, 0));
 #endif
+
 #if DO_LUA_INIT
   handle_luainit(L);
-#endif
 #endif
 }
 
