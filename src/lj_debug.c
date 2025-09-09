@@ -592,7 +592,7 @@ LUA_API int lua_getinfo_game(lua_State *L, const char *what, lua_Debug *ar)
   iar.i_ci = ar->i_ci;
   int res = lj_debug_getinfo(L, what, &iar, 0);
   if (res) {
-    ar->source = ar->source[0] == '@' ? ar->source + 1 : ar->source;
+      ar->source = iar.source[0] == '@' ? iar.source + 1 : iar.source;
   }
   memcpy(ar, &iar, sizeof(lua_Debug));
   return res;
