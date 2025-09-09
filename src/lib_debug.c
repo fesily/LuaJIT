@@ -316,14 +316,24 @@ static void hookf(lua_State *L, lua_Debug *ar)
 {
   static const char *const hooknames[] =
     {"call", "return", "line", "count", "tail return"};
+#if LJ_DS_HOOKTABLE
   (L->top++)->u64 = KEY_HOOK;
   lua_rawget(L, LUA_REGISTRYINDEX);
+  lua_pushlightuserdata(L, L);
+  lua_rawget(L, -2);
+#else
+  (L->top++)->u64 = KEY_HOOK;
+  lua_rawget(L, LUA_REGISTRYINDEX);
+#endif
   if (lua_isfunction(L, -1)) {
     lua_pushstring(L, hooknames[(int)ar->event]);
     if (ar->currentline >= 0)
       lua_pushinteger(L, ar->currentline);
     else lua_pushnil(L);
     lua_call(L, 2, 0);
+#if LJ_DS_HOOKTABLE
+    lua_pop(L, 1);  /* remove hook table */
+#endif
   }
 }
 
@@ -347,11 +357,29 @@ static char *unmakemask(int mask, char *smask)
   return smask;
 }
 
+#if LJ_DS_HOOKTABLE
+static void gethooktable (lua_State *L) {
+  (L->top++)->u64 = KEY_HOOK;
+  lua_rawget(L, LUA_REGISTRYINDEX);
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    lua_createtable(L, 0, 1);
+    (L->top++)->u64 = KEY_HOOK;
+    lua_pushvalue(L, -2);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+  }
+}
+#endif
+
 LJLIB_CF(debug_sethook)
 {
   int arg, mask, count;
   lua_Hook func;
+#if LJ_DS_HOOKTABLE
+  lua_State *L1 = getthread(L, &arg);
+#else
   (void)getthread(L, &arg);
+#endif
   if (lua_isnoneornil(L, arg+1)) {
     lua_settop(L, arg+1);
     func = NULL; mask = 0; count = 0;  /* turn off hooks */
@@ -361,23 +389,42 @@ LJLIB_CF(debug_sethook)
     count = luaL_optint(L, arg+3, 0);
     func = hookf; mask = makemask(smask, count);
   }
+#if LJ_DS_HOOKTABLE
+  gethooktable(L);
+  lua_pushlightuserdata(L, L1);
+  lua_pushvalue(L, arg+1);
+  lua_rawset(L, -3);  /* set new hook */
+  lua_pop(L, 1);  /* remove hook table */
+#else
   (L->top++)->u64 = KEY_HOOK;
   lua_pushvalue(L, arg+1);
   lua_rawset(L, LUA_REGISTRYINDEX);
+#endif
   lua_sethook(L, func, mask, count);
   return 0;
 }
 
 LJLIB_CF(debug_gethook)
 {
+#if LJ_DS_HOOKTABLE
+  int arg;
+  lua_State *L1 = getthread(L, &arg);
+#endif
   char buff[5];
   int mask = lua_gethookmask(L);
   lua_Hook hook = lua_gethook(L);
   if (hook != NULL && hook != hookf) {  /* external hook? */
     lua_pushliteral(L, "external hook");
   } else {
+#if LJ_DS_HOOKTABLE
+    gethooktable(L);
+    lua_pushlightuserdata(L, L1);
+    lua_rawget(L, -2);   /* get hook */
+    lua_remove(L, -2);  /* remove hook table */
+#else
     (L->top++)->u64 = KEY_HOOK;
     lua_rawget(L, LUA_REGISTRYINDEX);   /* get hook */
+#endif
   }
   lua_pushstring(L, unmakemask(mask, buff));
   lua_pushinteger(L, lua_gethookcount(L));

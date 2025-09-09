@@ -877,4 +877,8 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_BUILTIN_FUNCTION_INFO_TO_C LJ_DS
 #endif
 
+#ifndef LJ_DS_HOOKTABLE
+#define LJ_DS_HOOKTABLE LJ_DS
+#endif
+
 #endif
