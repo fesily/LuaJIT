@@ -1659,6 +1659,9 @@ static void fs_init(LexState *ls, FuncState *fs)
 #if LUA_COMPAT_VARARG
   fs->need_vararg = 0;
 #endif
+#if LJ_DS_TAILCALL_WRAPPER
+  fs->eflags = 0;
+#endif 
   /* Anchor table of constants in stack to avoid being collected. */
   settabV(L, L->top, fs->kt);
   incr_top(L);
@@ -1906,9 +1909,8 @@ static void parse_body(LexState *ls, ExpDesc *e, int needself, BCLine line)
   fs_init(ls, &fs);
   fscope_begin(&fs, &bl, 0);
 #if LJ_DS_TAILCALL_WRAPPER
-  fs.eflags = 0;
   if (tvisstr(&ls->tokval) && strcmp(strVdata(&ls->tokval), "LJ_DS_tailcall") == 0) {
-    fs.eflags |= FUNC_STATE_FLAG_DISABLE_TAILCALL | FUNC_STATE_FLAG_PROTO_TAILCALL;
+    fs.eflags |= FUNC_STATE_FLAG_PROTO_TAILCALL;
   }
 #endif
   fs.linedefined = line;

@@ -572,9 +572,9 @@ LJLIB_CF(collectgarbage)
 /* -- Base library: miscellaneous functions ------------------------------- */
 #if LJ_DS_NEW_PROXY_PATCH
 static int closure_func(lua_State *L) {
-  lj_assertL(L, lua_isfunction(L, lua_upvalueindex(1)),
+  lj_assertL(lua_isfunction(L, lua_upvalueindex(1)),
               "upvalue is not a function");
-  lj_assertL(L, lua_iscfunction(L, lua_upvalueindex(2)),
+  lj_assertL(lua_iscfunction(L, lua_upvalueindex(2)),
               "upvalue is not a function");
   int n = lua_gettop(L);  // Get the number of arguments
   lua_pushvalue(L, lua_upvalueindex(1));  // Push the upvalue (Lua function)
