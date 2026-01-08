@@ -74,7 +74,7 @@ LUALIB_API void luaL_openlibs(lua_State *L)
   lua_pop(L, 1);
 #ifdef LJ_DS
   const char* dump_fix = ""
-#if LJ_DS_MATH_FIX
+#if LUA_COMPAT_MATH
  "math.mod = math.fmod\n"
 #endif
 ;

@@ -781,28 +781,43 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS 0
 #endif
 
-#ifndef LJ_DS_STRING_HASH
-#define LJ_DS_STRING_HASH LJ_DS
+#ifndef LUAJIT_ENABLE_LUA51COMPAT
+#define LUAJIT_ENABLE_LUA51COMPAT 1
 #endif
 
+// use LJ_DS_HOOKTABLE to simulator lua5.1 debug.sethook behavior */
+#ifndef LJ_DS_HOOKTABLE
+#define LJ_DS_HOOKTABLE LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
+// disbale string.dump buildin lua function for lua5.1 behavior
 #ifndef LJ_DS_STRING_DUMP_FIX
-#define LJ_DS_STRING_DUMP_FIX LJ_DS
+#define LJ_DS_STRING_DUMP_FIX LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
-#ifndef LJ_DS_MATH_FIX 
-#define LJ_DS_MATH_FIX LJ_DS
-#endif
-
-#ifndef LJ_DS_MOD_GEMCORE_FIX
-#define LJ_DS_MOD_GEMCORE_FIX LJ_DS
+// fix math.mod to lua5.1 behavior
+#ifndef LUA_COMPAT_MATH 
+#define LUA_COMPAT_MATH LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
 #ifndef LJ_DS_BIG_UPVAL_PATCH
-#define LJ_DS_BIG_UPVAL_PATCH LJ_DS
+#define LJ_DS_BIG_UPVAL_PATCH LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
 #ifndef LJ_DS_PARSER_TABLE_PATCH
-#define LJ_DS_PARSER_TABLE_PATCH LJ_DS
+#define LJ_DS_PARSER_TABLE_PATCH LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
+#ifndef LUA_COMPAT_GFIND
+#define LUA_COMPAT_GFIND LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
+#ifndef LUA_COMPAT_VARARG
+#define LUA_COMPAT_VARARG LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
+#ifndef LJ_DS_STR_HASH_PATCH
+#define LJ_DS_STR_HASH_PATCH LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
 #ifndef LJ_NO_SYSTEM
@@ -823,18 +838,6 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 
 #ifndef LJ_DS_IO_FOPEN_PATCH
 #define LJ_DS_IO_FOPEN_PATCH LJ_DS
-#endif
-
-#ifndef LUA_COMPAT_GFIND
-#define LUA_COMPAT_GFIND LJ_DS
-#endif
-
-#ifndef LUA_COMPAT_VARARG
-#define LUA_COMPAT_VARARG LJ_DS
-#endif
-
-#ifndef LJ_DS_STR_HASH_PATCH
-#define LJ_DS_STR_HASH_PATCH LJ_DS
 #endif
 
 #ifndef LJ_DS_DEBUG_GETINFO_PATCH
@@ -911,10 +914,6 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 
 #ifndef LJ_DS_BUILTIN_FUNCTION_INFO_TO_C
 #define LJ_DS_BUILTIN_FUNCTION_INFO_TO_C LJ_DS
-#endif
-
-#ifndef LJ_DS_HOOKTABLE
-#define LJ_DS_HOOKTABLE LJ_DS
 #endif
 
 #endif
