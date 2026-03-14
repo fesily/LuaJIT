@@ -37,6 +37,7 @@ option(LUAJIT_DISABLE_JIT "Disable JIT." OFF)
 option(LUAJIT_CPU_SSE2 "Use SSE2 instead of x87 instructions." ON)
 option(LUAJIT_CPU_NOCMOV "Disable NOCMOV." OFF)
 option(LUAJIT_DISABLE_GC64 "Disable GC64" OFF)
+option(LUA_COMPAT_VARARG_N "Enable legacy Lua 5.1 arg.n population." OFF)
 option(LUAJIT_ENABLE_FSANITIZE "Enable fsanitize" OFF)
 option(LUAJIT_NUMMODE "num mode" 2)
 MARK_AS_ADVANCED(LUAJIT_DISABLE_FFI LUAJIT_ENABLE_LUA52COMPAT
@@ -65,6 +66,10 @@ ENDIF()
 
 IF(LUAJIT_CPU_NOCMOV)
   ADD_DEFINITIONS(-DLUAJIT_CPU_NOCMOV)
+ENDIF()
+
+IF(LUA_COMPAT_VARARG_N)
+  ADD_DEFINITIONS(-DLUA_COMPAT_VARARG_N=1)
 ENDIF()
 
 IF(LUAJIT_NUMMODE)
@@ -280,7 +285,12 @@ endif()
 
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h
   COMMAND minilua ${LUAJIT_DIR}/dynasm/dynasm.lua ${DASM_FLAGS} -o ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
-  DEPENDS ${LUAJIT_DIR}/dynasm/dynasm.lua minilua
+  DEPENDS
+    ${LUAJIT_DIR}/dynasm/dynasm.lua
+    ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+    ${LUAJIT_DIR}/src/lj_arch.h
+    ${LUAJIT_DIR}/src/lj_bc.h
+    minilua
 )
 
 add_custom_command(OUTPUT ${LUAJIT_DIR}/src/luajit_relver.txt

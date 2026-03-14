@@ -145,6 +145,7 @@ typedef struct FuncState {
   VarIndex uvtmp[LJ_MAX_UPVAL];	/* Temporary upvalue map. */
 #if LUA_COMPAT_VARARG
   uint8_t need_vararg;
+  uint8_t has_compat_arg;
 #endif
 #if LJ_DS_DYNAMIC_DISABLE_TAILCALL
   uint8_t eflags;
@@ -1139,10 +1140,10 @@ static MSize var_lookup_(FuncState *fs, GCstr *name, ExpDesc *e, int first)
     if ((int32_t)reg >= 0) {  /* Local in this function? */
       expr_init(e, VLOCAL, reg);
 #if LUA_COMPAT_VARARG
-    if (!fs->need_vararg && fs->flags & PROTO_VARARG){
-      if (name->len == (sizeof("arg") - 1) && strncmp(strdata(name), "arg", name->len) == 0){
-        fs->need_vararg = 1;
-      }
+    if (fs->has_compat_arg &&
+        name->len == (sizeof("arg") - 1) &&
+        strncmp(strdata(name), "arg", name->len) == 0) {
+      fs->need_vararg = 1;
     }
 #endif
       if (!first)
@@ -1583,18 +1584,6 @@ static GCproto *fs_finish(LexState *ls, BCLine line)
   /* Apply final fixups. */
   fs_fixup_ret(fs);
 
-#if LUA_COMPAT_VARARG
-  if ((fs->flags & PROTO_VARARG) && !fs->need_vararg) {
-    lj_assertX(fs->bcbase[1].ins == BCINS_AD(BC_TNEW, fs->numparams, 3), "TNEW numparams,3");
-    lj_assertX(fs->bcbase[2].ins == BCINS_ABC(BC_VARG, fs->numparams + 1, 0, fs->numparams), "VARG numparams+1,0,numparams");
-    lj_assertX(fs->bcbase[3].ins == BCINS_AD(BC_TSETM, fs->numparams + 1, 0), "TSETM numparams+1,0");
-    lj_assertX(fs->pc >= 3, "invaild opcode length");
-    fs->bcbase[1].ins = BCINS_AD(BC_KPRI, fs->numparams, 0);
-    fs->bcbase[2].ins = BCINS_AD(BC_KPRI, fs->numparams, 0);
-    fs->bcbase[3].ins = BCINS_AD(BC_KPRI, fs->numparams, 0);
-  }
-#endif
-
   /* Calculate total size of prototype including all colocated arrays. */
   sizept = sizeof(GCproto) + fs->pc*sizeof(BCIns) + fs->nkgc*sizeof(GCRef);
   sizept = (sizept + sizeof(TValue)-1) & ~(sizeof(TValue)-1);
@@ -1659,6 +1648,7 @@ static void fs_init(LexState *ls, FuncState *fs)
   fs->kt = lj_tab_new(L, 0, 0);
 #if LUA_COMPAT_VARARG
   fs->need_vararg = 0;
+  fs->has_compat_arg = 0;
 #endif
 #if LJ_DS_TAILCALL_WRAPPER
   fs->eflags = 0;
@@ -1874,6 +1864,7 @@ static BCReg parse_params(LexState *ls, int needself)
 {
   FuncState *fs = ls->fs;
   BCReg nparams = 0;
+  BCReg nlocals;
   lex_check(ls, '(');
   if (needself)
     var_new_lit(ls, nparams++, "self");
@@ -1883,6 +1874,10 @@ static BCReg parse_params(LexState *ls, int needself)
 	var_new(ls, nparams++, lex_str(ls));
       } else if (ls->tok == TK_dots) {
 	lj_lex_next(ls);
+  #if LUA_COMPAT_VARARG
+  fs->has_compat_arg = 1;
+  var_new_lit(ls, nparams, "arg");
+  #endif
 	fs->flags |= PROTO_VARARG;
 	break;
       } else {
@@ -1890,9 +1885,14 @@ static BCReg parse_params(LexState *ls, int needself)
       }
     } while (lex_opt(ls, ','));
   }
-  var_add(ls, nparams);
-  lj_assertFS(fs->nactvar == nparams, "bad regalloc");
-  bcreg_reserve(fs, nparams);
+  nlocals = nparams;
+#if LUA_COMPAT_VARARG
+  if (fs->has_compat_arg)
+    nlocals++;
+#endif
+  var_add(ls, nlocals);
+  lj_assertFS(fs->nactvar == nlocals, "bad regalloc");
+  bcreg_reserve(fs, nlocals);
   lex_check(ls, ')');
   return nparams;
 }
@@ -2067,9 +2067,6 @@ static void expr_simple(LexState *ls, ExpDesc *v)
     base = fs->freereg-1;
     expr_init(v, VCALL, bcemit_ABC(fs, BC_VARG, base, 2, fs->numparams));
     v->u.s.aux = base;
-#if LUA_COMPAT_VARARG
-    fs->need_vararg = 0; /* don't need 'arg' */
-#endif
     break;
   }
   case '{':  /* Table constructor. */
@@ -2791,80 +2788,83 @@ static void add_argstmt(LexState* ls)
   //skip if/while/do-end body
   if (ls->fs->bl->prev)
     return;
-  ExpDesc e;
+  if (!ls->fs->has_compat_arg)
+    return;
 
-  if (ls->fs->flags & PROTO_VARARG) {
-    var_new_lit(ls, 0, "arg");
-// nexps = expr_list(ls, &e);
-    {
-      synlevel_begin(ls);
-  // expr_unop(ls, &e);
-      {
-    // expr_simple(ls, v);
-        {
-      // expr_table(ls, v);
-          {
-            ExpDesc key, val;
-            FuncState *fs = ls->fs;
-            BCLine line = ls->linenumber;
-            BCInsLine *ilp;
-            BCIns *ip;
-            ExpDesc en;
-            BCReg base;
+  ExpDesc argtab, key, val, en;
+#if LUA_COMPAT_VARARG_N
+  ExpDesc selectfn, hasharg, nfield;
+#endif
+  FuncState *fs = ls->fs;
+  BCLine line = ls->linenumber;
+  BCInsLine *ilp;
+  BCIns *ip;
+  BCReg argslot;
+  BCReg base;
+#if LUA_COMPAT_VARARG_N
+  BCReg callbase, hashslot, vargslot;
+  BCPos pc, pcvarg;
+  GCstr *select_name = lj_parse_keepstr(ls, "select", sizeof("select")-1);
+  GCstr *hash_name = lj_parse_keepstr(ls, "#", sizeof("#")-1);
+  GCstr *n_name = lj_parse_keepstr(ls, "n", sizeof("n")-1);
+#else
+  BCPos pc;
+#endif
 
-            GCtab *t = NULL;
-            int vcall = 0, needarr = 0, fixt = 0;
-        uint32_t narr = 1;  /* First array index. */
-        uint32_t nhash = 0;  /* Number of hash entries. */
-            BCReg freg = fs->freereg;
-            BCPos pc = bcemit_AD(fs, BC_TNEW, freg, 0);
-            expr_init(&e, VNONRELOC, freg);
-            bcreg_reserve(fs, 1);
-            freg++;
+  synlevel_begin(ls);
 
-            vcall = 0;
-            expr_init(&key, VKNUM, 0);
-            setintV(&key.u.nval, (int)narr);
-            narr++;
-            needarr = vcall = 1;
+  argslot = fs->numparams;
 
-            // expr(ls, &val);
-            {
-              checkcond(ls, fs->flags & PROTO_VARARG, LJ_ERR_XDOTS);
-              bcreg_reserve(fs, 1);
-              base = fs->freereg-1;
-              expr_init(&val, VCALL, bcemit_ABC(fs, BC_VARG, base, 2, fs->numparams));
-              val.u.s.aux = base;
-            }
+  pc = bcemit_AD(fs, BC_TNEW, argslot, 0);
 
-            if (expr_isk(&key)) expr_index(fs, &e, &key);
-            bcemit_store(fs, &e, &val);
-            fs->freereg = freg;
+  expr_init(&argtab, VLOCAL, argslot);
+  argtab.u.s.aux = fs->varmap[argslot];
 
-            ilp = &fs->bcbase[fs->pc-1];
-            expr_init(&en, VKNUM, 0);
-            en.u.nval.u32.lo = narr-1;
-        en.u.nval.u32.hi = 0x43300000;  /* Biased integer to avoid denormals. */
-            if (narr > 256) { fs->pc--; ilp--; }
-            ilp->ins = BCINS_AD(BC_TSETM, freg, const_num(fs, &en));
-            setbc_b(&ilp[-1].ins, 0);
+  expr_init(&key, VKNUM, 0);
+  setintV(&key.u.nval, 1);
 
-        e.k = VNONRELOC;  /* May have been changed by expr_index. */
+  bcreg_reserve(fs, 1);
+  base = fs->freereg-1;
+  expr_init(&val, VCALL, bcemit_ABC(fs, BC_VARG, base, 2, fs->numparams));
+  val.u.s.aux = base;
+  expr_index(fs, &argtab, &key);
+  bcemit_store(fs, &argtab, &val);
+  fs->freereg = base;
 
+  ilp = &fs->bcbase[fs->pc-1];
+  expr_init(&en, VKNUM, 0);
+  en.u.nval.u32.lo = 1;
+  en.u.nval.u32.hi = 0x43300000;
+  ilp->ins = BCINS_AD(BC_TSETM, base, const_num(fs, &en));
+  setbc_b(&ilp[-1].ins, 0);
 
-            ip = &fs->bcbase[pc].ins;
-            if (!needarr) narr = 0;
-            else if (narr < 3) narr = 3;
-            else if (narr > 0x7ff) narr = 0x7ff;
-            setbc_d(ip, narr|(hsize2hbits(nhash)<<11));
-          }
-        }
-      }
-      synlevel_end(ls);
-    }
-    assign_adjust(ls, 1, 1, &e);
-    var_add(ls, 1);
-  }  
+  ip = &fs->bcbase[pc].ins;
+  setbc_d(ip, 3|(hsize2hbits(1)<<11));
+
+#if LUA_COMPAT_VARARG_N
+  expr_init(&selectfn, VGLOBAL, 0);
+  selectfn.u.sval = select_name;
+  expr_init(&hasharg, VKSTR, 0);
+  hasharg.u.sval = hash_name;
+  expr_init(&nfield, VKSTR, 0);
+  nfield.u.sval = n_name;
+
+  callbase = fs->freereg;
+  hashslot = callbase + 1 + ls->fr2;
+  vargslot = hashslot + 1;
+  bcreg_reserve(fs, (BCReg)(vargslot - fs->freereg + 1));
+
+  bcemit_AD(fs, BC_GGET, callbase, const_str(fs, &selectfn));
+  bcemit_AD(fs, BC_KSTR, hashslot, const_str(fs, &hasharg));
+  pcvarg = bcemit_ABC(fs, BC_VARG, vargslot, 2, fs->numparams);
+  setbc_b(&fs->bcbase[pcvarg].ins, 0);
+  bcemit_ABC(fs, BC_CALLM, callbase, 2, 1);
+  fs->bcbase[fs->pc - 1].line = line;
+  bcemit_ABC(fs, BC_TSETS, callbase, argslot, const_str(fs, &nfield));
+#endif
+  fs->freereg = fs->nactvar;
+
+  synlevel_end(ls);
 }
 #endif
 

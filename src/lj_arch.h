@@ -816,6 +816,10 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LUA_COMPAT_VARARG LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
+#ifndef LUA_COMPAT_VARARG_N
+#define LUA_COMPAT_VARARG_N 0
+#endif
+
 #ifndef LJ_DS_STR_HASH_PATCH
 #define LJ_DS_STR_HASH_PATCH LUAJIT_ENABLE_LUA51COMPAT
 #endif
