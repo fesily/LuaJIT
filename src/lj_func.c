@@ -53,6 +53,9 @@ static GCupval *func_finduv(lua_State *L, TValue *slot)
   /* No matching upvalue found. Create a new one. */
   uv = lj_mem_newt(L, sizeof(GCupval), GCupval);
   newwhite(g, uv);
+#if LJ_GEN_GC
+  setage(obj2gco(uv), G_NEW);
+#endif
   uv->gct = ~LJ_TUPVAL;
   uv->closed = 0;  /* Still open. */
   setmref(uv->v, slot);  /* Pointing to the stack slot. */

@@ -628,6 +628,13 @@
 #define LJ_HASBUFFER		1
 #endif
 
+/* Disable or enable the generational GC implementation. */
+#if defined(LUAJIT_DISABLE_GEN_GC)
+#define LJ_GEN_GC		0
+#else
+#define LJ_GEN_GC		1
+#endif
+
 #if defined(LUAJIT_DISABLE_PROFILE)
 #define LJ_HASPROFILE		0
 #elif LJ_TARGET_POSIX
@@ -909,7 +916,14 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 
 
 #ifndef LJ_DS_ENABLE_GC_STEP_TIME
-#define LJ_DS_ENABLE_GC_STEP_TIME LJ_DS
+#if LJ_DS && !LJ_GEN_GC
+#define LJ_DS_ENABLE_GC_STEP_TIME 1
+#else
+#define LJ_DS_ENABLE_GC_STEP_TIME 0
+#endif
+#endif
+
+#if LJ_DS_ENABLE_GC_STEP_TIME
 #define LUA_GCSTEPTIME 10
 #define LUA_GCSTEP2 11
 #endif

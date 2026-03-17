@@ -39,6 +39,10 @@
 #define gray2black(x)		((x)->gch.marked |= LJ_GC_BLACK)
 #define isfinalized(u)		((u)->marked & LJ_GC_FINALIZED)
 
+#if LJ_GEN_GC
+static GCRef gc_empty;
+#endif
+
 /* -- Mark phase ---------------------------------------------------------- */
 
 /* Mark a TValue (if needed). */
@@ -171,6 +175,19 @@ size_t lj_gc_separateudata(global_State *g, int all)
 /* -- Propagation phase --------------------------------------------------- */
 
 /* Traverse a table. */
+#if LJ_GEN_GC
+static void gc_genlink(global_State *g, GCobj *o)
+{
+  if (getage(o) == G_TOUCHED1) {
+    setgcrefr(gco2tab(o)->gclist, g->gc.grayagain);
+    setgcref(g->gc.grayagain, o);
+    black2gray(o);
+  } else if (getage(o) == G_TOUCHED2) {
+    setage(o, G_OLD);
+  }
+}
+#endif
+
 static int gc_traverse_tab(global_State *g, GCtab *t)
 {
   int weak = 0;
@@ -218,6 +235,17 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
       }
     }
   }
+#if LJ_GEN_GC
+  if (!weak && g->gc.kind == KGC_GEN) {
+    if (g->gc.state == GCSpropagate) {
+      setgcrefr(t->gclist, g->gc.grayagain);
+      setgcref(g->gc.grayagain, obj2gco(t));
+      black2gray(obj2gco(t));
+    } else {
+      gc_genlink(g, obj2gco(t));
+    }
+  }
+#endif
   return weak;
 }
 
@@ -284,7 +312,11 @@ static void gc_traverse_proto(global_State *g, GCproto *pt)
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT
+#if LJ_GEN_GC
+  if (g->gc.kind == KGC_INC && pt->trace) gc_marktrace(g, pt->trace);
+#else
   if (pt->trace) gc_marktrace(g, pt->trace);
+#endif
 #endif
 }
 
@@ -500,6 +532,44 @@ static void gc_clearweak(global_State *g, GCobj *o)
   }
 }
 
+#if LJ_GEN_GC
+static int gc_canpropagate(int gct)
+{
+  return gct != ~LJ_TSTR && gct != ~LJ_TUPVAL &&
+	 gct != ~LJ_TCDATA && gct != ~LJ_TUDATA;
+}
+
+static void gc_move_gray(global_State *g, GCRef *list)
+{
+  GCobj *o;
+  GCRef *again = &g->gc.grayagain;
+  GCRef *p = list;
+  while ((o = gcref(*p)) != NULL) {
+    setgcrefr(*p, o->gch.gclist);
+    if (!iswhite(o) && gc_canpropagate(o->gch.gct)) {
+      if (!isgray(o))
+	black2gray(o);
+      setgcrefr(o->gch.gclist, g->gc.gray);
+      setgcref(g->gc.gray, o);
+    } else {
+	setgcref(*again, o);
+	again = &o->gch.gclist;
+    }
+  }
+  setgcrefnull(*again);
+}
+
+static void gc_blackenweak(global_State *g)
+{
+  GCobj *o = gcref(g->gc.weak);
+  while (o) {
+    if (!iswhite(o))
+      gray2black(o);
+    o = gcref(o->gch.gclist);
+  }
+}
+#endif
+
 /* Call a userdata or cdata finalizer. */
 static void gc_call_finalizer(global_State *g, lua_State *L,
 			      cTValue *mo, GCobj *o)
@@ -619,6 +689,13 @@ void lj_gc_freeall(global_State *g)
 static void atomic(global_State *g, lua_State *L)
 {
   size_t udsize;
+#if LJ_GEN_GC
+  GCRef grayagain;
+
+  setgcrefr(grayagain, g->gc.grayagain);
+  setgcrefnull(g->gc.grayagain);
+  g->gc.state = GCSatomic;
+#endif
 
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
@@ -631,8 +708,16 @@ static void atomic(global_State *g, lua_State *L)
   gc_mark_gcroot(g);  /* Mark GC roots (again). */
   gc_propagate_gray(g);  /* Propagate all of the above. */
 
+#if LJ_GEN_GC
+  if (g->gc.kind == KGC_GEN) {
+    gc_move_gray(g, &grayagain);  /* Revisit only propagatable grayagain objects. */
+  } else {
+    setgcrefr(g->gc.gray, grayagain);  /* In incremental mode grayagain is re-propagatable. */
+  }
+#else
   setgcrefr(g->gc.gray, g->gc.grayagain);  /* Empty the 2nd chance list. */
   setgcrefnull(g->gc.grayagain);
+#endif
   gc_propagate_gray(g);  /* Propagate it. */
 
   udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
@@ -651,8 +736,313 @@ static void atomic(global_State *g, lua_State *L)
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
 }
 
+#if LJ_GEN_GC
+static size_t gc_onestep(lua_State *L);
+
+static int incstep(lua_State *L)
+{
+  global_State *g = G(L);
+  GCSize lim;
+  int32_t ostate = g->vmstate;
+  setvmstate(g, GC);
+  lim = (GCSTEPSIZE/100) * g->gc.stepmul;
+  if (lim == 0)
+    lim = LJ_MAX_MEM;
+  if (g->gc.total > g->gc.threshold)
+    g->gc.debt += g->gc.total - g->gc.threshold;
+  do {
+    lim -= (GCSize)gc_onestep(L);
+    if (g->gc.state == GCSpause) {
+      g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+      g->vmstate = ostate;
+      return 1;  /* Finished a GC cycle. */
+    }
+  } while (sizeof(lim) == 8 ? ((int64_t)lim > 0) : ((int32_t)lim > 0));
+  if (g->gc.debt < GCSTEPSIZE) {
+    g->gc.threshold = g->gc.total + GCSTEPSIZE;
+    g->vmstate = ostate;
+    return -1;
+  } else {
+    g->gc.debt -= GCSTEPSIZE;
+    g->gc.threshold = g->gc.total;
+    g->vmstate = ostate;
+    return 0;
+  }
+}
+
+static void sweep2old(lua_State *L, GCRef *p)
+{
+  GCobj *o;
+  global_State *g = G(L);
+  while ((o = gcref(*p)) != NULL) {
+    if (o->gch.gct == ~LJ_TTHREAD)
+      sweep2old(L, &gco2th(o)->openupval);
+    if (iswhite(o) && !isfixed(o)) {
+      lj_assertG(isdead(g, o), "survivor is not dead");
+      setgcrefr(*p, o->gch.nextgc);
+      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+    } else {
+      setage(o, G_OLD);
+      if (o->gch.gct == ~LJ_TTHREAD) {
+	setgcrefr(gco2th(o)->gclist, g->gc.grayagain);
+	setgcref(g->gc.grayagain, o);
+	black2gray(o);
+	lj_assertG(gcref(gco2th(o)->openupval) == NULL || !isblack(gcref(gco2th(o)->openupval)),
+		   "open upvalue unexpectedly black");
+	} else if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed) {
+	black2gray(o);
+	lj_assertG(!isblack(o), "open upvalue unexpectedly black");
+	} else if (!isblack(o)) {
+	gray2black(o);
+	}
+      p = &o->gch.nextgc;
+    }
+  }
+}
+
+static void sweepstringsold(lua_State *L)
+{
+  global_State *g = G(L);
+  MSize i;
+  for (i = 0; i <= g->str.mask; i++)
+    sweep2old(L, &g->str.tab[i]);
+}
+
+static GCRef *sweepgen(lua_State *L, global_State *g, GCRef *p, GCRef limit,
+		      GCRef *root)
+{
+  static const uint8_t nextage[] = {
+    G_SURVIVAL, G_OLD1, G_OLD1, G_OLD, G_OLD, G_TOUCHED1, G_TOUCHED2
+  };
+  GCobj *o;
+  GCobj *objlimit = gcref(limit);
+  while ((o = gcref(*p)) != objlimit) {
+    if (o->gch.gct == ~LJ_TTHREAD)
+      sweepgen(L, g, &gco2th(o)->openupval, gc_empty, NULL);
+    if (iswhite(o) && !isfixed(o)) {
+      lj_assertG(!isold(o) && isdead(g, o), "young object survived sweepgen");
+      setgcrefr(*p, o->gch.nextgc);
+      if (root && o == gcref(*root))
+	setgcrefr(*root, o->gch.nextgc);
+      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+    } else {
+      if (getage(o) == G_NEW)
+	makewhite(g, o);
+      setage(o, nextage[getage(o)]);
+      p = &o->gch.nextgc;
+    }
+  }
+  return p;
+}
+
+static void sweepstringsgen(lua_State *L)
+{
+  global_State *g = G(L);
+  MSize i;
+  for (i = 0; i <= g->str.mask; i++)
+    sweepgen(L, g, &g->str.tab[i], gc_empty, NULL);
+}
+
+static void gc_runtilstate(lua_State *L, int state)
+{
+  while (G(L)->gc.state != state)
+    gc_onestep(L);
+}
+
+static GCRef *correctgraylist(global_State *g, GCRef *p)
+{
+  GCobj *o;
+  while ((o = gcref(*p)) != NULL) {
+    switch (~o->gch.gct) {
+    case LJ_TTAB:
+    case LJ_TUDATA:
+      if (getage(o) == G_TOUCHED1) {
+	lj_assertG(isgray(o), "touched object lost gray state");
+	gray2black(o);
+	changeage(o, G_TOUCHED1, G_TOUCHED2);
+	p = &o->gch.gclist;
+      } else {
+	if (!iswhite(o)) {
+	  lj_assertG(isold(o), "non-old object in corrected gray list");
+	  if (getage(o) == G_TOUCHED2)
+	    changeage(o, G_TOUCHED2, G_OLD);
+	  gray2black(o);
+	}
+	*p = o->gch.gclist;
+      }
+      break;
+    case LJ_TTHREAD:
+	lj_assertG(!isblack(o), "thread unexpectedly black");
+	if (iswhite(o))
+	  *p = o->gch.gclist;
+	else
+	  p = &o->gch.gclist;
+	break;
+    default:
+	if (!iswhite(o))
+	  gray2black(o);
+	*p = o->gch.gclist;
+	break;
+    }
+  }
+  return p;
+}
+
+static void correctgraylists(global_State *g)
+{
+  GCRef *list = correctgraylist(g, &g->gc.grayagain);
+  *list = g->gc.weak;
+  setgcrefnull(g->gc.weak);
+  correctgraylist(g, list);
+}
+
+static void markold(global_State *g, GCRef from, GCRef to)
+{
+  GCobj *o;
+  GCobj *toobj = gcref(to);
+  while ((o = gcref(from)) != toobj) {
+    if (getage(o) == G_OLD1) {
+      int gct = o->gch.gct;
+      lj_assertG(!iswhite(o) || isfixed(o), "old1 object unexpectedly white");
+
+      if (isblack(o) && gc_canpropagate(gct)) {
+	black2gray(o);
+	setgcrefr(o->gch.gclist, g->gc.gray);
+	setgcref(g->gc.gray, o);
+      }
+    }
+    from = o->gch.nextgc;
+  }
+}
+
+static void markstringold(global_State *g)
+{
+  MSize i;
+  for (i = 0; i <= g->str.mask; i++)
+    markold(g, g->str.tab[i], gc_empty);
+}
+
+static void finishgencycle(lua_State *L, global_State *g)
+{
+  correctgraylists(g);
+  if (gcref(g->gc.mmudata) != NULL) {
+	g->gc.state = GCSfinalize;
+	return;
+  }
+  g->gc.state = GCSpropagate;
+}
+
+static void youngcollection(lua_State *L, global_State *g)
+{
+  GCRef *psurvival;
+  lj_assertG(g->gc.state == GCSpropagate, "young collection in bad state");
+  markold(g, g->gc.survival, g->gc.reallyold);
+  markold(g, g->gc.udatasurvival, g->gc.udatarold);
+  markstringold(g);
+  atomic(g, L);
+  gc_blackenweak(g);
+  psurvival = sweepgen(L, g, &g->gc.root, g->gc.survival, NULL);
+  sweepgen(L, g, psurvival, g->gc.reallyold, &g->gc.old);
+  g->gc.reallyold = g->gc.old;
+  g->gc.old = *psurvival;
+  g->gc.survival = g->gc.root;
+  sweepstringsgen(L);
+  psurvival = sweepgen(L, g, &mainthread(g)->nextgc, g->gc.udatasurvival, NULL);
+  sweepgen(L, g, psurvival, g->gc.udatarold, &g->gc.udataold);
+  g->gc.udatarold = g->gc.udataold;
+  g->gc.udataold = *psurvival;
+  g->gc.udatasurvival = mainthread(g)->nextgc;
+  finishgencycle(L, g);
+}
+
+static void entergen(lua_State *L, global_State *g)
+{
+  lj_trace_abort(g);
+  lj_trace_flushall(L);
+  gc_runtilstate(L, GCSpause);
+  gc_runtilstate(L, GCSpropagate);
+  atomic(g, L);
+  setgcrefnull(g->gc.gray);
+  setgcrefnull(g->gc.grayagain);
+  setgcrefnull(g->gc.weak);
+  sweep2old(L, &g->gc.root);
+  sweepstringsold(L);
+  g->gc.reallyold = g->gc.old = g->gc.survival = g->gc.root;
+  g->gc.udatarold = g->gc.udataold = g->gc.udatasurvival = mainthread(g)->nextgc;
+  g->gc.kind = KGC_GEN;
+  g->gc.genwork = KGC_GENWORK_NONE;
+  g->gc.estimate = g->gc.total;
+  g->gc.threshold = (g->gc.total / 100) * (100 + g->gc.genminormul);
+  finishgencycle(L, g);
+}
+
+static void enterinc(lua_State *L, global_State *g)
+{
+  setgcrefnull(g->gc.gray);
+  setgcrefnull(g->gc.grayagain);
+  setgcrefnull(g->gc.weak);
+  setgcrefnull(g->gc.reallyold);
+  setgcrefnull(g->gc.old);
+  setgcrefnull(g->gc.survival);
+  setgcrefnull(g->gc.udatarold);
+  setgcrefnull(g->gc.udataold);
+  setgcrefnull(g->gc.udatasurvival);
+  g->gc.state = GCSsweepstring;
+  g->gc.sweepstr = 0;
+  setmref(g->gc.sweep, &g->gc.root);
+  g->gc.estimate = g->gc.total;
+  g->gc.threshold = g->gc.total;
+  g->gc.debt = GCSTEPSIZE;
+  g->gc.kind = KGC_INC;
+  g->gc.genwork = KGC_GENWORK_NONE;
+  UNUSED(L);
+}
+
+static void fullgen(lua_State *L, global_State *g)
+{
+  enterinc(L, g);
+  entergen(L, g);
+}
+
+static void genstep(lua_State *L, global_State *g)
+{
+  if (g->gc.genwork == KGC_GENWORK_MAJOR) {
+  if (tvref(g->jit_base) != NULL)
+    return;
+  g->gc.genwork = KGC_GENWORK_NONE;
+  fullgen(L, g);
+  return;
+  }
+  if (g->gc.state == GCSfinalize) {
+  if (tvref(g->jit_base) != NULL)
+    return;
+  if (gcref(g->gc.mmudata) != NULL) {
+    gc_finalize(L);
+    return;
+  }
+  g->gc.state = GCSpropagate;
+  return;
+  }
+  GCSize majorbase = g->gc.estimate;
+  int majormul = getgcparam(g->gc.genmajormul);
+  if (g->gc.total > g->gc.threshold &&
+      g->gc.total > (majorbase / 100) * (100 + majormul)) {
+  if (tvref(g->jit_base) != NULL) {
+    g->gc.genwork = KGC_GENWORK_MAJOR;
+    g->gc.threshold = 0;
+    return;
+  }
+  fullgen(L, g);
+  } else {
+    youngcollection(L, g);
+    g->gc.threshold = (g->gc.total / 100) * (100 + g->gc.genminormul);
+    g->gc.estimate = majorbase;
+  }
+}
+#endif
+
 /* GC state machine. Returns a cost estimate for each step performed. */
-static size_t gc_onestep(lua_State *L, uint32_t sweeplim)
+static size_t gc_onestep(lua_State *L)
 {
   global_State *g = G(L);
   switch (g->gc.state) {
@@ -682,7 +1072,7 @@ static size_t gc_onestep(lua_State *L, uint32_t sweeplim)
     }
   case GCSsweep: {
     GCSize old = g->gc.total;
-    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), sweeplim));
+    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
@@ -695,7 +1085,7 @@ static size_t gc_onestep(lua_State *L, uint32_t sweeplim)
 	g->gc.debt = 0;
       }
     }
-    return sweeplim*GCSWEEPCOST;
+    return GCSWEEPMAX*GCSWEEPCOST;
     }
   case GCSfinalize:
     if (gcref(g->gc.mmudata) != NULL) {
@@ -722,6 +1112,12 @@ static size_t gc_onestep(lua_State *L, uint32_t sweeplim)
 int LJ_FASTCALL lj_gc_step(lua_State *L)
 {
   global_State *g = G(L);
+#if LJ_GEN_GC
+  if (g->gc.kind == KGC_INC)
+    return incstep(L);
+  genstep(L, g);
+  return 1;
+#else
   GCSize lim;
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
@@ -731,7 +1127,7 @@ int LJ_FASTCALL lj_gc_step(lua_State *L)
   if (g->gc.total > g->gc.threshold)
     g->gc.debt += g->gc.total - g->gc.threshold;
   do {
-    lim -= (GCSize)gc_onestep(L, GCSWEEPMAX);
+    lim -= (GCSize)gc_onestep(L);
     if (g->gc.state == GCSpause) {
       g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
       g->vmstate = ostate;
@@ -748,6 +1144,7 @@ int LJ_FASTCALL lj_gc_step(lua_State *L)
     g->vmstate = ostate;
     return 0;
   }
+#endif
 }
 
 /* Ditto, but fix the stack top first. */
@@ -767,10 +1164,59 @@ int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps)
   while (steps-- > 0 && lj_gc_step(L) == 0)
     ;
   /* Return 1 to force a trace exit. */
-  return (G(L)->gc.state == GCSatomic || G(L)->gc.state == GCSfinalize);
+  return (G(L)->gc.state == GCSatomic || G(L)->gc.state == GCSfinalize
+#if LJ_GEN_GC
+	  || G(L)->gc.genwork != KGC_GENWORK_NONE
+#endif
+	  );
 }
 #endif
 
+#if LJ_GEN_GC
+static void fullinc(lua_State *L, global_State *g)
+{
+  int32_t ostate = g->vmstate;
+  setvmstate(g, GC);
+  if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
+    setmref(g->gc.sweep, &g->gc.root);  /* Sweep everything (preserving it). */
+    setgcrefnull(g->gc.gray);  /* Reset lists from partial propagation. */
+    setgcrefnull(g->gc.grayagain);
+    setgcrefnull(g->gc.weak);
+    g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
+    g->gc.sweepstr = 0;
+  }
+  while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
+    gc_onestep(L);  /* Finish sweep. */
+  lj_assertG(g->gc.state == GCSfinalize || g->gc.state == GCSpause,
+	     "bad GC state");
+  /* Now perform a full GC. */
+  g->gc.state = GCSpause;
+  do { gc_onestep(L); } while (g->gc.state != GCSpause);
+  g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+  g->vmstate = ostate;
+}
+
+/* Perform a full GC cycle. */
+void lj_gc_fullgc(lua_State *L)
+{
+  global_State *g = G(L);
+  if (g->gc.kind == KGC_INC)
+    fullinc(L, g);
+  else
+    fullgen(L, g);
+}
+
+void lj_gc_changemode(lua_State *L, int newmode)
+{
+  global_State *g = G(L);
+  if (newmode != g->gc.kind) {
+    if (newmode == KGC_GEN)
+      entergen(L, g);
+    else
+      enterinc(L, g);
+  }
+}
+#else
 /* Perform a full GC cycle. */
 void lj_gc_fullgc(lua_State *L)
 {
@@ -786,15 +1232,16 @@ void lj_gc_fullgc(lua_State *L)
     g->gc.sweepstr = 0;
   }
   while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
-    gc_onestep(L, GCSWEEPMAX);  /* Finish sweep. */
+    gc_onestep(L);  /* Finish sweep. */
   lj_assertG(g->gc.state == GCSfinalize || g->gc.state == GCSpause,
 	     "bad GC state");
   /* Now perform a full GC. */
   g->gc.state = GCSpause;
-  do { gc_onestep(L, GCSWEEPMAX); } while (g->gc.state != GCSpause);
+  do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
   g->vmstate = ostate;
 }
+#endif
 
 /* -- Write barriers ------------------------------------------------------ */
 
@@ -807,10 +1254,22 @@ void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 	     "bad GC state");
   lj_assertG(o->gch.gct != ~LJ_TTAB, "barrier object is not a table");
   /* Preserve invariant during propagation. Otherwise it doesn't matter. */
+#if LJ_GEN_GC
+  if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
+    gc_mark(g, v);  /* Move frontier forward. */
+    if (isold(o)) {
+      lj_assertG(!isold(v), "old object points to old young target");
+      setage(v, G_OLD0);
+    }
+  } else {
+    makewhite(g, o);  /* Make it white to avoid the following barrier. */
+  }
+#else
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_mark(g, v);  /* Move frontier forward. */
   else
     makewhite(g, o);  /* Make it white to avoid the following barrier. */
+#endif
 }
 
 /* Specialized barrier for closed upvalue. Pass &uv->tv. */
@@ -849,11 +1308,27 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
 }
 
 #if LJ_HASJIT
-/* Mark a trace if it's saved during the propagation phase. */
+/* Mark or remember a trace when it's saved. */
 void lj_gc_barriertrace(global_State *g, uint32_t traceno)
 {
+#if LJ_GEN_GC
+  if (g->gc.kind == KGC_GEN) {
+    GCobj *o = obj2gco(traceref(G2J(g), traceno));
+    setage(o, G_OLD);
+    if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
+      gc_marktrace(g, traceno);
+    } else {
+      o->gch.marked &= (uint8_t)~LJ_GC_WHITES;
+      setgcrefr(gco2trace(o)->gclist, g->gc.grayagain);
+      setgcref(g->gc.grayagain, o);
+    }
+  } else if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
+    gc_marktrace(g, traceno);
+  }
+#else
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_marktrace(g, traceno);
+#endif
 }
 #endif
 
@@ -887,6 +1362,9 @@ void * LJ_FASTCALL lj_mem_newgco(lua_State *L, GCSize size)
   setgcrefr(o->gch.nextgc, g->gc.root);
   setgcref(g->gc.root, o);
   newwhite(g, o);
+#if LJ_GEN_GC
+  setage(o, G_NEW);
+#endif
   return o;
 }
 
@@ -940,7 +1418,7 @@ uint64_t elapsed;
   do {
     if (g->gc.total > g->gc.threshold)
       g->gc.debt += g->gc.total - g->gc.threshold;
-    gc_onestep(L, 1);
+    gc_onestep(L);
     if (g->gc.state == GCSpause) {
       g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
       g->vmstate = ostate;

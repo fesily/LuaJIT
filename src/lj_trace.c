@@ -939,7 +939,12 @@ int LJ_FASTCALL lj_trace_exit(jit_State *J, void *exptr)
     return -exitcode;
   } else if (LJ_HASPROFILE && (G(L)->hookmask & HOOK_PROFILE)) {
     /* Just exit to interpreter. */
-  } else if (G(L)->gc.state == GCSatomic || G(L)->gc.state == GCSfinalize) {
+  } else if (G(L)->gc.state == GCSatomic || G(L)->gc.state == GCSfinalize
+#if LJ_GEN_GC
+	     || (G(L)->gc.kind == KGC_GEN &&
+		 G(L)->gc.genwork != KGC_GENWORK_NONE)
+#endif
+	     ) {
     if (!(G(L)->hookmask & HOOK_GC))
       lj_gc_step(L);  /* Exited because of GC: drive GC forward. */
   } else if ((J->flags & JIT_F_ON)) {

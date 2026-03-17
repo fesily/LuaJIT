@@ -288,6 +288,9 @@ static GCstr *lj_str_alloc(lua_State *L, const char *str, MSize len,
   global_State *g = G(L);
   uintptr_t u;
   newwhite(g, s);
+#if LJ_GEN_GC
+  setage(obj2gco(s), G_NEW);
+#endif
   s->gct = ~LJ_TSTR;
   s->len = len;
   s->hash = hash;

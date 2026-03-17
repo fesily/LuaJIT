@@ -547,14 +547,36 @@ LJLIB_CF(gcinfo)
   return 1;
 }
 
+#if LJ_GEN_GC
+static int pushmode(lua_State *L, int oldmode)
+{
+  if (oldmode == LUA_GCINC)
+    setstrV(L, L->top++, lj_str_newlit(L, "incremental"));
+  else
+    setstrV(L, L->top++, lj_str_newlit(L, "generational"));
+  return 1;
+}
+#endif
+
 LJLIB_CF(collectgarbage)
 {
   int opt = lj_lib_checkopt(L, 1, LUA_GCCOLLECT,  /* ORDER LUA_GC* */
+#if LJ_GEN_GC
+    "\4stop\7restart\7collect\5count\1\377\4step\10setpause\12setstepmul\1\377\11isrunning\14generational\13incremental");
+#else
     "\4stop\7restart\7collect\5count\1\377\4step\10setpause\12setstepmul\1\377\11isrunning");
+#endif
   int32_t data = lj_lib_optint(L, 2, 0);
   if (opt == LUA_GCCOUNT) {
     setnumV(L->top, (lua_Number)G(L)->gc.total/1024.0);
   } else {
+#if LJ_GEN_GC
+    if (opt == LUA_GCGEN || opt == LUA_GCINC) {
+      int32_t data2 = lj_lib_optint(L, 3, 0);
+      pushmode(L, lua_gcparam(L, opt, data, data2));
+      return 1;
+    }
+#endif
     int res = lua_gc(L, opt, data);
     if (opt == LUA_GCSTEP || opt == LUA_GCISRUNNING)
       setboolV(L->top, res);

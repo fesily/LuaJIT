@@ -16,6 +16,9 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   GCudata *ud = lj_mem_newt(L, sizeof(GCudata) + sz, GCudata);
   global_State *g = G(L);
   newwhite(g, ud);  /* Not finalized. */
+#if LJ_GEN_GC
+  setage(obj2gco(ud), G_NEW);
+#endif
   ud->gct = ~LJ_TUDATA;
   ud->udtype = UDTYPE_USERDATA;
   ud->len = sz;

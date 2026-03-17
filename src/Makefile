@@ -197,7 +197,7 @@ HOST_RM?= rm -f
 # copy of (plain) Lua 5.1 or 5.2, plus Lua BitOp. E.g. with: HOST_LUA=lua
 HOST_LUA=
 
-HOST_XCFLAGS= -I.
+HOST_XCFLAGS= -I. $(XCFLAGS)
 HOST_XLDFLAGS=
 HOST_XLIBS=
 HOST_ACFLAGS= $(CCOPTIONS) $(HOST_XCFLAGS) $(TARGET_ARCH) $(HOST_CFLAGS)
@@ -419,6 +419,9 @@ ifneq (,$(findstring LJ_HASJIT 1,$(TARGET_TESTARCH)))
 endif
 ifneq (,$(findstring LJ_HASFFI 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D FFI
+endif
+ifneq (,$(findstring LJ_GEN_GC 1,$(TARGET_TESTARCH)))
+  DASM_AFLAGS+= -D LJ_GEN_GC
 endif
 ifneq (,$(findstring LJ_DUALNUM 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D DUALNUM

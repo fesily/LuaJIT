@@ -220,7 +220,7 @@ static int debug_getupvalue(lua_State *L, int get)
     TValue *val = NULL;
     GCobj *o;
     int index = 2;
-    name = lj_debug_uvnamev(index2adr(L, 1), (uint32_t)(index-1), &val, &o);
+    name = lj_debug_uvnamev(L->base, (uint32_t)(index-1), &val, &o);
     if (val && tvisfunc(val) && (!name || strlen(name) == 0)) {
       GCfunc *fn = funcV(val);
       if (iscfunc(fn)) {
