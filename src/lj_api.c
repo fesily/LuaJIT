@@ -147,6 +147,28 @@ LUA_API int lua_gettop(lua_State *L)
   return (int)(L->top - L->base);
 }
 
+#if LJ_GEN_GC
+static int gc_parammode(lua_State *L, int what, int data1, int data2)
+{
+  global_State *g = G(L);
+  int oldmode = g->gc.kind;
+  if (what == LUA_GCGEN) {
+    if (data1 > 0)
+      g->gc.genminormul = (uint8_t)(data1 > 255 ? 255 : data1);
+    if (data2 > 0)
+      setgcparam(g->gc.genmajormul, data2 > 1020 ? 1020 : data2);
+    lj_gc_changemode(L, KGC_GEN);
+  } else {
+    if (data1 > 0)
+      g->gc.pause = (MSize)data1;
+    if (data2 > 0)
+      g->gc.stepmul = (MSize)data2;
+    lj_gc_changemode(L, KGC_INC);
+  }
+  return oldmode == KGC_GEN ? LUA_GCGEN : LUA_GCINC;
+}
+#endif
+
 LUA_API void lua_settop(lua_State *L, int idx)
 {
   if (idx >= 0) {
@@ -1281,11 +1303,26 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
   case LUA_GCISRUNNING:
     res = (g->gc.threshold != LJ_MAX_MEM);
     break;
+#if LJ_GEN_GC
+  case LUA_GCGEN:
+  case LUA_GCINC:
+    res = gc_parammode(L, what, data, 0);
+    break;
+#endif
   default:
     res = -1;  /* Invalid option. */
   }
   return res;
 }
+
+#if LJ_GEN_GC
+LUA_API int lua_gcparam(lua_State *L, int what, int data1, int data2)
+{
+  if (what == LUA_GCGEN || what == LUA_GCINC)
+    return gc_parammode(L, what, data1, data2);
+  return lua_gc(L, what, data1);
+}
+#endif
 
 LUA_API lua_Alloc lua_getallocf(lua_State *L, void **ud)
 {

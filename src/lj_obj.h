@@ -60,7 +60,11 @@ typedef struct GCRef {
 } GCRef;
 
 /* Common GC header for all collectable objects. */
+#if LJ_GEN_GC
+#define GCHeader	GCRef nextgc; uint8_t marked; uint8_t gct; uint8_t age
+#else
 #define GCHeader	GCRef nextgc; uint8_t marked; uint8_t gct
+#endif
 /* This occupies 6 bytes, so use the next 2 bytes for non-32 bit fields. */
 
 #if LJ_GC64
@@ -589,6 +593,16 @@ typedef enum {
 #define basemt_obj(g, o)	((g)->gcroot[GCROOT_BASEMT+itypemap(o)])
 #define mmname_str(g, mm)	(strref((g)->gcroot[GCROOT_MMNAME+(mm)]))
 
+#if LJ_GEN_GC
+/* Kinds of garbage collection. */
+#define KGC_INC		0
+#define KGC_GEN		1
+
+/* Pending work for generational GC that must run off-trace. */
+#define KGC_GENWORK_NONE	0
+#define KGC_GENWORK_MAJOR	1
+#endif
+
 /* Garbage collector state. */
 typedef struct GCState {
   GCSize total;		/* Memory currently allocated. */
@@ -612,6 +626,18 @@ typedef struct GCState {
   GCSize estimate;	/* Estimate of memory actually in use. */
   MSize stepmul;	/* Incremental GC step granularity. */
   MSize pause;		/* Pause between successive GC cycles. */
+#if LJ_GEN_GC
+  uint8_t kind;		/* KGC_INC or KGC_GEN. */
+  uint8_t genminormul;	/* Minor collection trigger in gen mode. */
+  uint8_t genmajormul;	/* Major collection trigger in gen mode. */
+  uint8_t genwork;	/* Pending off-trace work in gen mode. */
+  GCRef survival;	/* Start of survivors from the last minor GC. */
+  GCRef old;		/* Start of objects promoted by the last minor GC. */
+  GCRef reallyold;	/* Start of objects skipped by minor GC. */
+  GCRef udatasurvival;	/* Userdata survivors from the last minor GC. */
+  GCRef udataold;	/* Userdata promoted by the last minor GC. */
+  GCRef udatarold;	/* Userdata skipped by minor GC. */
+#endif
 #if LJ_64
   MRef lightudseg;	/* Upper bits of lightuserdata segments. */
 #endif

@@ -43,6 +43,9 @@ GCcdata *lj_cdata_newv(lua_State *L, CTypeID id, CTSize sz, CTSize align)
   setgcrefr(cd->nextgc, g->gc.root);
   setgcref(g->gc.root, obj2gco(cd));
   newwhite(g, obj2gco(cd));
+#if LJ_GEN_GC
+  setage(obj2gco(cd), G_NEW);
+#endif
   cd->marked |= 0x80;
   cd->gct = ~LJ_TCDATA;
   cd->ctypeid = id;

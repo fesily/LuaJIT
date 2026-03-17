@@ -302,6 +302,18 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   g->gc.total = sizeof(GG_State);
   g->gc.pause = LUAI_GCPAUSE;
   g->gc.stepmul = LUAI_GCMUL;
+#if LJ_GEN_GC
+  g->gc.kind = KGC_INC;
+  g->gc.genminormul = LUAI_GENMINORMUL;
+  setgcparam(g->gc.genmajormul, LUAI_GENMAJORMUL);
+  g->gc.genwork = KGC_GENWORK_NONE;
+  setgcrefnull(g->gc.survival);
+  setgcrefnull(g->gc.old);
+  setgcrefnull(g->gc.reallyold);
+  setgcrefnull(g->gc.udatasurvival);
+  setgcrefnull(g->gc.udataold);
+  setgcrefnull(g->gc.udatarold);
+#endif
   lj_dispatch_init((GG_State *)L);
   L->status = LUA_ERRERR+1;  /* Avoid touching the stack upon memory error. */
   if (lj_vm_cpcall(L, NULL, NULL, cpluaopen) != 0) {

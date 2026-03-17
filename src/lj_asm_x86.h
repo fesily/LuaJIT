@@ -1912,12 +1912,20 @@ static void asm_cnew(ASMState *as, IRIns *ir)
     return;
   }
 
+#if LJ_GEN_GC
+  /* Initialize gct and ctypeid. lj_mem_newgco() already sets marked/age. */
+  emit_rmro(as, XO_MOVtow, RID_ECX, RID_RET, offsetof(GCcdata, ctypeid));
+  emit_loadi(as, RID_ECX, (int32_t)id);
+  emit_rmro(as, XO_MOVtob, RID_ECX, RID_RET, offsetof(GCcdata, gct));
+  emit_loadi(as, RID_ECX, (int32_t)~LJ_TCDATA);
+#else
   /* Combine initialization of marked, gct and ctypeid. */
   emit_movtomro(as, RID_ECX, RID_RET, offsetof(GCcdata, marked));
   emit_gri(as, XG_ARITHi(XOg_OR), RID_ECX,
 	   (int32_t)((~LJ_TCDATA<<8)+(id<<16)));
   emit_gri(as, XG_ARITHi(XOg_AND), RID_ECX, LJ_GC_WHITES);
   emit_opgl(as, XO_MOVZXb, RID_ECX, gc.currentwhite);
+#endif
 
   args[0] = ASMREF_L;     /* lua_State *L */
   args[1] = ASMREF_TMP1;  /* MSize size   */

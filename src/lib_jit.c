@@ -159,6 +159,10 @@ LJLIB_PUSH(top-2) LJLIB_SET(version)
 
 #define LJLIB_MODULE_jit_util
 
+#if LJ_HASJIT
+static GCtrace *jit_checktrace(lua_State *L);
+#endif
+
 /* -- Reflection API for Lua functions ------------------------------------ */
 
 static void setintfield(lua_State *L, GCtab *t, const char *name, int32_t val)
@@ -255,6 +259,68 @@ LJLIB_CF(jit_util_funcuvname)
     return 1;
   }
   return 0;
+}
+
+LJLIB_CF(jit_util_gcage)
+{
+#if LJ_GEN_GC
+  TValue *o = lj_lib_checkany(L, 1);
+  GCobj *gc;
+#if LJ_HASJIT
+  if (tvisnumber(o)) {
+    GCtrace *T = jit_checktrace(L);
+    if (!T)
+      return 0;
+    gc = obj2gco(T);
+  } else
+#endif
+  {
+    if (!tvisgcv(o))
+      lj_err_argtype(L, 1, "gcobject");
+    gc = gcV(o);
+  }
+  setintV(L->top-1, (int32_t)getage(gc));
+  return 1;
+#else
+  UNUSED(L);
+  return 0;
+#endif
+}
+
+LJLIB_CF(jit_util_gccolor)
+{
+  TValue *o = lj_lib_checkany(L, 1);
+  GCobj *gc;
+#if LJ_HASJIT
+  if (tvisnumber(o)) {
+    GCtrace *T = jit_checktrace(L);
+    if (!T)
+      return 0;
+    gc = obj2gco(T);
+  } else
+#endif
+  {
+    if (!tvisgcv(o))
+      lj_err_argtype(L, 1, "gcobject");
+    gc = gcV(o);
+  }
+  global_State *g = G(L);
+  setstrV(L, L->top-1, lj_str_newz(L,
+         isdead(g, gc) ? "dead" : isblack(gc) ? "black" :
+         isgray(gc) ? "gray" : "white"));
+  return 1;
+}
+
+static const char *const statenames[] = {
+  "pause", "propagate", "atomic", "sweepstring", "sweep",
+  "finalize", ""};
+
+LJLIB_CF(jit_util_gcstate)
+{
+  global_State *g = G(L);
+  const char *state = (g->gc.state <= GCSfinalize) ? statenames[g->gc.state] : "unknown";
+  setstrV(L, L->top++, lj_str_newz(L, state));
+  return 1;
 }
 
 /* -- Reflection API for traces ------------------------------------------- */

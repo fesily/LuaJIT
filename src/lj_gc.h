@@ -43,7 +43,31 @@ enum {
 #define flipwhite(x)	((x)->gch.marked ^= LJ_GC_WHITES)
 #define black2gray(x)	((x)->gch.marked &= (uint8_t)~LJ_GC_BLACK)
 #define fixstring(s)	((s)->marked |= LJ_GC_FIXED)
+#define isfixed(x)	((x)->gch.marked & LJ_GC_FIXED)
 #define markfinalized(x)	((x)->gch.marked |= LJ_GC_FINALIZED)
+
+#if LJ_GEN_GC
+/* Object age in generational mode. */
+#define G_NEW		0
+#define G_SURVIVAL	1
+#define G_OLD0		2
+#define G_OLD1		3
+#define G_OLD		4
+#define G_TOUCHED1	5
+#define G_TOUCHED2	6
+
+#define getage(o)	((o)->gch.age)
+#define setage(o, a)	((o)->gch.age = (a))
+#define isold(o)	(getage(o) > G_SURVIVAL)
+#define changeage(o, f, t) \
+  check_exp(getage(o) == (f), (o)->gch.age = (t))
+
+#define LUAI_GENMAJORMUL	100
+#define LUAI_GENMINORMUL	20
+
+#define getgcparam(p)	((p) * 4)
+#define setgcparam(p, v)	((p) = (v) / 4)
+#endif
 
 /* Collector. */
 LJ_FUNC size_t lj_gc_separateudata(global_State *g, int all);
@@ -85,9 +109,18 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
 	     "bad object states for backward barrier");
   lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
 	     "bad GC state");
+#if LJ_GEN_GC
+  if (getage(o) != G_TOUCHED2) {
+    setgcrefr(t->gclist, g->gc.grayagain);
+    setgcref(g->gc.grayagain, o);
+  }
+  black2gray(o);
+  setage(o, G_TOUCHED1);
+#else
   black2gray(o);
   setgcrefr(t->gclist, g->gc.grayagain);
   setgcref(g->gc.grayagain, o);
+#endif
 }
 
 /* Barrier for stores to table objects. TValue and GCobj variant. */
@@ -113,6 +146,9 @@ LJ_FUNC void *lj_mem_realloc(lua_State *L, void *p, GCSize osz, GCSize nsz);
 LJ_FUNC void * LJ_FASTCALL lj_mem_newgco(lua_State *L, GCSize size);
 LJ_FUNC void *lj_mem_grow(lua_State *L, void *p,
 			  MSize *szp, MSize lim, MSize esz);
+#if LJ_GEN_GC
+LJ_FUNC void lj_gc_changemode(lua_State *L, int newmode);
+#endif
 
 #define lj_mem_new(L, s)	lj_mem_realloc(L, NULL, 0, (s))
 

@@ -228,6 +228,11 @@ LUA_API int  (lua_status) (lua_State *L);
 #define LUA_GCSETPAUSE		6
 #define LUA_GCSETSTEPMUL	7
 #define LUA_GCISRUNNING		9
+#if !defined(LUAJIT_DISABLE_GEN_GC)
+#define LUA_GCGEN		10
+#define LUA_GCINC		11
+LUA_API int (lua_gcparam) (lua_State *L, int what, int data1, int data2);
+#endif
 
 LUA_API int (lua_gc) (lua_State *L, int what, int data);
 
