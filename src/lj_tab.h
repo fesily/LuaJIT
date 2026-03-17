@@ -94,8 +94,4 @@ LJ_FUNCA MSize LJ_FASTCALL lj_tab_len(GCtab *t);
 LJ_FUNC MSize LJ_FASTCALL lj_tab_len_hint(GCtab *t, size_t hint);
 #endif
 
-#if LJ_UNPACK_PATCH
-LJ_FUNCA MSize LJ_FASTCALL lj_tab_len_for_unpack(GCtab *t);
-#endif
-
 #endif

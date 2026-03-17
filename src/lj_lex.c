@@ -206,7 +206,7 @@ static void lex_string(LexState *ls, TValue *tv)
       case 'r': c = '\r'; break;
       case 't': c = '\t'; break;
       case 'v': c = '\v'; break;
-#if 0
+#if LUA_COMPAT_LEX_UNICODE
       case 'x':  /* Hexadecimal escape '\xXX'. */
 	c = (lex_next(ls) & 15u) << 4;
 	if (!lj_char_isdigit(ls->c)) {

@@ -67,7 +67,7 @@ static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
   do {
     if (ls->tailcall_wrapper && ls->p) {
       /* first return hook header */
-      const char *buffer = "function LJ_DS_tailcall(___tailcall, ...) return ___tailcall(...) end;";
+      const char *buffer = "local function LJ_DS_tailcall(___tailcall, ...) return ___tailcall(...) end;";
       ls->tailcall_wrapper->p = &ls->p[-1];
       lj_assertX(*(ls->tailcall_wrapper->p) == ls->c, "");
       ls->tailcall_wrapper->pe = ls->pe;

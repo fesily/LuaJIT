@@ -4059,10 +4059,22 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov RDd, MULTRES
     |  sub RDd, 1
     |  jz >4				// Nothing to copy?
+  #if LJ_UNPACK_PATCH
+    |  add RDd, TMPRd
+    |  // RD = last Lua index written by TSETM. LuaJIT array sizes are
+    |  // non-inclusive and lj_tab_reasize() itself adds +1, so compare
+    |  // against asize with >= and pass the max written index to resize.
+    |  sub RDd, 1
+    |  cmp RDd, TAB:RB->asize
+    |  jae >5				// Doesn't fit into array part?
+    |  sub RDd, TMPRd
+    |  add RDd, 1
+  #else
     |  add RDd, TMPRd			// Compute needed size.
     |  cmp RDd, TAB:RB->asize
     |  ja >5				// Doesn't fit into array part?
     |  sub RDd, TMPRd
+  #endif
     |  shl TMPRd, 3
     |  add TMPR, TAB:RB->array
     |3:  // Copy result slots to table.

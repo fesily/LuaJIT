@@ -820,6 +820,18 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LUA_COMPAT_VARARG_N 0
 #endif
 
+#ifndef LUA_COMPAT_LEX_UNICODE
+#define LUA_COMPAT_LEX_UNICODE !LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
+#ifndef LUA_COMPAT_STRFMT
+#define LUA_COMPAT_STRFMT LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
+#ifndef LJ_UNPACK_PATCH
+#define LJ_UNPACK_PATCH LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
 #ifndef LJ_DS_STR_HASH_PATCH
 #define LJ_DS_STR_HASH_PATCH LUAJIT_ENABLE_LUA51COMPAT
 #endif
@@ -854,10 +866,6 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 
 #ifndef LJ_DS_FULL_GC_HOOK
 #define LJ_DS_FULL_GC_HOOK LJ_DS
-#endif
-
-#ifndef LJ_UNPACK_PATCH
-#define LJ_UNPACK_PATCH LJ_DS
 #endif
 
 #ifndef LJ_DS_PATCH_READLINE

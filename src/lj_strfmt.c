@@ -80,15 +80,6 @@ SFormat LJ_FASTCALL lj_strfmt_parse(FormatState *fs)
 	  }
 	}
 
-c = 's'-'A';
-{
-uint32_t sx = strfmt_map[c];
-	  if (sx) {
-	    fs->p = p+1;
-	    return (sf | sx | ((c & 0x20) ? 0 : STRFMT_F_UPPER));
-	  }
-}
-
 	/* Return error location. */
 	if (*p >= 32) p++;
 	fs->len = (MSize)(p - (const uint8_t *)fs->str);
@@ -381,13 +372,23 @@ int lj_strfmt_putarg(lua_State *L, SBuf *sb, int arg, int retry)
   GCstr *fmt = lj_lib_checkstr(L, arg);
   FormatState fs;
   SFormat sf;
+#if LUA_COMPAT_STRFMT
+  char errfmt[3];
+#endif
   lj_strfmt_init(&fs, strdata(fmt), fmt->len);
   while ((sf = lj_strfmt_parse(&fs)) != STRFMT_EOF) {
     if (sf == STRFMT_LIT) {
       lj_buf_putmem(sb, fs.str, fs.len);
     } else if (sf == STRFMT_ERR) {
+#if LUA_COMPAT_STRFMT
+      errfmt[0] = '%';
+      errfmt[1] = fs.len > 1 ? fs.str[fs.len-1] : '\0';
+      errfmt[2] = '\0';
+      lj_err_callerv(L, LJ_ERR_STRFMT, errfmt);
+#else
       lj_err_callerv(L, LJ_ERR_STRFMT,
 		     strdata(lj_str_new(L, fs.str, fs.len)));
+#endif
     } else {
       TValue *o = &L->base[arg++];
       if (arg > narg)
@@ -553,6 +554,20 @@ GCstr * LJ_FASTCALL lj_strfmt_obj(lua_State *L, cTValue *o)
 ** - %f and other FP formats are really %.14g.
 ** - %s %c %p without formatting.
 */
+#if LUA_COMPAT_STRFMT
+static void strfmt_pushvf_lua51_fallback(SBuf *sb, FormatState *fs)
+{
+  const uint8_t *p = (const uint8_t *)fs->str;
+  lj_assertX(p < fs->e && *p == '%', "bad fallback start");
+  lj_buf_putb(sb, '%');
+  if (p + 1 < fs->e) {
+    lj_buf_putb(sb, p[1]);
+    fs->p = p + 2;
+  } else {
+    fs->p = fs->e;
+  }
+}
+#endif
 
 /* Push formatted message as a string object to Lua stack. va_list variant. */
 const char *lj_strfmt_pushvf(lua_State *L, const char *fmt, va_list argp)
@@ -589,8 +604,13 @@ const char *lj_strfmt_pushvf(lua_State *L, const char *fmt, va_list argp)
       lj_strfmt_putptr(sb, va_arg(argp, void *));
       break;
     case STRFMT_ERR:
+#if LUA_COMPAT_STRFMT
+      strfmt_pushvf_lua51_fallback(sb, &fs);
+#endif
     default:
+#if !LUA_COMPAT_STRFMT
       lj_buf_putb(sb, '?');
+#endif
       lj_assertL(0, "bad string format near offset %d", fs.len);
       break;
     }

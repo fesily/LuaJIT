@@ -1912,6 +1912,7 @@ static void parse_body(LexState *ls, ExpDesc *e, int needself, BCLine line)
 #if LJ_DS_TAILCALL_WRAPPER
   if (tvisstr(&ls->tokval) && strcmp(strVdata(&ls->tokval), "LJ_DS_tailcall") == 0) {
     fs.eflags |= FUNC_STATE_FLAG_PROTO_TAILCALL;
+    fs.eflags |= FUNC_STATE_FLAG_DISABLE_TAILCALL;
   }
 #endif
   fs.linedefined = line;

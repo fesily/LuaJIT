@@ -765,6 +765,9 @@ LJLIB_CF(ffi_abi)	LJLIB_REC(.)
 #if LUA_COMPAT_VARARG_N
     "\017compat_vararg_n"
 #endif
+#if LJ_UNPACK_PATCH
+    "\014unpack_patch"
+#endif
   ) >= 0;
   setboolV(L->top-1, b);
   setboolV(&G(L)->tmptv2, b);  /* Remember for trace recorder. */

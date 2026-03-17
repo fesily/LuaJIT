@@ -1738,8 +1738,14 @@ static void rec_tsetm(jit_State *J, BCReg ra, BCReg rn, int32_t i)
   ix.idxchain = 0;
 #ifdef LUAJIT_ENABLE_TABLE_BUMP
   if ((J->flags & JIT_F_OPT_SINK)) {
+#if LJ_UNPACK_PATCH
+    MSize maxindex = (MSize)(i + (rn - ra) - 1);
+    if ((MSize)t->asize <= maxindex)
+      lj_tab_reasize(J->L, t, (uint32_t)maxindex);
+#else
     if (t->asize < i+rn-ra)
       lj_tab_reasize(J->L, t, i+rn-ra);
+#endif
     setnilV(&ix.keyv);
     rec_idx_bump(J, &ix);
   }
