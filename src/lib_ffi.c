@@ -765,6 +765,9 @@ LJLIB_CF(ffi_abi)	LJLIB_REC(.)
 #if LUA_COMPAT_VARARG_N
     "\017compat_vararg_n"
 #endif
+#if LUA_COMPAT_LEX_UNICODE
+  "\022compat_lex_unicode"
+#endif
 #if LJ_UNPACK_PATCH
     "\014unpack_patch"
 #endif

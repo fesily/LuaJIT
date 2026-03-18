@@ -313,7 +313,7 @@ enum {
 CTTYDEF(CTTYIDDEF)
 #undef CTTYIDDEF
   /* Predefined typedefs and keywords follow. */
-  CTID_MAX = 0x7fffff
+  CTID_MAX = 65536
 };
 
 /* Target-dependent type IDs. */

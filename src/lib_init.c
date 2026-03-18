@@ -16,6 +16,7 @@
 #include "lj_arch.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 static luaL_Reg lj_lib_load[] = {
   { "",			luaopen_base },

@@ -5,6 +5,8 @@
 # Redistribution and use of this file is allowed according to the terms of the MIT license.
 # Debugged and (now seriously) modified by Ronan Collobert, for Torch7
 
+cmake_minimum_required(VERSION 3.16)
+
 project(LuaJIT C ASM)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
@@ -34,6 +36,8 @@ INCLUDE(CheckTypeSize)
 option(LUAJIT_DISABLE_FFI "Disable FFI." OFF)
 option(LUAJIT_ENABLE_LUA52COMPAT "Enable Lua 5.2 compatibility." OFF)
 option(LUAJIT_DISABLE_JIT "Disable JIT." OFF)
+option(LUAJIT_DISABLE_GEN_GC "Disable generational GC for the primary build." OFF)
+option(LUAJIT_BUILD_BOTH_GEN_GC "Build both generational-GC and non-generational-GC binaries." OFF)
 option(LUAJIT_CPU_SSE2 "Use SSE2 instead of x87 instructions." ON)
 option(LUAJIT_CPU_NOCMOV "Disable NOCMOV." OFF)
 option(LUAJIT_DISABLE_GC64 "Disable GC64" OFF)
@@ -375,48 +379,76 @@ include_directories(
 )
 
 IF(WITH_SHARED_LUA)
-    IF(WITH_AMALG)
-	add_library(luajit-5.1 SHARED ${LUAJIT_DIR}/src/ljamalg.c ${DEPS} )
-    ELSE()
-	add_library(luajit-5.1 SHARED ${SRC_LJCORE} ${DEPS} )
-    ENDIF()
-    SET_TARGET_PROPERTIES(luajit-5.1 PROPERTIES OUTPUT_NAME "lua51DS")
+    set(LUAJIT_LIBRARY_TYPE SHARED)
+    set(LUAJIT_LIBRARY_OUTPUT_BASE "lua51DS")
 ELSE()
-    IF(WITH_AMALG)
-	add_library(luajit-5.1 STATIC ${LUAJIT_DIR}/src/ljamalg.c ${DEPS} )
-    ELSE()
-	add_library(luajit-5.1 STATIC ${SRC_LJCORE} ${DEPS} )
-    ENDIF()
-    SET_TARGET_PROPERTIES(luajit-5.1 PROPERTIES
-	PREFIX "lib" IMPORT_PREFIX "lib" OUTPUT_NAME "luajit")
+    set(LUAJIT_LIBRARY_TYPE STATIC)
+    set(LUAJIT_LIBRARY_OUTPUT_BASE "luajit")
 ENDIF()
 
-target_compile_definitions(luajit-5.1 PRIVATE DO_LUA_INIT)
-target_link_libraries (luajit-5.1 ${LIBS} )
+macro(luajit_add_variant variant_target variant_output exe_target disable_gen_gc)
+  if(WITH_AMALG)
+    set(_luajit_lib_sources ${LUAJIT_DIR}/src/ljamalg.c ${DEPS})
+  else()
+    set(_luajit_lib_sources ${SRC_LJCORE} ${DEPS})
+  endif()
 
-IF(WIN32)
-  add_executable(luajit ${LUAJIT_DIR}/src/luajit.c)
-  target_compile_definitions(luajit PRIVATE LUA_BUILD_AS_DLL)
-  target_link_libraries(luajit luajit-5.1 ${LIBS})
-ELSE()
-  IF(WITH_AMALG)
-    add_executable(luajit ${LUAJIT_DIR}/src/luajit.c ${LUAJIT_DIR}/src/ljamalg.c ${DEPS})
-    # When using WITH_AMALG during a parallel build, its possible to run into
-    # false-positive "error: 'fold_hash' undeclared" compile errors due to a weird interaction
-    # when building two ljamalg.c at the same time.
-    #
-    # This adds a fake dependency from one to the other, forcing the build process to
-    # compile them sequentially rather than parallel.
-    #
-    # See https://github.com/torch/luajit-rocks/issues/39
-    add_dependencies(luajit luajit-5.1)
-  ELSE()
-    add_executable(luajit ${LUAJIT_DIR}/src/luajit.c ${SRC_LJCORE} ${DEPS})
-  ENDIF()
-  target_link_libraries(luajit ${LIBS})
-  SET_TARGET_PROPERTIES(luajit PROPERTIES ENABLE_EXPORTS ON)
-ENDIF()
-target_compile_definitions(luajit PRIVATE -DLJ_DS_DEBUG_GETINFO_PATCH=0)
+  add_library(${variant_target} ${LUAJIT_LIBRARY_TYPE} ${_luajit_lib_sources})
+
+  if(WITH_SHARED_LUA)
+    set_target_properties(${variant_target} PROPERTIES OUTPUT_NAME "${variant_output}")
+  else()
+    set_target_properties(${variant_target} PROPERTIES
+      PREFIX "lib" IMPORT_PREFIX "lib" OUTPUT_NAME "${variant_output}")
+  endif()
+
+  target_compile_definitions(${variant_target} PRIVATE DO_LUA_INIT)
+  if(disable_gen_gc)
+    target_compile_definitions(${variant_target} PRIVATE LUAJIT_DISABLE_GEN_GC)
+  endif()
+  target_link_libraries(${variant_target} ${LIBS})
+
+  if(WIN32)
+    add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c)
+    target_compile_definitions(${exe_target} PRIVATE LUA_BUILD_AS_DLL LJ_DS_DEBUG_GETINFO_PATCH=0)
+    if(disable_gen_gc)
+      target_compile_definitions(${exe_target} PRIVATE LUAJIT_DISABLE_GEN_GC)
+    endif()
+    target_link_libraries(${exe_target} ${variant_target} ${LIBS})
+  else()
+    if(WITH_AMALG)
+      add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c ${LUAJIT_DIR}/src/ljamalg.c ${DEPS})
+      # When using WITH_AMALG during a parallel build, its possible to run into
+      # false-positive "error: 'fold_hash' undeclared" compile errors due to a weird interaction
+      # when building two ljamalg.c at the same time.
+      #
+      # This adds a fake dependency from one to the other, forcing the build process to
+      # compile them sequentially rather than parallel.
+      #
+      # See https://github.com/torch/luajit-rocks/issues/39
+      add_dependencies(${exe_target} ${variant_target})
+    else()
+      add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c ${SRC_LJCORE} ${DEPS})
+    endif()
+    target_link_libraries(${exe_target} ${LIBS})
+    set_target_properties(${exe_target} PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_definitions(${exe_target} PRIVATE LJ_DS_DEBUG_GETINFO_PATCH=0)
+    if(disable_gen_gc)
+      target_compile_definitions(${exe_target} PRIVATE LUAJIT_DISABLE_GEN_GC)
+    endif()
+  endif()
+endmacro()
+
+if(LUAJIT_BUILD_BOTH_GEN_GC)
+  luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit FALSE)
+  luajit_add_variant(luajit-5.1-no-gen-gc ${LUAJIT_LIBRARY_OUTPUT_BASE}-no-gen-gc luajit-no-gen-gc TRUE)
+else()
+  if(LUAJIT_DISABLE_GEN_GC)
+    luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit TRUE)
+  else()
+    luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit FALSE)
+  endif()
+endif()
 
 MACRO(LUAJIT_add_custom_commands luajit_target)
   SET(target_srcs "")
@@ -467,3 +499,6 @@ MACRO(LUA_ADD_EXECUTABLE luajit_target)
 ENDMACRO(LUA_ADD_EXECUTABLE luajit_target)
 
 install(TARGETS luajit-5.1 RUNTIME DESTINATION .)
+if(LUAJIT_BUILD_BOTH_GEN_GC)
+  install(TARGETS luajit-5.1-no-gen-gc RUNTIME DESTINATION .)
+endif()
