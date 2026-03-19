@@ -141,7 +141,7 @@
 #define LUALIB_API	LUA_API
 
 #ifdef _WIN32
-#define LUA_DATA_API LUA_API
+#define LUA_DATA_API
 #else
 #define LUA_DATA_API
 #endif

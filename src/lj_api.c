@@ -1343,6 +1343,7 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
   case LUA_GCSTEPTIME:
     res = (int)(g->gc.stepmultime);
     g->gc.stepmultime = (MSize)data;
+    break;
 #endif
 #if LJ_GEN_GC
   case LUA_GCGEN:
