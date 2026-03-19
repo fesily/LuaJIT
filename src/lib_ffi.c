@@ -771,6 +771,9 @@ LJLIB_CF(ffi_abi)	LJLIB_REC(.)
 #if LJ_UNPACK_PATCH
     "\014unpack_patch"
 #endif
+#if LJ_GEN_GC
+    "\005gengc"
+#endif
   ) >= 0;
   setboolV(L->top-1, b);
   setboolV(&G(L)->tmptv2, b);  /* Remember for trace recorder. */

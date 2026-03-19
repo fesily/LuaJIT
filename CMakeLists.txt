@@ -338,38 +338,80 @@ list (APPEND SRC_BUILDVM ${LUAJIT_DIR}/src/luajit.h)
 ADD_EXECUTABLE(buildvm ${SRC_BUILDVM})
 SET_TARGET_PROPERTIES(buildvm PROPERTIES COMPILE_DEFINITIONS "${TARGET_ARCH}")
 
-macro(add_buildvm_target _target _mode)
-  add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${_target}
-    COMMAND buildvm ARGS -m ${_mode} -o ${CMAKE_CURRENT_BINARY_DIR}/${_target} ${ARGN}
+set(LUAJIT_NEEDS_NO_GEN_GC_GENERATED OFF)
+if(LUAJIT_DISABLE_GEN_GC OR LUAJIT_BUILD_BOTH_GEN_GC)
+  set(LUAJIT_NEEDS_NO_GEN_GC_GENERATED ON)
+endif()
+
+if(LUAJIT_NEEDS_NO_GEN_GC_GENERATED)
+  ADD_EXECUTABLE(buildvm_nogengc ${SRC_BUILDVM})
+  SET_TARGET_PROPERTIES(buildvm_nogengc PROPERTIES COMPILE_DEFINITIONS "${TARGET_ARCH}")
+  target_compile_definitions(buildvm_nogengc PRIVATE LUAJIT_DISABLE_GEN_GC)
+endif()
+
+macro(add_buildvm_target _buildvm_target _outdir _target _mode)
+  add_custom_command(OUTPUT ${_outdir}/${_target}
+    COMMAND ${_buildvm_target} ARGS -m ${_mode} -o ${_outdir}/${_target} ${ARGN}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS buildvm ${ARGN}
+    DEPENDS ${_buildvm_target} ${ARGN}
   )
 endmacro(add_buildvm_target)
 
-if (WIN32)
-  add_buildvm_target ( lj_vm.obj peobj )
-  set (LJ_VM_SRC ${CMAKE_CURRENT_BINARY_DIR}/lj_vm.obj)
-else ()
-  add_buildvm_target ( lj_vm.S ${LJVM_MODE} )
-  set (LJ_VM_SRC ${CMAKE_CURRENT_BINARY_DIR}/lj_vm.S)
-endif ()
-add_buildvm_target ( lj_ffdef.h   ffdef   ${SRC_LJLIB} )
-add_buildvm_target ( lj_bcdef.h  bcdef  ${SRC_LJLIB} )
-add_buildvm_target ( lj_folddef.h folddef ${LUAJIT_DIR}/src/lj_opt_fold.c )
-add_buildvm_target ( lj_recdef.h  recdef  ${SRC_LJLIB} )
-add_buildvm_target ( lj_libdef.h  libdef  ${SRC_LJLIB} )
-add_buildvm_target ( vmdef.lua  vmdef  ${SRC_LJLIB} )
+set(LUAJIT_DEFAULT_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
-SET(DEPS
-  ${LJ_VM_SRC}
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_ffdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_bcdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_libdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_recdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_folddef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/vmdef.lua
+if (WIN32)
+  add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} lj_vm.obj peobj)
+  set(LUAJIT_DEFAULT_VM_SRC ${LUAJIT_DEFAULT_GENERATED_DIR}/lj_vm.obj)
+else ()
+  add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} lj_vm.S ${LJVM_MODE})
+  set(LUAJIT_DEFAULT_VM_SRC ${LUAJIT_DEFAULT_GENERATED_DIR}/lj_vm.S)
+endif ()
+add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} lj_ffdef.h ffdef ${SRC_LJLIB})
+add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} lj_bcdef.h bcdef ${SRC_LJLIB})
+add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} lj_folddef.h folddef ${LUAJIT_DIR}/src/lj_opt_fold.c)
+add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} lj_recdef.h recdef ${SRC_LJLIB})
+add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} lj_libdef.h libdef ${SRC_LJLIB})
+add_buildvm_target(buildvm ${LUAJIT_DEFAULT_GENERATED_DIR} vmdef.lua vmdef ${SRC_LJLIB})
+
+SET(LUAJIT_DEFAULT_DEPS
+  ${LUAJIT_DEFAULT_VM_SRC}
+  ${LUAJIT_DEFAULT_GENERATED_DIR}/lj_ffdef.h
+  ${LUAJIT_DEFAULT_GENERATED_DIR}/lj_bcdef.h
+  ${LUAJIT_DEFAULT_GENERATED_DIR}/lj_libdef.h
+  ${LUAJIT_DEFAULT_GENERATED_DIR}/lj_recdef.h
+  ${LUAJIT_DEFAULT_GENERATED_DIR}/lj_folddef.h
+  ${LUAJIT_DEFAULT_GENERATED_DIR}/vmdef.lua
   )
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/vmdef.lua DESTINATION  ${TARGET_MOD_DIR}/scripts/jit)
+install(FILES ${LUAJIT_DEFAULT_GENERATED_DIR}/vmdef.lua DESTINATION ${TARGET_MOD_DIR}/scripts/jit)
+
+if(LUAJIT_NEEDS_NO_GEN_GC_GENERATED)
+  set(LUAJIT_NO_GEN_GC_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/no-gen-gc)
+  file(MAKE_DIRECTORY ${LUAJIT_NO_GEN_GC_GENERATED_DIR})
+
+  if (WIN32)
+    add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} lj_vm.obj peobj)
+    set(LUAJIT_NO_GEN_GC_VM_SRC ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/lj_vm.obj)
+  else ()
+    add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} lj_vm.S ${LJVM_MODE})
+    set(LUAJIT_NO_GEN_GC_VM_SRC ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/lj_vm.S)
+  endif ()
+  add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} lj_ffdef.h ffdef ${SRC_LJLIB})
+  add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} lj_bcdef.h bcdef ${SRC_LJLIB})
+  add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} lj_folddef.h folddef ${LUAJIT_DIR}/src/lj_opt_fold.c)
+  add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} lj_recdef.h recdef ${SRC_LJLIB})
+  add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} lj_libdef.h libdef ${SRC_LJLIB})
+  add_buildvm_target(buildvm_nogengc ${LUAJIT_NO_GEN_GC_GENERATED_DIR} vmdef.lua vmdef ${SRC_LJLIB})
+
+  SET(LUAJIT_NO_GEN_GC_DEPS
+    ${LUAJIT_NO_GEN_GC_VM_SRC}
+    ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/lj_ffdef.h
+    ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/lj_bcdef.h
+    ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/lj_libdef.h
+    ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/lj_recdef.h
+    ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/lj_folddef.h
+    ${LUAJIT_NO_GEN_GC_GENERATED_DIR}/vmdef.lua
+    )
+endif()
 
 ## COMPILE
 include_directories(
@@ -387,13 +429,27 @@ ELSE()
 ENDIF()
 
 macro(luajit_add_variant variant_target variant_output exe_target disable_gen_gc)
-  if(WITH_AMALG)
-    set(_luajit_lib_sources ${LUAJIT_DIR}/src/ljamalg.c ${DEPS})
+  set(_luajit_disable_gen_gc OFF)
+  if("${disable_gen_gc}" STREQUAL "TRUE" OR "${disable_gen_gc}" STREQUAL "ON" OR "${disable_gen_gc}" STREQUAL "1")
+    set(_luajit_disable_gen_gc ON)
+  endif()
+
+  if(_luajit_disable_gen_gc)
+    set(_luajit_generated_dir ${LUAJIT_NO_GEN_GC_GENERATED_DIR})
+    set(_luajit_variant_deps ${LUAJIT_NO_GEN_GC_DEPS})
   else()
-    set(_luajit_lib_sources ${SRC_LJCORE} ${DEPS})
+    set(_luajit_generated_dir ${LUAJIT_DEFAULT_GENERATED_DIR})
+    set(_luajit_variant_deps ${LUAJIT_DEFAULT_DEPS})
+  endif()
+
+  if(WITH_AMALG)
+    set(_luajit_lib_sources ${LUAJIT_DIR}/src/ljamalg.c ${_luajit_variant_deps})
+  else()
+    set(_luajit_lib_sources ${SRC_LJCORE} ${_luajit_variant_deps})
   endif()
 
   add_library(${variant_target} ${LUAJIT_LIBRARY_TYPE} ${_luajit_lib_sources})
+  target_include_directories(${variant_target} BEFORE PRIVATE ${_luajit_generated_dir})
 
   if(WITH_SHARED_LUA)
     set_target_properties(${variant_target} PROPERTIES OUTPUT_NAME "${variant_output}")
@@ -403,7 +459,7 @@ macro(luajit_add_variant variant_target variant_output exe_target disable_gen_gc
   endif()
 
   target_compile_definitions(${variant_target} PRIVATE DO_LUA_INIT)
-  if(disable_gen_gc)
+  if(_luajit_disable_gen_gc)
     target_compile_definitions(${variant_target} PRIVATE LUAJIT_DISABLE_GEN_GC)
   endif()
   target_link_libraries(${variant_target} ${LIBS})
@@ -411,13 +467,13 @@ macro(luajit_add_variant variant_target variant_output exe_target disable_gen_gc
   if(WIN32)
     add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c)
     target_compile_definitions(${exe_target} PRIVATE LUA_BUILD_AS_DLL LJ_DS_DEBUG_GETINFO_PATCH=0)
-    if(disable_gen_gc)
+    if(_luajit_disable_gen_gc)
       target_compile_definitions(${exe_target} PRIVATE LUAJIT_DISABLE_GEN_GC)
     endif()
     target_link_libraries(${exe_target} ${variant_target} ${LIBS})
   else()
     if(WITH_AMALG)
-      add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c ${LUAJIT_DIR}/src/ljamalg.c ${DEPS})
+      add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c ${LUAJIT_DIR}/src/ljamalg.c ${_luajit_variant_deps})
       # When using WITH_AMALG during a parallel build, its possible to run into
       # false-positive "error: 'fold_hash' undeclared" compile errors due to a weird interaction
       # when building two ljamalg.c at the same time.
@@ -428,12 +484,13 @@ macro(luajit_add_variant variant_target variant_output exe_target disable_gen_gc
       # See https://github.com/torch/luajit-rocks/issues/39
       add_dependencies(${exe_target} ${variant_target})
     else()
-      add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c ${SRC_LJCORE} ${DEPS})
+      add_executable(${exe_target} ${LUAJIT_DIR}/src/luajit.c ${SRC_LJCORE} ${_luajit_variant_deps})
     endif()
+    target_include_directories(${exe_target} BEFORE PRIVATE ${_luajit_generated_dir})
     target_link_libraries(${exe_target} ${LIBS})
     set_target_properties(${exe_target} PROPERTIES ENABLE_EXPORTS ON)
     target_compile_definitions(${exe_target} PRIVATE LJ_DS_DEBUG_GETINFO_PATCH=0)
-    if(disable_gen_gc)
+    if(_luajit_disable_gen_gc)
       target_compile_definitions(${exe_target} PRIVATE LUAJIT_DISABLE_GEN_GC)
     endif()
   endif()
@@ -441,7 +498,7 @@ endmacro()
 
 if(LUAJIT_BUILD_BOTH_GEN_GC)
   luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit FALSE)
-  luajit_add_variant(luajit-5.1-no-gen-gc ${LUAJIT_LIBRARY_OUTPUT_BASE}-no-gen-gc luajit-no-gen-gc TRUE)
+  luajit_add_variant(luajit-5.1_nogengc ${LUAJIT_LIBRARY_OUTPUT_BASE}_nogengc luajit_nogengc TRUE)
 else()
   if(LUAJIT_DISABLE_GEN_GC)
     luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit TRUE)
@@ -500,5 +557,5 @@ ENDMACRO(LUA_ADD_EXECUTABLE luajit_target)
 
 install(TARGETS luajit-5.1 RUNTIME DESTINATION .)
 if(LUAJIT_BUILD_BOTH_GEN_GC)
-  install(TARGETS luajit-5.1-no-gen-gc RUNTIME DESTINATION .)
+  install(TARGETS luajit-5.1_nogengc RUNTIME DESTINATION .)
 endif()
