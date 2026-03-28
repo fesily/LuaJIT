@@ -497,8 +497,8 @@ macro(luajit_add_variant variant_target variant_output exe_target disable_gen_gc
 endmacro()
 
 if(LUAJIT_BUILD_BOTH_GEN_GC)
-  luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit FALSE)
-  luajit_add_variant(luajit-5.1_nogengc ${LUAJIT_LIBRARY_OUTPUT_BASE}_nogengc luajit_nogengc TRUE)
+  luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit TRUE)
+  luajit_add_variant(luajit-5.1_gengc ${LUAJIT_LIBRARY_OUTPUT_BASE}_gengc luajit_gengc FALSE)
 else()
   if(LUAJIT_DISABLE_GEN_GC)
     luajit_add_variant(luajit-5.1 ${LUAJIT_LIBRARY_OUTPUT_BASE} luajit TRUE)
@@ -557,5 +557,5 @@ ENDMACRO(LUA_ADD_EXECUTABLE luajit_target)
 
 install(TARGETS luajit-5.1 RUNTIME DESTINATION .)
 if(LUAJIT_BUILD_BOTH_GEN_GC)
-  install(TARGETS luajit-5.1_nogengc RUNTIME DESTINATION .)
+  install(TARGETS luajit-5.1_gengc RUNTIME DESTINATION .)
 endif()
