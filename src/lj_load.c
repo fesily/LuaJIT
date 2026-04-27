@@ -95,28 +95,12 @@ static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
 }
 
 #if LJ_DS_DYNAMIC_TAILCALL_WRAPPER
-static char lj_call_LJ_DS_dynamic_tailcall_cb(lua_State *L, lua_Reader reader, void *data,
-		      const char *chunkname, const char *mode)
+typedef char (*lj_check_slowtailcall_fn)(lua_State *L, const char *chunkname);
+static lj_check_slowtailcall_fn lj_ds_slowtailcall_cb = NULL;
+
+LUA_API void lua_ds_set_slowtailcall_cb(lj_check_slowtailcall_fn fn)
 {
-  char tailcall = 0;
-  lua_getfield(L, LUA_REGISTRYINDEX, "LJ_DS_dynamic_tailcall_cb");
-  if (lua_isfunction(L, -1)) {
-    lua_pushlightuserdata(L, reader);
-    lua_pushlightuserdata(L, data);
-    lua_pushstring(L, chunkname);
-    lua_pushstring(L, mode);
-    if (lua_pcall(L, 4, 3, 0)) {
-      lua_pop(L, 1);
-    } else {
-      // skip ret[3]
-      const char* msg = lua_tostring(L, -2);
-      tailcall = lua_toboolean(L, -3);
-      lua_pop(L, 3);
-    }
-  } else {
-    lua_pop(L, 1);
-  }
-  return tailcall;
+  lj_ds_slowtailcall_cb = fn;
 }
 #endif
 
@@ -132,7 +116,7 @@ LUA_API int lua_loadx(lua_State *L, lua_Reader reader, void *data,
   lj_buf_init(L, &ls.sb);
 #if LJ_DS_DYNAMIC_TAILCALL_WRAPPER
   ParserTailWrapper tailcall_wrapper;
-  if (lj_call_LJ_DS_dynamic_tailcall_cb(L, reader, data, chunkname, mode))
+  if (lj_ds_slowtailcall_cb && lj_ds_slowtailcall_cb(L, chunkname))
     ls.tailcall_wrapper = &tailcall_wrapper;
   else
     ls.tailcall_wrapper = NULL;
