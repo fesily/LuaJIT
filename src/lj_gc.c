@@ -1395,6 +1395,11 @@ void *lj_mem_grow(lua_State *L, void *p, MSize *szp, MSize lim, MSize esz)
 int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
 {
   global_State *g = G(L);
+#if LJ_GEN_GC
+  if (g->gc.kind != KGC_INC) {
+    return lj_gc_step(L);
+  }
+#endif
   uint64_t timelim = (uint64_t)g->gc.stepmultime;  /* ns */
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);

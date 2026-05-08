@@ -916,7 +916,7 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 
 
 #ifndef LJ_DS_ENABLE_GC_STEP_TIME
-#if LJ_DS && !LJ_GEN_GC
+#if LJ_DS
 #define LJ_DS_ENABLE_GC_STEP_TIME 1
 #else
 #define LJ_DS_ENABLE_GC_STEP_TIME 0
@@ -924,11 +924,9 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #endif
 
 #if LJ_DS_ENABLE_GC_STEP_TIME
-#define LUA_GCSTEPTIME 10
-#define LUA_GCSTEP2 11
+#define LUA_GCSTEPTIME 12
+#define LUA_GCSTEP2 13
 #endif
-
-#define LJ_DS_DISABLE_GC_STEP LJ_DS_ENABLE_GC_STEP_TIME
 
 #ifndef LJ_DS_CUSTOM_OS_DATE
 #define LJ_DS_CUSTOM_OS_DATE LJ_DS

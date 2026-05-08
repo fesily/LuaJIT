@@ -1309,20 +1309,20 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
     break;
 #if LJ_DS_ENABLE_GC_STEP_TIME
   case LUA_GCSTEP2:
-#endif
-  case LUA_GCSTEP: {
-#if LJ_DS_DISABLE_GC_STEP
-      if (what == LUA_GCSTEP)
-        return -1;
-#endif
     GCSize a = (GCSize)data << 10;
     g->gc.threshold = (a <= g->gc.total) ? (g->gc.total - a) : 0;
-#if LJ_DS_ENABLE_GC_STEP_TIME
+    while (g->gc.total >= g->gc.threshold)
       if (lj_gc_step_timelimit(L) > 0) {
-#else
+    res = 1;
+    break;
+      }
+    break;
+#endif
+  case LUA_GCSTEP: {
+    GCSize a = (GCSize)data << 10;
+    g->gc.threshold = (a <= g->gc.total) ? (g->gc.total - a) : 0;
     while (g->gc.total >= g->gc.threshold)
       if (lj_gc_step(L) > 0) {
-#endif
 	res = 1;
 	break;
       }
