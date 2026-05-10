@@ -312,11 +312,7 @@ static void gc_traverse_proto(global_State *g, GCproto *pt)
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT
-#if LJ_GEN_GC
-  if (g->gc.kind == KGC_INC && pt->trace) gc_marktrace(g, pt->trace);
-#else
   if (pt->trace) gc_marktrace(g, pt->trace);
-#endif
 #endif
 }
 
