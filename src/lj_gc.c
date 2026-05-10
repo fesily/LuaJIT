@@ -960,7 +960,6 @@ static void youngcollection(lua_State *L, global_State *g)
 static void entergen(lua_State *L, global_State *g)
 {
   lj_trace_abort(g);
-  lj_trace_flushall(L);
   gc_runtilstate(L, GCSpause);
   gc_runtilstate(L, GCSpropagate);
   atomic(g, L);
