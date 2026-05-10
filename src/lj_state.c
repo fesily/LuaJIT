@@ -322,6 +322,9 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
     return NULL;
   }
   L->status = LUA_OK;
+#if LJ_GEN_GC
+  lj_gc_changemode(L, KGC_GEN);
+#endif
   return L;
 }
 
