@@ -107,16 +107,18 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
   GCobj *o = obj2gco(t);
   lj_assertG(isblack(o) && !isdead(g, o),
 	     "bad object states for backward barrier");
-  lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
-	     "bad GC state");
 #if LJ_GEN_GC
-  if (getage(o) != G_TOUCHED2) {
+  lj_assertG(g->gc.state != GCSpause,
+	     "bad GC state");
+  if (getage(o) < G_TOUCHED1) {
     setgcrefr(t->gclist, g->gc.grayagain);
     setgcref(g->gc.grayagain, o);
   }
   black2gray(o);
   setage(o, G_TOUCHED1);
 #else
+  lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
+	     "bad GC state");
   black2gray(o);
   setgcrefr(t->gclist, g->gc.grayagain);
   setgcref(g->gc.grayagain, o);

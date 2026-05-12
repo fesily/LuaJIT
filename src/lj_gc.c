@@ -312,11 +312,7 @@ static void gc_traverse_proto(global_State *g, GCproto *pt)
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT
-#if LJ_GEN_GC
-  if (g->gc.kind == KGC_INC && pt->trace) gc_marktrace(g, pt->trace);
-#else
   if (pt->trace) gc_marktrace(g, pt->trace);
-#endif
 #endif
 }
 
@@ -623,6 +619,9 @@ static void gc_finalize(lua_State *L)
     setgcrefr(o->gch.nextgc, g->gc.root);
     setgcref(g->gc.root, o);
     makewhite(g, o);
+#if LJ_GEN_GC
+    setage(o, G_NEW);
+#endif
     o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
     /* Resolve finalizer. */
     setcdataV(L, &tmp, gco2cd(o));
@@ -639,6 +638,9 @@ static void gc_finalize(lua_State *L)
   setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
   setgcref(mainthread(g)->nextgc, o);
   makewhite(g, o);
+#if LJ_GEN_GC
+  setage(o, G_NEW);
+#endif
   /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
   if (mo)
@@ -666,6 +668,9 @@ void lj_gc_finalize_cdata(lua_State *L)
       GCobj *o = gcV(&node[i].key);
       TValue tmp;
       makewhite(g, o);
+#if LJ_GEN_GC
+      setage(o, G_NEW);
+#endif
       o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
       copyTV(L, &tmp, &node[i].val);
       setnilV(&node[i].val);
@@ -806,8 +811,13 @@ static void sweepstringsold(lua_State *L)
 {
   global_State *g = G(L);
   MSize i;
-  for (i = 0; i <= g->str.mask; i++)
-    sweep2old(L, &g->str.tab[i]);
+  for (i = 0; i <= g->str.mask; i++) {
+    uintptr_t u = gcrefu(g->str.tab[i]);
+    GCRef q;
+    setgcrefp(q, (u & ~(uintptr_t)1));
+    sweep2old(L, &q);
+    setgcrefp(g->str.tab[i], (gcrefu(q) | (u & 1)));
+  }
 }
 
 static GCRef *sweepgen(lua_State *L, global_State *g, GCRef *p, GCRef limit,
@@ -841,8 +851,13 @@ static void sweepstringsgen(lua_State *L)
 {
   global_State *g = G(L);
   MSize i;
-  for (i = 0; i <= g->str.mask; i++)
-    sweepgen(L, g, &g->str.tab[i], gc_empty, NULL);
+  for (i = 0; i <= g->str.mask; i++) {
+    uintptr_t u = gcrefu(g->str.tab[i]);
+    GCRef q;
+    setgcrefp(q, (u & ~(uintptr_t)1));
+    sweepgen(L, g, &q, gc_empty, NULL);
+    setgcrefp(g->str.tab[i], (gcrefu(q) | (u & 1)));
+  }
 }
 
 static void gc_runtilstate(lua_State *L, int state)
@@ -920,8 +935,12 @@ static void markold(global_State *g, GCRef from, GCRef to)
 static void markstringold(global_State *g)
 {
   MSize i;
-  for (i = 0; i <= g->str.mask; i++)
-    markold(g, g->str.tab[i], gc_empty);
+  for (i = 0; i <= g->str.mask; i++) {
+    uintptr_t u = gcrefu(g->str.tab[i]);
+    GCRef q;
+    setgcrefp(q, (u & ~(uintptr_t)1));
+    markold(g, q, gc_empty);
+  }
 }
 
 static void finishgencycle(lua_State *L, global_State *g)
@@ -1251,8 +1270,12 @@ void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 {
   lj_assertG(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o),
 	     "bad object states for forward barrier");
+#if LJ_GEN_GC
+  lj_assertG(g->gc.state != GCSpause, "bad GC state");
+#else
   lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
 	     "bad GC state");
+#endif
   lj_assertG(o->gch.gct != ~LJ_TTAB, "barrier object is not a table");
   /* Preserve invariant during propagation. Otherwise it doesn't matter. */
 #if LJ_GEN_GC
@@ -1262,6 +1285,13 @@ void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
       lj_assertG(!isold(v), "old object points to old young target");
       setage(v, G_OLD0);
     }
+  } else if (g->gc.kind == KGC_GEN) {
+    /* Called during GCSfinalize (e.g. __gc stores into old object).
+    ** Don't makewhite: white+OLD would be collected by sweepgen.
+    ** Mark child forward and promote its age if parent is old. */
+    gc_mark(g, v);
+    if (isold(o))
+      setage(v, G_OLD0);
   } else {
     makewhite(g, o);  /* Make it white to avoid the following barrier. */
   }
@@ -1278,10 +1308,26 @@ void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
 {
 #define TV2MARKED(x) \
   (*((uint8_t *)(x) - offsetof(GCupval, tv) + offsetof(GCupval, marked)))
+#define TV(x) \
+  ((GCobj *)((char *)tv - offsetof(GCupval, tv)))
+#if LJ_GEN_GC
+  if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
+    gc_mark(g, gcV(tv));
+    if (isold(TV(tv)))
+      setage(gcV(tv), G_OLD0);
+  } else if (g->gc.kind == KGC_GEN) {
+    gc_mark(g, gcV(tv));
+    if (isold(TV(tv)))
+      setage(gcV(tv), G_OLD0);
+  } else {
+    TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~LJ_GC_COLORS) | curwhite(g);
+  }
+#else
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_mark(g, gcV(tv));
   else
     TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~LJ_GC_COLORS) | curwhite(g);
+#endif
 #undef TV2MARKED
 }
 
@@ -1300,6 +1346,13 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
       gray2black(o);  /* Make it black and preserve invariant. */
       if (tviswhite(&uv->tv))
 	lj_gc_barrierf(g, o, gcV(&uv->tv));
+#if LJ_GEN_GC
+    } else if (g->gc.kind == KGC_GEN) {
+      /* Closed during finalization (e.g. coroutine resumed from __gc).
+      ** Keep it black — the value was already reachable from the stack.
+      ** Don't makewhite: white+OLD would be collected by sweepgen. */
+      gray2black(o);
+#endif
     } else {
       makewhite(g, o);  /* Make it white, i.e. sweep the upvalue. */
       lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
@@ -1319,7 +1372,7 @@ void lj_gc_barriertrace(global_State *g, uint32_t traceno)
     if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
       gc_marktrace(g, traceno);
     } else {
-      o->gch.marked &= (uint8_t)~LJ_GC_WHITES;
+      o->gch.marked &= (uint8_t)~LJ_GC_COLORS;
       setgcrefr(gco2trace(o)->gclist, g->gc.grayagain);
       setgcref(g->gc.grayagain, o);
     }
