@@ -377,9 +377,9 @@
 |// Move table write barrier back. Overwrites reg.
 |.macro barrierback, tab, reg
 |.if LJ_GEN_GC
+|  cmp byte tab->age, G_TOUCHED1
+|  jae >9
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
-|  cmp byte tab->age, G_TOUCHED2
-|  je >9
 |  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |  mov tab->gclist, reg
 |9:

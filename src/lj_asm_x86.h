@@ -1946,8 +1946,8 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   ** 1. test tab->marked, LJ_GC_BLACK
   ** 2. jz l_end  (not black, skip)
   ** 3. tab->marked &= ~LJ_GC_BLACK  (black2gray)
-  ** 4. cmp tab->age, G_TOUCHED2
-  ** 5. je l_setage  (TOUCHED2: skip grayagain add)
+  ** 4. cmp tab->age, G_TOUCHED1
+  ** 5. jae l_setage  (TOUCHED1/TOUCHED2: skip grayagain add, already on list)
   ** 6. tmp = g->gc.grayagain
   ** 7. g->gc.grayagain = tab
   ** 8. tab->gclist = tmp
@@ -1964,10 +1964,10 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   emit_setgl(as, tab, gc.grayagain);
   /* Step 6: tmp = g->gc.grayagain */
   emit_getgl(as, tmp, gc.grayagain);
-  /* Step 5: je l_setage */
-  emit_sjcc(as, CC_E, l_setage);
-  /* Step 4: cmp byte [tab+age], G_TOUCHED2 */
-  emit_i8(as, G_TOUCHED2);
+  /* Step 5: jae l_setage */
+  emit_sjcc(as, CC_AE, l_setage);
+  /* Step 4: cmp byte [tab+age], G_TOUCHED1 */
+  emit_i8(as, G_TOUCHED1);
   emit_rmro(as, XO_ARITHib, XOg_CMP, tab, offsetof(GCtab, age));
   /* Step 3: tab->marked &= ~LJ_GC_BLACK (black2gray) */
   emit_i8(as, ~LJ_GC_BLACK);
