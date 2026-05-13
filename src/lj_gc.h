@@ -113,6 +113,8 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
 #if LJ_GEN_GC
   lj_assertG(g->gc.state != GCSpause,
 	     "bad GC state");
+  lj_assertG(g->gc.kind != KGC_INC || g->gc.state != GCSfinalize,
+	     "bad GC state for backward barrier in incremental mode");
   if (getage(o) < G_TOUCHED1) {
     setgcrefr(t->gclist, g->gc.grayagain);
     setgcref(g->gc.grayagain, o);

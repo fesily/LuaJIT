@@ -601,10 +601,7 @@ typedef enum {
 /* Kinds of garbage collection. */
 #define KGC_INC		0
 #define KGC_GEN		1
-
-/* Pending work for generational GC that must run off-trace. */
-#define KGC_GENWORK_NONE	0
-#define KGC_GENWORK_MAJOR	1
+#define KGC_GENMAJOR	2
 #endif
 
 /* Garbage collector state. */
@@ -631,10 +628,10 @@ typedef struct GCState {
   MSize stepmul;	/* Incremental GC step granularity. */
   MSize pause;		/* Pause between successive GC cycles. */
 #if LJ_GEN_GC
-  uint8_t kind;		/* KGC_INC or KGC_GEN. */
+  uint8_t kind;		/* KGC_INC, KGC_GEN, or KGC_GENMAJOR. */
   uint8_t genminormul;	/* Minor collection trigger in gen mode. */
   uint8_t genmajormul;	/* Major collection trigger in gen mode. */
-  uint8_t genwork;	/* Pending off-trace work in gen mode. */
+  uint8_t genmajor;	/* Major collection countdown in gen mode. */
   GCRef survival;	/* Start of survivors from the last minor GC. */
   GCRef old;		/* Start of objects promoted by the last minor GC. */
   GCRef reallyold;	/* Start of objects skipped by minor GC. */

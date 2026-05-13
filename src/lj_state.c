@@ -306,7 +306,7 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   g->gc.kind = KGC_INC;
   g->gc.genminormul = LUAI_GENMINORMUL;
   setgcparam(g->gc.genmajormul, LUAI_GENMAJORMUL);
-  g->gc.genwork = KGC_GENWORK_NONE;
+  g->gc.genmajor = 0;
   setgcrefnull(g->gc.survival);
   setgcrefnull(g->gc.old);
   setgcrefnull(g->gc.reallyold);

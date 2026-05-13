@@ -231,6 +231,12 @@ LUA_API int  (lua_status) (lua_State *L);
 #if !defined(LUAJIT_DISABLE_GEN_GC)
 #define LUA_GCGEN		10
 #define LUA_GCINC		11
+#define LUA_GCMODE		12
+#define LUA_GCKIND		13
+
+#define LUA_GCKINDINC		0
+#define LUA_GCKINDGENMINOR	1
+#define LUA_GCKINDGENMAJOR	2
 LUA_API int (lua_gcparam) (lua_State *L, int what, int data1, int data2);
 #endif
 
