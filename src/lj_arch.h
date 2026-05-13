@@ -924,8 +924,8 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #endif
 
 #if LJ_DS_ENABLE_GC_STEP_TIME
-#define LUA_GCSTEPTIME 12
-#define LUA_GCSTEP2 13
+#define LUA_GCSTEPTIME 14
+#define LUA_GCSTEP2 15
 #endif
 
 #ifndef LJ_DS_CUSTOM_OS_DATE
