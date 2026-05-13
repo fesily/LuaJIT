@@ -165,7 +165,7 @@ static int gc_parammode(lua_State *L, int what, int data1, int data2)
       g->gc.stepmul = (MSize)data2;
     lj_gc_changemode(L, KGC_INC);
   }
-  return oldmode == KGC_GEN ? LUA_GCGEN : LUA_GCINC;
+  return (oldmode == KGC_GEN || oldmode == KGC_GENMAJOR) ? LUA_GCGEN : LUA_GCINC;
 }
 #endif
 
@@ -1308,6 +1308,14 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
   case LUA_GCINC:
     res = gc_parammode(L, what, data, 0);
     break;
+  case LUA_GCMODE: {
+    res = (g->gc.kind == KGC_INC) ? LUA_GCINC : LUA_GCGEN;
+    break;
+  }
+  case LUA_GCKIND: {
+    res = g->gc.kind;
+    break;
+  }
 #endif
   default:
     res = -1;  /* Invalid option. */
