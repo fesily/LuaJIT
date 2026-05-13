@@ -139,6 +139,15 @@ void lj_str_resize(lua_State *L, MSize newmask)
   newtab = lj_mem_newvec(L, newmask+1, GCRef);
   memset(newtab, 0, (newmask+1)*sizeof(GCRef));
 
+#if LJ_GEN_GC
+  uint64_t *newdirty;
+  {
+    MSize newbmsize = ((newmask + 1) + 63) >> 6;
+    newdirty = lj_mem_newvec(L, newbmsize, uint64_t);
+    memset(newdirty, 0xff, newbmsize * sizeof(uint64_t));
+  }
+#endif
+
 #if LUAJIT_SECURITY_STRHASH
   /* Check which chains need secondary hashes. */
   if (g->str.second) {
@@ -212,6 +221,9 @@ void lj_str_resize(lua_State *L, MSize newmask)
   lj_str_freetab(g);
   g->str.tab = newtab;
   g->str.mask = newmask;
+#if LJ_GEN_GC
+  g->str.gendirty = newdirty;
+#endif
 }
 
 #if LUAJIT_SECURITY_STRHASH
@@ -304,6 +316,9 @@ static GCstr *lj_str_alloc(lua_State *L, const char *str, MSize len,
   memcpy(strdatawr(s), str, len);
   /* Add to string hash table. */
   hash &= g->str.mask;
+#if LJ_GEN_GC
+  g->str.gendirty[hash >> 6] |= (uint64_t)1 << (hash & 63);
+#endif
   u = gcrefu(g->str.tab[hash]);
   setgcrefp(s->nextgc, (u & ~(uintptr_t)1));
   /* NOBARRIER: The string table is a GC root. */
@@ -368,6 +383,9 @@ void LJ_FASTCALL lj_str_init(lua_State *L)
 {
   global_State *g = G(L);
   g->str.seed = lj_prng_u64(&g->prng);
+#if LJ_GEN_GC
+  g->str.gendirty = NULL;
+#endif
   lj_str_resize(L, LJ_MIN_STRTAB-1);
 }
 
