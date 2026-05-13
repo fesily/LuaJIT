@@ -1308,7 +1308,7 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
     res = (int)(g->gc.total & 0x3ff);
     break;
 #if LJ_DS_ENABLE_GC_STEP_TIME
-  case LUA_GCSTEP2:
+  case LUA_GCSTEP2: {
     GCSize a = (GCSize)data << 10;
     g->gc.threshold = (a <= g->gc.total) ? (g->gc.total - a) : 0;
     while (g->gc.total >= g->gc.threshold)
@@ -1317,6 +1317,7 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
     break;
       }
     break;
+  }
   case LUA_GCSTEPTIME:
     res = (int)(g->gc.stepmultime);
     g->gc.stepmultime = (MSize)data;
