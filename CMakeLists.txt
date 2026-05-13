@@ -81,9 +81,15 @@ IF(LUAJIT_NUMMODE)
 ENDIF()
 ######
 
+option(LUAJIT_ENABLE_ASSERTIONS "Enable assertions without sanitizer" OFF)
+option(LJ_GC_TRACE_LOG "Enable GC trace logging to stderr" OFF)
+
 if (LUAJIT_ENABLE_FSANITIZE)
       message(STATUS "luajit debug mode")
-      add_definitions(-DLUA_USE_APICHECK -DLUA_USE_ASSERT -DLUAJIT_USE_SYSMALLOC)
+      add_definitions(-DLUAJIT_USE_SYSMALLOC)
+      if (LUAJIT_ENABLE_ASSERTIONS)
+        add_definitions(-DLUA_USE_APICHECK -DLUA_USE_ASSERT)
+      endif()
       if (NOT MSVC)
         add_link_options(-fsanitize=address)
         add_compile_options(-fsanitize=address)
@@ -91,6 +97,14 @@ if (LUAJIT_ENABLE_FSANITIZE)
         add_link_options(/fsanitize=address)
         add_compile_options(/fsanitize=address)
       endif()
+elseif (LUAJIT_ENABLE_ASSERTIONS)
+      message(STATUS "luajit assertions mode")
+      add_definitions(-DLUA_USE_APICHECK -DLUA_USE_ASSERT)
+endif()
+
+if (LJ_GC_TRACE_LOG)
+      message(STATUS "GC trace logging enabled")
+      add_definitions(-DLJ_GC_TRACE_LOG)
 endif()
 
 CHECK_TYPE_SIZE("void*" SIZEOF_VOID_P)
@@ -287,8 +301,9 @@ if(MINILUA_USE_LIBM)
   TARGET_LINK_LIBRARIES(minilua m)
 endif()
 
+# Generate buildvm_arch.h WITH gen-gc support (default: gen-gc enabled)
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h
-  COMMAND minilua ${LUAJIT_DIR}/dynasm/dynasm.lua ${DASM_FLAGS} -o ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+  COMMAND minilua ${LUAJIT_DIR}/dynasm/dynasm.lua ${DASM_FLAGS} -D LJ_GEN_GC -o ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
   DEPENDS
     ${LUAJIT_DIR}/dynasm/dynasm.lua
     ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
@@ -344,9 +359,30 @@ if(LUAJIT_DISABLE_GEN_GC OR LUAJIT_BUILD_BOTH_GEN_GC)
 endif()
 
 if(LUAJIT_NEEDS_NO_GEN_GC_GENERATED)
-  ADD_EXECUTABLE(buildvm_nogengc ${SRC_BUILDVM})
+  # Generate a separate buildvm_arch.h WITHOUT gen-gc DynASM flag
+  set(LUAJIT_NO_GEN_GC_BUILDVM_DIR ${CMAKE_CURRENT_BINARY_DIR}/no-gen-gc-buildvm)
+  file(MAKE_DIRECTORY ${LUAJIT_NO_GEN_GC_BUILDVM_DIR})
+  add_custom_command(OUTPUT ${LUAJIT_NO_GEN_GC_BUILDVM_DIR}/buildvm_arch.h
+    COMMAND minilua ${LUAJIT_DIR}/dynasm/dynasm.lua ${DASM_FLAGS} -o ${LUAJIT_NO_GEN_GC_BUILDVM_DIR}/buildvm_arch.h ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+    DEPENDS
+      ${LUAJIT_DIR}/dynasm/dynasm.lua
+      ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+      ${LUAJIT_DIR}/src/lj_arch.h
+      ${LUAJIT_DIR}/src/lj_bc.h
+      minilua
+  )
+
+  # buildvm_nogengc uses the no-gen-gc arch header
+  set(SRC_BUILDVM_NOGENGC)
+  file(GLOB_RECURSE SRC_BUILDVM_NOGENGC "${LUAJIT_DIR}/src/host/buildvm*.c")
+  list(APPEND SRC_BUILDVM_NOGENGC ${LUAJIT_NO_GEN_GC_BUILDVM_DIR}/buildvm_arch.h)
+  list(APPEND SRC_BUILDVM_NOGENGC ${LUAJIT_DIR}/src/luajit.h)
+
+  ADD_EXECUTABLE(buildvm_nogengc ${SRC_BUILDVM_NOGENGC})
   SET_TARGET_PROPERTIES(buildvm_nogengc PROPERTIES COMPILE_DEFINITIONS "${TARGET_ARCH}")
   target_compile_definitions(buildvm_nogengc PRIVATE LUAJIT_DISABLE_GEN_GC)
+  # Include the no-gen-gc buildvm dir FIRST so it picks up the non-gengc buildvm_arch.h
+  target_include_directories(buildvm_nogengc BEFORE PRIVATE ${LUAJIT_NO_GEN_GC_BUILDVM_DIR})
 endif()
 
 macro(add_buildvm_target _buildvm_target _outdir _target _mode)
