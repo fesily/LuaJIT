@@ -21,8 +21,14 @@ LJ_FUNC void lj_str_resize(lua_State *L, MSize newmask);
 LJ_FUNCA GCstr *lj_str_new(lua_State *L, const char *str, size_t len);
 LJ_FUNC void LJ_FASTCALL lj_str_free(global_State *g, GCstr *s);
 LJ_FUNC void LJ_FASTCALL lj_str_init(lua_State *L);
+#if LJ_GEN_GC
 #define lj_str_freetab(g) \
-  (lj_mem_freevec(g, g->str.tab, g->str.mask+1, GCRef))
+  (lj_mem_freevec(g, (g)->str.gendirty, (((g)->str.mask+1+63)>>6), uint64_t), \
+   lj_mem_freevec(g, (g)->str.tab, (g)->str.mask+1, GCRef))
+#else
+#define lj_str_freetab(g) \
+  (lj_mem_freevec(g, (g)->str.tab, (g)->str.mask+1, GCRef))
+#endif
 
 #define lj_str_newz(L, s)	(lj_str_new(L, s, strlen(s)))
 #define lj_str_newlit(L, s)	(lj_str_new(L, "" s, sizeof(s)-1))

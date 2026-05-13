@@ -658,6 +658,9 @@ typedef struct StrInternState {
   uint8_t unused1;
   uint8_t unused2;
   LJ_ALIGN(8) uint64_t seed;	/* Random string seed. */
+#if LJ_GEN_GC
+  uint64_t *gendirty;	/* Bitmap: 1 = bucket has young/OLD1 strings. */
+#endif
 } StrInternState;
 
 /* Global state, shared by all threads of a Lua universe. */

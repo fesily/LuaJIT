@@ -871,6 +871,33 @@ static GCRef *sweepgen(lua_State *L, global_State *g, GCRef *p, GCRef limit,
 static void sweepstringsgen(lua_State *L)
 {
   global_State *g = G(L);
+#if LJ_GEN_GC
+  MSize nwords = ((g->str.mask + 1) + 63) >> 6;
+  MSize wi;
+  for (wi = 0; wi < nwords; wi++) {
+    uint64_t bits = g->str.gendirty[wi];
+    if (bits == 0) continue;
+    while (bits) {
+      MSize bit = lj_ffs64(bits);
+      MSize i = (wi << 6) | bit;
+      if (i <= g->str.mask) {
+	uintptr_t u = gcrefu(g->str.tab[i]);
+	GCRef q;
+	GCobj *o;
+	int has_young = 0;
+	setgcrefp(q, (u & ~(uintptr_t)1));
+	sweepgen(L, g, &q, gc_empty, NULL);
+	setgcrefp(g->str.tab[i], (gcrefu(q) | (u & 1)));
+	for (o = gcref(q); o != NULL; o = gcnext(o)) {
+	  if (getage(o) < G_OLD) { has_young = 1; break; }
+	}
+	if (!has_young)
+	  g->str.gendirty[wi] &= ~((uint64_t)1 << bit);
+      }
+      bits &= bits - 1;
+    }
+  }
+#else
   MSize i;
   for (i = 0; i <= g->str.mask; i++) {
     uintptr_t u = gcrefu(g->str.tab[i]);
@@ -879,6 +906,7 @@ static void sweepstringsgen(lua_State *L)
     sweepgen(L, g, &q, gc_empty, NULL);
     setgcrefp(g->str.tab[i], (gcrefu(q) | (u & 1)));
   }
+#endif
 }
 
 static void gc_runtilstate(lua_State *L, int state)
@@ -995,7 +1023,8 @@ static void youngcollection(lua_State *L, global_State *g)
   lj_assertG(g->gc.state == GCSpropagate, "young collection in bad state");
   markold(g, g->gc.survival, g->gc.reallyold);
   markold(g, g->gc.udatasurvival, g->gc.udatarold);
-  markstringold(g);
+  /* Strings are leaf objects — gc_canpropagate returns false for them,
+  ** so markold is a no-op. Skip the full string table scan. */
 #if LJ_HASJIT
   gc_marktraceprotos(g);
 #endif
@@ -1026,6 +1055,9 @@ static void entergen(lua_State *L, global_State *g)
   setgcrefnull(g->gc.weak);
   sweep2old(L, &g->gc.root);
   sweepstringsold(L);
+#if LJ_GEN_GC
+  memset(g->str.gendirty, 0, (((g->str.mask + 1) + 63) >> 6) * sizeof(uint64_t));
+#endif
   g->gc.reallyold = g->gc.old = g->gc.survival = g->gc.root;
   g->gc.udatarold = g->gc.udataold = g->gc.udatasurvival = mainthread(g)->nextgc;
   g->gc.kind = KGC_GEN;
@@ -1112,6 +1144,9 @@ static void minor2inc(lua_State *L, global_State *g)
   g->gc.estimate = g->gc.total;
   g->gc.threshold = g->gc.total;
   g->gc.debt = GCSTEPSIZE;
+#if LJ_GEN_GC
+  memset(g->str.gendirty, 0xff, (((g->str.mask + 1) + 63) >> 6) * sizeof(uint64_t));
+#endif
 }
 
 /* Complete major phase, return to generational mode. */
@@ -1123,6 +1158,9 @@ static void major2gen(lua_State *L, global_State *g)
   setgcrefnull(g->gc.weak);
   promote2old(g, &g->gc.root);
   promotestringsold(g);
+#if LJ_GEN_GC
+  memset(g->str.gendirty, 0, (((g->str.mask + 1) + 63) >> 6) * sizeof(uint64_t));
+#endif
   g->gc.reallyold = g->gc.old = g->gc.survival = g->gc.root;
   g->gc.udatarold = g->gc.udataold = g->gc.udatasurvival = mainthread(g)->nextgc;
   g->gc.kind = KGC_GEN;
