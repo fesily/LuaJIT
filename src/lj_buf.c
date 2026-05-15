@@ -158,11 +158,27 @@ SBuf * LJ_FASTCALL lj_buf_putchar(SBuf *sb, int c)
 
 SBuf * LJ_FASTCALL lj_buf_putstr(SBuf *sb, GCstr *s)
 {
-  MSize len = s->len;
+  MSize len;
+#ifdef __SANITIZE_ADDRESS__
+  {
+    extern int __asan_address_is_poisoned(void const volatile *addr);
+    if (__asan_address_is_poisoned((void *)&s->len)) {
+      char msg[256];
+      int n = snprintf(msg, sizeof(msg),
+	"\n!!! lj_buf_putstr: FREED string %p (ASAN poisoned)\n"
+	"  sb=%p\n", (void *)s, (void *)sb);
+      write(2, msg, n);
+      _exit(99);
+    }
+  }
+#endif
+  len = s->len;
+  {
   char *w = lj_buf_more(sb, len);
   w = lj_buf_wmem(w, strdata(s), len);
   sb->w = w;
   return sb;
+  }
 }
 
 /* -- High-level buffer put operations ------------------------------------ */

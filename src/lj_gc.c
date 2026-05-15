@@ -13,6 +13,42 @@
 #include "lj_gc.h"
 #include "lj_err.h"
 #include "lj_buf.h"
+
+#ifdef __SANITIZE_ADDRESS__
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+static void asan_crash_handler(int sig)
+{
+  void *bt[128];
+  int n = backtrace(bt, 128);
+  const char msg[] = "\n=== LuaJIT ASAN crash backtrace ===\n";
+  write(STDERR_FILENO, msg, sizeof(msg)-1);
+  backtrace_symbols_fd(bt, n, STDERR_FILENO);
+  const char end[] = "=== end ===\n";
+  write(STDERR_FILENO, end, sizeof(end)-1);
+  _exit(128 + sig);
+}
+void __asan_on_error(void)
+{
+  void *bt[128];
+  int n = backtrace(bt, 128);
+  const char msg[] = "\n=== LuaJIT ASAN on_error backtrace ===\n";
+  write(STDERR_FILENO, msg, sizeof(msg)-1);
+  backtrace_symbols_fd(bt, n, STDERR_FILENO);
+  const char end[] = "=== end ===\n";
+  write(STDERR_FILENO, end, sizeof(end)-1);
+}
+__attribute__((constructor)) static void install_asan_handler(void)
+{
+  struct sigaction sa;
+  sa.sa_handler = asan_crash_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESETHAND;  /* One-shot: don't loop */
+  sigaction(SIGABRT, &sa, NULL);
+  sigaction(SIGSEGV, &sa, NULL);
+}
+#endif
 #include "lj_str.h"
 #include "lj_tab.h"
 #include "lj_func.h"
@@ -123,6 +159,15 @@ static void gc_mark_uv(global_State *g)
   for (uv = uvnext(&g->uvhead); uv != &g->uvhead; uv = uvnext(uv)) {
     lj_assertG(uvprev(uvnext(uv)) == uv && uvnext(uvprev(uv)) == uv,
 	       "broken upvalue chain");
+#if LJ_GEN_GC
+    if (g->gc.kind != KGC_INC) {
+      if (iswhite(obj2gco(uv))) {
+	gc_mark(g, obj2gco(uv));
+      } else {
+	gc_marktv(g, uvval(uv));
+      }
+    } else
+#endif
     if (isgray(obj2gco(uv)))
       gc_marktv(g, uvval(uv));
   }
@@ -352,6 +397,16 @@ static void gc_traverse_thread(global_State *g, lua_State *th)
     for (; o < top; o++)  /* Clear unmarked slots. */
       setnilV(o);
   }
+#if LJ_GEN_GC
+  if (g->gc.kind != KGC_INC) {
+    GCobj *uvobj = gcref(th->openupval);
+    while (uvobj != NULL) {
+      if (iswhite(uvobj))
+	gc_mark(g, uvobj);
+      uvobj = gcnext(uvobj);
+    }
+  }
+#endif
   gc_markobj(g, tabref(th->env));
   lj_state_shrinkstack(th, gc_traverse_frames(g, th));
 }
@@ -977,6 +1032,17 @@ static void markold(global_State *g, GCRef from, GCRef to)
 	setgcrefr(o->gch.gclist, g->gc.gray);
 	setgcref(g->gc.gray, o);
       }
+#if LJ_GEN_GC
+      if (gct == ~LJ_TUPVAL) {
+	GCupval *uv = gco2uv(o);
+	if (uv->closed)
+	  gc_marktv(g, uvval(uv));
+      } else if (gct == ~LJ_TUDATA) {
+	GCtab *mt = tabref(gco2ud(o)->metatable);
+	if (mt) gc_markobj(g, mt);
+	gc_markobj(g, tabref(gco2ud(o)->env));
+      }
+#endif
     }
     from = o->gch.nextgc;
   }
@@ -1171,6 +1237,8 @@ static void major2gen(lua_State *L, global_State *g)
 
 static void genstep(lua_State *L, global_State *g)
 {
+  if (tvref(g->jit_base))  /* Don't run any GC activity on trace. */
+    return;
   if (g->gc.state == GCSfinalize) {
     if (gcref(g->gc.mmudata) != NULL) {
       gc_finalize(L);
@@ -1477,18 +1545,19 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
   uv->closed = 1;
   setgcrefr(o->gch.nextgc, g->gc.root);
   setgcref(g->gc.root, o);
+#if LJ_GEN_GC
+  if (g->gc.kind != KGC_INC) {
+    o->gch.marked = (o->gch.marked & (uint8_t)~LJ_GC_WHITES) | LJ_GC_BLACK;
+    if (tvisgcv(&uv->tv) && iswhite(gcV(&uv->tv)))
+      gc_mark(g, gcV(&uv->tv));
+    return;
+  }
+#endif
   if (isgray(o)) {  /* A closed upvalue is never gray, so fix this. */
     if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
       gray2black(o);  /* Make it black and preserve invariant. */
       if (tviswhite(&uv->tv))
 	lj_gc_barrierf(g, o, gcV(&uv->tv));
-#if LJ_GEN_GC
-    } else if (g->gc.kind != KGC_INC) {
-      /* Closed during finalization (e.g. coroutine resumed from __gc).
-      ** Keep it black — the value was already reachable from the stack.
-      ** Don't makewhite: white+OLD would be collected by sweepgen. */
-      gray2black(o);
-#endif
     } else {
       makewhite(g, o);  /* Make it white, i.e. sweep the upvalue. */
       lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,

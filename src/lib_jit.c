@@ -799,7 +799,7 @@ static uint32_t jit_cpudetect(void)
 }
 
 #if LJ_DS_JIT_DEFAULT_OPT_PATCH
-LUA_DATA_API uint32_t (*lj_jit_default_flags)() = 0;
+LUA_DATA_API uint32_t (*lj_jit_default_flags)(uint32_t flags) = 0;
 #endif
 
 /* Initialize JIT compiler. */
@@ -809,7 +809,7 @@ static void jit_init(lua_State *L)
   J->flags = JIT_F_ON | jit_cpudetect() | JIT_F_OPT_DEFAULT;
 #if LJ_DS_JIT_DEFAULT_OPT_PATCH
   if (lj_jit_default_flags)
-    J->flags |= lj_jit_default_flags();
+    J->flags = lj_jit_default_flags(J->flags);
 #endif
   memcpy(J->param, jit_param_default, sizeof(J->param));
 #if LJ_TARGET_UNALIGNED

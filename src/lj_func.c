@@ -93,6 +93,16 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
     lj_assertG(!isblack(o), "bad black upvalue");
     lj_assertG(!uv->closed && uvval(uv) != &uv->tv, "closed upvalue in chain");
     setgcrefr(L->openupval, uv->nextgc);  /* No longer in open list. */
+#if LJ_GEN_GC
+    if (g->gc.kind != KGC_INC) {
+      unlinkuv(g, uv);
+      lj_gc_closeuv(g, uv);
+      /* lj_gc_closeuv already added the upvalue to gc.root. Set age to
+      ** G_SURVIVAL so sweepgen won't makewhite it (only G_NEW gets that),
+      ** and it naturally ages to G_OLD1 where markold re-marks its value. */
+      setage(o, G_SURVIVAL);
+    } else
+#endif
     if (isdead(g, o)) {
       lj_func_freeuv(g, uv);
     } else {

@@ -43,6 +43,7 @@ option(LUAJIT_CPU_NOCMOV "Disable NOCMOV." OFF)
 option(LUAJIT_DISABLE_GC64 "Disable GC64" OFF)
 option(LUA_COMPAT_VARARG_N "Enable legacy Lua 5.1 arg.n population." OFF)
 option(LUAJIT_ENABLE_FSANITIZE "Enable fsanitize" OFF)
+option(LUAJIT_USE_GDBJIT "Enable GDB JIT API integration." OFF)
 option(LUAJIT_NUMMODE "num mode" 2)
 MARK_AS_ADVANCED(LUAJIT_DISABLE_FFI LUAJIT_ENABLE_LUA52COMPAT
   LUAJIT_DISABLE_GC64
@@ -76,6 +77,10 @@ IF(LUA_COMPAT_VARARG_N)
   ADD_DEFINITIONS(-DLUA_COMPAT_VARARG_N=1)
 ENDIF()
 
+IF(LUAJIT_USE_GDBJIT)
+  ADD_DEFINITIONS(-DLUAJIT_USE_GDBJIT)
+ENDIF()
+
 IF(LUAJIT_NUMMODE)
   add_definitions(-DLUAJIT_NUMMODE=${LUAJIT_NUMMODE})
 ENDIF()
@@ -106,6 +111,16 @@ if (LJ_GC_TRACE_LOG)
       message(STATUS "GC trace logging enabled")
       add_definitions(-DLJ_GC_TRACE_LOG)
 endif()
+
+function(luajit_disable_sanitizer_for_target target_name)
+  if(LUAJIT_ENABLE_FSANITIZE AND TARGET ${target_name})
+    if(NOT MSVC)
+      # buildvm is a host-side generator; keep it unsanitized for stable tool execution.
+      target_compile_options(${target_name} PRIVATE -fno-sanitize=address -fno-sanitize=all)
+      target_link_options(${target_name} PRIVATE -fno-sanitize=address -fno-sanitize=all)
+    endif()
+  endif()
+endfunction()
 
 CHECK_TYPE_SIZE("void*" SIZEOF_VOID_P)
 IF(SIZEOF_VOID_P EQUAL 8)
@@ -352,6 +367,7 @@ list (APPEND SRC_BUILDVM ${LUAJIT_DIR}/src/luajit.h)
 ## GENERATE
 ADD_EXECUTABLE(buildvm ${SRC_BUILDVM})
 SET_TARGET_PROPERTIES(buildvm PROPERTIES COMPILE_DEFINITIONS "${TARGET_ARCH}")
+luajit_disable_sanitizer_for_target(buildvm)
 
 set(LUAJIT_NEEDS_NO_GEN_GC_GENERATED OFF)
 if(LUAJIT_DISABLE_GEN_GC OR LUAJIT_BUILD_BOTH_GEN_GC)
@@ -380,6 +396,7 @@ if(LUAJIT_NEEDS_NO_GEN_GC_GENERATED)
 
   ADD_EXECUTABLE(buildvm_nogengc ${SRC_BUILDVM_NOGENGC})
   SET_TARGET_PROPERTIES(buildvm_nogengc PROPERTIES COMPILE_DEFINITIONS "${TARGET_ARCH}")
+  luajit_disable_sanitizer_for_target(buildvm_nogengc)
   target_compile_definitions(buildvm_nogengc PRIVATE LUAJIT_DISABLE_GEN_GC)
   # Include the no-gen-gc buildvm dir FIRST so it picks up the non-gengc buildvm_arch.h
   target_include_directories(buildvm_nogengc BEFORE PRIVATE ${LUAJIT_NO_GEN_GC_BUILDVM_DIR})
