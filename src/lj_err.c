@@ -582,9 +582,19 @@ static const uint8_t err_frame_jit_template[] = {
 #if LJ_LE
   0,0,0,
 #endif
-  0,0,0,0, 0, 0,0,0, /* Code size, augmentation length, alignment. */
+  0,0,0,0, 0,  /* Code size, augmentation length. */
 #if LJ_64
-  0,0,0,0,  /* Alignment. */
+  /* CFI: tell the unwinder to stop at the mcode frame boundary so that
+  ** _Unwind_Backtrace (used by ASAN, glibc backtrace(), etc.) doesn't
+  ** dereference garbage when walking through trace frames. The exception
+  ** path is unaffected because err_unwind_jit installs a new context in
+  ** _UA_CLEANUP_PHASE without consulting CFI for the trace frame.
+  */
+  0x0c, 7, 8,        /* DW_CFA_def_cfa: r7 (RSP), offset 8. */
+  0x07, 16,          /* DW_CFA_undefined: r16 (RIP) -> end of stack. */
+  0, 0,              /* DW_CFA_nop padding. */
+#else
+  0,0,0,  /* Alignment. */
 #endif
   0,0,0,0  /* Final FDE. */
 };
