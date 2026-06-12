@@ -13,7 +13,7 @@
 
 GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
 {
-  GCudata *ud = lj_mem_newt(L, sizeof(GCudata) + sz, GCudata);
+  GCudata *ud = (GCudata *)lj_mem_newagco(L, sizeof(GCudata) + sz, 1);
   global_State *g = G(L);
   newwhite(g, ud);  /* Not finalized. */
   ud->gct = ~LJ_TUDATA;
@@ -30,7 +30,7 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
 
 void LJ_FASTCALL lj_udata_free(global_State *g, GCudata *ud)
 {
-  lj_mem_free(g, ud, sizeudata(ud));
+  lj_mem_freegco(g, ud, sizeudata(ud));
 }
 
 #if LJ_64

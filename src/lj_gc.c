@@ -28,6 +28,9 @@
 #include "lj_dispatch.h"
 #include "lj_vm.h"
 #include "lj_vmevent.h"
+#if LJ_HASGCARENA
+#include "lj_arena.h"
+#endif
 
 #define GCSTEPSIZE	1024u
 #define GCSWEEPMAX	40
@@ -688,6 +691,9 @@ static size_t gc_onestep(lua_State *L)
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
       if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	lj_str_resize(L, g->str.mask >> 1);  /* Shrink string table. */
+#if LJ_HASGCARENA
+      lj_arena_shrink(g);  /* Coalesce free space, release empty arenas. */
+#endif
       if (gcref(g->gc.mmudata)) {  /* Need any finalizations? */
 	g->gc.state = GCSfinalize;
       } else {  /* Otherwise skip this phase to help the JIT. */
@@ -877,6 +883,9 @@ void *lj_mem_realloc(lua_State *L, void *p, GCSize osz, GCSize nsz)
 /* Allocate new GC object and link it to the root set. */
 void * LJ_FASTCALL lj_mem_newgco(lua_State *L, GCSize size)
 {
+#if LJ_HASGCARENA
+  return lj_mem_newgco_arena(L, size, 0, 1);
+#else
   global_State *g = G(L);
   GCobj *o = (GCobj *)g->allocf(g->allocd, NULL, 0, size);
   if (o == NULL)
@@ -888,7 +897,38 @@ void * LJ_FASTCALL lj_mem_newgco(lua_State *L, GCSize size)
   setgcref(g->gc.root, o);
   newwhite(g, o);
   return o;
+#endif
 }
+
+#if LJ_HASGCARENA
+
+/*
+** Out-of-line continuation of lj_mem_newgco_arena(): the current arena
+** had no bump space (or the size calls for a huge block).
+*/
+void *lj_mem_newgco_slow(lua_State *L, GCSize size, int trav, int link)
+{
+  global_State *g = G(L);
+  GCobj *o;
+  if (LJ_LIKELY(size < ArenaHugeThreshold)) {
+    o = (GCobj *)lj_arena_findspace(g, size, trav);
+  } else {
+    o = (GCobj *)lj_hugeblock_alloc(g, size);
+  }
+  if (o == NULL)
+    lj_err_mem(L);
+  lj_assertG(checkptrGC(o),
+	     "allocated memory address %p outside required range", o);
+  g->gc.total += size;
+  if (link) {
+    setgcrefr(o->gch.nextgc, g->gc.root);
+    setgcref(g->gc.root, o);
+    newwhite(g, o);
+  }
+  return o;
+}
+
+#endif
 
 /* Resize growable vector. */
 void *lj_mem_grow(lua_State *L, void *p, MSize *szp, MSize lim, MSize esz)

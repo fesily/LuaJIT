@@ -85,7 +85,7 @@ static GCtab *newtab(lua_State *L, uint32_t asize, uint32_t hbits)
   if (LJ_MAX_COLOSIZE != 0 && asize > 0 && asize <= LJ_MAX_COLOSIZE) {
     Node *nilnode;
     lj_assertL((sizeof(GCtab) & 7) == 0, "bad GCtab size");
-    t = (GCtab *)lj_mem_newgco(L, sizetabcolo(asize));
+    t = (GCtab *)lj_mem_newgcot(L, sizetabcolo(asize));
     t->gct = ~LJ_TTAB;
     t->nomm = (uint8_t)~0;
     t->colo = (int8_t)asize;
@@ -220,9 +220,9 @@ void LJ_FASTCALL lj_tab_free(global_State *g, GCtab *t)
   if (t->asize > 0 && LJ_MAX_COLOSIZE != 0 && t->colo <= 0)
     lj_mem_freevec(g, tvref(t->array), t->asize, TValue);
   if (LJ_MAX_COLOSIZE != 0 && t->colo)
-    lj_mem_free(g, t, sizetabcolo((uint32_t)t->colo & 0x7f));
+    lj_mem_freegco(g, t, sizetabcolo((uint32_t)t->colo & 0x7f));
   else
-    lj_mem_freet(g, t);
+    lj_mem_freegco(g, t, sizeof(GCtab));
 }
 
 /* -- Table resizing ------------------------------------------------------ */

@@ -19,7 +19,7 @@
 
 void LJ_FASTCALL lj_func_freeproto(global_State *g, GCproto *pt)
 {
-  lj_mem_free(g, pt, pt->sizept);
+  lj_mem_freegco(g, pt, pt->sizept);
 }
 
 /* -- Upvalues ------------------------------------------------------------ */
@@ -51,7 +51,7 @@ static GCupval *func_finduv(lua_State *L, TValue *slot)
     pp = &p->nextgc;
   }
   /* No matching upvalue found. Create a new one. */
-  uv = lj_mem_newt(L, sizeof(GCupval), GCupval);
+  uv = (GCupval *)lj_mem_newagco(L, sizeof(GCupval), 1);
   newwhite(g, uv);
   uv->gct = ~LJ_TUPVAL;
   uv->closed = 0;  /* Still open. */
@@ -71,7 +71,7 @@ static GCupval *func_finduv(lua_State *L, TValue *slot)
 /* Create an empty and closed upvalue. */
 static GCupval *func_emptyuv(lua_State *L)
 {
-  GCupval *uv = (GCupval *)lj_mem_newgco(L, sizeof(GCupval));
+  GCupval *uv = (GCupval *)lj_mem_newgcot(L, sizeof(GCupval));
   uv->gct = ~LJ_TUPVAL;
   uv->closed = 1;
   setnilV(&uv->tv);
@@ -103,14 +103,14 @@ void LJ_FASTCALL lj_func_freeuv(global_State *g, GCupval *uv)
 {
   if (!uv->closed)
     unlinkuv(g, uv);
-  lj_mem_freet(g, uv);
+  lj_mem_freegco(g, uv, sizeof(GCupval));
 }
 
 /* -- Functions (closures) ------------------------------------------------ */
 
 GCfunc *lj_func_newC(lua_State *L, MSize nelems, GCtab *env)
 {
-  GCfunc *fn = (GCfunc *)lj_mem_newgco(L, sizeCfunc(nelems));
+  GCfunc *fn = (GCfunc *)lj_mem_newgcot(L, sizeCfunc(nelems));
   fn->c.gct = ~LJ_TFUNC;
   fn->c.ffid = FF_C;
   fn->c.nupvalues = (uint8_t)nelems;
@@ -123,10 +123,25 @@ GCfunc *lj_func_newC(lua_State *L, MSize nelems, GCtab *env)
 static GCfunc *func_newL(lua_State *L, GCproto *pt, GCtab *env)
 {
   uint32_t count;
-  GCfunc *fn = (GCfunc *)lj_mem_newgco(L, sizeLfunc((MSize)pt->sizeuv));
+  GCfunc *fn = (GCfunc *)lj_mem_newgcot(L, sizeLfunc((MSize)pt->sizeuv));
   fn->l.gct = ~LJ_TFUNC;
   fn->l.ffid = FF_LUA;
+#if LJ_HASGCARENA
+  {
+    /* The arena allocator frees with the exact allocation size, which is
+    ** derived from nupvalues. An OOM while the upvalues are created would
+    ** leave a smaller nupvalues behind, so set the final count right away.
+    ** The refs point at the function itself until they are filled in:
+    ** harmless for the GC traversal, unlike cleared refs.
+    */
+    MSize i;
+    for (i = 0; i < pt->sizeuv; i++)
+      setgcref(fn->l.uvptr[i], obj2gco(fn));
+    fn->l.nupvalues = (uint8_t)pt->sizeuv;
+  }
+#else
   fn->l.nupvalues = 0;  /* Set to zero until upvalues are initialized. */
+#endif
   /* NOBARRIER: Really a setgcref. But the GCfunc is new (marked white). */
   setmref(fn->l.pc, proto_bc(pt));
   setgcref(fn->l.env, obj2gco(env));
@@ -186,6 +201,6 @@ void LJ_FASTCALL lj_func_free(global_State *g, GCfunc *fn)
 {
   MSize size = isluafunc(fn) ? sizeLfunc((MSize)fn->l.nupvalues) :
 			       sizeCfunc((MSize)fn->c.nupvalues);
-  lj_mem_free(g, fn, size);
+  lj_mem_freegco(g, fn, size);
 }
 

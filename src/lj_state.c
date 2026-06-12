@@ -28,6 +28,9 @@
 #include "lj_prng.h"
 #include "lj_lex.h"
 #include "lj_alloc.h"
+#if LJ_HASGCARENA
+#include "lj_arena.h"
+#endif
 #include "luajit.h"
 
 /* -- Stack handling ------------------------------------------------------ */
@@ -227,6 +230,9 @@ static void close_state(lua_State *L)
     lj_mem_freevec(g, mref(g->gc.lightudseg, uint32_t), segnum, uint32_t);
   }
 #endif
+#if LJ_HASGCARENA
+  lj_arena_freeall(g);
+#endif
   lj_assertG(g->gc.total == sizeof(GG_State),
 	     "memory leak of %lld bytes",
 	     (long long)(g->gc.total - sizeof(GG_State)));
@@ -387,6 +393,6 @@ void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
     lj_assertG(gcref(L->openupval) == NULL, "stale open upvalues");
   }
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
-  lj_mem_freet(g, L);
+  lj_mem_freegco(g, L, sizeof(lua_State));
 }
 

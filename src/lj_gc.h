@@ -122,6 +122,94 @@ static LJ_AINLINE void lj_mem_free(global_State *g, void *p, size_t osize)
   g->allocf(g->allocd, p, osize, 0);
 }
 
+/*
+** GC object allocation. GC objects are segregated from other memory:
+** with LJ_HASGCARENA they are placed in arenas (lj_arena.h), otherwise
+** they share the lua_Alloc allocator with everything else.
+**
+**   lj_mem_newgco   non-traversable object, linked to the GC root list.
+**   lj_mem_newgcot  traversable object, linked to the GC root list.
+**   lj_mem_newagco  unlinked object; the caller manages the nextgc chain.
+**   lj_mem_freegco  free any GC object (the inverse of all of the above).
+*/
+#if LJ_HASGCARENA
+#include "lj_arena.h"
+
+LJ_FUNC void *lj_mem_newgco_slow(lua_State *L, GCSize size, int trav,
+				 int link);
+
+/*
+** Inline fast path: bump-allocate from the current arena.
+** trav and link are compile-time constants at all call sites.
+*/
+static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
+					    int trav, int link)
+{
+  global_State *g = G(L);
+  if (LJ_LIKELY(size < ArenaHugeThreshold)) {
+    GCArena *a = mref(trav ? g->gc.travarena : g->gc.arena, GCArena);
+    GCobj *o = a ? (GCobj *)arena_alloc(a, size) : NULL;
+    if (LJ_LIKELY(o != NULL)) {
+      g->gc.total += size;
+      if (link) {
+	setgcrefr(o->gch.nextgc, g->gc.root);
+	setgcref(g->gc.root, o);
+	newwhite(g, o);
+      }
+      return o;
+    }
+  }
+  return lj_mem_newgco_slow(L, size, trav, link);
+}
+
+/* Free a GC object allocated by lj_mem_newgco_arena(). */
+static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
+{
+  g->gc.total -= (GCSize)osize;
+  if (LJ_LIKELY(!lj_arena_ishuge(p))) {
+    GCArena *a = ptr2arena(p);
+    GCCellID c = ptr2cell(p);
+    GCCellID n = arena_roundcells(osize);
+    ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
+    a->freegen++;
+    if (c + n == (GCCellID)a->celltop) {  /* Roll back the bump frontier. */
+      a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
+      a->mark[arena_blockidx(c)] &= ~arena_blockbit(c);
+      a->celltop = (GCCellID1)c;
+      return;
+    }
+    a->freecells += n;
+    if (fl != NULL && n <= ArenaBins) {
+      /* Push onto the intrusive per-size free list. The block keeps its */
+      /* allocated bitmap state, so no bitmap access here at all. */
+      uint32_t b = n - 1;
+      *(GCCellID1 *)p = fl->bins[b];
+      fl->bins[b] = (GCCellID1)c;
+      fl->binmask |= 1u << b;
+      return;
+    }
+    if (fl != NULL) {
+      lj_arena_freerange(a, fl, c, n);
+    } else {
+      /* No free list yet: flip to the Free bitmap state; the first */
+      /* slow-path allocation scavenges these blocks into a new list. */
+      a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
+      a->mark[arena_blockidx(c)] |= arena_blockbit(c);
+    }
+  } else {
+    lj_hugeblock_free(g, p, osize);
+  }
+}
+
+#define lj_mem_newgcot(L, s)	lj_mem_newgco_arena(L, (GCSize)(s), 1, 1)
+#define lj_mem_newagco(L, s, trav)  lj_mem_newgco_arena(L, (GCSize)(s), (trav), 0)
+#define lj_mem_freegco(g, p, s)	lj_mem_freegco_(g, (p), (s))
+#else
+#define lj_mem_newgcot(L, s)	lj_mem_newgco(L, (GCSize)(s))
+#define lj_mem_newagco(L, s, trav)  lj_mem_new(L, (GCSize)(s))
+#define lj_mem_freegco(g, p, s)	lj_mem_free(g, (p), (s))
+#endif
+
 #define lj_mem_newvec(L, n, t)	((t *)lj_mem_new(L, (GCSize)((n)*sizeof(t))))
 #define lj_mem_reallocvec(L, p, on, n, t) \
   ((p) = (t *)lj_mem_realloc(L, p, (on)*sizeof(t), (GCSize)((n)*sizeof(t))))
@@ -129,7 +217,7 @@ static LJ_AINLINE void lj_mem_free(global_State *g, void *p, size_t osize)
   ((p) = (t *)lj_mem_grow(L, (p), &(n), (m), (MSize)sizeof(t)))
 #define lj_mem_freevec(g, p, n, t)	lj_mem_free(g, (p), (n)*sizeof(t))
 
-#define lj_mem_newobj(L, t)	((t *)lj_mem_newgco(L, sizeof(t)))
+#define lj_mem_newobj(L, t)	((t *)lj_mem_newgcot(L, sizeof(t)))
 #define lj_mem_newt(L, s, t)	((t *)lj_mem_new(L, (s)))
 #define lj_mem_freet(g, p)	lj_mem_free(g, (p), sizeof(*(p)))
 

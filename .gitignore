@@ -10,3 +10,4 @@
 *.dmp
 *.swp
 .tags
+test/test_arena

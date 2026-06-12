@@ -275,7 +275,7 @@ static LJ_NOINLINE GCstr *lj_str_rehash_chain(lua_State *L, StrHash hashc,
 static GCstr *lj_str_alloc(lua_State *L, const char *str, MSize len,
 			   StrHash hash, int hashalg)
 {
-  GCstr *s = lj_mem_newt(L, lj_str_size(len), GCstr);
+  GCstr *s = (GCstr *)lj_mem_newagco(L, lj_str_size(len), 0);
   global_State *g = G(L);
   uintptr_t u;
   newwhite(g, s);
@@ -358,7 +358,7 @@ GCstr *lj_str_new(lua_State *L, const char *str, size_t lenx)
 void LJ_FASTCALL lj_str_free(global_State *g, GCstr *s)
 {
   g->str.num--;
-  lj_mem_free(g, s, lj_str_size(s->len));
+  lj_mem_freegco(g, s, lj_str_size(s->len));
 }
 
 void LJ_FASTCALL lj_str_init(lua_State *L)

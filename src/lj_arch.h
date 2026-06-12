@@ -600,6 +600,17 @@
 #define LJ_GC64			0
 #endif
 
+/* Arena-based allocator for GC objects. */
+#if defined(LUAJIT_ENABLE_GCARENA) && !defined(LUAJIT_USE_SYSMALLOC)
+#if LJ_64 && !LJ_GC64
+#define LJ_HASGCARENA		0	/* Needs full-width GC refs on 64 bit. */
+#else
+#define LJ_HASGCARENA		1
+#endif
+#else
+#define LJ_HASGCARENA		0
+#endif
+
 /* 2-slot frame info. */
 #if LJ_GC64
 #define LJ_FR2			1

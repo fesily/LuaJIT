@@ -615,6 +615,16 @@ typedef struct GCState {
 #if LJ_64
   MRef lightudseg;	/* Upper bits of lightuserdata segments. */
 #endif
+#if LJ_HASGCARENA
+  MRef arena;		/* Current non-traversable allocation arena. */
+  MRef travarena;	/* Current traversable allocation arena. */
+  MRef arenas;		/* Vector of all arenas (GCArena **). */
+  MRef chunks;		/* List of reserved OS memory chunks. */
+  MSize arenassz;	/* Size of arena vector. */
+  MSize arenastop;	/* Number of arenas. */
+  MSize hugenum;	/* Number of huge blocks. */
+  GCSize hugemem;	/* Memory in huge blocks (rounded to arena size). */
+#endif
 } GCState;
 
 /* String interning state. */
