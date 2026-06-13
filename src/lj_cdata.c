@@ -95,10 +95,10 @@ void lj_cdata_setfin(lua_State *L, GCcdata *cd, GCobj *obj, uint32_t it)
     tv = lj_tab_set(L, t, &tmp);
     if (it == LJ_TNIL) {
       setnilV(tv);
-      cd->marked &= ~LJ_GC_CDATA_FIN;
+      lj_gc_markedand(G(L), cd, (uint8_t)~LJ_GC_CDATA_FIN);
     } else {
       setgcV(L, tv, obj, it);
-      cd->marked |= LJ_GC_CDATA_FIN;
+      lj_gc_markedor(G(L), cd, LJ_GC_CDATA_FIN);
     }
   }
 }

@@ -643,6 +643,16 @@
 #define LJ_HASPROFILE		0
 #endif
 
+/* Concurrent GC: requires GC64 (atomic TValue stores), a TSO memory model
+** (x64) and POSIX threads. Other archs need publication fences (not yet done).
+*/
+#if defined(LUAJIT_ENABLE_CONCGC) && LJ_GC64 && LJ_TARGET_X64 && \
+    LJ_TARGET_POSIX
+#define LJ_CONCGC		1
+#else
+#define LJ_CONCGC		0
+#endif
+
 #ifndef LJ_ARCH_HASFPU
 #define LJ_ARCH_HASFPU		1
 #endif

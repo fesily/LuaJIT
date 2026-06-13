@@ -29,6 +29,7 @@
 #include "lj_lex.h"
 #include "lj_alloc.h"
 #include "luajit.h"
+#include "lj_gcconc.h"
 
 /* -- Stack handling ------------------------------------------------------ */
 
@@ -209,6 +210,9 @@ static TValue *cpluaopen(lua_State *L, lua_CFunction dummy, void *ud)
 static void close_state(lua_State *L)
 {
   global_State *g = G(L);
+#if LJ_CONCGC
+  lj_concgc_shutdown(g);
+#endif
   lj_func_closeuv(L, tvref(L->stack));
   lj_gc_freeall(g);
   lj_assertG(gcref(g->gc.root) == obj2gco(L),
@@ -330,6 +334,13 @@ LUA_API void lua_close(lua_State *L)
   L = mainthread(g);  /* Only the main thread can be closed. */
 #if LJ_HASPROFILE
   luaJIT_profile_stop(L);
+#endif
+#if LJ_CONCGC
+  /* Converge any concurrent cycle and stop the marker thread before
+  ** mutating GC state single-threaded (separateudata etc.).
+  */
+  lj_gc_setconcmode(L, 0);
+  lj_concgc_shutdown(g);
 #endif
   setgcrefnull(g->cur_L);
   lj_func_closeuv(L, tvref(L->stack));

@@ -435,7 +435,7 @@ static void emit_loadk64(ASMState *as, Reg r, IRIns *ir)
 /* Label for short jumps. */
 typedef MCode *MCLabel;
 
-#if LJ_32 && LJ_HASFFI
+#if (LJ_32 && LJ_HASFFI) || LJ_CONCGC
 /* jmp short target */
 static void emit_sjmp(ASMState *as, MCLabel target)
 {

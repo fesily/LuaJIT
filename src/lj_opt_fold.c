@@ -2444,7 +2444,14 @@ LJFOLD(TBAR TDUP)
 LJFOLDF(barrier_tnew_tdup)
 {
   /* New tables are always white and never need a barrier. */
-  if (fins->op1 < J->chain[IR_LOOP])  /* Except across a GC step. */
+  if (fins->op1 < J->chain[IR_LOOP]  /* Except across a GC step. */
+#if LJ_CONCGC
+      /* Or when the concurrent marker can blacken them asynchronously
+      ** (no GC step needed). Falls through to the sound CSE rule.
+      */
+      || J2G(J)->gc.concmode
+#endif
+      )
     return NEXTFOLD;
   return DROPFOLD;
 }

@@ -13,6 +13,7 @@
 #include "lj_gc.h"
 #include "lj_err.h"
 #include "lj_tab.h"
+#include "lj_gcconc.h"
 
 /* -- Object hashing ------------------------------------------------------ */
 
@@ -233,6 +234,10 @@ void lj_tab_resize(lua_State *L, GCtab *t, uint32_t asize, uint32_t hbits)
   Node *oldnode = noderef(t->node);
   uint32_t oldasize = t->asize;
   uint32_t oldhmask = t->hmask;
+  /* The concurrent marker may be traversing the old array/node parts:
+  ** park it across the realloc/free and the header pointer swaps.
+  */
+  lj_concgc_pause_begin(G(L));
   if (asize > oldasize) {  /* Array part grows? */
     TValue *array;
     uint32_t i;
@@ -289,6 +294,7 @@ void lj_tab_resize(lua_State *L, GCtab *t, uint32_t asize, uint32_t hbits)
     g = G(L);
     lj_mem_freevec(g, oldnode, oldhmask+1, Node);
   }
+  lj_concgc_pause_end(G(L));
 }
 
 static uint32_t countint(cTValue *key, uint32_t *bins)

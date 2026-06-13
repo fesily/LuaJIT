@@ -31,6 +31,7 @@
 #include "lj_vmevent.h"
 #include "lj_target.h"
 #include "lj_prng.h"
+#include "lj_gcconc.h"
 
 /* -- Error handling ------------------------------------------------------ */
 
@@ -72,9 +73,12 @@ static TraceNo trace_findfree(jit_State *J)
   osz = J->sizetrace;
   if (osz >= lim)
     return 0;  /* Too many traces. */
+  /* The concurrent marker dereferences J->trace: park it across the move. */
+  lj_concgc_pause_begin(J2G(J));
   lj_mem_growvec(J->L, J->trace, J->sizetrace, lim, GCRef);
   for (; osz < J->sizetrace; osz++)
     setgcrefnull(J->trace[osz]);
+  lj_concgc_pause_end(J2G(J));
   return J->freetrace;
 }
 
@@ -260,16 +264,22 @@ void lj_trace_flush(jit_State *J, TraceNo traceno)
 {
   if (traceno > 0 && traceno < J->sizetrace) {
     GCtrace *T = traceref(J, traceno);
-    if (T && T->root == 0)
+    if (T && T->root == 0) {
+      /* The marker follows pt->trace/nextroot chains. */
+      lj_concgc_pause_begin(J2G(J));
       trace_flushroot(J, T);
+      lj_concgc_pause_end(J2G(J));
+    }
   }
 }
 
 /* Flush all traces associated with a prototype. */
 void lj_trace_flushproto(global_State *g, GCproto *pt)
 {
+  lj_concgc_pause_begin(g);
   while (pt->trace != 0)
     trace_flushroot(G2J(g), traceref(G2J(g), pt->trace));
+  lj_concgc_pause_end(g);
 }
 
 /* Flush all traces. */
@@ -279,6 +289,8 @@ int lj_trace_flushall(lua_State *L)
   ptrdiff_t i;
   if ((J2G(J)->hookmask & HOOK_GC))
     return 1;
+  /* The concurrent marker walks J->trace and trace link fields. */
+  lj_concgc_pause_begin(J2G(J));
   for (i = (ptrdiff_t)J->sizetrace-1; i > 0; i--) {
     GCtrace *T = traceref(J, i);
     if (T) {
@@ -289,6 +301,7 @@ int lj_trace_flushall(lua_State *L)
       setgcrefnull(J->trace[i]);
     }
   }
+  lj_concgc_pause_end(J2G(J));
   J->cur.traceno = 0;
   J->freetrace = 0;
   /* Clear penalty cache. */
@@ -504,6 +517,11 @@ static void trace_stop(jit_State *J)
   TraceNo traceno = J->cur.traceno;
   GCtrace *T = J->curfinal;
 
+  /* The marker must not observe trace links (pt->trace, nextroot,
+  ** nextside, link) pointing at this trace before J->trace[traceno] is
+  ** repointed from &J->cur to the heap copy in trace_save.
+  */
+  lj_concgc_pause_begin(J2G(J));
   switch (op) {
   case BC_FORL:
     setbc_op(pc+bc_j(J->cur.startins), BC_JFORI);  /* Patch FORI, too. */
@@ -558,6 +576,7 @@ static void trace_stop(jit_State *J)
   lj_mcode_commit(J, J->cur.mcode);
   J->postproc = LJ_POST_NONE;
   trace_save(J, T);
+  lj_concgc_pause_end(J2G(J));
 
   lj_vmevent_send(J2G(J), TRACE,
     setstrV(V, V->top++, lj_str_newlit(V, "stop"));

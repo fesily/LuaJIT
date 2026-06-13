@@ -17,6 +17,7 @@
 #include "lj_trace.h"
 #include "lj_vm.h"
 #include "lj_strfmt.h"
+#include "lj_gcconc.h"
 
 /*
 ** LuaJIT can either use internal or external frame unwinding:
@@ -769,6 +770,10 @@ LJ_NOINLINE void LJ_FASTCALL lj_err_throw(lua_State *L, int errcode)
 {
   global_State *g = G(L);
   lj_trace_abort(g);
+#if LJ_CONCGC
+  /* Restore the marker if an error escaped a pause bracket. */
+  if (concgcstate(g)) lj_concgc_unpause(g);
+#endif
   L->status = LUA_OK;
 #if LJ_UNWIND_EXT
   err_raise_ext(g, errcode);

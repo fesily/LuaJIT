@@ -1281,6 +1281,11 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
   case LUA_GCISRUNNING:
     res = (g->gc.threshold != LJ_MAX_MEM);
     break;
+#if LJ_CONCGC
+  case LUA_GCCONCURRENT:
+    res = lj_gc_setconcmode(L, data);
+    break;
+#endif
   default:
     res = -1;  /* Invalid option. */
   }

@@ -28,6 +28,7 @@
 #include "lj_dispatch.h"
 #include "lj_vm.h"
 #include "lj_vmevent.h"
+#include "lj_gcconc.h"
 
 #define GCSTEPSIZE	1024u
 #define GCSWEEPMAX	40
@@ -41,11 +42,24 @@
 
 /* -- Mark phase ---------------------------------------------------------- */
 
-/* Mark a TValue (if needed). */
+static void gc_mark(global_State *g, GCobj *o);
+
+/* Mark a TValue (if needed). The slot is snapshotted with a single
+** atomic load: under concurrent marking the mutator may rewrite it
+** between accesses (GC64 TValue = one naturally aligned 64-bit word).
+*/
+#if LJ_CONCGC
+#define gc_tvload(tv)	lj_atomic_load64(&((const TValue *)(tv))->u64)
+#else
+#define gc_tvload(tv)	(((const TValue *)(tv))->u64)
+#endif
 #define gc_marktv(g, tv) \
-  { lj_assertG(!tvisgcv(tv) || (~itype(tv) == gcval(tv)->gch.gct), \
+  { TValue gc_tvc; \
+    gc_tvc.u64 = gc_tvload(tv); \
+    lj_assertG(!tvisgcv(&gc_tvc) || \
+	       (~itype(&gc_tvc) == gcval(&gc_tvc)->gch.gct), \
 	       "TValue and GC type mismatch"); \
-    if (tviswhite(tv)) gc_mark(g, gcV(tv)); }
+    if (tviswhite(&gc_tvc)) gc_mark(g, gcV(&gc_tvc)); }
 
 /* Mark a GCobj (if needed). */
 #define gc_markobj(g, o) \
@@ -54,10 +68,74 @@
 /* Mark a string object. */
 #define gc_mark_str(s)		((s)->marked &= (uint8_t)~LJ_GC_WHITES)
 
+#if LJ_CONCGC
+/* Mark a string object, safe against the mutator's LOGGED RMW. */
+#define gc_mark_str_c(g, s) \
+  { if (LJ_UNLIKELY((g)->gc.cmark)) \
+      lj_atomic_and8(&(s)->marked, (uint8_t)~LJ_GC_WHITES); \
+    else gc_mark_str(s); }
+#else
+#define gc_mark_str_c(g, s)	gc_mark_str(s)
+#endif
+
+#if LJ_CONCGC
+/* Mark the children of a userdata. Shared by all (re-)mark paths. */
+static void gc_mark_udchildren(global_State *g, GCudata *ud)
+{
+  GCtab *mt = tabref(ud->metatable);
+  if (mt) gc_markobj(g, mt);
+  gc_markobj(g, tabref(ud->env));
+  if (LJ_HASBUFFER && ud->udtype == UDTYPE_BUFFER) {
+    SBufExt *sbx = (SBufExt *)uddata(ud);
+    if (sbufiscow(sbx) && gcref(sbx->cowref))
+      gc_markobj(g, gcref(sbx->cowref));
+    if (gcref(sbx->dict_str))
+      gc_markobj(g, gcref(sbx->dict_str));
+    if (gcref(sbx->dict_mt))
+      gc_markobj(g, gcref(sbx->dict_mt));
+  }
+}
+
+/* Concurrent marking. Runs on the GC thread, and on the mutator while the
+** GC thread is parked (drains). Colors via atomic RMW: the mutator RMWs
+** LJ_GC_LOGGED in the same byte. The gray queue is the jobs vector --
+** gclist belongs to the mutator's store log during concurrent marking.
+** Never reads Lua stacks: threads defer to threadv (traversed in the
+** atomic phase) and closed upvalue values defer to uvv (re-read at the
+** single-threaded finish; open upvalue values live in stacks and are
+** re-marked by gc_mark_uv in the atomic phase).
+*/
+static void gc_mark_conc(global_State *g, GCobj *o)
+{
+  ConcGCState *cs = concgcstate(g);
+  int gct = o->gch.gct;
+  lj_atomic_and8(&o->gch.marked, (uint8_t)~LJ_GC_WHITES);  /* white2gray */
+  if (LJ_UNLIKELY(gct == ~LJ_TUDATA)) {
+    lj_atomic_or8(&o->gch.marked, LJ_GC_BLACK);  /* Udata are never gray. */
+    gc_mark_udchildren(g, gco2ud(o));
+  } else if (LJ_UNLIKELY(gct == ~LJ_TUPVAL)) {
+    if (gco2uv(o)->closed) {
+      lj_atomic_or8(&o->gch.marked, LJ_GC_BLACK);
+      lj_concgc_vecpush(&cs->uvv, o);  /* Value re-read at finish. */
+    }
+  } else if (LJ_UNLIKELY(gct == ~LJ_TTHREAD)) {
+    lj_concgc_vecpush(&cs->threadv, o);  /* Stays gray. */
+  } else if (gct != ~LJ_TSTR && gct != ~LJ_TCDATA) {
+    lj_concgc_vecpush(&cs->jobs, o);
+  }
+}
+#endif
+
 /* Mark a white GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
 {
   int gct = o->gch.gct;
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(g->gc.cmark)) {
+    gc_mark_conc(g, o);
+    return;
+  }
+#endif
   lj_assertG(iswhite(o), "mark of non-white object");
   lj_assertG(!isdead(g, o), "mark of dead object");
   white2gray(o);
@@ -104,6 +182,27 @@ static void gc_mark_start(global_State *g)
   setgcrefnull(g->gc.gray);
   setgcrefnull(g->gc.grayagain);
   setgcrefnull(g->gc.weak);
+#if LJ_CONCGC
+  if (g->gc.concmode && concgcstate(g)) {
+    /* Roots go into the jobs vector; the marker thread takes over.
+    ** cmark is set before any root can be marked, so all marking in
+    ** this cycle consistently uses the concurrent paths.
+    */
+    ConcGCState *cs = concgcstate(g);
+    cs->jobs.n = cs->threadv.n = cs->weakv.n = cs->uvv.n = cs->ssb.n = 0;
+    cs->stepn = 0;
+    cs->drains = 0;
+    g->gc.cmark = 1;
+    gc_markobj(g, mainthread(g));
+    gc_markobj(g, tabref(mainthread(g)->env));
+    gc_markobj(g, vmthread(g));
+    gc_marktv(g, &g->registrytv);
+    gc_mark_gcroot(g);
+    g->gc.state = GCSpropagate;
+    lj_concgc_startmark(g);
+    return;
+  }
+#endif
   gc_markobj(g, mainthread(g));
   gc_markobj(g, tabref(mainthread(g)->env));
   gc_markobj(g, vmthread(g));
@@ -178,6 +277,22 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
   GCtab *mt = tabref(t->metatable);
   if (mt)
     gc_markobj(g, mt);
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(g->gc.cmark)) {
+    /* The __mode lookup is unsafe on the GC thread: lj_meta_fastg may
+    ** write the mt->nomm negative cache (racing the mutator's nomm
+    ** invalidations) and lj_tab_getstr walks hash collision chains the
+    ** mutator may relink mid-walk. Conservatively treat any table with
+    ** a metatable as possibly weak: queue it for re-examination at the
+    ** single-threaded finish and mark its contents strongly. If it is
+    ** actually weak this keeps clearable entries alive for one cycle
+    ** (floating garbage), which is safe.
+    */
+    if (mt)
+      lj_concgc_vecpush(&concgcstate(g)->weakv, obj2gco(t));
+    goto nonweak;
+  }
+#endif
   mode = lj_meta_fastg(g, mt, MM_mode);
   if (mode && tvisstr(mode)) {  /* Valid __mode field? */
     const char *modestr = strVdata(mode);
@@ -201,6 +316,9 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
   }
   if (weak == LJ_GC_WEAK)  /* Nothing to mark if both keys/values are weak. */
     return 1;
+#if LJ_CONCGC
+nonweak:
+#endif
   if (!(weak & LJ_GC_WEAKVAL)) {  /* Mark array part. */
     MSize i, asize = t->asize;
     for (i = 0; i < asize; i++)
@@ -245,6 +363,15 @@ static void gc_marktrace(global_State *g, TraceNo traceno)
 {
   GCobj *o = obj2gco(traceref(G2J(g), traceno));
   lj_assertG(traceno != G2J(g)->cur.traceno, "active trace escaped");
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(g->gc.cmark)) {
+    if (iswhite(o)) {
+      lj_atomic_and8(&o->gch.marked, (uint8_t)~LJ_GC_WHITES);
+      lj_concgc_vecpush(&concgcstate(g)->jobs, o);
+    }
+    return;
+  }
+#endif
   if (iswhite(o)) {
     white2gray(o);
     setgcrefr(o->gch.gclist, g->gc.gray);
@@ -256,6 +383,7 @@ static void gc_marktrace(global_State *g, TraceNo traceno)
 static void gc_traverse_trace(global_State *g, GCtrace *T)
 {
   IRRef ref;
+  TraceNo link, nextroot, nextside;
   if (T->traceno == 0) return;
   for (ref = T->nk; ref < REF_TRUE; ref++) {
     IRIns *ir = &T->ir[ref];
@@ -264,9 +392,11 @@ static void gc_traverse_trace(global_State *g, GCtrace *T)
     if (irt_is64(ir->t) && ir->o != IR_KNULL)
       ref++;
   }
-  if (T->link) gc_marktrace(g, T->link);
-  if (T->nextroot) gc_marktrace(g, T->nextroot);
-  if (T->nextside) gc_marktrace(g, T->nextside);
+  /* Single loads: trace flushes rewrite these under the pause bracket. */
+  link = T->link; nextroot = T->nextroot; nextside = T->nextside;
+  if (link) gc_marktrace(g, link);
+  if (nextroot) gc_marktrace(g, nextroot);
+  if (nextside) gc_marktrace(g, nextside);
   gc_markobj(g, gcref(T->startpt));
 }
 
@@ -280,11 +410,17 @@ static void gc_traverse_trace(global_State *g, GCtrace *T)
 static void gc_traverse_proto(global_State *g, GCproto *pt)
 {
   ptrdiff_t i;
-  gc_mark_str(proto_chunkname(pt));
+  gc_mark_str_c(g, proto_chunkname(pt));
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT
-  if (pt->trace) gc_marktrace(g, pt->trace);
+  {
+    /* Single load: trace flushes rewrite pt->trace under the pause
+    ** bracket, but this read may race with the bracket's entry.
+    */
+    TraceNo tr = pt->trace;
+    if (tr) gc_marktrace(g, tr);
+  }
 #endif
 }
 
@@ -371,6 +507,51 @@ static size_t gc_propagate_gray(global_State *g)
     m += propagatemark(g);
   return m;
 }
+
+#if LJ_CONCGC
+/* -- Concurrent mark driver ----------------------------------------------
+**
+** Runs on the GC thread (between park points) and on the mutator during
+** drains while the GC thread is parked. The gray queue is the jobs
+** vector. Threads and the current trace are never traversed here.
+*/
+
+/* Traverse one object from the jobs vector and blacken it. */
+static void gc_conc_traverse1(global_State *g, GCobj *o)
+{
+  int gct = o->gch.gct;
+  lj_assertG(gct != ~LJ_TTHREAD, "thread on concurrent gray queue");
+  lj_atomic_or8(&o->gch.marked, LJ_GC_BLACK);  /* gray2black */
+  if (LJ_LIKELY(gct == ~LJ_TTAB)) {
+    GCtab *t = gco2tab(o);
+    if (gc_traverse_tab(g, t) > 0)
+      lj_atomic_and8(&o->gch.marked, (uint8_t)~LJ_GC_BLACK);  /* Keep gray. */
+  } else if (gct == ~LJ_TFUNC) {
+    gc_traverse_func(g, gco2func(o));
+  } else if (gct == ~LJ_TPROTO) {
+    gc_traverse_proto(g, gco2pt(o));
+  } else {
+#if LJ_HASJIT
+    gc_traverse_trace(g, gco2trace(o));
+#else
+    lj_assertG(0, "bad GC type %d", gct);
+#endif
+  }
+}
+
+/* One burst of concurrent marking. Returns 0 when out of work. */
+int lj_gc_conc_burst(global_State *g)
+{
+  ConcGCState *cs = concgcstate(g);
+  MSize n;
+  for (n = 0; n < CONCGC_BURST; n++) {
+    if (cs->jobs.n == 0)
+      return 0;
+    gc_conc_traverse1(g, cs->jobs.p[--cs->jobs.n]);
+  }
+  return 1;
+}
+#endif
 
 /* -- Sweep phase --------------------------------------------------------- */
 
@@ -617,11 +798,172 @@ void lj_gc_freeall(global_State *g)
 
 /* -- Collector ----------------------------------------------------------- */
 
+#if LJ_CONCGC
+/*
+** Drain the mutator's store log. Must run with the GC thread parked
+** (during the cycle) or stopped (at the finish): colors are exact then,
+** and pushing to the GC-thread-owned vectors is safe.
+**
+** Per-type requeue rules:
+**   Table/func/proto/trace: black -> re-gray + jobs (full re-traversal);
+**     white -> mark (forward); gray -> already queued or deferred.
+**   Thread: skip (never traversed before the atomic phase).
+**   Upvalue (from closeuv): non-white -> mark value now, blacken, and
+**     push to uvv so the value is re-read once more at the finish.
+**     This restores the "closed upvalues are never gray" invariant
+**     before the atomic phase.
+**   Userdata: black -> re-mark metatable/env children.
+** Returns 1 if any new mark work was generated.
+*/
+static int gc_conc_drainlog(global_State *g)
+{
+  ConcGCState *cs = concgcstate(g);
+  GCobj *o;
+  MSize i;
+  int work = 0;
+  /* Objects with a gclist field, from the grayagain log. */
+  o = gcref(g->gc.grayagain);
+  setgcrefnull(g->gc.grayagain);
+  while (o != NULL) {
+    GCobj *next = gcref(o->gch.gclist);
+    o->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
+    if (o->gch.gct != ~LJ_TTHREAD && isblack(o)) {
+      o->gch.marked &= (uint8_t)~LJ_GC_BLACK;  /* black2gray */
+      lj_concgc_vecpush(&cs->jobs, o);
+      work = 1;
+    } else if (o->gch.gct == ~LJ_TTRACE && iswhite(o)) {
+      /* Trace barrier is a forward barrier: the trace was published into
+      ** a possibly-black proto, so the trace itself must get marked.
+      */
+      gc_mark(g, o);
+      work = 1;
+    }
+    /* Other white parents need no requeue: they are either dead or will
+    ** be traversed after this drain and then see the new children. Gray
+    ** parents are queued already; their traversal is yet to come.
+    */
+    o = next;
+  }
+  /* Upvalues and userdata, from the ssb vector. */
+  for (i = 0; i < cs->ssb.n; i++) {
+    o = cs->ssb.p[i];
+    o->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
+    if (o->gch.gct == ~LJ_TUPVAL) {
+      GCupval *uv = gco2uv(o);
+      lj_assertG(uv->closed, "open upvalue in SSB");
+      if (!iswhite(o)) {
+	gc_marktv(g, &uv->tv);
+	o->gch.marked |= LJ_GC_BLACK;  /* Closed upvalues are never gray. */
+	lj_concgc_vecpush(&cs->uvv, o);  /* Re-read once more at finish. */
+	work = 1;
+      }
+    } else {
+      lj_assertG(o->gch.gct == ~LJ_TUDATA, "bad SSB object type");
+      if (isblack(o)) {
+	gc_mark_udchildren(g, gco2ud(o));
+	work = 1;
+      }
+    }
+  }
+  cs->ssb.n = 0;
+  return work;
+}
+
+/*
+** Finish concurrent marking: stop the marker thread, then converge
+** single-threaded (colors exact, no concurrent stores -- the mutator is
+** executing this very function). The log MUST be drained before jobs are
+** requeued onto gc.gray: log entries chain through gclist, which the
+** gray list reuses. After this the regular atomic() runs with cmark == 0.
+*/
+static void gc_conc_finish(global_State *g)
+{
+  ConcGCState *cs = concgcstate(g);
+  MSize i;
+  lj_concgc_stopmark(g);  /* Clears cmark. */
+  gc_conc_drainlog(g);  /* Frees all gclist fields (cmark=0: marks direct). */
+  while (cs->jobs.n > 0) {  /* Requeue leftover gray queue. */
+    GCobj *o = cs->jobs.p[--cs->jobs.n];
+    lj_assertG(isgray(o), "non-gray object on concurrent gray queue");
+    setgcrefr(o->gch.gclist, g->gc.gray);
+    setgcref(g->gc.gray, o);
+  }
+  /* Closed upvalues collected during marking: re-read their values. */
+  for (i = 0; i < cs->uvv.n; i++) {
+    GCupval *uv = gco2uv(cs->uvv.p[i]);
+    if (!iswhite(obj2gco(uv)))
+      gc_marktv(g, &uv->tv);
+  }
+  cs->uvv.n = 0;
+  /* Tables with metatables were marked strongly and collected in weakv
+  ** (the __mode lookup is unsafe on the GC thread). Re-traverse them on
+  ** the normal path, which derives the weak bits and chains actual weak
+  ** tables onto gc.weak. Entries may repeat (re-traversals after drains);
+  ** dedup via the LOGGED bit, free here: single-threaded, log drained.
+  */
+  for (i = 0; i < cs->weakv.n; i++) {
+    GCobj *o = cs->weakv.p[i];
+    if (!iswhite(o) && !(o->gch.marked & LJ_GC_LOGGED)) {
+      o->gch.marked |= LJ_GC_LOGGED;
+      o->gch.marked &= (uint8_t)~LJ_GC_BLACK;  /* Re-gray for traversal. */
+      setgcrefr(o->gch.gclist, g->gc.gray);
+      setgcref(g->gc.gray, o);
+    }
+  }
+  for (i = 0; i < cs->weakv.n; i++)
+    cs->weakv.p[i]->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
+  cs->weakv.n = 0;
+  /* Note: the FFI finalizer table needs no special handling -- it turns
+  ** black after traversal (gc_traverse_tab returns < 0 for it) and new
+  ** entries are covered by lj_gc_anybarriert at the setfin call sites.
+  */
+  gc_propagate_gray(g);  /* Cannot create new log entries (cmark=0). */
+  /* Deferred threads rejoin via grayagain for the atomic phase. */
+  for (i = 0; i < cs->threadv.n; i++) {
+    GCobj *o = cs->threadv.p[i];
+    setgcrefr(o->gch.gclist, g->gc.grayagain);
+    setgcref(g->gc.grayagain, o);
+  }
+  cs->threadv.n = 0;
+}
+
+/* Set concurrent GC mode. Returns previous mode, -1 on init failure. */
+int lj_gc_setconcmode(lua_State *L, int enable)
+{
+  global_State *g = G(L);
+  int prev = g->gc.concmode;
+  if (enable) {
+    if (!lj_concgc_init(g))
+      return -1;
+#if LJ_HASJIT
+    /* Traces compiled while concmode was off may have elided TBARs for
+    ** trace-allocated tables (fold barrier_tnew_tdup), which is unsound
+    ** once the marker can blacken them asynchronously.
+    */
+    if (!prev)
+      lj_trace_flushall(L);
+#endif
+    g->gc.concmode = 1;
+  } else {
+    if (g->gc.cmark) {
+      /* Mid-cycle: finish marking synchronously, then disable. */
+      gc_conc_finish(g);
+      g->gc.state = GCSatomic;
+    }
+    g->gc.concmode = 0;
+  }
+  return prev;
+}
+#endif
+
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
 static void atomic(global_State *g, lua_State *L)
 {
   size_t udsize;
 
+#if LJ_CONCGC
+  lj_assertG(!g->gc.cmark, "atomic phase entered while marker running");
+#endif
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
@@ -629,6 +971,7 @@ static void atomic(global_State *g, lua_State *L)
   setgcrefnull(g->gc.weak);
   lj_assertG(!iswhite(obj2gco(mainthread(g))), "main thread turned white");
   gc_markobj(g, L);  /* Mark running thread. */
+  gc_marktv(g, &g->registrytv);  /* Registry may have been replaced. */
   gc_traverse_curtrace(g);  /* Traverse current trace. */
   gc_mark_gcroot(g);  /* Mark GC roots (again). */
   gc_propagate_gray(g);  /* Propagate all of the above. */
@@ -662,6 +1005,40 @@ static size_t gc_onestep(lua_State *L)
     gc_mark_start(g);  /* Start a new GC cycle by marking all GC roots. */
     return 0;
   case GCSpropagate:
+#if LJ_CONCGC
+    if (LJ_UNLIKELY(g->gc.cmark)) {
+      /* Marker thread is propagating. Drain the store log periodically;
+      ** when the marker reports out-of-work and the log is clean, move
+      ** to the atomic phase. A steadily mutating workload could keep the
+      ** log non-empty forever, so after CONCGC_MAXDRAIN rounds force the
+      ** single-threaded finish, which always converges.
+      */
+      ConcGCState *cs = concgcstate(g);
+      if (++cs->stepn >= CONCGC_DRAINSTEP || lj_concgc_markdone(cs)) {
+	int work;
+	cs->stepn = 0;
+	if (++cs->drains > CONCGC_MAXDRAIN) {
+	  gc_conc_finish(g);
+	  g->gc.state = GCSatomic;
+	  return 0;
+	}
+	lj_concgc_park(g);
+	work = gc_conc_drainlog(g);
+	if (cs->jobs.n > 0)
+	  work = 1;
+	if (!work && lj_concgc_markdone(cs)) {
+	  gc_conc_finish(g);
+	  g->gc.state = GCSatomic;
+	  return 0;
+	}
+	if (work)
+	  lj_concgc_startmark(g);  /* (Re-)arm the marker. */
+	else
+	  lj_concgc_resume(g);
+      }
+      return GCSWEEPMAX*GCSWEEPCOST;  /* Nominal cost; work is off-thread. */
+    }
+#endif
     if (gcref(g->gc.gray) != NULL)
       return propagatemark(g);  /* Propagate one gray object. */
     g->gc.state = GCSatomic;  /* End of mark phase. */
@@ -778,7 +1155,31 @@ void lj_gc_fullgc(lua_State *L)
 {
   global_State *g = G(L);
   int32_t ostate = g->vmstate;
+#if LJ_CONCGC
+  uint8_t oconcmode = g->gc.concmode;
+#endif
   setvmstate(g, GC);
+#if LJ_CONCGC
+  g->gc.concmode = 0;  /* Fully synchronous cycle below. */
+  if (g->gc.cmark) {
+    /* Stop the marker; the fast-forward below discards partial marks.
+    ** LOGGED bits must be cleared or future logging would skip objects.
+    */
+    ConcGCState *cs = concgcstate(g);
+    GCobj *o;
+    MSize i;
+    lj_concgc_stopmark(g);
+    o = gcref(g->gc.grayagain);
+    while (o != NULL) {
+      o->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
+      o = gcref(o->gch.gclist);
+    }
+    for (i = 0; i < cs->ssb.n; i++)
+      cs->ssb.p[i]->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
+    cs->ssb.n = 0;
+    cs->jobs.n = cs->threadv.n = cs->weakv.n = cs->uvv.n = 0;
+  }
+#endif
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
     setmref(g->gc.sweep, &g->gc.root);  /* Sweep everything (preserving it). */
     setgcrefnull(g->gc.gray);  /* Reset lists from partial propagation. */
@@ -795,14 +1196,48 @@ void lj_gc_fullgc(lua_State *L)
   g->gc.state = GCSpause;
   do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+#if LJ_CONCGC
+  g->gc.concmode = oconcmode;
+#endif
   g->vmstate = ostate;
 }
 
 /* -- Write barriers ------------------------------------------------------ */
 
+#if LJ_CONCGC
+/* Log a barrier parent during concurrent marking. Never touches colors.
+** Objects with a gclist field go onto gc.grayagain; upvalues and userdata
+** (whose gclist would overlay live fields) go into the ssb vector.
+*/
+static void gc_conc_log(global_State *g, GCobj *o)
+{
+  /* Skip open upvalues: their value lives in a stack slot, which the
+  ** atomic-phase thread scan covers; they are never black (matches the
+  ** non-concurrent barrier, which cannot trigger for them either).
+  */
+  if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
+    return;
+  if (!(gcmarked(o) & LJ_GC_LOGGED)) {
+    lj_atomic_or8(&o->gch.marked, LJ_GC_LOGGED);
+    if (o->gch.gct == ~LJ_TUPVAL || o->gch.gct == ~LJ_TUDATA) {
+      lj_concgc_vecpush(&concgcstate(g)->ssb, o);
+    } else {
+      setgcrefr(o->gch.gclist, g->gc.grayagain);
+      setgcref(g->gc.grayagain, o);
+    }
+  }
+}
+#endif
+
 /* Move the GC propagation frontier forward. */
 void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 {
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(g->gc.cmark)) {
+    gc_conc_log(g, o);  /* Log the parent; the drain re-marks children. */
+    return;
+  }
+#endif
   lj_assertG(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o),
 	     "bad object states for forward barrier");
   lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
@@ -820,6 +1255,12 @@ void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
 {
 #define TV2MARKED(x) \
   (*((uint8_t *)(x) - offsetof(GCupval, tv) + offsetof(GCupval, marked)))
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(g->gc.cmark)) {
+    gc_conc_log(g, (GCobj *)((char *)tv - offsetof(GCupval, tv)));
+    return;
+  }
+#endif
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_mark(g, gcV(tv));
   else
@@ -837,6 +1278,16 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
   uv->closed = 1;
   setgcrefr(o->gch.nextgc, g->gc.root);
   setgcref(g->gc.root, o);
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(g->gc.cmark)) {
+    /* Colors are GC-thread-owned and possibly stale; log unconditionally.
+    ** The drain restores the "closed upvalues are never gray" invariant
+    ** and (re-)marks the value before the atomic phase.
+    */
+    gc_conc_log(g, o);
+    return;
+  }
+#endif
   if (isgray(o)) {  /* A closed upvalue is never gray, so fix this. */
     if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
       gray2black(o);  /* Make it black and preserve invariant. */
@@ -854,6 +1305,13 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
 /* Mark a trace if it's saved during the propagation phase. */
 void lj_gc_barriertrace(global_State *g, uint32_t traceno)
 {
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(g->gc.cmark)) {
+    /* Log the trace itself; the drain marks logged white traces. */
+    gc_conc_log(g, obj2gco(traceref(G2J(g), traceno)));
+    return;
+  }
+#endif
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_marktrace(g, traceno);
 }

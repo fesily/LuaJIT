@@ -518,7 +518,7 @@ LJLIB_CF(ffi_new)	LJLIB_REC(.)
 	/* Add to finalizer table, if still enabled. */
 	copyTV(L, lj_tab_set(L, t, o-1), tv);
 	lj_gc_anybarriert(L, t);
-	cd->marked |= LJ_GC_CDATA_FIN;
+	lj_gc_markedor(G(L), cd, LJ_GC_CDATA_FIN);
       }
     }
   }

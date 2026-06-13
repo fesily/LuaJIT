@@ -375,11 +375,47 @@
 |.endmacro
 |
 |// Move table write barrier back. Overwrites reg.
+|// Concurrent mark (cmark set): colors are GC-thread-owned -- set LOGGED
+|// and push onto the store log instead. LOGGED decisions are mutator-only,
+|// but the byte is shared with the GC thread's color RMWs: lock or.
+|// Caveat: uses labels 8 and 9 locally.
 |.macro barrierback, tab, reg
+|.if CONCGC
+|  cmp byte [DISPATCH+DISPATCH_GL(gc.cmark)], 0
+|  je >8
+|  test byte tab->marked, LJ_GC_LOGGED
+|  jnz >9
+|  lock
+|  or byte tab->marked, LJ_GC_LOGGED
+|  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
+|  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
+|  mov tab->gclist, reg
+|  jmp >9
+|8:
 |  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
 |  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |  mov tab->gclist, reg
+|9:
+|.else
+|  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
+|  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
+|  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
+|  mov tab->gclist, reg
+|.endif
+|.endmacro
+|
+|// Barrier guard: branch to target when a table store needs the barrier.
+|// Under concurrent marking the mutator may read stale colors, so the
+|// trigger widens from isblack to (isblack || cmark); the barrierback
+|// macro itself dedups via LJ_GC_LOGGED.
+|.macro barrierguard, tab, target
+|  test byte tab->marked, LJ_GC_BLACK		// isblack(table)
+|  jnz target
+|.if CONCGC
+|  cmp byte [DISPATCH+DISPATCH_GL(gc.cmark)], 0
+|  jne target
+|.endif
 |.endmacro
 |
 |//-----------------------------------------------------------------------
@@ -1284,12 +1320,13 @@ static void build_subroutines(BuildCtx *ctx)
   |  mov TAB:RB->metatable, TAB:RA
   |  mov PC, [BASE-8]
   |  mov [BASE-16], TAB:TMPR			// Return original table.
-  |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
-  |  jz >1
-  |  // Possible write barrier. Table is black, but skip iswhite(mt) check.
-  |  barrierback TAB:RB, RC
+  |  barrierguard TAB:RB, >5
   |1:
   |  jmp ->fff_res1
+  |5:
+  |  // Possible write barrier. Table is black or cmark. Skip iswhite(mt).
+  |  barrierback TAB:RB, RC
+  |  jmp <1
   |
   |.ffunc_2 rawget
   |.if X64WIN
@@ -3897,8 +3934,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp aword [RC], LJ_TNIL
     |  je >3				// Previous value is nil?
     |1:
-    |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
-    |  jnz >7
+    |  barrierguard TAB:RB, >7
     |2:  // Set array slot.
     |  mov RB, [BASE+RA*8]
     |  mov [RC], RB
@@ -3941,8 +3977,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp aword [TMPR], LJ_TNIL
     |  je >4				// Previous value is nil?
     |2:
-    |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
-    |  jnz >7
+    |  barrierguard TAB:RB, >7
     |3:  // Set node value.
     |  mov ITYPE, [BASE+RA*8]
     |  mov [TMPR], ITYPE
@@ -3998,8 +4033,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp aword [RC], LJ_TNIL
     |  je >3				// Previous value is nil?
     |1:
-    |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
-    |  jnz >7
+    |  barrierguard TAB:RB, >7
     |2:	 // Set array slot.
     |  mov ITYPE, [BASE+RA*8]
     |  mov [RC], ITYPE
@@ -4026,8 +4060,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |.else
     |  cvttsd2si RCd, qword [BASE+RC*8]
     |.endif
-    |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
-    |  jnz >7
+    |  barrierguard TAB:RB, >7
     |2:
     |  cmp RCd, TAB:RB->asize
     |  jae ->vmeta_tsetr
@@ -4051,8 +4084,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  lea RA, [BASE+RA*8]
     |  mov TAB:RB, [RA-8]		// Guaranteed to be a table.
     |  cleartp TAB:RB
-    |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
-    |  jnz >7
+    |  barrierguard TAB:RB, >7
     |2:
     |  mov RDd, MULTRES
     |  sub RDd, 1

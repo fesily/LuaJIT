@@ -84,7 +84,12 @@ LJLIB_CF(table_insert)		LJLIB_REC(.)
   if (nargs != 2*sizeof(TValue)) {
     if (nargs != 3*sizeof(TValue))
       lj_err_caller(L, LJ_ERR_TABINS);
-    /* NOBARRIER: This just moves existing elements around. */
+    /* NOBARRIER: This just moves existing elements around -- except under
+    ** concurrent marking, where the shifts can race with the traversal of
+    ** t (a value may hop behind the scan cursor): log t for a re-scan.
+    */
+    if (LJ_UNLIKELY(lj_gc_cmark(G(L))))
+      lj_gc_barrierback(G(L), t);
     for (n = lj_lib_checkint(L, 2); i > n; i--) {
       /* The set may invalidate the get pointer, so need to do it first! */
       TValue *dst = lj_tab_setint(L, t, i);

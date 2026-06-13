@@ -20,6 +20,7 @@
 
 #include "lj_assert.c"
 #include "lj_gc.c"
+#include "lj_gcconc.c"
 #include "lj_err.c"
 #include "lj_char.c"
 #include "lj_bc.c"

@@ -1933,6 +1933,41 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   Reg tab = ra_alloc1(as, ir->op1, RSET_GPR);
   Reg tmp = ra_scratch(as, rset_exclude(RSET_GPR, tab));
   MCLabel l_end = emit_label(as);
+#if LJ_CONCGC
+  /* Concurrent-mark aware barrier. Forward code layout:
+  **   cmp byte [g->gc.cmark], 0; jne >conc
+  **   test byte tab->marked, BLACK; jz >end
+  **   and byte tab->marked, ~BLACK
+  **   jmp >push
+  ** conc:                        // Colors GC-thread-owned: log instead.
+  **   test byte tab->marked, LOGGED; jnz >end
+  **   lock or byte tab->marked, LOGGED
+  ** push:
+  **   tmp = g->gc.grayagain; g->gc.grayagain = tab; tab->gclist = tmp
+  ** end:
+  */
+  MCLabel l_push, l_conc;
+  emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
+  emit_setgl(as, tab, gc.grayagain);
+  emit_getgl(as, tmp, gc.grayagain);
+  l_push = emit_label(as);
+  emit_i8(as, LJ_GC_LOGGED);
+  emit_rmro(as, XO_ARITHib, XOg_OR, tab, offsetof(GCtab, marked));
+  *--as->mcp = 0xf0;  /* LOCK prefix: GC thread RMWs colors in this byte. */
+  emit_sjcc(as, CC_NZ, l_end);
+  emit_i8(as, LJ_GC_LOGGED);
+  emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+  l_conc = emit_label(as);
+  emit_sjmp(as, l_push);
+  emit_i8(as, ~LJ_GC_BLACK);
+  emit_rmro(as, XO_ARITHib, XOg_AND, tab, offsetof(GCtab, marked));
+  emit_sjcc(as, CC_Z, l_end);
+  emit_i8(as, LJ_GC_BLACK);
+  emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+  emit_sjcc(as, CC_NZ, l_conc);
+  emit_i8(as, 0);
+  emit_rma(as, XO_ARITHib, XOg_CMP, &J2G(as->J)->gc.cmark);
+#else
   emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
   emit_setgl(as, tab, gc.grayagain);
   emit_getgl(as, tmp, gc.grayagain);
@@ -1941,6 +1976,7 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   emit_sjcc(as, CC_Z, l_end);
   emit_i8(as, LJ_GC_BLACK);
   emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+#endif
 }
 
 static void asm_obar(ASMState *as, IRIns *ir)

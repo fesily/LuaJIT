@@ -282,6 +282,10 @@ ifneq (,$(findstring LJ_TARGET_PS3 1,$(TARGET_TESTARCH)))
   TARGET_XLIBS+= -lpthread
 endif
 
+ifneq (,$(findstring LJ_CONCGC 1,$(TARGET_TESTARCH)))
+  TARGET_XLIBS+= -lpthread
+endif
+
 TARGET_XCFLAGS+= $(CCOPT_$(TARGET_LJARCH))
 TARGET_ARCH+= $(patsubst %,-DLUAJIT_TARGET=LUAJIT_ARCH_%,$(TARGET_LJARCH))
 
@@ -420,6 +424,9 @@ endif
 ifneq (,$(findstring LJ_HASFFI 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D FFI
 endif
+ifneq (,$(findstring LJ_CONCGC 1,$(TARGET_TESTARCH)))
+  DASM_AFLAGS+= -D CONCGC
+endif
 ifneq (,$(findstring LJ_DUALNUM 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D DUALNUM
 endif
@@ -514,7 +521,7 @@ LJLIB_O= lib_base.o lib_math.o lib_bit.o lib_string.o lib_table.o \
 	 lib_buffer.o
 LJLIB_C= $(LJLIB_O:.o=.c)
 
-LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
+LJCORE_O= lj_assert.o lj_gc.o lj_gcconc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
 	  lj_str.o lj_tab.o lj_func.o lj_udata.o lj_meta.o lj_debug.o \
 	  lj_prng.o lj_state.o lj_dispatch.o lj_vmevent.o lj_vmmath.o \
 	  lj_strscan.o lj_strfmt.o lj_strfmt_num.o lj_serialize.o \

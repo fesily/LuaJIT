@@ -595,7 +595,7 @@ typedef struct GCState {
   GCSize threshold;	/* Memory threshold. */
   uint8_t currentwhite;	/* Current white color. */
   uint8_t state;	/* GC state. */
-  uint8_t unused0;
+  uint8_t cmark;	/* Concurrent mark running (always 0 if !LJ_CONCGC). */
 #if LJ_64
   uint8_t lightudnum;	/* Number of lightuserdata segments - 1. */
 #else
@@ -615,6 +615,11 @@ typedef struct GCState {
 #if LJ_64
   MRef lightudseg;	/* Upper bits of lightuserdata segments. */
 #endif
+  uint8_t concmode;	/* Concurrent GC enabled by user (LJ_CONCGC). */
+  uint8_t unused2;
+  uint8_t unused3;
+  uint8_t unused4;
+  MRef concstate;	/* ConcGCState* (LJ_CONCGC, else NULL). */
 } GCState;
 
 /* String interning state. */
