@@ -33,6 +33,7 @@
 #include "lj_vm.h"
 #include "lj_vmevent.h"
 #include "lj_lib.h"
+#include "lj_gcstat.h"
 
 #include "luajit.h"
 
@@ -165,6 +166,13 @@ static void setintfield(lua_State *L, GCtab *t, const char *name, int32_t val)
 {
   setintV(lj_tab_setstr(L, t, lj_str_newz(L, name)), val);
 }
+
+#if LUAJIT_GC_STAT
+static void setnumfield(lua_State *L, GCtab *t, const char *name, lua_Number val)
+{
+  setnumV(lj_tab_setstr(L, t, lj_str_newz(L, name)), val);
+}
+#endif
 
 /* local info = jit.util.funcinfo(func [,pc]) */
 LJLIB_CF(jit_util_funcinfo)
@@ -412,6 +420,88 @@ LJLIB_CF(jit_util_ircalladdr)
 }
 
 #endif
+
+/* tbl = jit.util.gcstat() -- snapshot current GC stats as a table. */
+LJLIB_CF(jit_util_gcstat)
+{
+#if LUAJIT_GC_STAT
+  global_State *g = G(L);
+  uint64_t now_ns = lj_gcstat_now_ns();
+  GCtab *t, *phases;
+  int i;
+  static const char *const names[] = {
+#define GCSTAT_N3_(name) #name,
+    GCSTAT_PHASES(GCSTAT_N3_)
+#undef GCSTAT_N3_
+  };
+  lua_createtable(L, 0, 8);
+  t = tabV(L->top-1);
+  setnumfield(L, t, "epoch_elapsed_ms",
+	      (lua_Number)((now_ns - g->stat.reset_epoch_ns) / 1000000ull));
+  setintfield(L, t, "cycle_count", (int32_t)g->stat.cycle_count);
+  setintfield(L, t, "drain_rounds", (int32_t)g->stat.drain_rounds);
+  setintfield(L, t, "gcthread_bursts", (int32_t)g->stat.gcthread_bursts);
+  setnumfield(L, t, "bytes_total", (lua_Number)g->gc.total);
+  setnumfield(L, t, "bytes_peak", (lua_Number)g->stat.bytes_peak);
+  lua_createtable(L, 0, GCSTAT_PHASE__COUNT);
+  phases = tabV(L->top-1);
+  setgcV(L, lj_tab_setstr(L, t, lj_str_newlit(L, "phases")),
+	 obj2gco(phases), LJ_TTAB);
+  for (i = 0; i < GCSTAT_PHASE__COUNT; i++) {
+    GCtab *ph;
+    lua_createtable(L, 0, 3);
+    ph = tabV(L->top-1);
+    setgcV(L, lj_tab_setstr(L, phases, lj_str_newz(L, names[i])),
+	   obj2gco(ph), LJ_TTAB);
+    setnumfield(L, ph, "ns_total", (lua_Number)g->stat.phase[i].ns_total);
+    setnumfield(L, ph, "ns_max", (lua_Number)g->stat.phase[i].ns_max);
+    setnumfield(L, ph, "count", (lua_Number)g->stat.phase[i].count);
+    L->top--;  /* Pop ph; phases keeps the reference. */
+  }
+  L->top--;  /* Pop phases; t keeps the reference. */
+  return 1;  /* Return t. */
+#else
+  UNUSED(L);
+  return 0;
+#endif
+}
+
+/* jit.util.gcstat_reset() -- zero all counters and restart the epoch. */
+LJLIB_CF(jit_util_gcstat_reset)
+{
+#if LUAJIT_GC_STAT
+  lj_gcstat_reset(G(L));
+  return 0;
+#else
+  UNUSED(L);
+  return 0;
+#endif
+}
+
+/* ok = jit.util.gcstat_dump(filename [, {append=bool, label=str}]) */
+LJLIB_CF(jit_util_gcstat_dump)
+{
+#if LUAJIT_GC_STAT
+  const char *filename = luaL_checkstring(L, 1);
+  int append = 0;
+  const char *label = NULL;
+  if (!lua_isnoneornil(L, 2)) {
+    if (!lua_istable(L, 2))
+      lj_err_argtype(L, 2, "table");
+    lua_getfield(L, 2, "append");
+    append = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "label");
+    if (lua_isstring(L, -1)) label = lua_tostring(L, -1);
+    lua_pop(L, 1);
+  }
+  setboolV(L->top++, lj_gcstat_dump(G(L), filename, append, label));
+  return 1;
+#else
+  UNUSED(L);
+  return 0;
+#endif
+}
 
 #include "lj_libdef.h"
 

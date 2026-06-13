@@ -653,6 +653,13 @@
 #define LJ_CONCGC		0
 #endif
 
+/* GC instrumentation: phase-level timing + counters. Opt-in, off by default
+** in production. Enable with -DLUAJIT_GC_STAT=1. Independent of LJ_CONCGC so
+** it can also profile the incremental GC for comparison. */
+#ifndef LUAJIT_GC_STAT
+#define LUAJIT_GC_STAT		0
+#endif
+
 #ifndef LJ_ARCH_HASFPU
 #define LJ_ARCH_HASFPU		1
 #endif

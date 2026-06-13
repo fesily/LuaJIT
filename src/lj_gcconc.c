@@ -15,6 +15,7 @@
 
 #include "lj_gc.h"
 #include "lj_gcconc.h"
+#include "lj_gcstat.h"
 
 /* Cross-thread progress flags (parkreq, markdone) are advisory wake-up
 ** hints; all real synchronization happens through cs->lock. Relaxed
@@ -62,8 +63,19 @@ static void *gcthread_main(void *arg)
     cs->parked = 0;
     pthread_mutex_unlock(&cs->lock);
     /* CONCGC_MARK: traverse gray objects in bursts. */
+#if LUAJIT_GC_STAT
+    {
+      uint64_t _t0 = lj_gcstat_now_ns();
+      uint32_t _bursts = 0;
+      while (!flag_load(&cs->parkreq) && lj_gc_conc_burst(g))
+	_bursts++;
+      GCSTAT_ADD(g, gcthread_mark, lj_gcstat_now_ns() - _t0);
+      g->stat.gcthread_bursts += _bursts;
+    }
+#else
     while (!flag_load(&cs->parkreq) && lj_gc_conc_burst(g))
       ;
+#endif
     pthread_mutex_lock(&cs->lock);
     if (cs->phase == CONCGC_MARK && !flag_load(&cs->parkreq)) {
       flag_store(&cs->markdone, 1);  /* Out of gray objects: announce and go idle. */

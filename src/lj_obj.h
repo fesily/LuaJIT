@@ -590,6 +590,7 @@ typedef enum {
 #define mmname_str(g, mm)	(strref((g)->gcroot[GCROOT_MMNAME+(mm)]))
 
 /* Garbage collector state. */
+#include "lj_gcstat_def.h"
 typedef struct GCState {
   GCSize total;		/* Memory currently allocated. */
   GCSize threshold;	/* Memory threshold. */
@@ -666,6 +667,9 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
+#if LUAJIT_GC_STAT
+  GCStat stat;		/* GC instrumentation. */
+#endif
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)

@@ -464,3 +464,38 @@ M4 整体作废,sweep 退回主线程位图增量扫描。**
 |---|---|
 | arena 分支长期不收敛,两轨变双倍维护 | M3 末设硬决策点,逾期即按原案交付,arena 改为 vNext 迁移 |
 | quad-color gray bit 与并发清理的细节(GC 线程不清 gray bit 导致重复入队) | 重复入队无害(幂等重扫);量大时握手清理,与 LOGGED 同款论证 |
+
+## 附录:GC stats 插桩(实测验证模块)
+
+构建时加 `-DLUAJIT_GC_STAT=1`(与 `-DLUAJIT_ENABLE_CONCGC` 并存)启用相位级
+计时。flag 关闭时全为 no-op,`lj_gcstat.c` 退化为 stub,生产构建与测试套件零影响
+(已验证:concgc / concgc+stat / 纯构建 三种配置均 505 passed / 21 failed 同基线)。
+
+Lua API(`require("jit.util")`):
+- `gcstat()` → 表,含 `cycle_count`、`drain_rounds`、`gcthread_bursts`、
+  `bytes_total`、`bytes_peak`,及 `phases.<name>.{ns_total,ns_max,count}`。
+- `gcstat_reset()` — 清零计数器并重置 epoch。
+- `gcstat_dump(filename [, {append=bool, label=str}])` — 追加一行 CSV。
+
+相位:`mark_start`、`drainlog`、`conc_park`、`conc_finish`、`atomic`(mutator 侧)
+与 `gcthread_mark`(GC 线程后台标记)。关键验证指标 = `gcthread_mark.ns_total`
+对 mutator 侧相位之和的比值(offload ratio)。
+
+### 实测结论(2026-06-13,churn / 大稳定堆 两类负载)
+
+**插桩推翻了"标记已卸载到 GC 线程"的乐观假设。** 两类负载下:
+- `gcthread_mark` 仅 0.02–0.9 ms,offload ratio ≈ **0.00–0.01**(后台几乎不干活)。
+- `atomic` 相位主导一切(55→190+ ms),且并发模式的 atomic **总耗时反而比增量模式高
+  2–3 倍**(cycles 也多:55→93)——并发周期被频繁触发,但每轮 GC 线程还没标几个对象
+  就被 `conc_park` 拉回,绝大部分标记工作落回 STW 的 atomic 收敛阶段。
+
+控制实验:将 `CONCGC_DRAINSTEP` 由 8 扫到 512(park 频率降 64 倍),`gcthread_mark`
+纹丝不动(0.89→0.88ms),cycles 恒为 92。**排除"测量伪影/线程被握手饿死"假设** ——
+GC 线程确实在运行(262 bursts / 91 cycles),只是每周期约 180 对象、~12µs 即 markdone,
+周期太碎、触发太频繁,后台标记器无法摊薄成本。
+
+即:churn benchmark 上 conc wall < inc wall(0.85 vs 1.18s)**不是因为标记被并行掉了**,
+更可能来自周期调度差异/堆峰值更低(11.7MB vs 17.8MB)。先前 −30% 的"标记并发"解释站不住。
+
+待修方向:并发周期触发阈值(concmode 下 gc.pause/stepmul)使周期数量虚高、单周期工作集过小;
+应让并发周期**启动更少、运行更久**(灰集预估够大时才转并发),后台标记器才有实质工作集。

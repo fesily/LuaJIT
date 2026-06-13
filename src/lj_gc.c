@@ -29,6 +29,7 @@
 #include "lj_vm.h"
 #include "lj_vmevent.h"
 #include "lj_gcconc.h"
+#include "lj_gcstat.h"
 
 #define GCSTEPSIZE	1024u
 #define GCSWEEPMAX	40
@@ -189,6 +190,8 @@ static void gc_mark_start(global_State *g)
     ** this cycle consistently uses the concurrent paths.
     */
     ConcGCState *cs = concgcstate(g);
+    GCSTAT_SCOPE(g, mark_start);
+    GCSTAT_COUNT_CYCLE(g);
     cs->jobs.n = cs->threadv.n = cs->weakv.n = cs->uvv.n = cs->ssb.n = 0;
     cs->stepn = 0;
     cs->drains = 0;
@@ -200,6 +203,7 @@ static void gc_mark_start(global_State *g)
     gc_mark_gcroot(g);
     g->gc.state = GCSpropagate;
     lj_concgc_startmark(g);
+    GCSTAT_SCOPE_END(g);
     return;
   }
 #endif
@@ -821,6 +825,8 @@ static int gc_conc_drainlog(global_State *g)
   GCobj *o;
   MSize i;
   int work = 0;
+  GCSTAT_SCOPE(g, drainlog);
+  GCSTAT_COUNT_DRAIN(g);
   /* Objects with a gclist field, from the grayagain log. */
   o = gcref(g->gc.grayagain);
   setgcrefnull(g->gc.grayagain);
@@ -866,6 +872,7 @@ static int gc_conc_drainlog(global_State *g)
     }
   }
   cs->ssb.n = 0;
+  GCSTAT_SCOPE_END(g);
   return work;
 }
 
@@ -880,6 +887,7 @@ static void gc_conc_finish(global_State *g)
 {
   ConcGCState *cs = concgcstate(g);
   MSize i;
+  GCSTAT_SCOPE(g, conc_finish);
   lj_concgc_stopmark(g);  /* Clears cmark. */
   gc_conc_drainlog(g);  /* Frees all gclist fields (cmark=0: marks direct). */
   while (cs->jobs.n > 0) {  /* Requeue leftover gray queue. */
@@ -925,6 +933,7 @@ static void gc_conc_finish(global_State *g)
     setgcref(g->gc.grayagain, o);
   }
   cs->threadv.n = 0;
+  GCSTAT_SCOPE_END(g);
 }
 
 /* Set concurrent GC mode. Returns previous mode, -1 on init failure. */
@@ -964,6 +973,8 @@ static void atomic(global_State *g, lua_State *L)
 #if LJ_CONCGC
   lj_assertG(!g->gc.cmark, "atomic phase entered while marker running");
 #endif
+  GCSTAT_SCOPE(g, atomic);
+  GCSTAT_PEAK(g);
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
@@ -994,6 +1005,7 @@ static void atomic(global_State *g, lua_State *L)
   g->strempty.marked = g->gc.currentwhite;
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
+  GCSTAT_SCOPE_END(g);
 }
 
 /* GC state machine. Returns a cost estimate for each step performed. */
@@ -1022,7 +1034,11 @@ static size_t gc_onestep(lua_State *L)
 	  g->gc.state = GCSatomic;
 	  return 0;
 	}
-	lj_concgc_park(g);
+	{
+	  GCSTAT_SCOPE(g, conc_park);
+	  lj_concgc_park(g);
+	  GCSTAT_SCOPE_END(g);
+	}
 	work = gc_conc_drainlog(g);
 	if (cs->jobs.n > 0)
 	  work = 1;
