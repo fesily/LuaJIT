@@ -177,6 +177,30 @@ static void gc_mark_gcroot(global_State *g)
       gc_markobj(g, gcref(g->gcroot[i]));
 }
 
+#if LJ_CONCGC
+/* Seed the concurrent gray queue with the heap objects reachable from a
+** thread's live stack slots. Runs on the mutator at cycle start (cmark set,
+** marker still idle, jobs vector mutator-owned), so there is no concurrent
+** stack mutation and no stack realloc race. The thread object itself stays
+** deferred to threadv; atomic() re-traverses every thread regardless, so
+** this is a pure optimization -- it hands the marker thread the large object
+** graph that hangs off stack roots, which would otherwise be left entirely
+** to the single-threaded atomic phase. Skips the atomic-only slot clearing
+** and the stack shrink (which would realloc the stack). Marking an already
+** non-white child is a no-op, so seeding the same thread twice is harmless.
+*/
+static void gc_conc_seed_stack(global_State *g, lua_State *th)
+{
+  TValue *o, *top = th->top;
+  for (o = tvref(th->stack)+1+LJ_FR2; o < top; o++)
+    gc_marktv(g, o);
+  /* GC64 (required by LJ_CONCGC) keeps frame functions in stack slots, so
+  ** the slot scan above already covers them; no frame walk needed here.
+  */
+  gc_markobj(g, tabref(th->env));
+}
+#endif
+
 /* Start a GC cycle and mark the root set. */
 static void gc_mark_start(global_State *g)
 {
@@ -201,6 +225,18 @@ static void gc_mark_start(global_State *g)
     gc_markobj(g, vmthread(g));
     gc_marktv(g, &g->registrytv);
     gc_mark_gcroot(g);
+    /* Seed the marker with the heap graph hanging off live stack roots, so
+    ** stack-rooted working sets are marked concurrently instead of falling
+    ** entirely to the atomic phase. The running thread (cur_L) and the main
+    ** thread hold the active locals; other coroutines stay deferred (no cheap
+    ** global thread list) and are picked up by atomic()'s thread re-traversal.
+    */
+    {
+      lua_State *curL = gco2th(gcref(g->cur_L));
+      gc_conc_seed_stack(g, mainthread(g));
+      if (curL && curL != mainthread(g))
+	gc_conc_seed_stack(g, curL);
+    }
     g->gc.state = GCSpropagate;
     lj_concgc_startmark(g);
     GCSTAT_SCOPE_END(g);

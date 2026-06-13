@@ -33,6 +33,11 @@ static LJ_AINLINE uint8_t lj_atomic_load8(const uint8_t *p)
   return __atomic_load_n(p, __ATOMIC_RELAXED);
 }
 
+static LJ_AINLINE void lj_atomic_store8(uint8_t *p, uint8_t v)
+{
+  __atomic_store_n(p, v, __ATOMIC_RELAXED);
+}
+
 static LJ_AINLINE uint32_t lj_atomic_load32(const uint32_t *p)
 {
   return __atomic_load_n(p, __ATOMIC_RELAXED);

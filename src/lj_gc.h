@@ -52,9 +52,23 @@ enum {
 #define isdead(g, v)	(gcmarked(v) & otherwhite(g) & LJ_GC_WHITES)
 
 #define curwhite(g)	((g)->gc.currentwhite & LJ_GC_WHITES)
+#if LJ_CONCGC
+/* Object birth/recoloring races with the marker's atomic marked-byte loads
+** in gc_traverse_*. Pair the store with relaxed atomics so TSAN sees a
+** consistent contract; x86 emits the same plain MOV either way.
+*/
+#define newwhite(g, x) \
+  lj_atomic_store8(&obj2gco(x)->gch.marked, (uint8_t)curwhite(g))
+#define makewhite(g, x) do { \
+    uint8_t _m = lj_atomic_load8(&(x)->gch.marked); \
+    lj_atomic_store8(&(x)->gch.marked, \
+		     (uint8_t)((_m & (uint8_t)~LJ_GC_COLORS) | curwhite(g))); \
+  } while (0)
+#else
 #define newwhite(g, x)	(obj2gco(x)->gch.marked = (uint8_t)curwhite(g))
 #define makewhite(g, x) \
   ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_COLORS) | curwhite(g))
+#endif
 #define flipwhite(x)	((x)->gch.marked ^= LJ_GC_WHITES)
 #define black2gray(x)	((x)->gch.marked &= (uint8_t)~LJ_GC_BLACK)
 #define markfinalized(x)	((x)->gch.marked |= LJ_GC_FINALIZED)
