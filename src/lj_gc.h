@@ -23,6 +23,9 @@ enum {
 #define LJ_GC_CDATA_FIN	0x10
 #define LJ_GC_FIXED	0x20
 #define LJ_GC_SFIXED	0x40
+#if LJ_HASGCMARK
+#define LJ_GC_GRAY	0x80	/* Inline gray bit (FFI off frees this bit). */
+#endif
 
 #define LJ_GC_WHITES	(LJ_GC_WHITE0 | LJ_GC_WHITE1)
 #define LJ_GC_COLORS	(LJ_GC_WHITES | LJ_GC_BLACK)

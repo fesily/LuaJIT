@@ -777,6 +777,66 @@ int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps)
 }
 #endif
 
+#if LJ_HASGCMARK
+/*
+** Phase M shadow-verify: with header colors still authoritative, rebuild
+** the arena mark bitmap from the live object set and assert it matches.
+** Called at the end of a full GC, when every surviving GC object is live,
+** so after shadow-marking all live arena objects there must be zero
+** allocated-but-unmarked (dead) objects left. This validates the Phase S
+** locate primitives (flushbins + setmark + block & ~mark) on the real
+** heap without changing any GC behavior.
+*/
+static void gcverify_count_dead(void *o, int gct, void *ud)
+{
+  UNUSED(o); UNUSED(gct);
+  (*(MSize *)ud)++;
+}
+
+static void gc_arena_verify(global_State *g)
+{
+  GCobj *o;
+  MSize i, dead = 0;
+  /* Flush bins + clear all GC mark bits: clean slate, allocator-truthful. */
+  lj_arena_gcprepare(g);
+  /* Shadow-mark every live object reachable from the GC roots. The root
+  ** chain holds all non-string collectable objects; strings live in the
+  ** intern table; finalizable udata hang off the mainthread chain (already
+  ** part of the root chain via nextgc). Open upvalues are NOT on the root
+  ** chain -- they hang off each thread's openupval list (gc_sweep sweeps
+  ** them per-thread the same way). mainthread/strempty are not in any
+  ** arena (dlmalloc) and are skipped by arena_obj_shadowmark. */
+  for (o = gcref(g->gc.root); o != NULL; o = gcnext(o)) {
+    if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g)))
+      arena_obj_shadowmark(o);
+    if (o->gch.gct == ~LJ_TTHREAD) {  /* Walk the thread's open upvalues. */
+      GCobj *uv;
+      for (uv = gcref(gco2th(o)->openupval); uv != NULL; uv = gcnext(uv))
+	if (!lj_arena_ishuge(uv))
+	  arena_obj_shadowmark(uv);
+    }
+  }
+  for (i = 0; i <= g->str.mask; i++) {
+    GCRef r = g->str.tab[i];
+    /* Chain head low bit is the hashalg flag; mask it off. */
+    for (o = (GCobj *)(gcrefu(r) & ~(uintptr_t)1); o != NULL; o = gcnext(o))
+      if (!lj_arena_ishuge(o))
+	arena_obj_shadowmark(o);
+  }
+  /* After a full GC nothing dead remains, so no allocated arena object may
+  ** be left unmarked. */
+  for (i = 0; i < g->gc.arenastop; i++)
+    lj_arena_visit_unmarked(mref(g->gc.arenas, GCArena *)[i],
+			    gcverify_count_dead, &dead);
+  lj_assertG(dead == 0,
+	     "arena shadow-verify: %d live objects missed by the bitmap",
+	     (int)dead);
+  /* Clear the shadow marks again so the allocator's bins (rebuilt lazily)
+  ** start from a clean mark bitmap. */
+  lj_arena_gcprepare(g);
+}
+#endif
+
 /* Perform a full GC cycle. */
 void lj_gc_fullgc(lua_State *L)
 {
@@ -800,6 +860,9 @@ void lj_gc_fullgc(lua_State *L)
   do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
   g->vmstate = ostate;
+#if LJ_HASGCMARK
+  gc_arena_verify(g);  /* Phase M: cross-check the arena mark bitmap. */
+#endif
 }
 
 /* -- Write barriers ------------------------------------------------------ */
