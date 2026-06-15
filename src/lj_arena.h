@@ -285,6 +285,7 @@ LJ_FUNC void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud);
 ** still-authoritative header colors.
 */
 LJ_FUNC void lj_arena_gcprepare(global_State *g);
+LJ_FUNC void lj_arena_gc_markinit(global_State *g);
 LJ_FUNC MSize lj_arena_count_marked(global_State *g);
 LJ_FUNC MSize lj_arena_count_allocated(global_State *g);
 #endif

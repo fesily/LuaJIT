@@ -648,6 +648,31 @@ void lj_arena_gcprepare(global_State *g)
   }
 }
 
+/*
+** Initialize arenas for a mark-driven GC cycle. Flush bins so (block,mark)
+** is authoritative, then clear mark bits only for allocated cells:
+**   mark[w] &= ~block[w]
+** Allocated objects become White=(1,0), ready for the mark phase to set
+** their mark bits. Free blocks preserve Free=(0,1) state, so the allocator
+** can continue servicing mutator allocations during incremental marking.
+*/
+void lj_arena_gc_markinit(global_State *g)
+{
+  MSize i;
+  for (i = 0; i < g->gc.arenastop; i++) {
+    GCArena *a = mref(g->gc.arenas, GCArena *)[i];
+    ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
+    uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    if (fl != NULL) {
+      arena_flushbins(a, fl);
+      freelist_reset(fl);
+      fl->scavgen = a->freegen - 1;
+    }
+    for (w = UnusedBlockWords; w <= wtop; w++)
+      a->mark[w] &= ~a->block[w];
+  }
+}
+
 MSize lj_arena_count_marked(global_State *g)
 {
   MSize i, n = 0;

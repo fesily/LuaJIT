@@ -44,6 +44,13 @@
 
 /* -- Mark phase ---------------------------------------------------------- */
 
+#if LJ_HASGCMARK
+/* GG_State objects (mainthread, strempty) live in dlmalloc, not arenas. */
+#define gc_inarena(g, o)  \
+  (!lj_arena_ishuge(o) && \
+   (o) != obj2gco(mainthread(g)) && (o) != obj2gco(&(g)->strempty))
+#endif
+
 /* Mark a TValue (if needed). */
 #define gc_marktv(g, tv) \
   { lj_assertG(!tvisgcv(tv) || (~itype(tv) == gcval(tv)->gch.gct), \
@@ -55,7 +62,15 @@
   { if (iswhite(obj2gco(o))) gc_mark(g, obj2gco(o)); }
 
 /* Mark a string object. */
-#define gc_mark_str(s)		((s)->marked &= (uint8_t)~LJ_GC_WHITES)
+#if LJ_HASGCMARK
+#define gc_mark_str(g, s) do { \
+  (s)->marked &= (uint8_t)~LJ_GC_WHITES; \
+  if (gc_inarena(g, obj2gco(s))) \
+    arena_obj_setmark(ptr2arena(s), ptr2cell(s)); \
+  } while (0)
+#else
+#define gc_mark_str(g, s)	((s)->marked &= (uint8_t)~LJ_GC_WHITES)
+#endif
 
 /* Mark a white GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
@@ -64,6 +79,10 @@ static void gc_mark(global_State *g, GCobj *o)
   lj_assertG(iswhite(o), "mark of non-white object");
   lj_assertG(!isdead(g, o), "mark of dead object");
   white2gray(o);
+#if LJ_HASGCMARK
+  if (gc_inarena(g, o))
+    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+#endif
   if (LJ_UNLIKELY(gct == ~LJ_TUDATA)) {
     GCtab *mt = tabref(gco2ud(o)->metatable);
     gray2black(o);  /* Userdata are never gray. */
@@ -107,6 +126,9 @@ static void gc_mark_start(global_State *g)
   setgcrefnull(g->gc.gray);
   setgcrefnull(g->gc.grayagain);
   setgcrefnull(g->gc.weak);
+#if LJ_HASGCMARK
+  lj_arena_gc_markinit(g);
+#endif
   gc_markobj(g, mainthread(g));
   gc_markobj(g, tabref(mainthread(g)->env));
   gc_markobj(g, vmthread(g));
@@ -250,6 +272,10 @@ static void gc_marktrace(global_State *g, TraceNo traceno)
   lj_assertG(traceno != G2J(g)->cur.traceno, "active trace escaped");
   if (iswhite(o)) {
     white2gray(o);
+#if LJ_HASGCMARK
+    if (gc_inarena(g, o))
+      arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+#endif
     setgcrefr(o->gch.gclist, g->gc.gray);
     setgcref(g->gc.gray, o);
   }
@@ -283,7 +309,7 @@ static void gc_traverse_trace(global_State *g, GCtrace *T)
 static void gc_traverse_proto(global_State *g, GCproto *pt)
 {
   ptrdiff_t i;
-  gc_mark_str(proto_chunkname(pt));
+  gc_mark_str(g, proto_chunkname(pt));
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT
@@ -416,8 +442,8 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 #if LJ_HASGCMARK
     if (g->gc.bitmapsweep && !lj_arena_ishuge(o) &&
 	o != obj2gco(mainthread(g))) {
-      /* Post-snapshot allocation (carries curwhite): always alive. */
       if ((o->gch.marked & LJ_GC_WHITES) == curwhite(g) ||
+	  (o->gch.marked & LJ_GC_FIXED) ||
 	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
 	makewhite(g, o);
 	p = &o->gch.nextgc;
@@ -462,6 +488,7 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
     if (g->gc.bitmapsweep && !lj_arena_ishuge(o) &&
 	o != obj2gco(&g->strempty)) {
       if ((o->gch.marked & LJ_GC_WHITES) == curwhite(g) ||
+	  (o->gch.marked & LJ_GC_FIXED) ||
 	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
 	makewhite(g, o);
 	p = &o->gch.nextgc;
@@ -488,11 +515,11 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
 }
 
 /* Check whether we can clear a key or a value slot from a table. */
-static int gc_mayclear(cTValue *o, int val)
+static int gc_mayclear(global_State *g, cTValue *o, int val)
 {
   if (tvisgcv(o)) {  /* Only collectable objects can be weak references. */
     if (tvisstr(o)) {  /* But strings cannot be used as weak references. */
-      gc_mark_str(strV(o));  /* And need to be marked. */
+      gc_mark_str(g, strV(o));  /* And need to be marked. */
       return 0;
     }
     if (iswhite(gcV(o)))
@@ -515,7 +542,7 @@ static void gc_clearweak(global_State *g, GCobj *o)
       for (i = 0; i < asize; i++) {
 	/* Clear array slot when value is about to be collected. */
 	TValue *tv = arrayslot(t, i);
-	if (gc_mayclear(tv, 1))
+	if (gc_mayclear(g, tv, 1))
 	  setnilV(tv);
       }
     }
@@ -525,8 +552,8 @@ static void gc_clearweak(global_State *g, GCobj *o)
       for (i = 0; i <= hmask; i++) {
 	Node *n = &node[i];
 	/* Clear hash slot when key or value is about to be collected. */
-	if (!tvisnil(&n->val) && (gc_mayclear(&n->key, 0) ||
-				  gc_mayclear(&n->val, 1)))
+	if (!tvisnil(&n->val) && (gc_mayclear(g, &n->key, 0) ||
+				  gc_mayclear(g, &n->val, 1)))
 	  setnilV(&n->val);
       }
     }
@@ -689,7 +716,49 @@ static void atomic(global_State *g, lua_State *L)
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
 #if LJ_HASGCMARK
   g->gc.bitmapsweep = 1;
-  gc_arena_snapshot_live(g, otherwhite(g));
+  /* Cross-check: mark-driven bitmap vs snapshot-style alive predicate. */
+  {
+    int ow = otherwhite(g);
+    GCobj *o;
+    MSize i;
+    MSize missing = 0;
+    for (o = gcref(g->gc.root); o != NULL; o = gcnext(o)) {
+      if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g)) &&
+	  !(o->gch.marked & LJ_GC_FIXED) &&
+	  ((o->gch.marked ^ LJ_GC_WHITES) & ow) &&
+	  !arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
+	missing++;
+	if (missing <= 3)
+	  lj_assertG(0,
+	    "mark-driven miss: gct=%d marked=0x%02x ptr=%p",
+	    o->gch.gct, o->gch.marked, (void*)o);
+      }
+      if (o->gch.gct == ~LJ_TTHREAD) {
+	GCobj *uv;
+	for (uv = gcref(gco2th(o)->openupval); uv != NULL; uv = gcnext(uv))
+	  if (!lj_arena_ishuge(uv) && !(uv->gch.marked & LJ_GC_FIXED) &&
+	      ((uv->gch.marked ^ LJ_GC_WHITES) & ow) &&
+	      !arena_obj_ismarked(ptr2arena(uv), ptr2cell(uv)))
+	    missing++;
+      }
+    }
+    for (i = 0; i <= g->str.mask; i++) {
+      GCRef r = g->str.tab[i];
+      for (o = (GCobj *)(gcrefu(r) & ~(uintptr_t)1); o != NULL; o = gcnext(o))
+	if (!lj_arena_ishuge(o) && !(o->gch.marked & LJ_GC_FIXED) &&
+	    ((o->gch.marked ^ LJ_GC_WHITES) & ow) &&
+	    !arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
+	  missing++;
+	  if (missing <= 3)
+	    lj_assertG(0,
+	      "mark-driven miss str: marked=0x%02x len=%d ptr=%p",
+	      o->gch.marked, (int)gco2str(o)->len, (void*)o);
+	}
+    }
+    if (missing)
+      lj_assertG(0, "mark-driven bitmap missed %d non-FIXED objects",
+		 (int)missing);
+  }
 #endif
 }
 
