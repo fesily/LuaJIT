@@ -413,6 +413,21 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
   while ((o = gcref(*p)) != NULL && lim-- > 0) {
     if (o->gch.gct == ~LJ_TTHREAD)  /* Need to sweep open upvalues, too. */
       gc_fullsweep(g, &gco2th(o)->openupval);
+#if LJ_HASGCMARK
+    /* Phase M dry-run cross-check: the snapshot at the atomic boundary set
+    ** the arena mark bit for every alive object the link-sweep should
+    ** preserve. Skip objects allocated after the snapshot (carry currentwhite)
+    ** and the shutdown sweep (ow == LJ_GC_SFIXED, no snapshot ran). */
+    if (ow != LJ_GC_SFIXED && !lj_arena_ishuge(o) &&
+	o != obj2gco(mainthread(g)) &&
+	(o->gch.marked & LJ_GC_WHITES) != curwhite(g)) {
+      int alive = ((o->gch.marked ^ LJ_GC_WHITES) & ow) != 0;
+      int bit = arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+      lj_assertG(bit == alive,
+		 "dry-run sweep mismatch: gct=%d marked=%02x bit=%d alive=%d",
+		 (int)o->gch.gct, (int)o->gch.marked, bit, alive);
+    }
+#endif
     if (((o->gch.marked ^ LJ_GC_WHITES) & ow)) {  /* Black or current white? */
       lj_assertG(!isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		 "sweep of undead object");
@@ -441,6 +456,17 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
   GCobj *o;
   setgcrefp(q, (u & ~(uintptr_t)1));
   while ((o = gcref(*p)) != NULL) {
+#if LJ_HASGCMARK
+    if (ow != LJ_GC_SFIXED && !lj_arena_ishuge(o) &&
+	o != obj2gco(&g->strempty) &&
+	(o->gch.marked & LJ_GC_WHITES) != curwhite(g)) {
+      int alive = ((o->gch.marked ^ LJ_GC_WHITES) & ow) != 0;
+      int bit = arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+      lj_assertG(bit == alive,
+		 "dry-run sweepstr mismatch: marked=%02x bit=%d alive=%d",
+		 (int)o->gch.marked, bit, alive);
+    }
+#endif
     if (((o->gch.marked ^ LJ_GC_WHITES) & ow)) {  /* Black or current white? */
       lj_assertG(!isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		 "sweep of undead string");
@@ -618,6 +644,10 @@ void lj_gc_freeall(global_State *g)
 
 /* -- Collector ----------------------------------------------------------- */
 
+#if LJ_HASGCMARK
+static void gc_arena_snapshot_live(global_State *g, int ow);
+#endif
+
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
 static void atomic(global_State *g, lua_State *L)
 {
@@ -652,6 +682,9 @@ static void atomic(global_State *g, lua_State *L)
   g->strempty.marked = g->gc.currentwhite;
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
+#if LJ_HASGCMARK
+  gc_arena_snapshot_live(g, otherwhite(g));  /* Phase M dry-run snapshot. */
+#endif
 }
 
 /* GC state machine. Returns a cost estimate for each step performed. */
@@ -793,6 +826,45 @@ static void gcverify_count_dead(void *o, int gct, void *ud)
   (*(MSize *)ud)++;
 }
 
+/*
+** Phase M dry-run: snapshot the link-sweep's "alive" verdict into the arena
+** mark bitmap at the atomic->sweep boundary. Walks the same root set as
+** gc_arena_verify, but applies the post-flip alive predicate -- a live
+** object is BLACK or NEW-white (everything except OLD-white = otherwhite).
+** gc_sweep / gc_sweepstr later cross-check the bitmap bit against their
+** own classification; any disagreement asserts. Purely observational --
+** the snapshot only writes mark bits, never frees, never reclassifies.
+**
+** ow=otherwhite(g) selects the alive predicate; pass ow=0 to mark every
+** reachable object unconditionally (used on the lj_gc_fullgc fast-forward
+** path where atomic() did not run and the sweep simply preserves all).
+*/
+static void gc_arena_snapshot_live(global_State *g, int ow)
+{
+  GCobj *o;
+  MSize i;
+  lj_arena_gcprepare(g);
+  for (o = gcref(g->gc.root); o != NULL; o = gcnext(o)) {
+    if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g)) &&
+	(!ow || ((o->gch.marked ^ LJ_GC_WHITES) & ow)))
+      arena_obj_shadowmark(o);
+    if (o->gch.gct == ~LJ_TTHREAD) {
+      GCobj *uv;
+      for (uv = gcref(gco2th(o)->openupval); uv != NULL; uv = gcnext(uv))
+	if (!lj_arena_ishuge(uv) &&
+	    (!ow || ((uv->gch.marked ^ LJ_GC_WHITES) & ow)))
+	  arena_obj_shadowmark(uv);
+    }
+  }
+  for (i = 0; i <= g->str.mask; i++) {
+    GCRef r = g->str.tab[i];
+    for (o = (GCobj *)(gcrefu(r) & ~(uintptr_t)1); o != NULL; o = gcnext(o))
+      if (!lj_arena_ishuge(o) &&
+	  (!ow || ((o->gch.marked ^ LJ_GC_WHITES) & ow)))
+	arena_obj_shadowmark(o);
+  }
+}
+
 static void gc_arena_verify(global_State *g)
 {
   GCobj *o;
@@ -850,6 +922,12 @@ void lj_gc_fullgc(lua_State *L)
     setgcrefnull(g->gc.weak);
     g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
     g->gc.sweepstr = 0;
+#if LJ_HASGCMARK
+    /* atomic() didn't run, so currentwhite wasn't flipped and the sweep
+    ** simply preserves all reachable objects. Snapshot every reachable
+    ** object so the bitmap dual-check has a meaningful baseline. */
+    gc_arena_snapshot_live(g, 0);
+#endif
   }
   while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
     gc_onestep(L);  /* Finish sweep. */
