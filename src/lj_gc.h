@@ -25,6 +25,10 @@ enum {
 #define LJ_GC_SFIXED	0x40
 #if LJ_HASGCMARK
 #define LJ_GC_GRAY	0x80	/* Inline gray bit (FFI off frees this bit). */
+
+/* gcmarkflags bits in GCState. */
+#define GCF_BITMAPSWEEP	0x01	/* Bitmap sweep active for this GC cycle. */
+#define GCF_MARKALLOC	0x02	/* Allocate-black: mark new arena objects. */
 #endif
 
 #define LJ_GC_WHITES	(LJ_GC_WHITE0 | LJ_GC_WHITE1)
@@ -169,6 +173,10 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
     GCobj *o = a ? (GCobj *)arena_alloc(a, size) : NULL;
     if (LJ_LIKELY(o != NULL)) {
       g->gc.total += size;
+#if LJ_HASGCMARK
+      if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC))
+	arena_obj_setmark(a, ptr2cell(o));
+#endif
       if (link) {
 	setgcrefr(o->gch.nextgc, g->gc.root);
 	setgcref(g->gc.root, o);

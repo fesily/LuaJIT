@@ -140,6 +140,7 @@ static void gc_mark_start(global_State *g)
   setgcrefnull(g->gc.weak);
 #if LJ_HASGCMARK
   lj_arena_gc_markinit(g);
+  g->gc.gcmarkflags |= GCF_MARKALLOC;
 #endif
   gc_markobj(g, mainthread(g));
   gc_markobj(g, tabref(mainthread(g)->env));
@@ -457,10 +458,9 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
     if (o->gch.gct == ~LJ_TTHREAD)  /* Need to sweep open upvalues, too. */
       gc_fullsweep(g, &gco2th(o)->openupval);
 #if LJ_HASGCMARK
-    if (g->gc.bitmapsweep && !lj_arena_ishuge(o) &&
+    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) && !lj_arena_ishuge(o) &&
 	o != obj2gco(mainthread(g))) {
-      if ((o->gch.marked & LJ_GC_WHITES) == curwhite(g) ||
-	  (o->gch.marked & LJ_GC_FIXED) ||
+      if ((o->gch.marked & LJ_GC_FIXED) ||
 	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
 	makewhite(g, o);
 	p = &o->gch.nextgc;
@@ -502,10 +502,9 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
   setgcrefp(q, (u & ~(uintptr_t)1));
   while ((o = gcref(*p)) != NULL) {
 #if LJ_HASGCMARK
-    if (g->gc.bitmapsweep && !lj_arena_ishuge(o) &&
+    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) && !lj_arena_ishuge(o) &&
 	o != obj2gco(&g->strempty)) {
-      if ((o->gch.marked & LJ_GC_WHITES) == curwhite(g) ||
-	  (o->gch.marked & LJ_GC_FIXED) ||
+      if ((o->gch.marked & LJ_GC_FIXED) ||
 	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
 	makewhite(g, o);
 	p = &o->gch.nextgc;
@@ -728,7 +727,7 @@ static void atomic(global_State *g, lua_State *L)
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
 #if LJ_HASGCMARK
-  g->gc.bitmapsweep = 1;
+  g->gc.gcmarkflags |= GCF_BITMAPSWEEP;
 #endif
 }
 
@@ -768,7 +767,7 @@ static size_t gc_onestep(lua_State *L)
     g->gc.estimate -= old - g->gc.total;
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
 #if LJ_HASGCMARK
-      g->gc.bitmapsweep = 0;
+      g->gc.gcmarkflags = 0;
 #endif
       if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	lj_str_resize(L, g->str.mask >> 1);  /* Shrink string table. */
@@ -932,7 +931,7 @@ void lj_gc_fullgc(lua_State *L)
     g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
     g->gc.sweepstr = 0;
 #if LJ_HASGCMARK
-    g->gc.bitmapsweep = 0;  /* Use header predicate; preserves all. */
+    g->gc.gcmarkflags = 0;  /* Use header predicate; preserves all. */
 #endif
   }
   while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
@@ -1067,6 +1066,12 @@ void *lj_mem_newgco_slow(lua_State *L, GCSize size, int trav, int link)
   lj_assertG(checkptrGC(o),
 	     "allocated memory address %p outside required range", o);
   g->gc.total += size;
+#if LJ_HASGCMARK
+  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC) &&
+      !lj_arena_ishuge(o)) {
+    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+  }
+#endif
   if (link) {
     setgcrefr(o->gch.nextgc, g->gc.root);
     setgcref(g->gc.root, o);

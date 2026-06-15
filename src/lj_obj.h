@@ -596,7 +596,7 @@ typedef struct GCState {
   uint8_t currentwhite;	/* Current white color. */
   uint8_t state;	/* GC state. */
 #if LJ_HASGCMARK
-  uint8_t bitmapsweep;	/* Bitmap sweep active for this GC cycle. */
+  uint8_t gcmarkflags;	/* GC mark flags: bit 0=bitmapsweep, bit 1=markalloc. */
 #else
   uint8_t unused0;
 #endif
