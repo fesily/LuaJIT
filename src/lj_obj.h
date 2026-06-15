@@ -595,7 +595,11 @@ typedef struct GCState {
   GCSize threshold;	/* Memory threshold. */
   uint8_t currentwhite;	/* Current white color. */
   uint8_t state;	/* GC state. */
+#if LJ_HASGCMARK
+  uint8_t bitmapsweep;	/* Bitmap sweep active for this GC cycle. */
+#else
   uint8_t unused0;
+#endif
 #if LJ_64
   uint8_t lightudnum;	/* Number of lightuserdata segments - 1. */
 #else
