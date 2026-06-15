@@ -26,16 +26,18 @@ typedef struct ConcVec {
 **
 **   Object color/weak bits of marked     GC thread (atomic RMW)
 **   LJ_GC_LOGGED bit of marked           mutator (atomic RMW)
-**   gc.grayagain and all gclist fields   mutator (the store log)
-**   jobs/threadv/weakv/uvv vectors       GC thread
-**   ssb vector                           mutator (gclist-less parents)
-**   gc.gray, gc.weak                     unused (empty)
+**   logring (mutator -> marker channel)  SPSC: mutator produces, marker
+**                                        consumes (lock-free, acq/rel)
+**   jobs/threadv/weakv/uvv vectors       GC thread (marker-PRIVATE)
+**   gc.gray, gc.grayagain, gc.weak       unused during cmark (the atomic
+**                                        phase reuses them)
 **   gc.root list, allocator, gc.total    mutator
 **
-** Either side touches the other's state only while the GC thread is
-** parked. The GC thread parks only between two object traversals, when
-** it holds no interior pointers. The park/resume mutex fully orders
-** memory at the boundary.
+** New (free-running) model: the mutator NEVER parks the marker per step.
+** The marker runs free, draining the logring and its own gray jobs
+** continuously. The two threads synchronize exactly once per cycle, at the
+** termination handshake (mutator sets finishreq; marker drains both queues,
+** sets markdone, idles), immediately before the STW atomic phase.
 **
 ** The mutator runs without fences. Colors only darken during marking
 ** (white -> gray -> black; the white flip happens single-threaded in
@@ -43,18 +45,17 @@ typedef struct ConcVec {
 ** state. Child iswhite() checks in the barrier macros are therefore
 ** conservative-safe, but parent isblack() checks can miss. Under cmark
 ** the parent trigger becomes "not yet LOGGED"; a triggered barrier
-** never touches colors, it only logs the parent (gc.grayagain via
-** gclist, or the ssb vector for upvalues/userdata). LOGGED decisions
-** are mutator-only and thus exact. Both sides RMW the shared marked
-** byte atomically, so neither loses the other's bits.
+** never touches colors, it only logs the parent pointer into logring.
+** LOGGED decisions are mutator-only and thus exact. Both sides RMW the
+** shared marked byte atomically, so neither loses the other's bits.
 **
-** Draining (mutator, GC thread parked) clears LOGGED and requeues
-** logged black parents for re-traversal; stores racing with the
-** re-traversal log the parent again. The final drain runs single-
-** threaded before the atomic phase, where colors are exact, so marking
-** converges. Drains happen only inside lj_gc_step: the JIT's TBAR
-** elimination (gcstep_barrier in lj_opt_fold.c) assumes a logged table
-** stays logged between two GC steps.
+** The marker drains logring entries by clearing LOGGED and requeueing
+** logged black parents (and upvalues/userdata) for re-traversal into its
+** private jobs; stores racing with the re-traversal re-log the parent.
+** The final convergence runs single-threaded in gc_conc_finish + the
+** atomic phase (cmark cleared, colors exact), so marking converges.
+** The JIT's TBAR elimination (gcstep_barrier in lj_opt_fold.c) assumes a
+** logged table stays logged between two GC steps.
 **
 ** The GC thread never reads Lua stacks: threads are deferred to the
 ** atomic phase (threadv), open upvalue values live in stacks and are
@@ -68,6 +69,22 @@ typedef struct ConcVec {
 ** lj_concgc_pause_begin/end. An error escaping such a bracket unwinds
 ** through lj_err_throw, which calls lj_concgc_unpause.
 */
+
+/* Lock-free SPSC ring for mutator(barrier) -> marker dirty-parent pointers.
+** Producer: the single running mutator. Consumer: the marker thread.
+** Fixed power-of-two capacity; on full, the producer falls back to a
+** one-shot park-drain (lj_concgc_logfull) so entries are never dropped.
+** head is advanced by the consumer, tail by the producer.
+*/
+#define CONCGC_RING_SIZE	(1u << 16)	/* 65536 GCobj* slots. */
+#define CONCGC_RING_MASK	(CONCGC_RING_SIZE - 1)
+
+typedef struct SpscRing {
+  GCobj *slot[CONCGC_RING_SIZE];
+  uint32_t head;	/* Consumer (marker) read index. */
+  uint32_t tail;	/* Producer (mutator) write index. */
+} SpscRing;
+
 typedef struct ConcGCState {
   global_State *g;
   pthread_t thread;
@@ -82,11 +99,12 @@ typedef struct ConcGCState {
   uint32_t parkdepth;		/* Nested pause scopes (mutator-owned). */
   uint32_t stepn;		/* GC steps since last drain. */
   uint32_t drains;		/* Drain rounds this cycle. */
-  ConcVec jobs;			/* Gray queue (GC-thread-owned). */
+  volatile uint32_t finishreq;	/* Mutator asks the marker to finish. */
+  SpscRing *logring;		/* Mutator -> marker dirty-parent log. */
+  ConcVec jobs;			/* Gray queue (marker-private). */
   ConcVec threadv;		/* Threads, deferred to the atomic phase. */
   ConcVec weakv;		/* Weak tables found while marking. */
   ConcVec uvv;			/* Closed upvalues, re-marked at finish. */
-  ConcVec ssb;			/* Log of gclist-less parents (mutator). */
 } ConcGCState;
 
 #define concgcstate(g)	((ConcGCState *)mref((g)->gc.concstate, void))
@@ -112,8 +130,13 @@ LJ_FUNC void lj_concgc_unpause(global_State *g);
 LJ_FUNC void lj_concgc_vecpush(ConcVec *v, GCobj *o);
 LJ_FUNC void lj_concgc_freevecs(ConcGCState *cs);
 
-/* lj_gc.c -- one traversal burst, called from the GC thread. */
+/* SPSC log ring (mutator producer -- lj_gcconc.c). */
+LJ_FUNC int lj_concgc_ringpush(ConcGCState *cs, GCobj *o);
+
+/* lj_gc.c -- marker consumer side and free-running burst. */
 LJ_FUNC int lj_gc_conc_burst(global_State *g);
+LJ_FUNC MSize lj_concgc_ringdrain(global_State *g, MSize max);
+LJ_FUNC void lj_concgc_logfull(global_State *g, GCobj *o);
 
 /* Park the GC thread around realloc/free of buffers it may read. */
 static LJ_AINLINE void lj_concgc_pause_begin(global_State *g)

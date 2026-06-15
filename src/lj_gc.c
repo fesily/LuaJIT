@@ -216,7 +216,9 @@ static void gc_mark_start(global_State *g)
     ConcGCState *cs = concgcstate(g);
     GCSTAT_SCOPE(g, mark_start);
     GCSTAT_COUNT_CYCLE(g);
-    cs->jobs.n = cs->threadv.n = cs->weakv.n = cs->uvv.n = cs->ssb.n = 0;
+    cs->jobs.n = cs->threadv.n = cs->weakv.n = cs->uvv.n = 0;
+    cs->logring->head = cs->logring->tail = 0;
+    cs->finishreq = 0;
     cs->stepn = 0;
     cs->drains = 0;
     g->gc.cmark = 1;
@@ -855,59 +857,105 @@ void lj_gc_freeall(global_State *g)
 **   Userdata: black -> re-mark metatable/env children.
 ** Returns 1 if any new mark work was generated.
 */
+/* Per-object log handler. Called by the marker on each ring entry
+** (free-running mode), and by the mutator on remaining ring entries at
+** cycle termination (marker idle, mutator single-threaded -- see
+** gc_conc_finish). The dirty parent is re-grayed (or its children
+** re-marked, for upvalue/userdata which are never gray).
+*/
+static void gc_conc_logmark(global_State *g, GCobj *o)
+{
+  ConcGCState *cs = concgcstate(g);
+  /* Clear LOGGED first: a racing mutator write can then re-log this object
+  ** (correct -- it will appear again in the ring and we re-traverse).
+  */
+  lj_atomic_and8(&o->gch.marked, (uint8_t)~LJ_GC_LOGGED);
+  if (o->gch.gct == ~LJ_TUPVAL) {
+    GCupval *uv = gco2uv(o);
+    /* Open upvalues are never logged (see gc_conc_log); only closed here. */
+    if (uv->closed && !iswhite(o)) {
+      gc_marktv(g, &uv->tv);
+      lj_atomic_or8(&o->gch.marked, LJ_GC_BLACK);
+      lj_concgc_vecpush(&cs->uvv, o);  /* Re-read once more at finish. */
+    }
+  } else if (o->gch.gct == ~LJ_TUDATA) {
+    if (isblack(o))
+      gc_mark_udchildren(g, gco2ud(o));
+  } else if (o->gch.gct == ~LJ_TTRACE && iswhite(o)) {
+    /* Trace forward barrier: trace was published into possibly-black proto. */
+    gc_mark(g, o);
+  } else if (isblack(o)) {
+    /* gclist-bearing parent (table/func/proto): re-gray and requeue. */
+    lj_atomic_and8(&o->gch.marked, (uint8_t)~LJ_GC_BLACK);  /* black2gray */
+    lj_concgc_vecpush(&cs->jobs, o);
+  }
+  /* Else: white parent is dead or will be visited; gray is already queued. */
+}
+
+/* Marker-side ringdrain: pop up to `max` entries and dispatch logmark.
+** Single consumer; safe under SPSC. */
+MSize lj_concgc_ringdrain(global_State *g, MSize max)
+{
+  ConcGCState *cs = concgcstate(g);
+  SpscRing *r = cs->logring;
+  uint32_t head = r->head;
+  uint32_t tail = lj_atomic_load32_acq(&r->tail);
+  MSize n = 0;
+  while (head != tail && n < max) {
+    GCobj *o = r->slot[head & CONCGC_RING_MASK];
+    head++; n++;
+    gc_conc_logmark(g, o);
+  }
+  lj_atomic_store32_rel(&r->head, head);
+  return n;
+}
+
+/* Ring full fallback: park the marker, drain inline, push the missed entry,
+** resume. Rare; if it fires often, enlarge CONCGC_RING_SIZE. */
+void lj_concgc_logfull(global_State *g, GCobj *o)
+{
+  ConcGCState *cs = concgcstate(g);
+  lj_concgc_park(g);
+  while (lj_concgc_ringdrain(g, CONCGC_RING_SIZE)) ;
+  /* Now empty; the push must succeed. */
+  (void)lj_concgc_ringpush(cs, o);
+  lj_concgc_resume(g);
+}
+
+/* Termination convergence drain. Called from gc_conc_finish AFTER the
+** marker is idle (markdone observed). Single-threaded: the marker is
+** parked at the IDLE wait, the mutator is executing this code path so
+** no new ring entries arrive. Drains everything the marker did not get
+** to before idling.
+*/
 static int gc_conc_drainlog(global_State *g)
 {
   ConcGCState *cs = concgcstate(g);
-  GCobj *o;
-  MSize i;
-  int work = 0;
+  SpscRing *r = cs->logring;
+  uint32_t head = r->head;
+  uint32_t tail = r->tail;  /* No producer running; plain read. */
+  int work = (head != tail);
+  GCobj *ga;
   GCSTAT_SCOPE(g, drainlog);
   GCSTAT_COUNT_DRAIN(g);
-  /* Objects with a gclist field, from the grayagain log. */
-  o = gcref(g->gc.grayagain);
+  while (head != tail) {
+    GCobj *o = r->slot[head & CONCGC_RING_MASK];
+    head++;
+    gc_conc_logmark(g, o);
+  }
+  r->head = head;
+  /* Also drain g->gc.grayagain: JIT-compiled TBAR (vm_x64.dasc / asm_tbar)
+  ** still pushes barrier-logged tables onto the grayagain chain via
+  ** tab->gclist, bypassing the SPSC ring. Process those here too.
+  */
+  ga = gcref(g->gc.grayagain);
   setgcrefnull(g->gc.grayagain);
-  while (o != NULL) {
-    GCobj *next = gcref(o->gch.gclist);
-    o->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
-    if (o->gch.gct != ~LJ_TTHREAD && isblack(o)) {
-      o->gch.marked &= (uint8_t)~LJ_GC_BLACK;  /* black2gray */
-      lj_concgc_vecpush(&cs->jobs, o);
-      work = 1;
-    } else if (o->gch.gct == ~LJ_TTRACE && iswhite(o)) {
-      /* Trace barrier is a forward barrier: the trace was published into
-      ** a possibly-black proto, so the trace itself must get marked.
-      */
-      gc_mark(g, o);
-      work = 1;
-    }
-    /* Other white parents need no requeue: they are either dead or will
-    ** be traversed after this drain and then see the new children. Gray
-    ** parents are queued already; their traversal is yet to come.
-    */
-    o = next;
+  while (ga != NULL) {
+    GCobj *next = gcref(ga->gch.gclist);
+    if (!work) work = 1;
+    gc_conc_logmark(g, ga);
+    ga = next;
   }
-  /* Upvalues and userdata, from the ssb vector. */
-  for (i = 0; i < cs->ssb.n; i++) {
-    o = cs->ssb.p[i];
-    o->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
-    if (o->gch.gct == ~LJ_TUPVAL) {
-      GCupval *uv = gco2uv(o);
-      lj_assertG(uv->closed, "open upvalue in SSB");
-      if (!iswhite(o)) {
-	gc_marktv(g, &uv->tv);
-	o->gch.marked |= LJ_GC_BLACK;  /* Closed upvalues are never gray. */
-	lj_concgc_vecpush(&cs->uvv, o);  /* Re-read once more at finish. */
-	work = 1;
-      }
-    } else {
-      lj_assertG(o->gch.gct == ~LJ_TUDATA, "bad SSB object type");
-      if (isblack(o)) {
-	gc_mark_udchildren(g, gco2ud(o));
-	work = 1;
-      }
-    }
-  }
-  cs->ssb.n = 0;
   GCSTAT_SCOPE_END(g);
   return work;
 }
@@ -957,10 +1005,6 @@ static void gc_conc_finish(global_State *g)
   for (i = 0; i < cs->weakv.n; i++)
     cs->weakv.p[i]->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
   cs->weakv.n = 0;
-  /* Note: the FFI finalizer table needs no special handling -- it turns
-  ** black after traversal (gc_traverse_tab returns < 0 for it) and new
-  ** entries are covered by lj_gc_anybarriert at the setfin call sites.
-  */
   gc_propagate_gray(g);  /* Cannot create new log entries (cmark=0). */
   /* Deferred threads rejoin via grayagain for the atomic phase. */
   for (i = 0; i < cs->threadv.n; i++) {
@@ -1055,38 +1099,49 @@ static size_t gc_onestep(lua_State *L)
   case GCSpropagate:
 #if LJ_CONCGC
     if (LJ_UNLIKELY(g->gc.cmark)) {
-      /* Marker thread is propagating. Drain the store log periodically;
-      ** when the marker reports out-of-work and the log is clean, move
-      ** to the atomic phase. A steadily mutating workload could keep the
-      ** log non-empty forever, so after CONCGC_MAXDRAIN rounds force the
-      ** single-threaded finish, which always converges.
+      /* Free-running marker: the mutator never blocks here. It asks the
+      ** marker to finish (set finishreq), then polls markdone on each step
+      ** while continuing user code. The marker drains the ring + jobs
+      ** concurrently; on convergence it sets markdone and the mutator
+      ** invokes gc_conc_finish (STW termination) on the next step.
       */
       ConcGCState *cs = concgcstate(g);
-      if (++cs->stepn >= CONCGC_DRAINSTEP || lj_concgc_markdone(cs)) {
-	int work;
-	cs->stepn = 0;
-	if (++cs->drains > CONCGC_MAXDRAIN) {
-	  gc_conc_finish(g);
-	  g->gc.state = GCSatomic;
-	  return 0;
+      uint32_t *fr = (uint32_t *)&cs->finishreq;
+      /* JIT-compiled barrierback (vm_x64.dasc) logs dirty tables by pushing
+      ** them onto g->gc.grayagain via tab->gclist -- it cannot cheaply do the
+      ** SPSC ring push inline. The marker only drains the ring, so without
+      ** this these tables accumulate for the whole cycle and are re-grayed +
+      ** re-traversed synchronously in the STW finish (the dominant pause
+      ** cost). Splice grayagain into the ring here so the marker processes
+      ** them in the background. Safe: the mutator exclusively owns grayagain
+      ** while executing this C step (the JIT barrier runs on the same thread,
+      ** never concurrently), and the marker never touches grayagain.
+      */
+      {
+	GCobj *ga = gcref(g->gc.grayagain);
+	if (LJ_UNLIKELY(ga != NULL)) {
+	  setgcrefnull(g->gc.grayagain);
+	  do {
+	    GCobj *next = gcref(ga->gch.gclist);
+	    if (LJ_UNLIKELY(!lj_concgc_ringpush(cs, ga)))
+	      lj_concgc_logfull(g, ga);
+	    ga = next;
+	  } while (ga != NULL);
 	}
-	{
-	  GCSTAT_SCOPE(g, conc_park);
-	  lj_concgc_park(g);
-	  GCSTAT_SCOPE_END(g);
-	}
-	work = gc_conc_drainlog(g);
-	if (cs->jobs.n > 0)
-	  work = 1;
-	if (!work && lj_concgc_markdone(cs)) {
-	  gc_conc_finish(g);
-	  g->gc.state = GCSatomic;
-	  return 0;
-	}
-	if (work)
-	  lj_concgc_startmark(g);  /* (Re-)arm the marker. */
-	else
-	  lj_concgc_resume(g);
+      }
+      /* Give the marker time to keep up: only request finish once the
+      ** mutator has driven enough GC steps that the heap proportional
+      ** budget has been spent. Otherwise the mutator races ahead and the
+      ** marker is asked to converge before it has a real working set.
+      */
+      if (++cs->stepn >= CONCGC_DRAINSTEP * 16) {
+	if (!lj_atomic_load32(fr))
+	  lj_atomic_store32(fr, 1);
+      }
+      if (lj_concgc_markdone(cs)) {
+	gc_conc_finish(g);
+	g->gc.state = GCSatomic;
+	return 0;
       }
       return GCSWEEPMAX*GCSWEEPCOST;  /* Nominal cost; work is off-thread. */
     }
@@ -1219,17 +1274,23 @@ void lj_gc_fullgc(lua_State *L)
     */
     ConcGCState *cs = concgcstate(g);
     GCobj *o;
-    MSize i;
+    SpscRing *r;
+    uint32_t h, t;
     lj_concgc_stopmark(g);
     o = gcref(g->gc.grayagain);
     while (o != NULL) {
       o->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
       o = gcref(o->gch.gclist);
     }
-    for (i = 0; i < cs->ssb.n; i++)
-      cs->ssb.p[i]->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
-    cs->ssb.n = 0;
+    r = cs->logring;  /* Clear LOGGED on every queued entry. */
+    h = r->head; t = r->tail;
+    while (h != t) {
+      r->slot[h & CONCGC_RING_MASK]->gch.marked &= (uint8_t)~LJ_GC_LOGGED;
+      h++;
+    }
+    r->head = r->tail = 0;
     cs->jobs.n = cs->threadv.n = cs->weakv.n = cs->uvv.n = 0;
+    cs->finishreq = 0;
   }
 #endif
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
@@ -1258,8 +1319,9 @@ void lj_gc_fullgc(lua_State *L)
 
 #if LJ_CONCGC
 /* Log a barrier parent during concurrent marking. Never touches colors.
-** Objects with a gclist field go onto gc.grayagain; upvalues and userdata
-** (whose gclist would overlay live fields) go into the ssb vector.
+** Pushes the dirty-parent pointer onto the lock-free SPSC ring; the marker
+** consumes it and re-grays / re-traverses via gc_conc_logmark. On ring
+** full the mutator falls back to a one-shot park-drain (logfull).
 */
 static void gc_conc_log(global_State *g, GCobj *o)
 {
@@ -1270,13 +1332,10 @@ static void gc_conc_log(global_State *g, GCobj *o)
   if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
     return;
   if (!(gcmarked(o) & LJ_GC_LOGGED)) {
+    ConcGCState *cs = concgcstate(g);
     lj_atomic_or8(&o->gch.marked, LJ_GC_LOGGED);
-    if (o->gch.gct == ~LJ_TUPVAL || o->gch.gct == ~LJ_TUDATA) {
-      lj_concgc_vecpush(&concgcstate(g)->ssb, o);
-    } else {
-      setgcrefr(o->gch.gclist, g->gc.grayagain);
-      setgcref(g->gc.grayagain, o);
-    }
+    if (LJ_UNLIKELY(!lj_concgc_ringpush(cs, o)))
+      lj_concgc_logfull(g, o);
   }
 }
 #endif

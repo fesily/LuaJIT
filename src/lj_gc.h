@@ -40,6 +40,7 @@ enum {
 */
 #if LJ_CONCGC
 #include "lj_atomic.h"
+#include "lj_gcconc.h"
 #define gcmarked(x)	(lj_atomic_load8((const uint8_t *)&(x)->gch.marked))
 #else
 #define gcmarked(x)	((x)->gch.marked)
@@ -139,7 +140,7 @@ LJ_FUNC void lj_gc_barriertrace(global_State *g, uint32_t traceno);
 
 /* Move the GC propagation frontier back for tables (make it gray again).
 ** Under concurrent marking: never touch colors (GC thread owns them);
-** log the table on gc.grayagain instead, deduplicated by LJ_GC_LOGGED.
+** push the table onto the SPSC log ring, deduplicated by LJ_GC_LOGGED.
 ** The atomic or is required because the GC thread concurrently RMWs
 ** color bits in the same byte.
 */
@@ -149,9 +150,10 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
 #if LJ_CONCGC
   if (LJ_UNLIKELY(g->gc.cmark)) {
     if (!(gcmarked(o) & LJ_GC_LOGGED)) {
+      ConcGCState *cs = concgcstate(g);
       lj_atomic_or8(&o->gch.marked, LJ_GC_LOGGED);
-      setgcrefr(t->gclist, g->gc.grayagain);
-      setgcref(g->gc.grayagain, o);
+      if (LJ_UNLIKELY(!lj_concgc_ringpush(cs, o)))
+	lj_concgc_logfull(g, o);
     }
     return;
   }

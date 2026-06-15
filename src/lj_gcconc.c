@@ -16,6 +16,7 @@
 #include "lj_gc.h"
 #include "lj_gcconc.h"
 #include "lj_gcstat.h"
+#include "lj_atomic.h"
 
 /* Cross-thread progress flags (parkreq, markdone) are advisory wake-up
 ** hints; all real synchronization happens through cs->lock. Relaxed
@@ -38,11 +39,25 @@ void lj_concgc_vecpush(ConcVec *v, GCobj *o)
   v->p[v->n++] = o;
 }
 
+/* Producer (mutator): try to enqueue one dirty-parent pointer.
+** Returns 0 if the ring is full (caller must invoke lj_concgc_logfull). */
+int lj_concgc_ringpush(ConcGCState *cs, GCobj *o)
+{
+  SpscRing *r = cs->logring;
+  uint32_t tail = r->tail;			/* Producer-owned, plain. */
+  uint32_t head = lj_atomic_load32_acq(&r->head);
+  if (tail - head >= CONCGC_RING_SIZE)
+    return 0;					/* Full. */
+  r->slot[tail & CONCGC_RING_MASK] = o;		/* Data write... */
+  lj_atomic_store32_rel(&r->tail, tail + 1);	/* ...published by release. */
+  return 1;
+}
+
 void lj_concgc_freevecs(ConcGCState *cs)
 {
   free(cs->jobs.p); free(cs->threadv.p); free(cs->weakv.p);
-  free(cs->uvv.p); free(cs->ssb.p);
-  memset(&cs->jobs, 0, 5*sizeof(ConcVec));
+  free(cs->uvv.p);
+  memset(&cs->jobs, 0, 4*sizeof(ConcVec));
 }
 
 /* -- GC thread main loop -------------------------------------------------- */
@@ -62,19 +77,40 @@ static void *gcthread_main(void *arg)
       break;
     cs->parked = 0;
     pthread_mutex_unlock(&cs->lock);
-    /* CONCGC_MARK: traverse gray objects in bursts. */
+    /* CONCGC_MARK: free-running drain+burst loop.
+    ** Yields when both ring and jobs are empty so a steady-state mutator
+    ** doesn't burn a core. Exits to the lock on parkreq (logfull /
+    ** pause_begin), or after both queues are empty AND finishreq is set
+    ** (cycle termination -- the mutator will observe markdone and run
+    ** the STW finish). */
 #if LUAJIT_GC_STAT
     {
       uint64_t _t0 = lj_gcstat_now_ns();
       uint32_t _bursts = 0;
-      while (!flag_load(&cs->parkreq) && lj_gc_conc_burst(g))
-	_bursts++;
+      while (!flag_load(&cs->parkreq)) {
+	int did = 0;
+	if (lj_concgc_ringdrain(g, CONCGC_BURST) > 0) did = 1;
+	if (lj_gc_conc_burst(g)) { did = 1; _bursts++; }
+	if (!did) {
+	  if (flag_load(&cs->finishreq))
+	    break;  /* Cycle complete: announce markdone under the lock. */
+	  sched_yield();  /* Idle; let the mutator make progress. */
+	}
+      }
       GCSTAT_ADD(g, gcthread_mark, lj_gcstat_now_ns() - _t0);
       g->stat.gcthread_bursts += _bursts;
     }
 #else
-    while (!flag_load(&cs->parkreq) && lj_gc_conc_burst(g))
-      ;
+    while (!flag_load(&cs->parkreq)) {
+      int did = 0;
+      if (lj_concgc_ringdrain(g, CONCGC_BURST) > 0) did = 1;
+      if (lj_gc_conc_burst(g)) did = 1;
+      if (!did) {
+	if (flag_load(&cs->finishreq))
+	  break;
+	sched_yield();
+      }
+    }
 #endif
     pthread_mutex_lock(&cs->lock);
     if (cs->phase == CONCGC_MARK && !flag_load(&cs->parkreq)) {
@@ -101,6 +137,8 @@ int lj_concgc_init(global_State *g)
   cs->g = g;
   cs->phase = CONCGC_IDLE;
   cs->parked = 1;
+  cs->logring = (SpscRing *)calloc(1, sizeof(SpscRing));
+  if (cs->logring == NULL) { free(cs); return 0; }
   pthread_mutex_init(&cs->lock, NULL);
   pthread_cond_init(&cs->wake_gc, NULL);
   pthread_cond_init(&cs->wake_mut, NULL);
@@ -108,6 +146,7 @@ int lj_concgc_init(global_State *g)
     pthread_mutex_destroy(&cs->lock);
     pthread_cond_destroy(&cs->wake_gc);
     pthread_cond_destroy(&cs->wake_mut);
+    free(cs->logring);
     free(cs);
     return 0;
   }
@@ -131,6 +170,7 @@ void lj_concgc_shutdown(global_State *g)
   pthread_cond_destroy(&cs->wake_gc);
   pthread_cond_destroy(&cs->wake_mut);
   lj_concgc_freevecs(cs);
+  free(cs->logring);
   free(cs);
   setmref(g->gc.concstate, NULL);
   g->gc.cmark = 0;

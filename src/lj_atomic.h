@@ -48,6 +48,16 @@ static LJ_AINLINE void lj_atomic_store32(uint32_t *p, uint32_t v)
   __atomic_store_n(p, v, __ATOMIC_RELAXED);
 }
 
+static LJ_AINLINE uint32_t lj_atomic_load32_acq(const uint32_t *p)
+{
+  return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static LJ_AINLINE void lj_atomic_store32_rel(uint32_t *p, uint32_t v)
+{
+  __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
 static LJ_AINLINE uint64_t lj_atomic_load64(const uint64_t *p)
 {
   return __atomic_load_n(p, __ATOMIC_RELAXED);
