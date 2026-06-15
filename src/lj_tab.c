@@ -228,16 +228,115 @@ void LJ_FASTCALL lj_tab_free(global_State *g, GCtab *t)
 
 /* -- Table resizing ------------------------------------------------------ */
 
+#if LJ_CONCGC
+/* Free an old table buffer that the concurrent marker may still be reading.
+** If the marker's hazard pointer currently names this table, the block is
+** deferred to the cycle finish (when the marker is stopped); otherwise it is
+** freed immediately. The SC fence + SC load pair with the marker's SC store
+** in gc_traverse_tab (Dekker): a block still under traversal is never freed.
+** Call this AFTER the new buffer + its length have been published.
+*/
+static LJ_AINLINE void tab_freebuf_conc(global_State *g, GCtab *t,
+					void *old, size_t sz)
+{
+  lj_atomic_thread_fence_seqcst();
+  if (lj_atomic_load64_seqcst(&g->gc.markhazard.ptr64) == (uint64_t)(void *)t)
+    lj_concgc_deferfree(g, old, sz);
+  else
+    lj_mem_free(g, old, sz);
+}
+
+/* Concurrent-mark variant of lj_tab_resize. The marker may be traversing
+** t's array/node without parking, so all buffer/length publication is
+** ordered (release) and the marker reads length-before-pointer with
+** cap(buffer) >= length maintained: grow the buffer before raising the
+** length; lower the length before shrinking the buffer; never free a block
+** the marker may read (tab_freebuf_conc).
+*/
+static void tab_resize_conc(lua_State *L, GCtab *t, uint32_t asize,
+			    uint32_t hbits)
+{
+  global_State *g = G(L);
+  Node *oldnode = noderef(t->node);
+  uint32_t oldasize = t->asize;
+  uint32_t oldhmask = t->hmask;
+  if (asize > oldasize) {  /* Array part grows: alloc + copy (never realloc, */
+    TValue *oarray = tvref(t->array);   /* which would free the old block). */
+    TValue *array;
+    uint32_t i;
+    int colocated = (LJ_MAX_COLOSIZE != 0 && t->colo > 0);
+    if (asize > LJ_MAX_ASIZE)
+      lj_err_msg(L, LJ_ERR_TABOV);
+    array = lj_mem_newvec(L, asize, TValue);
+    for (i = 0; i < oldasize; i++)  /* Copy then nil-fill BEFORE publishing. */
+      copyTV(L, &array[i], &oarray[i]);
+    for (i = oldasize; i < asize; i++)
+      setnilV(&array[i]);
+    lj_atomic_store64_rel(&t->array.ptr64, (uint64_t)(void *)array);
+    lj_atomic_store32_rel(&t->asize, asize);  /* Raise length after buffer. */
+    if (colocated)
+      t->colo = (int8_t)(t->colo | 0x80);  /* Mark as separated (colo < 0). */
+    else
+      tab_freebuf_conc(g, t, oarray, oldasize*sizeof(TValue));
+  }
+  /* Create new (empty) hash part. */
+  if (hbits) {
+    uint32_t hsize;
+    Node *node;
+    if (hbits > LJ_MAX_HBITS)
+      lj_err_msg(L, LJ_ERR_TABOV);
+    hsize = 1u << hbits;
+    node = lj_mem_newvec(L, hsize, Node);
+    { uint32_t i;  /* Initialize fully BEFORE publishing node/hmask. */
+      for (i = 0; i < hsize; i++) {
+	setmref(node[i].next, NULL); setnilV(&node[i].key); setnilV(&node[i].val);
+      }
+    }
+    setfreetop(t, node, &node[hsize]);
+    lj_atomic_store64_rel(&t->node.ptr64, (uint64_t)(void *)node);
+    lj_atomic_store32_rel(&t->hmask, hsize-1);
+  } else {
+    lj_atomic_store32_rel(&t->hmask, 0);  /* Lower length before pointer. */
+    lj_atomic_store64_rel(&t->node.ptr64, (uint64_t)(void *)&g->nilnode);
+#if LJ_GC64
+    setmref(t->freetop, &g->nilnode);
+#endif
+  }
+  if (asize < oldasize) {  /* Array part shrinks: keep the (bigger) buffer, */
+    TValue *array = tvref(t->array);    /* only lower asize (cap >= asize). */
+    uint32_t i;
+    lj_atomic_store32_rel(&t->asize, asize);  /* Lower length; no realloc. */
+    for (i = asize; i < oldasize; i++)  /* Reinsert displaced array values. */
+      if (!tvisnil(&array[i]))
+	copyTV(L, lj_tab_setinth(L, t, (int32_t)i), &array[i]);
+    /* Note: the old (larger) array block is retained -- physically shrinking
+    ** it would free memory the marker may read. The slack is reclaimed by the
+    ** next non-concurrent resize. */
+  }
+  if (oldhmask > 0) {  /* Reinsert pairs from old hash part. */
+    uint32_t i;
+    for (i = 0; i <= oldhmask; i++) {
+      Node *n = &oldnode[i];
+      if (!tvisnil(&n->val))
+	copyTV(L, lj_tab_set(L, t, &n->key), &n->val);
+    }
+    tab_freebuf_conc(g, t, oldnode, (oldhmask+1)*sizeof(Node));
+  }
+}
+#endif
+
 /* Resize a table to fit the new array/hash part sizes. */
 void lj_tab_resize(lua_State *L, GCtab *t, uint32_t asize, uint32_t hbits)
 {
   Node *oldnode = noderef(t->node);
   uint32_t oldasize = t->asize;
   uint32_t oldhmask = t->hmask;
-  /* The concurrent marker may be traversing the old array/node parts:
-  ** park it across the realloc/free and the header pointer swaps.
-  */
-  lj_concgc_pause_begin(G(L));
+#if LJ_CONCGC
+  if (LJ_UNLIKELY(G(L)->gc.cmark)) {  /* Marker may be traversing this table. */
+    tab_resize_conc(L, t, asize, hbits);
+    return;
+  }
+#endif
   if (asize > oldasize) {  /* Array part grows? */
     TValue *array;
     uint32_t i;
@@ -294,7 +393,6 @@ void lj_tab_resize(lua_State *L, GCtab *t, uint32_t asize, uint32_t hbits)
     g = G(L);
     lj_mem_freevec(g, oldnode, oldhmask+1, Node);
   }
-  lj_concgc_pause_end(G(L));
 }
 
 static uint32_t countint(cTValue *key, uint32_t *bins)

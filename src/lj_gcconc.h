@@ -21,6 +21,19 @@ typedef struct ConcVec {
   MSize n, sz;
 } ConcVec;
 
+/* Deferred buffer free: an old table array/node block that the marker may
+** still be reading (hazard pointer matched at lj_tab_resize). Freed at the
+** single-threaded cycle finish, when the marker is stopped. */
+typedef struct DeferBuf {
+  void *p;		/* Block to free. */
+  size_t sz;		/* Byte size for lj_mem_free accounting. */
+} DeferBuf;
+
+typedef struct DeferVec {
+  DeferBuf *p;
+  MSize n, sz;
+} DeferVec;
+
 /*
 ** Ownership while concurrent marking runs (g->gc.cmark != 0):
 **
@@ -105,6 +118,7 @@ typedef struct ConcGCState {
   ConcVec threadv;		/* Threads, deferred to the atomic phase. */
   ConcVec weakv;		/* Weak tables found while marking. */
   ConcVec uvv;			/* Closed upvalues, re-marked at finish. */
+  DeferVec deferbuf;		/* Old table buffers awaiting hazard-safe free. */
 } ConcGCState;
 
 #define concgcstate(g)	((ConcGCState *)mref((g)->gc.concstate, void))
@@ -129,6 +143,10 @@ LJ_FUNC void lj_concgc_stopmark(global_State *g);
 LJ_FUNC void lj_concgc_unpause(global_State *g);
 LJ_FUNC void lj_concgc_vecpush(ConcVec *v, GCobj *o);
 LJ_FUNC void lj_concgc_freevecs(ConcGCState *cs);
+
+/* Hazard-pointer deferred buffer free (lj_tab_resize -> cycle finish). */
+LJ_FUNC void lj_concgc_deferfree(global_State *g, void *p, size_t sz);
+LJ_FUNC void lj_concgc_draindefer(global_State *g);
 
 /* SPSC log ring (mutator producer -- lj_gcconc.c). */
 LJ_FUNC int lj_concgc_ringpush(ConcGCState *cs, GCobj *o);

@@ -63,6 +63,35 @@ static LJ_AINLINE uint64_t lj_atomic_load64(const uint64_t *p)
   return __atomic_load_n(p, __ATOMIC_RELAXED);
 }
 
+static LJ_AINLINE uint64_t lj_atomic_load64_acq(const uint64_t *p)
+{
+  return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static LJ_AINLINE void lj_atomic_store64_rel(uint64_t *p, uint64_t v)
+{
+  __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
+/* Sequentially-consistent hazard-pointer slot accesses (lj_tab_resize vs
+** the concurrent marker): the SC ordering is what makes the Dekker-style
+** mutual-visibility argument hold (see lj_tab_resize / gc_traverse_tab).
+*/
+static LJ_AINLINE uint64_t lj_atomic_load64_seqcst(const uint64_t *p)
+{
+  return __atomic_load_n(p, __ATOMIC_SEQ_CST);
+}
+
+static LJ_AINLINE void lj_atomic_store64_seqcst(uint64_t *p, uint64_t v)
+{
+  __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
+}
+
+static LJ_AINLINE void lj_atomic_thread_fence_seqcst(void)
+{
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
 #else
 #error "LJ_CONCGC requires GCC/Clang atomic builtins"
 #endif

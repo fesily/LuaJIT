@@ -58,6 +58,39 @@ void lj_concgc_freevecs(ConcGCState *cs)
   free(cs->jobs.p); free(cs->threadv.p); free(cs->weakv.p);
   free(cs->uvv.p);
   memset(&cs->jobs, 0, 4*sizeof(ConcVec));
+  free(cs->deferbuf.p);
+  memset(&cs->deferbuf, 0, sizeof(DeferVec));
+}
+
+/* Queue an old table buffer for hazard-safe deferred free. Mutator-owned:
+** pushed from lj_tab_resize, drained at the single-threaded cycle finish.
+** The marker never touches this vector. */
+void lj_concgc_deferfree(global_State *g, void *p, size_t sz)
+{
+  DeferVec *v = &concgcstate(g)->deferbuf;
+  if (LJ_UNLIKELY(v->n >= v->sz)) {
+    MSize nsz = v->sz ? v->sz*2 : 64;
+    DeferBuf *np = (DeferBuf *)realloc(v->p, nsz*sizeof(DeferBuf));
+    if (np == NULL) abort();  /* Rare hazard-match path; no safe error path. */
+    v->p = np;
+    v->sz = nsz;
+  }
+  v->p[v->n].p = p;
+  v->p[v->n].sz = sz;
+  v->n++;
+}
+
+/* Free all deferred table buffers. Called at the cycle finish / mode teardown
+** when the marker is stopped (markhazard guaranteed NULL), so the blocks can
+** no longer be under traversal. */
+void lj_concgc_draindefer(global_State *g)
+{
+  ConcGCState *cs = concgcstate(g);
+  DeferVec *v = &cs->deferbuf;
+  MSize i;
+  for (i = 0; i < v->n; i++)
+    lj_mem_free(g, v->p[i].p, v->p[i].sz);
+  v->n = 0;
 }
 
 /* -- GC thread main loop -------------------------------------------------- */
@@ -151,6 +184,7 @@ int lj_concgc_init(global_State *g)
     return 0;
   }
   cs->threadok = 1;
+  setmref(g->gc.markhazard, NULL);
   setmref(g->gc.concstate, cs);
   return 1;
 }
@@ -237,6 +271,10 @@ void lj_concgc_stopmark(global_State *g)
   pthread_mutex_unlock(&cs->lock);
   cs->parkdepth = 0;
   cs->stepn = 0;
+  /* Marker is parked and cmark cleared: markhazard is quiescent, so any old
+  ** table buffers deferred during this cycle can now be freed safely. */
+  setmref(g->gc.markhazard, NULL);
+  lj_concgc_draindefer(g);
 }
 
 #endif

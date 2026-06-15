@@ -330,9 +330,40 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
     ** actually weak this keeps clearable entries alive for one cycle
     ** (floating garbage), which is safe.
     */
+    TValue *array;
+    Node *node;
+    MSize i, asize, hmask;
     if (mt)
       lj_concgc_vecpush(&concgcstate(g)->weakv, obj2gco(t));
-    goto nonweak;
+    /* Publish the hazard pointer before dereferencing t's array/node so a
+    ** concurrent lj_tab_resize defers (not frees) any block we may read.
+    ** The SC store pairs with the SC fence+load in lj_tab_resize (Dekker:
+    ** at least one side observes the other, so a still-read block is never
+    ** freed). Read length before pointer (asize before array, hmask before
+    ** node): lj_tab_resize maintains cap(buffer) >= length by growing the
+    ** buffer before raising the length and lowering the length before
+    ** shrinking the buffer, so a length-then-pointer read never pairs a
+    ** small old buffer with a large new length (no out-of-bounds read).
+    */
+    lj_atomic_store64_seqcst(&g->gc.markhazard.ptr64, (uint64_t)(void *)t);
+    asize = lj_atomic_load32_acq(&t->asize);
+    array = (TValue *)lj_atomic_load64_acq(&t->array.ptr64);
+    for (i = 0; i < asize; i++)
+      gc_marktv(g, &array[i]);
+    hmask = lj_atomic_load32_acq(&t->hmask);
+    node = (Node *)lj_atomic_load64_acq(&t->node.ptr64);
+    if (hmask > 0) {
+      for (i = 0; i <= hmask; i++) {
+	Node *n = &node[i];
+	if (!tvisnil(&n->val)) {
+	  lj_assertG(!tvisnil(&n->key), "mark of nil key in non-empty slot");
+	  gc_marktv(g, &n->key);
+	  gc_marktv(g, &n->val);
+	}
+      }
+    }
+    lj_atomic_store64_seqcst(&g->gc.markhazard.ptr64, (uint64_t)0);
+    return 0;  /* Marked strongly; weakv requeue handles weak re-examination. */
   }
 #endif
   mode = lj_meta_fastg(g, mt, MM_mode);
@@ -358,9 +389,6 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
   }
   if (weak == LJ_GC_WEAK)  /* Nothing to mark if both keys/values are weak. */
     return 1;
-#if LJ_CONCGC
-nonweak:
-#endif
   if (!(weak & LJ_GC_WEAKVAL)) {  /* Mark array part. */
     MSize i, asize = t->asize;
     for (i = 0; i < asize; i++)

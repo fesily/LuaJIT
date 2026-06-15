@@ -621,6 +621,9 @@ typedef struct GCState {
   uint8_t unused3;
   uint8_t unused4;
   MRef concstate;	/* ConcGCState* (LJ_CONCGC, else NULL). */
+#if LJ_CONCGC
+  MRef markhazard;	/* GCtab* whose buffers the marker is traversing. */
+#endif
 } GCState;
 
 /* String interning state. */
