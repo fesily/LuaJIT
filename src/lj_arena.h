@@ -177,6 +177,36 @@ static LJ_AINLINE CellState arena_cellstate(GCArena *a, GCCellID c)
   return (CellState)((b << 1) | m);
 }
 
+#if LJ_HASGCMARK
+/* -- GC mark bitmap primitives ------------------------------------------- */
+/*
+** These operate on the arena mark[] bitmap as the GC "reachable" bit:
+** after lj_arena_flushbins() the (block,mark) pair is clean (allocated
+** objects are White=(1,0), free blocks are Free=(0,1)), so setting the
+** mark bit of an allocated block turns it Black=(1,1). They are defined
+** for Phase 0 with independent unit tests but are not yet wired into the
+** collector (that happens in Phase M/S).
+*/
+
+/* Mark an allocated object cell as reachable (White -> Black). */
+static LJ_AINLINE void arena_obj_setmark(GCArena *a, GCCellID c)
+{
+  a->mark[arena_blockidx(c)] |= arena_blockbit(c);
+}
+
+/* Is the allocated object cell marked reachable? */
+static LJ_AINLINE int arena_obj_ismarked(GCArena *a, GCCellID c)
+{
+  return (a->mark[arena_blockidx(c)] & arena_blockbit(c)) != 0;
+}
+
+/* Clear an object's mark bit (Black -> White), e.g. at end of sweep. */
+static LJ_AINLINE void arena_obj_clearmark(GCArena *a, GCCellID c)
+{
+  a->mark[arena_blockidx(c)] &= ~arena_blockbit(c);
+}
+#endif
+
 /* -- Bump allocation fast path ------------------------------------------- */
 
 static LJ_AINLINE void *arena_alloc(GCArena *a, size_t size)
@@ -215,6 +245,25 @@ LJ_FUNC void lj_arena_freerange(GCArena *a, ArenaFreeList *fl, GCCellID c,
 LJ_FUNC void *lj_arena_findspace(global_State *g, size_t size, int trav);
 LJ_FUNC void lj_arena_shrink(global_State *g);
 LJ_FUNC void lj_arena_freeall(global_State *g);
+
+#if LJ_HASGCMARK
+/*
+** Flush all free-list bins back into the block map, so the (block,mark)
+** pair becomes the single source of truth (allocated=White, free=Free).
+** Must be called on each arena before a GC mark phase reads mark bits.
+** Phase 0: implemented and unit-tested; not yet called by the collector.
+*/
+LJ_FUNC void lj_arena_flushbins(GCArena *a);
+
+/*
+** Visit each marked (reachable) or each unmarked (dead) allocated object
+** in an arena, calling cb(cellptr, gct, ud) for matches. Used by the
+** Phase S bitmap sweep to locate dead objects fast. Phase 0: skeleton
+** with unit tests over a constructed bitmap; not yet wired into sweep.
+*/
+typedef void (*ArenaObjVisitor)(void *cellptr, int gct, void *ud);
+LJ_FUNC void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud);
+#endif
 
 LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);
 LJ_FUNC void lj_hugeblock_free(global_State *g, void *p, size_t size);

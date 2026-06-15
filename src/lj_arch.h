@@ -600,16 +600,9 @@
 #define LJ_GC64			0
 #endif
 
-/* Arena-based allocator for GC objects. */
-#if defined(LUAJIT_ENABLE_GCARENA) && !defined(LUAJIT_USE_SYSMALLOC)
-#if LJ_64 && !LJ_GC64
-#define LJ_HASGCARENA		0	/* Needs full-width GC refs on 64 bit. */
-#else
-#define LJ_HASGCARENA		1
-#endif
-#else
-#define LJ_HASGCARENA		0
-#endif
+/* GC object allocator and next-gen GC gates are defined after LJ_64
+** (which they depend on); see below.
+*/
 
 /* 2-slot frame info. */
 #if LJ_GC64
@@ -685,6 +678,29 @@
 #else
 #define LJ_32			0
 #define LJ_64			1
+#endif
+
+/* Arena-based allocator for GC objects (depends on LJ_64/LJ_GC64). */
+#if defined(LUAJIT_ENABLE_GCARENA) && !defined(LUAJIT_USE_SYSMALLOC)
+#if LJ_64 && !LJ_GC64
+#define LJ_HASGCARENA		0	/* Needs full-width GC refs on 64 bit. */
+#else
+#define LJ_HASGCARENA		1
+#endif
+#else
+#define LJ_HASGCARENA		0
+#endif
+
+/*
+** Arena-based quad-color incremental GC (mark/sweep on the arena bitmap).
+** Currently x64 only: the write barrier and color bits are touched in the
+** x64 interpreter (vm_x64.dasc) and JIT backend (lj_asm_x86.h). Other
+** targets keep the arena allocator but run the tri-color linked-list GC.
+*/
+#if LJ_HASGCARENA && LJ_TARGET_X64
+#define LJ_HASGCMARK		1
+#else
+#define LJ_HASGCMARK		0
 #endif
 
 #ifndef LJ_TARGET_UNALIGNED

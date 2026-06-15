@@ -131,6 +131,131 @@ static void free_one(int idx)
   live[idx] = live[--nlive];
 }
 
+/* -- Phase 0: GC mark/sweep bitmap primitive tests ----------------------- */
+
+/* Visitor collects the cell pointers it is handed. */
+static void *visited[MAXLIVE];
+static int nvisited;
+static void collect_visitor(void *cellptr, int gct, void *ud)
+{
+  (void)ud;
+  if (gct != 0x42) {  /* We stamp every test object's gct with 0x42. */
+    fprintf(stderr, "FAIL: visitor saw wrong gct %d at %p\n", gct, cellptr);
+    exit(1);
+  }
+  visited[nvisited++] = cellptr;
+}
+
+static int ptr_in(void **arr, int n, void *p)
+{
+  int i;
+  for (i = 0; i < n; i++) if (arr[i] == p) return 1;
+  return 0;
+}
+
+/*
+** Allocate N small objects in a single fresh arena, mark a chosen subset
+** reachable, then flushbins + visit_unmarked and assert the visitor sees
+** exactly the unmarked objects (and no marked ones, no free cells).
+*/
+static void test_gcmark_primitives(void)
+{
+  enum { N = 400 };
+  void *objs[N];
+  int marked[N];
+  GCArena *a;
+  int i, nlive_local = 0, nmarked = 0;
+
+  /* Fresh non-traversable arena dedicated to this test. */
+  for (i = 0; i < N; i++) {
+    size_t size = 16 + (rnd() % 7) * 16;  /* 1..8 cells, hits the bins. */
+    void *p = alloc_one(size);
+    if (p == NULL) { fprintf(stderr, "FAIL: gcmark alloc OOM\n"); exit(1); }
+    ((GCobj *)p)->gch.gct = 0x42;
+    objs[i] = p;
+  }
+  /* Free a third of them, so the arena has a mix of free blocks (some */
+  /* land in bins as pseudo-White) and live objects. */
+  for (i = 0; i < N; i += 3) {
+    lj_arena_freeblock(&G, ptr2arena(objs[i]), objs[i], 16);
+    objs[i] = NULL;
+  }
+  /* Re-allocate a few to repopulate bins with pseudo-White blocks. */
+  for (i = 0; i < 20; i++) {
+    void *p = alloc_one(16);
+    ((GCobj *)p)->gch.gct = 0x42;
+    /* Track it in a free slot. */
+    {
+      int j; for (j = 0; j < N; j++) if (objs[j] == NULL) { objs[j] = p; break; }
+    }
+  }
+
+  /* Mark a random subset of the live objects reachable. */
+  for (i = 0; i < N; i++) {
+    if (objs[i] == NULL) continue;
+    nlive_local++;
+    if (rnd() & 1) {
+      a = ptr2arena(objs[i]);
+      arena_obj_setmark(a, ptr2cell(objs[i]));
+      marked[i] = 1;
+      nmarked++;
+    } else {
+      marked[i] = 0;
+    }
+  }
+
+  /* Flush bins on every arena so (block,mark) is the single truth. */
+  for (i = 0; i < (int)G.gc.arenastop; i++)
+    lj_arena_flushbins(mref(G.gc.arenas, GCArena *)[i]);
+
+  /* After flushbins, marked objects must read as marked, unmarked not. */
+  for (i = 0; i < N; i++) {
+    if (objs[i] == NULL) continue;
+    a = ptr2arena(objs[i]);
+    if (arena_obj_ismarked(a, ptr2cell(objs[i])) != marked[i]) {
+      fprintf(stderr, "FAIL: mark bit mismatch obj %d (want %d)\n", i, marked[i]);
+      exit(1);
+    }
+  }
+
+  /* Visit all unmarked allocated objects across arenas. */
+  nvisited = 0;
+  for (i = 0; i < (int)G.gc.arenastop; i++)
+    lj_arena_visit_unmarked(mref(G.gc.arenas, GCArena *)[i], collect_visitor, NULL);
+
+  /* Every unmarked live object must be visited exactly once... */
+  for (i = 0; i < N; i++) {
+    if (objs[i] == NULL || marked[i]) continue;
+    if (!ptr_in(visited, nvisited, objs[i])) {
+      fprintf(stderr, "FAIL: unmarked obj %d not visited\n", i);
+      exit(1);
+    }
+  }
+  /* ...and no marked object may appear in the visited set. */
+  for (i = 0; i < N; i++) {
+    if (objs[i] == NULL || !marked[i]) continue;
+    if (ptr_in(visited, nvisited, objs[i])) {
+      fprintf(stderr, "FAIL: marked obj %d wrongly visited\n", i);
+      exit(1);
+    }
+  }
+  if (nvisited != nlive_local - nmarked) {
+    fprintf(stderr, "FAIL: visited %d, expected %d unmarked\n",
+	    nvisited, nlive_local - nmarked);
+    exit(1);
+  }
+
+  /* Clear marks (Black -> White) and free everything for a clean teardown. */
+  for (i = 0; i < N; i++) {
+    if (objs[i] == NULL) continue;
+    a = ptr2arena(objs[i]);
+    if (marked[i]) arena_obj_clearmark(a, ptr2cell(objs[i]));
+    lj_arena_freeblock(&G, a, objs[i], 16);
+  }
+  printf("gcmark primitives: %d live, %d marked, %d visited OK\n",
+	 nlive_local, nmarked, nvisited);
+}
+
 int main(void)
 {
   long iter;
@@ -195,6 +320,11 @@ int main(void)
     live[nlive].tag = (uint32_t)iter; nlive++;
   }
   check_bitmaps();
+  while (nlive > 0)
+    free_one(nlive - 1);
+
+  /* Phase 0: GC mark/sweep bitmap primitives. */
+  test_gcmark_primitives();
   while (nlive > 0)
     free_one(nlive - 1);
 

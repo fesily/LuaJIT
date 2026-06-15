@@ -28,7 +28,17 @@ enum {
 #define LJ_GC_COLORS	(LJ_GC_WHITES | LJ_GC_BLACK)
 #define LJ_GC_WEAK	(LJ_GC_WEAKKEY | LJ_GC_WEAKVAL)
 
-/* Macros to test and set GCobj colors. */
+/*
+** Color test/set macros.
+**
+** With LJ_HASGCMARK the next-gen collector will keep the white/black
+** "reachable" state in the arena mark bitmap and an inline gray bit, so
+** these macros become the single seam through which all modules touch
+** object color. Phase 0 keeps the implementation byte-for-byte identical
+** to the classic header-based tri-color scheme (zero behavior change);
+** Phase M swaps the LJ_HASGCMARK branch to the bitmap representation
+** without touching the many call sites across the tree.
+*/
 #define iswhite(x)	((x)->gch.marked & LJ_GC_WHITES)
 #define isblack(x)	((x)->gch.marked & LJ_GC_BLACK)
 #define isgray(x)	(!((x)->gch.marked & (LJ_GC_BLACK|LJ_GC_WHITES)))

@@ -182,6 +182,27 @@ void lj_arena_freerange(GCArena *a, ArenaFreeList *fl, GCCellID c, GCCellID n)
 /* -- Scavenging ---------------------------------------------------------- */
 
 /*
+** Flush all bins: binned free blocks carry the allocated (White) bitmap
+** state so the hot alloc/free path avoids touching the bitmaps. Convert
+** them back to the Free bitmap state, making (block,mark) the single
+** source of truth. Leaves bins[] still pointing at the (now Free) blocks;
+** callers either freelist_reset() or rebuild the lists afterwards.
+*/
+static void arena_flushbins(GCArena *a, ArenaFreeList *fl)
+{
+  uint32_t w;
+  for (w = 0; w < ArenaBins; w++) {
+    GCCellID c = fl->bins[w];
+    while (c != 0) {
+      GCCellID next = *(GCCellID1 *)arena_cellptr(a, c);
+      a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
+      a->mark[arena_blockidx(c)] |= arena_blockbit(c);
+      c = next;
+    }
+  }
+}
+
+/*
 ** Rebuild the free list from the block map: find all free blocks,
 ** coalesce adjacent ones and roll back the bump frontier if the topmost
 ** block is free. Cost is one linear pass over the metadata (max 16 KB).
@@ -192,17 +213,7 @@ static void arena_scavenge(GCArena *a, ArenaFreeList *fl)
   uint32_t w, wtop = arena_blockidx(top - 1);
   GCCellID runstart = 0;
   int infree = 0;
-  /* Flush the bins first: binned blocks look allocated, convert them */
-  /* to the Free bitmap state so the scan finds and coalesces them. */
-  for (w = 0; w < ArenaBins; w++) {
-    GCCellID c = fl->bins[w];
-    while (c != 0) {
-      GCCellID next = *(GCCellID1 *)arena_cellptr(a, c);
-      a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
-      a->mark[arena_blockidx(c)] |= arena_blockbit(c);
-      c = next;
-    }
-  }
+  arena_flushbins(a, fl);  /* (block,mark) becomes the single truth. */
   freelist_reset(fl);
   for (w = UnusedBlockWords; w <= wtop; w++) {
     GCBlockword heads = a->block[w] | a->mark[w];
@@ -557,6 +568,50 @@ void lj_arena_freeall(global_State *g)
     g->allocf(g->allocd, c, sizeof(ArenaChunk), 0);
   }
 }
+
+#if LJ_HASGCMARK
+/* -- GC mark/sweep bitmap support (Phase 0: standalone, not yet wired) --- */
+
+/*
+** Public bin flush: make (block,mark) the single source of truth before a
+** GC mark phase reads mark bits. After this, allocated objects are White
+** (1,0) and free blocks are Free (0,1). The free list is reset; the next
+** allocation rebuilds it via scavenge.
+*/
+void lj_arena_flushbins(GCArena *a)
+{
+  ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
+  if (fl != NULL) {
+    arena_flushbins(a, fl);
+    freelist_reset(fl);
+    /* Force the next allocslow to rescan: bins no longer cache anything. */
+    fl->scavgen = a->freegen - 1;
+  }
+}
+
+/*
+** Visit every allocated-but-unmarked (dead) object in an arena, calling
+** cb(cellptr, gct, ud). Scans (block & ~mark) one word at a time, so it
+** skips whole 32-cell spans that are fully marked or fully free without
+** touching object data. Requires lj_arena_flushbins() first so that free
+** blocks read as (0,1) and never as (1,0). Reads gct from each object's
+** GCHeader (the only object-data access, needed for type dispatch).
+*/
+void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud)
+{
+  uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+  for (w = UnusedBlockWords; w <= wtop; w++) {
+    GCBlockword dead = a->block[w] & ~a->mark[w];  /* White block heads. */
+    while (dead) {
+      uint32_t bitidx = lj_ffs(dead);
+      GCCellID c = (w << 5) + bitidx;
+      GCobj *o = (GCobj *)arena_cellptr(a, c);
+      dead &= dead - 1;
+      cb((void *)o, (int)o->gch.gct, ud);
+    }
+  }
+}
+#endif
 
 /* -- Huge blocks --------------------------------------------------------- */
 
