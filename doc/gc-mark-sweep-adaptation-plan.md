@@ -77,7 +77,40 @@
 
 ## 1. 总体架构决策
 
-### 1.1 颜色编码(quad-color,迁入位图)
+### 1.0 颜色迁移分两小步(已与用户确认)
+
+完整 quad-color 要 white/black 在 arena 位图、gray 位 inline 在 header。但 `marked` 字节 8 位全满(§0.2-D + Phase 0 核实:`0x80` 被 cdata `cdataisv` 占用)。为降低单步风险,**禁用 FFI** 腾出 `0x80`,拆成两步:
+
+- **Step 1(本轮 Phase M)**:`LUAJIT_DISABLE_FFI` + **white/black 迁入 arena 位图**(复用 Phase 0 的 `arena_obj_setmark`/`ismarked`/`clearmark`)+ **gray 位 = `0x80`**(`LJ_GC_GRAY`)。mark/sweep/barrier 全部改走新表示。**关键依赖顺序**:white/black 必须和 gray 位一起迁——因为只有 black 进了位图(查它要访问元数据),"barrier 只查 inline gray 位"才有性能意义;若 white/black 留 header,`isblack` 本就 inline 便宜,单加 gray 位是纯增风险无收益(已与用户确认此依赖)。
+- **Step 2(后续)**:gray 位从 `0x80` 搬到 `0x01`(white 腾出位),重新启用 FFI(cdata 走完整 quad-color)。
+
+→ 本轮一步拿到完整 quad-color 收益(barrier 查 gray 位、mark/sweep 走位图),只是 cdata/FFI 暂缺席、gray 位暂栖 `0x80`。
+
+#### Step 1 的颜色表示
+
+`marked` 字节本轮布局(FFI 禁用,`0x80` 空出给 gray):
+```
+0x01/0x02 WHITE0/1  → 迁出,header 不再表 white(位空出,Step2 给 gray)
+0x04 BLACK          → 迁出,header 不再表 black(可达性改由位图 mark 表示)
+0x08 FINALIZED   0x10 WEAKVAL   0x20 FIXED   0x40 SFIXED   0x80 GRAY(本轮新增)
+```
+
+**white/black 迁入位图的具体编码**(arena 内对象,flush bin 后):
+| 状态 | block | mark | gray(header 0x80) |
+|------|-------|------|-------------------|
+| White(未标记) | 1 | 0 | 0 |
+| Light-gray(新分配/被写) | 1 | 0 | 1 |
+| Dark-gray(已入 gray list) | 1 | 1 | 1 |
+| Black(已遍历) | 1 | 1 | 0 |
+
+- "可达" = mark 位(arena `mark[]`)。"待遍历" = gray 位(header `0x80`)。
+- `iswhite(o)` = `!mark位 && !gray位`;`isblack(o)` = `mark位 && !gray位`;`isgray(o)` = `gray位`。
+- **双白机制消失**:颜色在位图,不需要 WHITE0/WHITE1 翻转。sweep 末尾整字清 mark 位即"翻白"。`currentwhite`/`otherwhite`/`isdead` 语义需重新定义(见 Phase M)。
+- **huge block / 非 arena 对象**:huge block 无位图,mark/gray 状态存独立 hash(本轮 FFI 禁用后 huge 对象只有超大 string/table/proto,数量少,可先简单处理)。
+
+
+
+### 1.1 颜色编码(最终形态,Step 2 目标)
 
 图纸 quad-color = 4 态,由 **segregated mark 位**(arena 位图,表"已标记/可达")+ **inline gray 位**(对象头 1 bit,表"在 gray stack 上待遍历")组合:
 
@@ -88,11 +121,22 @@
 | Dark-gray | 1 | 1 | 已入 gray stack 待遍历 |
 | Black | 1 | 0 | 已遍历完 |
 
-**注意与分配器位的复用冲突**:arena 现有 (block,mark) 已用于 allocated/free 判别(§0.2-A)。新增的 **GC mark 位不能直接复用分配器的 `mark[]`**(它表 Free),需要厘清:
-- 方案采用:**分配器的 `block[]` 表"这是一个已分配对象的块首",GC 的"可达"标记复用 `mark[]`** —— 但 `mark[]` 当前表 Free。
-- 解法:flush bin 后,allocated 对象的 (block,mark)=(1,0)=White,free 块=(0,1)。GC mark 阶段把存活对象的 mark 位置 1 → (1,1)=Black,与图纸编码天然一致!free 块 (0,1) 在 mark 阶段不会被访问(不是对象)。**sweep 用图纸公式 `block'=block&mark`**:black(11)→保留并 mark 清 0 变 white(10);white(10)→block 清 0 变 free。
-- 这正是 §0.2-A 要求"mark 前 flush bin"的原因:只有 flush 后 (block,mark) 才干净到能套用图纸公式。
-- **gray 位**:放对象头 `marked` 的 `0x01`(腾出的 white 位)。
+最终形态下:flush bin 后 allocated 对象 (block,mark)=(1,0)=White,free 块=(0,1)。mark 阶段把存活对象 mark 位置 1 →(1,1)=Black。sweep 用图纸公式 `block'=block&mark`。gray 位放 `0x01`(white 腾出位)。
+
+### 1.1' 颜色编码(本轮过渡形态,Step 1)
+
+本轮 white/black 仍在 header,arena mark 位图**不表颜色**(仍是分配器的 Free 判别),只有 gray 位是新的:
+
+| 状态 | header white/black | header gray 位(`0x80`) | 含义 |
+|------|-------------------|----------------------|------|
+| White | WHITE0/1 | 0 | 未标记 |
+| Light-gray | WHITE0/1 | 1 | 新分配/被写;barrier 不触发(图纸 light-gray) |
+| Dark-gray | (WHITE,在 gray stack) | 1 | 已 push 到 arena gray stack 待遍历 |
+| Black | BLACK | 0 | 已遍历完 |
+
+- **gray 位 = `marked & 0x80`**(`LJ_GC_GRAY`),仅 `LJ_HASGCMARK`(x64+arena,且本轮要求 FFI 禁用)下定义。
+- mark/black 仍走 header(复用现有 `isblack`/`makewhite` 逻辑);**新增的是 gray 位的置位/清除 + push 到对象所在 arena 的 gray stack**(替代现有 `g->gc.gray` 全局链表)。
+- barrier 改为查 gray 位(图纸:gray 位已置则不触发),而非现有的查 black + white。
 
 ### 1.2 gray 组织(per-arena gray stack + 优先级队列)
 
