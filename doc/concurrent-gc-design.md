@@ -56,6 +56,10 @@
 
 ### 3.2 状态机
 
+> **注**:下图的"周期性握手(drain 日志, 重扫)"反映旧 park/drain 设计。
+> 当前实现中标记器自由运行、mutator 不再周期性 park,握手退化为周期末单次
+> `finishreq → markdone → gc_conc_finish`。详见 §14。
+
 ```
             (主线程)         (GC线程)        (主线程,STW)   (GC线程)      (主线程,增量)  (主线程,增量)
 GCSpause → GCSrootscan → GCSpropagate_c → GCSatomic → GCSsweep_c → GCSfree → GCSfinalize → GCSpause
@@ -73,6 +77,11 @@ GCSpause → GCSrootscan → GCSpropagate_c → GCSatomic → GCSsweep_c → GCS
 `lj_gc_step` 在并发阶段的职责退化为:响应握手请求、推进 Free 配额、检查 GC 线程是否完成并推动状态切换。JIT 的 `asm_gc_check` / `lj_gc_step_jit` 不需要改语义。
 
 ### 3.3 安全点与握手(handshake)
+
+> **⚠️ 本节描述的"主线程每步 park 标记器去 drain 日志"握手已被废弃。**
+> 实测证明该设计使 mutator 每隔数步就阻塞在标记器上,无法重叠,并发模式比
+> 增量慢 3.6–14×(详见附录实测结论)。当前实现改为**无锁 SPSC 环 + 自由运行
+> 标记器 + 单次终止握手**,见 **§14**。本节保留作设计演进记录。
 
 - 主线程的安全点 = 进入 `lj_gc_step` 的时刻(分配点 `lj_gc_check`、JIT 的 `asm_gc_check`、以及可选在 BC 循环回边的 hook 检查里加一个廉价标志位测试)。
 - GC 线程通过原子标志 `g->gc.hsreq` 请求握手;主线程在安全点看到后进入握手例程:
@@ -393,9 +402,9 @@ JIT/VM 汇编部分;**并发 sweep(M4)未做**(per §13 决策点,sweep 仍为
    改述为"LOGGED 只在 GC step 边界被清",与原 grayagain 不变量同构,
    折叠规则无需改动。trace 执行期间 GCSatomic 仍拒绝运行(jit_base 检查
    继承原版)。
-9. **measured**:churn 基准(8e5 表分配+字符串,JIT on)主线程 wall
-   时间较增量模式约 -25%;-joff 约 -15%。全测试集(505 项)与基线
-   失败集一致;TSAN(-joff)0 报告;assert 构建全绿。
+9. **measured**:见 **§14.5**(无锁环重设计后的权威实测)。早期 churn 基准的
+   "−25% wall"已被推翻为周期调度伪影(详见附录 2026-06-13 结论);重设计后并发
+   在计算重叠/低变异率负载上可与增量持平甚至反超,且 mutator `park=0`。
 
 ---
 
@@ -483,6 +492,10 @@ Lua API(`require("jit.util")`):
 
 ### 实测结论(2026-06-13,churn / 大稳定堆 两类负载)
 
+> **⚠️ 本小节的悲观结论针对的是旧 park/drain 握手设计(§3.3),已被 §14 的
+> 无锁环重设计取代。** 保留作演进记录:它正是促成重设计的决定性证据
+> ——"后台几乎不干活、mutator 阻塞在标记器上"的根因诊断。重设计后的权威实测见 §14.5。
+
 **插桩推翻了"标记已卸载到 GC 线程"的乐观假设。** 两类负载下:
 - `gcthread_mark` 仅 0.02–0.9 ms,offload ratio ≈ **0.00–0.01**(后台几乎不干活)。
 - `atomic` 相位主导一切(55→190+ ms),且并发模式的 atomic **总耗时反而比增量模式高
@@ -499,3 +512,107 @@ GC 线程确实在运行(262 bursts / 91 cycles),只是每周期约 180 对象�
 
 待修方向:并发周期触发阈值(concmode 下 gc.pause/stepmul)使周期数量虚高、单周期工作集过小;
 应让并发周期**启动更少、运行更久**(灰集预估够大时才转并发),后台标记器才有实质工作集。
+
+---
+
+## 14. 当前架构:无锁环握手重设计(2026-06-14,已落地并提交)
+
+> 本节是**当前实现的权威描述**。§3.2/§3.3 的 park/drain 握手与附录
+> 2026-06-13 的悲观实测结论均描述的是被本节取代的旧设计,保留作演进记录。
+> 对应提交:`6784cee0`(在 `b84ad23e` 之上)。
+
+### 14.1 为什么重设计:旧握手是结构性串行
+
+旧设计中 `lj_gc_step → gc_onestep` 的 `GCSpropagate` 并发分支每
+`CONCGC_DRAINSTEP` 步就 `lj_concgc_park` 把标记器停在 burst 边界,然后主线程
+独占地 drain 日志链(`grayagain` + ssb)。这是**同步路径上的阻塞**:
+mutator 驱动一个 GC step 就为该 step 的时长被挂起,即便它"有别的活要干"也无济于事
+——别的活在同一条串行线程上。控制实验(`tests/heap_mut.lua` 调节变异率)证明:
+
+- 即便 **f=0(只读、零屏障、零重灰)**,并发仍比增量慢 3.6×;
+- 计算重叠测试(`tests/heap_compute.lua`,每轮插入纯计算核)中,
+  `park ≈ bg_mark`:mutator 几乎把标记器的整个标记时间都耗在 `conc_park` 阻塞上,
+  哪怕它手头有 8M 次计算迭代。**计算与标记永远串行,从不并发。**
+
+结论:safepoint-handshake 设计无法实现 mutator/marker 重叠。要真并发,mutator
+必须**永不阻塞在标记器上**——log-and-return 屏障 + 标记器自由运行 + 仅在周期末
+单次同步。这就是本节的重设计。
+
+### 14.2 无锁 SPSC 环日志屏障
+
+写屏障不再推 `grayagain`/`gclist`(主线程独占链),改为推一个**单生产者单消费者
+环形缓冲**(`SpscRing`,65536 个 `GCobj*` 槽,`lj_gcconc.h`):
+
+- **生产者 = mutator**:`lj_concgc_ringpush`(`lj_gcconc.c`)写槽 + release 发布
+  `tail`;`LJ_GC_LOGGED` 位仍做单周期去重(主线程独占决策,`lock or` 置位)。
+  环满时 `lj_concgc_logfull` 一次性 park-drain-resume 兜底(罕见)。
+- **消费者 = 标记器**:`lj_concgc_ringdrain` acquire 读 `tail`、消费、release 写
+  `head`;每条目走 `gc_conc_logmark`(清 LOGGED + 按类型重灰/重标)。
+
+环是无锁的,mutator 推日志后立即返回,**不再 park**。
+
+### 14.3 自由运行标记器 + 单次终止握手
+
+`gcthread_main`(`lj_gcconc.c`)重写为自由运行循环:
+`drain ring + burst jobs + 两者皆空时 sched_yield`,直到 `parkreq`(logfull/
+pause)或"两队列空 ∧ finishreq"。终止握手退化为单次:
+
+1. mutator 在 `gc_onestep` `GCSpropagate` 分支累计够步数后置 `finishreq`;
+2. 标记器排空 ring+jobs 后置 `markdone`、转 IDLE;
+3. mutator 下一步轮询到 `markdone`,调 `gc_conc_finish`(单线程 STW 收敛)
+   后进入 `GCSatomic`。
+
+mutator 在整个并发标记期**只在最后的 `gc_conc_finish` 这一次 STW**,中途零阻塞。
+
+### 14.4 JIT 屏障的 grayagain 兼容路径与后台卸载
+
+JIT 编译的 `barrierback`(`vm_x64.dasc` 宏)与 VM 解释器屏障在 cmark 下仍把脏表
+推 `g->gc.grayagain`(经 `tab->gclist`),**绕过 SPSC 环**——让汇编内联直接 ring-push
+代价高,故保留旧形态。两处消费它:
+
+1. **正确性**:`gc_conc_drainlog`(STW finish 内)在排空 ring 后**也排空 grayagain
+   链**,经 `gc_conc_logmark` 归一到新协议。这是修复重设计初期挂死 bug 的关键
+   ——否则 JIT 推入的 WHITE+LOGGED 表会被 `atomic()` 的
+   `setgcref(gray, grayagain)` 无颜色检查地搬上 gray 链,令 `propagatemark` 死循环。
+2. **性能(STW finish 优化,本次提交)**:仅靠 (1) 时,grayagain 在整个周期里累积
+   (实测一次 finish 见 **277,196 个表,其中一个 420 万槽**),全部在 STW 里被
+   重灰 + 重遍历——`gc_propagate_gray` 占 finish 的 75–97%。修复:
+   **`gc_onestep` 并发分支每步把 `grayagain` 整链 splice 进 SPSC 环**,让标记器
+   在后台消费,而非堆到 STW。安全性:mutator 执行该 C step 时独占 `grayagain`
+   (JIT 屏障在同一线程,从不并发),标记器从不碰 `grayagain`;LOGGED 去重保持
+   (标记器 logmark 会清)。**无需改汇编**——C 侧晚一步捕获同一批条目,近乎零代价。
+
+### 14.5 实测收益(clean build,`tests/heap_compute.lua`,1GB 堆,JIT on)
+
+重设计消除"mutator park 在标记器上"的陷阱:
+
+- **所有运行 `park=0.0ms`**(核心架构目标达成)。
+- 计算重叠:citers=0 时 conc 1.23s vs inc 1.29s(**0.95×,并发反超**,
+  重设计前为 6.4× 慢);citers=8M 1.49×(前为 3.6× 慢)。
+- 变异率扫:f=1% 时 **0.67×(并发反超约 50%)**;f=0% 1.23×(前 3.6× 慢)。
+
+STW finish 后台卸载优化(本次提交,叠加在重设计之上):
+
+| 指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| finish 时 grayagain 残留 | 277,196 | **0** |
+| `conc_finish` STW 总计 | 160ms | **34ms** |
+| `drainlog`(嵌套) | 37ms | **0.1ms** |
+| **单次最大暂停** | **32.6ms** | **17.2ms** |
+| citers=0 最坏单暂停 | 74ms | **0ms** |
+| 2GB citers=8M | — | **0ms** |
+
+残留 ~17ms/周期 = 紧邻 `markdone` 被观测前那一步推入 grayagain 的**最后一批**
+(标记器尚未来得及消费);可进一步在调用 `gc_conc_finish` 前再 drain 一次
+grayagain,或将 `finishreq` 推迟到 grayagain+ring 双空后再置。
+
+验证:assert 构建在 citers=0/8M + heap_mut churn 上零 GC 断言;全测试集
+**505/21 = 基线**(经 git-stash A/B 在 clean build 上确认与基线逐项一致);
+生产构建无告警;`5e5 表 churn + collect` 烟测通过。
+
+### 14.6 KPI 取舍
+
+本设计的 KPI 是**尽量小的 STW、尽量小的性能损耗,总时间允许增加**。
+后台卸载把 finish 的重遍历从 STW 移到后台标记器(后台 CPU 上升、总 CPU 上升),
+换取单次暂停下降 ~47%、最坏情形归零——正是该取舍的体现。
+
