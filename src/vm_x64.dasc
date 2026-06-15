@@ -377,6 +377,9 @@
 |// Move table write barrier back. Overwrites reg.
 |.macro barrierback, tab, reg
 |  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
+|.if LJ_HASGCMARK
+|  or byte tab->marked, LJ_GC_GRAY
+|.endif
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
 |  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |  mov tab->gclist, reg

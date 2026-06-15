@@ -38,8 +38,15 @@
 #define GCFINALIZECOST	100
 
 /* Macros to set GCobj colors and flags. */
+#if LJ_HASGCMARK
+#define white2gray(x) \
+  ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_WHITES) | LJ_GC_GRAY)
+#define gray2black(x) \
+  ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_GRAY) | LJ_GC_BLACK)
+#else
 #define white2gray(x)		((x)->gch.marked &= (uint8_t)~LJ_GC_WHITES)
 #define gray2black(x)		((x)->gch.marked |= LJ_GC_BLACK)
+#endif
 #define isfinalized(u)		((u)->marked & LJ_GC_FINALIZED)
 
 /* -- Mark phase ---------------------------------------------------------- */
@@ -106,6 +113,11 @@ static void gc_mark(global_State *g, GCobj *o)
     lj_assertG(gct == ~LJ_TFUNC || gct == ~LJ_TTAB ||
 	       gct == ~LJ_TTHREAD || gct == ~LJ_TPROTO || gct == ~LJ_TTRACE,
 	       "bad GC type %d", gct);
+#if LJ_HASGCMARK
+    lj_assertG(o->gch.marked & LJ_GC_GRAY,
+      "gc_mark push without gray bit: gct=%d marked=0x%02x",
+      o->gch.gct, o->gch.marked);
+#endif
     setgcrefr(o->gch.gclist, g->gc.gray);
     setgcref(g->gc.gray, o);
   }
@@ -355,6 +367,11 @@ static size_t propagatemark(global_State *g)
   GCobj *o = gcref(g->gc.gray);
   int gct = o->gch.gct;
   lj_assertG(isgray(o), "propagation of non-gray object");
+#if LJ_HASGCMARK
+  lj_assertG(o->gch.marked & LJ_GC_GRAY,
+    "gray object missing gray bit: gct=%d marked=0x%02x ptr=%p state=%d",
+    o->gch.gct, o->gch.marked, (void*)o, g->gc.state);
+#endif
   gray2black(o);
   setgcrefr(g->gc.gray, o->gch.gclist);  /* Remove from gray list. */
   if (LJ_LIKELY(gct == ~LJ_TTAB)) {
@@ -957,7 +974,7 @@ void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_mark(g, gcV(tv));
   else
-    TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~LJ_GC_COLORS) | curwhite(g);
+    TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~(LJ_GC_COLORS|LJ_GC_GRAY)) | curwhite(g);
 #undef TV2MARKED
 }
 

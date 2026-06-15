@@ -1936,6 +1936,10 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
   emit_setgl(as, tab, gc.grayagain);
   emit_getgl(as, tmp, gc.grayagain);
+#if LJ_HASGCMARK
+  emit_i8(as, LJ_GC_GRAY);
+  emit_rmro(as, XO_ARITHib, XOg_OR, tab, offsetof(GCtab, marked));
+#endif
   emit_i8(as, ~LJ_GC_BLACK);
   emit_rmro(as, XO_ARITHib, XOg_AND, tab, offsetof(GCtab, marked));
   emit_sjcc(as, CC_Z, l_end);
