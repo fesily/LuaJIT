@@ -416,7 +416,9 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 #if LJ_HASGCMARK
     if (g->gc.bitmapsweep && !lj_arena_ishuge(o) &&
 	o != obj2gco(mainthread(g))) {
-      if (arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
+      /* Post-snapshot allocation (carries curwhite): always alive. */
+      if ((o->gch.marked & LJ_GC_WHITES) == curwhite(g) ||
+	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
 	makewhite(g, o);
 	p = &o->gch.nextgc;
       } else {
@@ -459,7 +461,8 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
 #if LJ_HASGCMARK
     if (g->gc.bitmapsweep && !lj_arena_ishuge(o) &&
 	o != obj2gco(&g->strempty)) {
-      if (arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
+      if ((o->gch.marked & LJ_GC_WHITES) == curwhite(g) ||
+	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
 	makewhite(g, o);
 	p = &o->gch.nextgc;
       } else {
@@ -685,8 +688,8 @@ static void atomic(global_State *g, lua_State *L)
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
 #if LJ_HASGCMARK
-  if (g->gc.bitmapsweep)
-    gc_arena_snapshot_live(g, otherwhite(g));
+  g->gc.bitmapsweep = 1;
+  gc_arena_snapshot_live(g, otherwhite(g));
 #endif
 }
 
@@ -938,9 +941,6 @@ void lj_gc_fullgc(lua_State *L)
   lj_assertG(g->gc.state == GCSfinalize || g->gc.state == GCSpause,
 	     "bad GC state");
   /* Now perform a full GC. */
-#if LJ_HASGCMARK
-  g->gc.bitmapsweep = 1;
-#endif
   g->gc.state = GCSpause;
   do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
