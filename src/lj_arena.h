@@ -280,14 +280,10 @@ LJ_FUNC void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud);
 /*
 ** Phase M shadow-verify support. lj_arena_gcprepare() flushes bins and
 ** clears all GC mark bits across every arena, ready for a fresh mark
-** cycle. lj_arena_count_marked()/count_allocated() tally objects across
-** all arenas so the collector can cross-check the bitmap against the
-** still-authoritative header colors.
+** cycle.
 */
 LJ_FUNC void lj_arena_gcprepare(global_State *g);
 LJ_FUNC void lj_arena_gc_markinit(global_State *g);
-LJ_FUNC MSize lj_arena_count_marked(global_State *g);
-LJ_FUNC MSize lj_arena_count_allocated(global_State *g);
 #endif
 
 LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);

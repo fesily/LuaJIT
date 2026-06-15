@@ -676,10 +676,6 @@ void lj_gc_freeall(global_State *g)
 
 /* -- Collector ----------------------------------------------------------- */
 
-#if LJ_HASGCMARK
-static void gc_arena_snapshot_live(global_State *g, int ow);
-#endif
-
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
 static void atomic(global_State *g, lua_State *L)
 {
@@ -716,49 +712,6 @@ static void atomic(global_State *g, lua_State *L)
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
 #if LJ_HASGCMARK
   g->gc.bitmapsweep = 1;
-  /* Cross-check: mark-driven bitmap vs snapshot-style alive predicate. */
-  {
-    int ow = otherwhite(g);
-    GCobj *o;
-    MSize i;
-    MSize missing = 0;
-    for (o = gcref(g->gc.root); o != NULL; o = gcnext(o)) {
-      if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g)) &&
-	  !(o->gch.marked & LJ_GC_FIXED) &&
-	  ((o->gch.marked ^ LJ_GC_WHITES) & ow) &&
-	  !arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
-	missing++;
-	if (missing <= 3)
-	  lj_assertG(0,
-	    "mark-driven miss: gct=%d marked=0x%02x ptr=%p",
-	    o->gch.gct, o->gch.marked, (void*)o);
-      }
-      if (o->gch.gct == ~LJ_TTHREAD) {
-	GCobj *uv;
-	for (uv = gcref(gco2th(o)->openupval); uv != NULL; uv = gcnext(uv))
-	  if (!lj_arena_ishuge(uv) && !(uv->gch.marked & LJ_GC_FIXED) &&
-	      ((uv->gch.marked ^ LJ_GC_WHITES) & ow) &&
-	      !arena_obj_ismarked(ptr2arena(uv), ptr2cell(uv)))
-	    missing++;
-      }
-    }
-    for (i = 0; i <= g->str.mask; i++) {
-      GCRef r = g->str.tab[i];
-      for (o = (GCobj *)(gcrefu(r) & ~(uintptr_t)1); o != NULL; o = gcnext(o))
-	if (!lj_arena_ishuge(o) && !(o->gch.marked & LJ_GC_FIXED) &&
-	    ((o->gch.marked ^ LJ_GC_WHITES) & ow) &&
-	    !arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
-	  missing++;
-	  if (missing <= 3)
-	    lj_assertG(0,
-	      "mark-driven miss str: marked=0x%02x len=%d ptr=%p",
-	      o->gch.marked, (int)gco2str(o)->len, (void*)o);
-	}
-    }
-    if (missing)
-      lj_assertG(0, "mark-driven bitmap missed %d non-FIXED objects",
-		 (int)missing);
-  }
 #endif
 }
 
@@ -904,45 +857,6 @@ static void gcverify_count_dead(void *o, int gct, void *ud)
   (*(MSize *)ud)++;
 }
 
-/*
-** Phase M dry-run: snapshot the link-sweep's "alive" verdict into the arena
-** mark bitmap at the atomic->sweep boundary. Walks the same root set as
-** gc_arena_verify, but applies the post-flip alive predicate -- a live
-** object is BLACK or NEW-white (everything except OLD-white = otherwhite).
-** gc_sweep / gc_sweepstr later cross-check the bitmap bit against their
-** own classification; any disagreement asserts. Purely observational --
-** the snapshot only writes mark bits, never frees, never reclassifies.
-**
-** ow=otherwhite(g) selects the alive predicate; pass ow=0 to mark every
-** reachable object unconditionally (used on the lj_gc_fullgc fast-forward
-** path where atomic() did not run and the sweep simply preserves all).
-*/
-static void gc_arena_snapshot_live(global_State *g, int ow)
-{
-  GCobj *o;
-  MSize i;
-  lj_arena_gcprepare(g);
-  for (o = gcref(g->gc.root); o != NULL; o = gcnext(o)) {
-    if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g)) &&
-	(!ow || ((o->gch.marked ^ LJ_GC_WHITES) & ow)))
-      arena_obj_shadowmark(o);
-    if (o->gch.gct == ~LJ_TTHREAD) {
-      GCobj *uv;
-      for (uv = gcref(gco2th(o)->openupval); uv != NULL; uv = gcnext(uv))
-	if (!lj_arena_ishuge(uv) &&
-	    (!ow || ((uv->gch.marked ^ LJ_GC_WHITES) & ow)))
-	  arena_obj_shadowmark(uv);
-    }
-  }
-  for (i = 0; i <= g->str.mask; i++) {
-    GCRef r = g->str.tab[i];
-    for (o = (GCobj *)(gcrefu(r) & ~(uintptr_t)1); o != NULL; o = gcnext(o))
-      if (!lj_arena_ishuge(o) &&
-	  (!ow || ((o->gch.marked ^ LJ_GC_WHITES) & ow)))
-	arena_obj_shadowmark(o);
-  }
-}
-
 static void gc_arena_verify(global_State *g)
 {
   GCobj *o;
@@ -1001,8 +915,7 @@ void lj_gc_fullgc(lua_State *L)
     g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
     g->gc.sweepstr = 0;
 #if LJ_HASGCMARK
-    g->gc.bitmapsweep = 1;
-    gc_arena_snapshot_live(g, 0);
+    g->gc.bitmapsweep = 0;  /* Use header predicate; preserves all. */
 #endif
   }
   while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)

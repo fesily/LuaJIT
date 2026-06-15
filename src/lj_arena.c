@@ -612,18 +612,6 @@ void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud)
   }
 }
 
-/* Count block heads in an arena that are marked / allocated. */
-static MSize arena_popcount(GCArena *a, int wantmarked)
-{
-  uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
-  MSize n = 0;
-  for (w = UnusedBlockWords; w <= wtop; w++) {
-    GCBlockword bits = wantmarked ? (a->block[w] & a->mark[w]) : a->block[w];
-    n += (MSize)__builtin_popcount(bits);
-  }
-  return n;
-}
-
 /*
 ** Prepare every arena for a fresh GC mark cycle: flush bins so the block
 ** map is authoritative, then clear all GC mark bits (so nothing reads as
@@ -671,22 +659,6 @@ void lj_arena_gc_markinit(global_State *g)
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
-}
-
-MSize lj_arena_count_marked(global_State *g)
-{
-  MSize i, n = 0;
-  for (i = 0; i < g->gc.arenastop; i++)
-    n += arena_popcount(mref(g->gc.arenas, GCArena *)[i], 1);
-  return n;
-}
-
-MSize lj_arena_count_allocated(global_State *g)
-{
-  MSize i, n = 0;
-  for (i = 0; i < g->gc.arenastop; i++)
-    n += arena_popcount(mref(g->gc.arenas, GCArena *)[i], 0);
-  return n;
 }
 #endif
 
