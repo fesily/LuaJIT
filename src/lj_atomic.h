@@ -92,6 +92,11 @@ static LJ_AINLINE void lj_atomic_thread_fence_seqcst(void)
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+static LJ_AINLINE uint64_t lj_atomic_xchg64(uint64_t *p, uint64_t v)
+{
+  return __atomic_exchange_n(p, v, __ATOMIC_ACQ_REL);
+}
+
 #else
 #error "LJ_CONCGC requires GCC/Clang atomic builtins"
 #endif

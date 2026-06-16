@@ -1943,12 +1943,12 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   **   test byte tab->marked, LOGGED; jnz >end
   **   lock or byte tab->marked, LOGGED
   ** push:
-  **   tmp = g->gc.grayagain; g->gc.grayagain = tab; tab->gclist = tmp
+  **   tmp = g->gc.grayagain; tab->gclist = tmp; g->gc.grayagain = tab
   ** end:
   */
   MCLabel l_push, l_conc;
-  emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
   emit_setgl(as, tab, gc.grayagain);
+  emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
   emit_getgl(as, tmp, gc.grayagain);
   l_push = emit_label(as);
   emit_i8(as, LJ_GC_LOGGED);
@@ -1968,8 +1968,8 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   emit_i8(as, 0);
   emit_rma(as, XO_ARITHib, XOg_CMP, &J2G(as->J)->gc.cmark);
 #else
-  emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
   emit_setgl(as, tab, gc.grayagain);
+  emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
   emit_getgl(as, tmp, gc.grayagain);
   emit_i8(as, ~LJ_GC_BLACK);
   emit_rmro(as, XO_ARITHib, XOg_AND, tab, offsetof(GCtab, marked));

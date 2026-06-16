@@ -42,7 +42,10 @@ typedef struct DeferVec {
 **   logring (mutator -> marker channel)  SPSC: mutator produces, marker
 **                                        consumes (lock-free, acq/rel)
 **   jobs/threadv/weakv/uvv vectors       GC thread (marker-PRIVATE)
-**   gc.gray, gc.grayagain, gc.weak       unused during cmark (the atomic
+**   gc.gray                              unused during cmark
+**   gc.grayagain                         shared: mutator pushes (VM/JIT
+**                                        barrier), marker steals (xchg)
+**   gc.weak                              unused during cmark (the atomic
 **                                        phase reuses them)
 **   gc.root list, allocator, gc.total    mutator
 **
@@ -154,6 +157,7 @@ LJ_FUNC int lj_concgc_ringpush(ConcGCState *cs, GCobj *o);
 /* lj_gc.c -- marker consumer side and free-running burst. */
 LJ_FUNC int lj_gc_conc_burst(global_State *g);
 LJ_FUNC MSize lj_concgc_ringdrain(global_State *g, MSize max);
+LJ_FUNC MSize lj_concgc_draingrayagain(global_State *g);
 LJ_FUNC void lj_concgc_logfull(global_State *g, GCobj *o);
 
 /* Park the GC thread around realloc/free of buffers it may read. */

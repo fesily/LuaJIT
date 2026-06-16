@@ -938,6 +938,27 @@ MSize lj_concgc_ringdrain(global_State *g, MSize max)
   return n;
 }
 
+/* Marker-side grayagain steal: atomically take the entire grayagain chain
+** and process it. The mutator (JIT barrier / VM barrierback) pushes with
+** link-before-publish order (gclist = old; grayagain = tab) under x86-TSO,
+** so any node visible through the head pointer has a valid gclist link.
+** Called from the marker loop when ring+jobs are empty but the cycle is not
+** yet finished -- this drains dirty tables that the mutator's gc_onestep
+** has not had a chance to splice into the ring (e.g. during a long compute
+** window with no allocation / GC step). */
+MSize lj_concgc_draingrayagain(global_State *g)
+{
+  GCobj *ga = (GCobj *)lj_atomic_xchg64(&g->gc.grayagain.gcptr64, 0);
+  MSize n = 0;
+  while (ga != NULL) {
+    GCobj *next = gcref(ga->gch.gclist);
+    gc_conc_logmark(g, ga);
+    ga = next;
+    n++;
+  }
+  return n;
+}
+
 /* Ring full fallback: park the marker, drain inline, push the missed entry,
 ** resume. Rare; if it fires often, enlarge CONCGC_RING_SIZE. */
 void lj_concgc_logfull(global_State *g, GCobj *o)
@@ -976,8 +997,7 @@ static int gc_conc_drainlog(global_State *g)
   ** still pushes barrier-logged tables onto the grayagain chain via
   ** tab->gclist, bypassing the SPSC ring. Process those here too.
   */
-  ga = gcref(g->gc.grayagain);
-  setgcrefnull(g->gc.grayagain);
+  ga = (GCobj *)lj_atomic_xchg64(&g->gc.grayagain.gcptr64, 0);
   while (ga != NULL) {
     GCobj *next = gcref(ga->gch.gclist);
     if (!work) work = 1;
@@ -1135,26 +1155,21 @@ static size_t gc_onestep(lua_State *L)
       */
       ConcGCState *cs = concgcstate(g);
       uint32_t *fr = (uint32_t *)&cs->finishreq;
-      /* JIT-compiled barrierback (vm_x64.dasc) logs dirty tables by pushing
-      ** them onto g->gc.grayagain via tab->gclist -- it cannot cheaply do the
-      ** SPSC ring push inline. The marker only drains the ring, so without
-      ** this these tables accumulate for the whole cycle and are re-grayed +
-      ** re-traversed synchronously in the STW finish (the dominant pause
-      ** cost). Splice grayagain into the ring here so the marker processes
-      ** them in the background. Safe: the mutator exclusively owns grayagain
-      ** while executing this C step (the JIT barrier runs on the same thread,
-      ** never concurrently), and the marker never touches grayagain.
+      /* JIT-compiled barrierback (vm_x64.dasc / asm_tbar) logs dirty tables
+      ** by pushing them onto g->gc.grayagain via tab->gclist -- it cannot
+      ** cheaply do the SPSC ring push inline. Splice grayagain into the ring
+      ** here so the marker processes them while busy. The marker also steals
+      ** grayagain directly (lj_concgc_draingrayagain) when idle, covering
+      ** compute windows where the mutator runs no GC steps. Both paths use
+      ** atomic xchg on grayagain to avoid tearing.
       */
       {
-	GCobj *ga = gcref(g->gc.grayagain);
-	if (LJ_UNLIKELY(ga != NULL)) {
-	  setgcrefnull(g->gc.grayagain);
-	  do {
-	    GCobj *next = gcref(ga->gch.gclist);
-	    if (LJ_UNLIKELY(!lj_concgc_ringpush(cs, ga)))
-	      lj_concgc_logfull(g, ga);
-	    ga = next;
-	  } while (ga != NULL);
+	GCobj *ga = (GCobj *)lj_atomic_xchg64(&g->gc.grayagain.gcptr64, 0);
+	while (ga != NULL) {
+	  GCobj *next = gcref(ga->gch.gclist);
+	  if (LJ_UNLIKELY(!lj_concgc_ringpush(cs, ga)))
+	    lj_concgc_logfull(g, ga);
+	  ga = next;
 	}
       }
       /* Give the marker time to keep up: only request finish once the

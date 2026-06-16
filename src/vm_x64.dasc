@@ -388,20 +388,20 @@
 |  lock
 |  or byte tab->marked, LJ_GC_LOGGED
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
+|  mov tab->gclist, reg	// Link old head before publishing (TSO-safe for marker steal).
 |  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
-|  mov tab->gclist, reg
 |  jmp >9
 |8:
 |  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
-|  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |  mov tab->gclist, reg
+|  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |9:
 |.else
 |  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
-|  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |  mov tab->gclist, reg
+|  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |.endif
 |.endmacro
 |

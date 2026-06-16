@@ -111,11 +111,14 @@ static void *gcthread_main(void *arg)
     cs->parked = 0;
     pthread_mutex_unlock(&cs->lock);
     /* CONCGC_MARK: free-running drain+burst loop.
-    ** Yields when both ring and jobs are empty so a steady-state mutator
-    ** doesn't burn a core. Exits to the lock on parkreq (logfull /
-    ** pause_begin), or after both queues are empty AND finishreq is set
-    ** (cycle termination -- the mutator will observe markdone and run
-    ** the STW finish). */
+    ** Yields when ring, jobs, AND grayagain are all empty so a steady-state
+    ** mutator doesn't burn a core. Exits to the lock on parkreq (logfull /
+    ** pause_begin), or after all three sources are empty AND finishreq is
+    ** set (cycle termination -- the mutator will observe markdone and run
+    ** the STW finish, which drains any last-moment grayagain entries).
+    ** The grayagain steal is checked BEFORE finishreq: dirty tables pushed
+    ** during a compute window must be processed in the background to avoid
+    ** a whole-table rescan in the STW finish. */
 #if LUAJIT_GC_STAT
     {
       uint64_t _t0 = lj_gcstat_now_ns();
@@ -125,8 +128,11 @@ static void *gcthread_main(void *arg)
 	if (lj_concgc_ringdrain(g, CONCGC_BURST) > 0) did = 1;
 	if (lj_gc_conc_burst(g)) { did = 1; _bursts++; }
 	if (!did) {
+	  if (lj_concgc_draingrayagain(g) > 0) { did = 1; _bursts++; }
+	}
+	if (!did) {
 	  if (flag_load(&cs->finishreq))
-	    break;  /* Cycle complete: announce markdone under the lock. */
+	    break;  /* All three empty + finish requested: done. */
 	  sched_yield();  /* Idle; let the mutator make progress. */
 	}
       }
@@ -138,6 +144,9 @@ static void *gcthread_main(void *arg)
       int did = 0;
       if (lj_concgc_ringdrain(g, CONCGC_BURST) > 0) did = 1;
       if (lj_gc_conc_burst(g)) did = 1;
+      if (!did) {
+	if (lj_concgc_draingrayagain(g) > 0) did = 1;
+      }
       if (!did) {
 	if (flag_load(&cs->finishreq))
 	  break;
