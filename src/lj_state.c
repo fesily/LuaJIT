@@ -277,11 +277,20 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   L = &GG->L;
   g = &GG->g;
   L->gct = ~LJ_TTHREAD;
+#if LJ_HASGCMARK
+  L->marked = LJ_GC_WHITE1 | LJ_GC_GRAY | LJ_GC_FIXED | LJ_GC_SFIXED;
+#else
   L->marked = LJ_GC_WHITE0 | LJ_GC_FIXED | LJ_GC_SFIXED;  /* Prevent free. */
+#endif
   L->dummy_ffid = FF_C;
   setmref(L->glref, g);
+#if LJ_HASGCMARK
+  g->gc.currentwhite = LJ_GC_WHITE1 | LJ_GC_FIXED;
+  g->strempty.marked = LJ_GC_WHITE1 | LJ_GC_GRAY | LJ_GC_FIXED | LJ_GC_SFIXED;
+#else
   g->gc.currentwhite = LJ_GC_WHITE0 | LJ_GC_FIXED;
   g->strempty.marked = LJ_GC_WHITE0;
+#endif
   g->strempty.gct = ~LJ_TSTR;
   g->allocf = allocf;
   g->allocd = allocd;
@@ -374,7 +383,12 @@ lua_State *lj_state_new(lua_State *L)
   setmrefr(L1->glref, L->glref);
   setgcrefr(L1->env, L->env);
   stack_init(L1, L);  /* init stack */
+#if LJ_HASGCMARK
+  lj_assertL(iswhite(obj2gco(L1)) || isgray(obj2gco(L1)),
+	     "new thread object is not white or gray");
+#else
   lj_assertL(iswhite(obj2gco(L1)), "new thread object is not white");
+#endif
   return L1;
 }
 

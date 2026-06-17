@@ -13,6 +13,7 @@
 
 #include "lj_obj.h"
 #include "lj_arena.h"
+#include "lj_err.h"
 
 #include <string.h>
 
@@ -451,6 +452,9 @@ static void arena_destroy(global_State *g, GCArena *a)
   MSize i = a->id;
   if (fl != NULL)
     g->allocf(g->allocd, fl, sizeof(ArenaFreeList), 0);
+#if LJ_HASGCMARK
+  lj_arena_gray_free(g, a);
+#endif
   vec[i] = vec[--g->gc.arenastop];  /* Swap-remove from the registry. */
   vec[i]->id = i;
   c->freemap |= 1u << slot;
@@ -562,6 +566,14 @@ void lj_arena_freeall(global_State *g)
   g->gc.arenassz = 0;
   setmref(g->gc.arena, NULL);
   setmref(g->gc.travarena, NULL);
+#if LJ_HASGCMARK
+  if (mref(g->gc.grayastack, MSize) != NULL)
+    g->allocf(g->allocd, mref(g->gc.grayastack, MSize),
+	      g->gc.grayasz*sizeof(MSize), 0);
+  setmref(g->gc.grayastack, NULL);
+  g->gc.grayastop = 0;
+  g->gc.grayasz = 0;
+#endif
   while ((c = mref(g->gc.chunks, ArenaChunk)) != NULL) {
     setmref(g->gc.chunks, c->next);
     arena_os_release(c->base, ARENA_CHUNK_SIZE);
@@ -609,6 +621,49 @@ void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud)
       dead &= dead - 1;
       cb((void *)o, (int)o->gch.gct, ud);
     }
+  }
+}
+
+/* -- Per-arena gray stack ------------------------------------------------- */
+
+/* Grow (or initially allocate) the per-arena gray stack. */
+GCCellID1 *lj_arena_gray_grow(global_State *g, GCArena *a)
+{
+  GCCellID1 *base = mref(a->greybase, GCCellID1);
+  GCCellID1 *top = mref(a->greytop, GCCellID1);
+  size_t oldcap, newcap;
+  GCCellID1 *buf;
+  if (base == NULL) {
+    newcap = ArenaGrayInitSize;
+    buf = (GCCellID1 *)g->allocf(g->allocd, NULL, 0, newcap * sizeof(GCCellID1));
+    if (LJ_UNLIKELY(buf == NULL)) lj_err_mem(mainthread(g));
+    setmref(a->greybase, buf);
+    setmref(a->greytop, buf);
+    setmref(a->greyend, buf + newcap);
+    return buf;
+  }
+  oldcap = (size_t)(mref(a->greyend, GCCellID1) - base);
+  newcap = oldcap * 2;
+  buf = (GCCellID1 *)g->allocf(g->allocd, base,
+				oldcap * sizeof(GCCellID1),
+				newcap * sizeof(GCCellID1));
+  if (LJ_UNLIKELY(buf == NULL)) lj_err_mem(mainthread(g));
+  setmref(a->greybase, buf);
+  setmref(a->greytop, buf + (size_t)(top - base));
+  setmref(a->greyend, buf + newcap);
+  return buf + (size_t)(top - base);
+}
+
+/* Free the per-arena gray stack buffer. */
+void lj_arena_gray_free(global_State *g, GCArena *a)
+{
+  GCCellID1 *base = mref(a->greybase, GCCellID1);
+  if (base != NULL) {
+    size_t cap = (size_t)(mref(a->greyend, GCCellID1) - base);
+    g->allocf(g->allocd, base, cap * sizeof(GCCellID1), 0);
+    setmref(a->greybase, NULL);
+    setmref(a->greytop, NULL);
+    setmref(a->greyend, NULL);
   }
 }
 

@@ -42,7 +42,7 @@
 #define white2gray(x) \
   ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_WHITES) | LJ_GC_GRAY)
 #define gray2black(x) \
-  ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_GRAY) | LJ_GC_BLACK)
+  ((x)->gch.marked &= (uint8_t)~LJ_GC_GRAY)
 #else
 #define white2gray(x)		((x)->gch.marked &= (uint8_t)~LJ_GC_WHITES)
 #define gray2black(x)		((x)->gch.marked |= LJ_GC_BLACK)
@@ -52,43 +52,80 @@
 /* -- Mark phase ---------------------------------------------------------- */
 
 #if LJ_HASGCMARK
-/* GG_State objects (mainthread, strempty) live in dlmalloc, not arenas. */
+/* Mainthread and strempty live in dlmalloc, not arenas.
+** Huge GC objects (>= ArenaHugeThreshold) are arena-aligned allocations
+** without arena metadata — caught by lj_arena_ishuge. */
 #define gc_inarena(g, o)  \
   (!lj_arena_ishuge(o) && \
    (o) != obj2gco(mainthread(g)) && (o) != obj2gco(&(g)->strempty))
+/* Fast in-arena check for gc_mark hot path. Avoids two pointer comparisons
+** by using SFIXED bit: only mainthread and strempty have it (both set in
+** lj_state.c init + atomic). Huge blocks need the address-based check. */
+#define gc_mark_inarena(o) \
+  (!lj_arena_ishuge(o) && !((o)->gch.marked & LJ_GC_SFIXED))
 #endif
 
 /* Mark a TValue (if needed). */
+#if LJ_HASGCMARK
+/* Under single-white + bitmap, makewhite during sweep produces objects with
+** gray=1,whites=0 (curwhite=0 after flip). These must be re-marked next cycle.
+** Check both white and gray; compiler optimizes to: test byte marked, 0x03. */
 #define gc_marktv(g, tv) \
-  { lj_assertG(!tvisgcv(tv) || (~itype(tv) == gcval(tv)->gch.gct), \
-	       "TValue and GC type mismatch"); \
-    if (tviswhite(tv)) gc_mark(g, gcV(tv)); }
+  { if (tvisgcv(tv) && (iswhite(gcV(tv)) || isgray(gcV(tv)))) gc_mark(g, gcV(tv)); }
+#else
+#define gc_marktv(g, tv) \
+  { if (tviswhite(tv)) gc_mark(g, gcV(tv)); }
+#endif
 
 /* Mark a GCobj (if needed). */
+
+#if LJ_HASGCMARK
+#define gc_markobj(g, o) \
+  { if (iswhite(obj2gco(o)) || isgray(obj2gco(o))) gc_mark(g, obj2gco(o)); }
+#else
 #define gc_markobj(g, o) \
   { if (iswhite(obj2gco(o))) gc_mark(g, obj2gco(o)); }
+#endif
 
 /* Mark a string object. */
 #if LJ_HASGCMARK
 #define gc_mark_str(g, s) do { \
-  (s)->marked &= (uint8_t)~LJ_GC_WHITES; \
   if (gc_inarena(g, obj2gco(s))) \
     arena_obj_setmark(ptr2arena(s), ptr2cell(s)); \
+  else { \
+    (s)->marked &= (uint8_t)~LJ_GC_WHITES; \
+    (s)->marked |= LJ_GC_BLACK; \
+  } \
   } while (0)
 #else
 #define gc_mark_str(g, s)	((s)->marked &= (uint8_t)~LJ_GC_WHITES)
 #endif
 
-/* Mark a white GCobj. */
+/* Mark a GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
 {
   int gct = o->gch.gct;
-  lj_assertG(iswhite(o), "mark of non-white object");
-  lj_assertG(!isdead(g, o), "mark of dead object");
+#if LJ_HASGCMARK
+  int inarena = gc_mark_inarena(o);
+  GCArena *a;
+  GCCellID c;
+  if (inarena) {
+    a = ptr2arena(o);
+    c = ptr2cell(o);
+    if (arena_obj_ismarked(a, c))
+      return;
+  } else if (!iswhite(o)) {
+    if (o->gch.marked & LJ_GC_BLACK)
+      return;
+  }
+#endif
+  lj_assertG(iswhite(o) || isgray(o), "mark of non-white/gray object");
   white2gray(o);
 #if LJ_HASGCMARK
-  if (gc_inarena(g, o))
-    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+  if (inarena)
+    arena_obj_setmark(a, c);
+  else
+    o->gch.marked |= LJ_GC_BLACK;
 #endif
   if (LJ_UNLIKELY(gct == ~LJ_TUDATA)) {
     GCtab *mt = tabref(gco2ud(o)->metatable);
@@ -117,9 +154,14 @@ static void gc_mark(global_State *g, GCobj *o)
     lj_assertG(o->gch.marked & LJ_GC_GRAY,
       "gc_mark push without gray bit: gct=%d marked=0x%02x",
       o->gch.gct, o->gch.marked);
+    if (inarena) {
+      arena_gray_push(g, a, (GCCellID1)c);
+    } else
 #endif
-    setgcrefr(o->gch.gclist, g->gc.gray);
-    setgcref(g->gc.gray, o);
+    {
+      setgcrefr(o->gch.gclist, g->gc.gray);
+      setgcref(g->gc.gray, o);
+    }
   }
 }
 
@@ -139,8 +181,20 @@ static void gc_mark_start(global_State *g)
   setgcrefnull(g->gc.grayagain);
   setgcrefnull(g->gc.weak);
 #if LJ_HASGCMARK
+  /* Restore currentwhite for the new cycle. After sweep, currentwhite had
+  ** no WHITE1 bit (flipped at atomic). Restore it so curwhite()=WHITE1
+  ** and newwhite()=WHITE1|GRAY for newly allocated objects. */
+  g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
+  g->gc.grayastop = 0;
+  {
+    MSize i;
+    for (i = 0; i < g->gc.arenastop; i++) {
+      GCArena *a = mref(g->gc.arenas, GCArena *)[i];
+      if (mref(a->greybase, GCCellID1) != NULL)
+	arena_gray_reset(a);
+    }
+  }
   lj_arena_gc_markinit(g);
-  g->gc.gcmarkflags |= GCF_MARKALLOC;
 #endif
   gc_markobj(g, mainthread(g));
   gc_markobj(g, tabref(mainthread(g)->env));
@@ -286,11 +340,20 @@ static void gc_marktrace(global_State *g, TraceNo traceno)
   if (iswhite(o)) {
     white2gray(o);
 #if LJ_HASGCMARK
-    if (gc_inarena(g, o))
-      arena_obj_setmark(ptr2arena(o), ptr2cell(o));
-#endif
+    if (gc_inarena(g, o)) {
+      GCArena *a = ptr2arena(o);
+      GCCellID c = ptr2cell(o);
+      arena_obj_setmark(a, c);
+      arena_gray_push(g, a, (GCCellID1)c);
+    } else {
+      o->gch.marked |= LJ_GC_BLACK;
+      setgcrefr(o->gch.gclist, g->gc.gray);
+      setgcref(g->gc.gray, o);
+    }
+#else
     setgcrefr(o->gch.gclist, g->gc.gray);
     setgcref(g->gc.gray, o);
+#endif
   }
 }
 
@@ -353,28 +416,49 @@ static void gc_traverse_thread(global_State *g, lua_State *th)
   TValue *o, *top = th->top;
   for (o = tvref(th->stack)+1+LJ_FR2; o < top; o++)
     gc_marktv(g, o);
+#if LJ_HASGCMARK
+  /* Under single-white, always clear above top — not just at atomic.
+  ** With gc_marktv accepting gray objects, stale stack slots from
+  ** previous frames would otherwise keep dead objects alive. */
+  {
+    TValue *stend = tvref(th->stack) + th->stacksize;
+    for (; o < stend; o++)
+      setnilV(o);
+  }
+#else
   if (g->gc.state == GCSatomic) {
     top = tvref(th->stack) + th->stacksize;
     for (; o < top; o++)  /* Clear unmarked slots. */
       setnilV(o);
   }
+#endif
   gc_markobj(g, tabref(th->env));
   lj_state_shrinkstack(th, gc_traverse_frames(g, th));
 }
 
 /* Propagate one gray object. Traverse it and turn it black. */
-static size_t propagatemark(global_State *g)
+static size_t propagatemark(global_State *g
+#if LJ_HASGCMARK
+  , GCobj *o
+#endif
+)
 {
+#if !LJ_HASGCMARK
   GCobj *o = gcref(g->gc.gray);
+#endif
   int gct = o->gch.gct;
   lj_assertG(isgray(o), "propagation of non-gray object");
 #if LJ_HASGCMARK
   lj_assertG(o->gch.marked & LJ_GC_GRAY,
     "gray object missing gray bit: gct=%d marked=0x%02x ptr=%p state=%d",
     o->gch.gct, o->gch.marked, (void*)o, g->gc.state);
+  lj_assertG(!(o->gch.marked & LJ_GC_BLACK) || !gc_inarena(g, o),
+    "arena object has header BLACK bit: ptr=%p gct=%d marked=0x%02x",
+    (void*)o, o->gch.gct, o->gch.marked);
+#else
+  setgcrefr(g->gc.gray, o->gch.gclist);  /* Remove from gray list. */
 #endif
   gray2black(o);
-  setgcrefr(g->gc.gray, o->gch.gclist);  /* Remove from gray list. */
   if (LJ_LIKELY(gct == ~LJ_TTAB)) {
     GCtab *t = gco2tab(o);
     if (gc_traverse_tab(g, t) > 0)
@@ -410,12 +494,62 @@ static size_t propagatemark(global_State *g)
   }
 }
 
+#if LJ_HASGCMARK
+/* Find the next arena with a non-empty gray stack, starting from cursor. */
+static GCArena *gc_grayarena_pop(global_State *g)
+{
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  MSize *stack = mref(g->gc.grayastack, MSize);
+  while (g->gc.grayastop > 0) {
+    MSize idx = stack[g->gc.grayastop - 1];
+    GCArena *a = arenas[idx];
+    if ((a->flags & ArenaFlag_TravObjs) && !arena_gray_empty(a))
+      return a;
+    g->gc.grayastop--;  /* Stale entry — discard. */
+  }
+  return NULL;
+}
+
+/* Pop one gray object from an arena and propagate it. */
+static size_t gc_propagate_arena(global_State *g, GCArena *a)
+{
+  GCCellID1 cellid = arena_gray_pop(a);
+  GCobj *o = (GCobj *)arena_cellptr(a, cellid);
+  lj_assertG(isgray(o), "arena gray stack: non-gray object cellid=%u gct=%d marked=0x%02x",
+    (unsigned)cellid, o->gch.gct, o->gch.marked);
+  return propagatemark(g, o);
+}
+#endif
+
 /* Propagate all gray objects. */
 static size_t gc_propagate_gray(global_State *g)
 {
   size_t m = 0;
+#if LJ_HASGCMARK
+  /* Drain global gray list (non-arena objects). */
+  while (gcref(g->gc.gray) != NULL) {
+    GCobj *o = gcref(g->gc.gray);
+    setgcrefr(g->gc.gray, o->gch.gclist);
+    m += propagatemark(g, o);
+  }
+  /* Drain all arena gray stacks. */
+  {
+    GCArena *a;
+    while ((a = gc_grayarena_pop(g)) != NULL) {
+      while (!arena_gray_empty(a))
+	m += gc_propagate_arena(g, a);
+      /* Also drain any objects pushed to global gray during traversal. */
+      while (gcref(g->gc.gray) != NULL) {
+	GCobj *o = gcref(g->gc.gray);
+	setgcrefr(g->gc.gray, o->gch.gclist);
+	m += propagatemark(g, o);
+      }
+    }
+  }
+#else
   while (gcref(g->gc.gray) != NULL)
     m += propagatemark(g);
+#endif
   return m;
 }
 
@@ -479,7 +613,8 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
       makewhite(g, o);  /* Value is alive, change to the current white. */
       p = &o->gch.nextgc;
     } else {  /* Otherwise value is dead, free it. */
-      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED,
+      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED
+		 || (LJ_HASGCMARK && !iswhite(o)),
 		 "sweep of unlive object");
       setgcrefr(*p, o->gch.nextgc);
       if (o == gcref(g->gc.root))
@@ -521,14 +656,222 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
       makewhite(g, o);  /* String is alive, change to the current white. */
       p = &o->gch.nextgc;
     } else {  /* Otherwise string is dead, free it. */
-      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED,
-		 "sweep of unlive string");
+      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED
+		 || (LJ_HASGCMARK && !iswhite(o)),
+		 "sweep of unlive string: marked=0x%02x ow=0x%02x cw=0x%02x",
+		 o->gch.marked, ow, g->gc.currentwhite);
       setgcrefr(*p, o->gch.nextgc);
       lj_str_free(g, gco2str(o));
     }
   }
   setgcrefp(*chain, (gcrefu(q) | (u & 1)));
 }
+
+#if LJ_HASGCMARK
+/*
+** Bitmap-driven sweep: scan arena mark bitmaps to locate dead objects.
+** Replaces the linked-list gc_sweep for traversable arena objects.
+** String sweep (gc_sweepstr) is kept as-is since dead strings must be
+** unlinked from the hash-chain-based intern table.
+*/
+
+/* Sweep phase constants. */
+enum {
+  SweepPhase_Bitmap,	/* Scanning arena bitmaps, freeing dead objects. */
+  SweepPhase_Rebuild,	/* Rebuilding the root chain from surviving objects. */
+  SweepPhase_Done	/* Bitmap sweep complete. */
+};
+
+/*
+** Incremental bitmap sweep. Scans trav arenas for dead objects
+** (block=1, mark=0) and frees them. Returns a cost estimate.
+** The root chain becomes stale during this phase — it is rebuilt
+** after all arenas have been scanned (SweepPhase_Rebuild).
+*/
+static size_t gc_bitmap_sweep(global_State *g)
+{
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  MSize ai = g->gc.sweepa;
+  uint32_t w = g->gc.sweepw;
+  uint32_t freed = 0;
+
+  while (ai < g->gc.arenastop && freed < GCSWEEPMAX) {
+    GCArena *a = arenas[ai];
+    uint32_t wtop;
+    if (!(a->flags & ArenaFlag_TravObjs)) {
+      ai++;
+      w = UnusedBlockWords;
+      continue;
+    }
+    /* Flush free-list bins before scanning: binned free blocks keep the
+    ** allocated bitmap state (block=1, mark=0) for hot-path performance.
+    ** Without flushing, bitmap sweep would see them as dead objects.
+    ** Must flush on every entry (not just first) because the mutator may
+    ** allocate from bins between incremental steps, and freeing during
+    ** sweep itself pushes to bins. */
+    lj_arena_flushbins(a);
+    wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    while (w <= wtop && freed < GCSWEEPMAX) {
+      GCBlockword dead = a->block[w] & ~a->mark[w];
+      while (dead) {
+	uint32_t bitidx = lj_ffs(dead);
+	GCCellID c = (w << 5) + bitidx;
+	GCobj *o = (GCobj *)arena_cellptr(a, c);
+	dead &= dead - 1;
+	/* Skip open upvalues: they're on per-thread openupval chains,
+	** freed by lj_state_free (dead thread) or gc_fullsweep in rebuild. */
+	if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
+	  continue;
+	/* Strings are swept by gc_sweepstr (hash table phase); skip them. */
+	if (o->gch.gct == ~LJ_TSTR)
+	  continue;
+	/* Dead finalized cdata are not freed here: lj_cdata_free detects the
+	** LJ_GC_CDATA_FIN flag and links them onto the mmudata ring (marking
+	** them finalized + white) instead of releasing the cell. The cell
+	** stays allocated (block=1, mark=0) until gc_finalize runs the __gc
+	** callback and re-roots the object, exactly like the list sweep. */
+	/* Under HASGCMARK, gray-only objects (from sweep makewhite with
+	** curwhite=0) may not pass isdead() but are genuinely dead
+	** when the bitmap says block=1, mark=0. */
+	lj_assertG(isdead(g, o) || (o->gch.marked & LJ_GC_FIXED)
+		   || (LJ_HASGCMARK && !iswhite(o)),
+		   "bitmap sweep freeing non-dead object: o=%p gct=%d marked=0x%02x",
+		   (void*)o, o->gch.gct, o->gch.marked);
+	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+	freed++;
+      }
+      w++;
+    }
+    if (w > wtop) {
+      ai++;
+      w = UnusedBlockWords;
+    }
+  }
+
+  g->gc.sweepa = ai;
+  g->gc.sweepw = (uint16_t)w;
+  if (ai >= g->gc.arenastop)
+    g->gc.sweepphase = SweepPhase_Rebuild;
+  return freed;
+}
+
+/*
+** Rebuild the root chain and mainthread->nextgc (udata) chain from
+** arena block bitmaps after bitmap sweep. Also makewhite surviving
+** objects and sweep each thread's open upvalue list.
+*/
+static void gc_rebuild_rootchain(global_State *g)
+{
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  GCRef newroot;
+  GCRef *roottail = &newroot;
+  GCRef newud;
+  GCRef *udtail = &newud;
+  MSize i;
+
+  setgcrefnull(newroot);
+  setgcrefnull(newud);
+
+#if LJ_HASFFI
+  /* Sweep VLA cdata on their separate chain.  These live in non-trav arenas
+  ** where bitmap scanning can't read gct (GCcdataVar prefix).  The chain
+  ** is never corrupted by bitmap sweep since it's independent of gc.root.
+  ** Survivors stay on cdatavroot, never on gc.root. */
+  {
+    GCRef newcdatav;
+    GCRef *cdatavtail = &newcdatav;
+    GCobj *o = gcref(g->gc.cdatavroot);
+    setgcrefnull(newcdatav);
+    while (o != NULL) {
+      GCobj *next = gcnext(o);
+      if (iswhite(o)) {
+	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+      } else {
+	makewhite(g, o);
+	setgcref(*cdatavtail, o);
+	cdatavtail = &o->gch.nextgc;
+      }
+      o = next;
+    }
+    setgcrefnull(*cdatavtail);
+    setgcrefr(g->gc.cdatavroot, newcdatav);
+  }
+#endif
+
+  /* Clear mark bits for udata on the mmudata ring so the bitmap scan
+  ** below won't re-link them.  gc_finalize manages their lifecycle. */
+  if (gcref(g->gc.mmudata)) {
+    GCobj *root = gcref(g->gc.mmudata);
+    GCobj *u = root;
+    do {
+      u = gcnext(u);
+      if (!lj_arena_ishuge(u))
+	arena_obj_clearmark(ptr2arena(u), ptr2cell(u));
+    } while (u != root);
+  }
+
+  for (i = 0; i < g->gc.arenastop; i++) {
+    GCArena *a = arenas[i];
+    uint32_t w, wtop;
+    if (!(a->flags & ArenaFlag_TravObjs)) continue;
+    lj_arena_flushbins(a);
+    wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    for (w = UnusedBlockWords; w <= wtop; w++) {
+      GCBlockword alive = a->block[w] & a->mark[w];
+      while (alive) {
+	uint32_t bitidx = lj_ffs(alive);
+	GCCellID c = (w << 5) + bitidx;
+	GCobj *o = (GCobj *)arena_cellptr(a, c);
+	alive &= alive - 1;
+	if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
+	  continue;
+	if (o->gch.gct == ~LJ_TSTR)
+	  continue;
+	makewhite(g, o);
+	if (o->gch.gct == ~LJ_TUDATA) {
+	  setgcref(*udtail, o);
+	  udtail = &o->gch.nextgc;
+	} else {
+	  if (o->gch.gct == ~LJ_TTHREAD)
+	    gc_fullsweep(g, &gco2th(o)->openupval);
+	  setgcref(*roottail, o);
+	  roottail = &o->gch.nextgc;
+	}
+      }
+    }
+  }
+
+  /* Terminate the udata sub-chain with NULL. mainthread->nextgc points
+  ** to the udata-only sub-chain, which lj_gc_separateudata walks. */
+  setgcrefnull(*udtail);
+  setgcrefr(mainthread(g)->nextgc, newud);
+
+  /* Root chain: arena objects → mainthread → udata chain → NULL.
+  ** mainthread is NOT in any arena (dlmalloc), so we append it manually.
+  ** Sweep mainthread's openupvals BEFORE clearing marks (second pass). */
+  makewhite(g, obj2gco(mainthread(g)));
+  gc_fullsweep(g, &mainthread(g)->openupval);
+  if (gcref(newroot)) {
+    setgcref(g->gc.root, gcref(newroot));
+    /* Append mainthread at the end of the arena object chain. */
+    setgcref(*roottail, obj2gco(mainthread(g)));
+  } else {
+    setgcref(g->gc.root, obj2gco(mainthread(g)));
+  }
+
+  /* Second pass: clear mark bits on all arenas now that openupval sweeps
+  ** are done and no longer need to read them. */
+  for (i = 0; i < g->gc.arenastop; i++) {
+    GCArena *a = arenas[i];
+    uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    for (w = UnusedBlockWords; w <= wtop; w++)
+      a->mark[w] &= ~a->block[w];
+  }
+
+  g->gc.sweepphase = SweepPhase_Done;
+
+}
+#endif
 
 /* Check whether we can clear a key or a value slot from a table. */
 static int gc_mayclear(global_State *g, cTValue *o, int val)
@@ -686,6 +1029,9 @@ void lj_gc_freeall(global_State *g)
   /* Free everything, except super-fixed objects (the main thread). */
   g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_SFIXED;
   gc_fullsweep(g, &g->gc.root);
+#if LJ_HASGCMARK && LJ_HASFFI
+  gc_fullsweep(g, &g->gc.cdatavroot);
+#endif
   for (i = g->str.mask; i != ~(MSize)0; i--)  /* Free all string hash chains. */
     gc_sweepstr(g, &g->str.tab[i]);
 }
@@ -700,16 +1046,53 @@ static void atomic(global_State *g, lua_State *L)
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
+#if LJ_HASGCMARK
+  /* Redirect weak tables to arena gray stacks. */
+  {
+    GCobj *o = gcref(g->gc.weak);
+    setgcrefnull(g->gc.weak);
+    while (o != NULL) {
+      GCobj *next = gcref(o->gch.gclist);
+      if (gc_inarena(g, o)) {
+	arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
+      } else {
+	setgcrefr(o->gch.gclist, g->gc.gray);
+	setgcref(g->gc.gray, o);
+      }
+      o = next;
+    }
+  }
+#else
   setgcrefr(g->gc.gray, g->gc.weak);  /* Empty the list of weak tables. */
   setgcrefnull(g->gc.weak);
+#endif
   lj_assertG(!iswhite(obj2gco(mainthread(g))), "main thread turned white");
   gc_markobj(g, L);  /* Mark running thread. */
   gc_traverse_curtrace(g);  /* Traverse current trace. */
   gc_mark_gcroot(g);  /* Mark GC roots (again). */
   gc_propagate_gray(g);  /* Propagate all of the above. */
 
+#if LJ_HASGCMARK
+  /* Drain grayagain: redirect arena objects to arena gray stacks,
+  ** non-arena objects to the global gray list. */
+  {
+    GCobj *o = gcref(g->gc.grayagain);
+    setgcrefnull(g->gc.grayagain);
+    while (o != NULL) {
+      GCobj *next = gcref(o->gch.gclist);
+      if (gc_inarena(g, o)) {
+	arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
+      } else {
+	setgcrefr(o->gch.gclist, g->gc.gray);
+	setgcref(g->gc.gray, o);
+      }
+      o = next;
+    }
+  }
+#else
   setgcrefr(g->gc.gray, g->gc.grayagain);  /* Empty the 2nd chance list. */
   setgcrefnull(g->gc.grayagain);
+#endif
   gc_propagate_gray(g);  /* Propagate it. */
 
   udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
@@ -722,12 +1105,23 @@ static void atomic(global_State *g, lua_State *L)
   lj_buf_shrink(L, &g->tmpbuf);  /* Shrink temp buffer. */
 
   /* Prepare for sweep phase. */
+#if LJ_HASGCMARK
+  /* Flip current white. With single WHITE1, this toggles WHITE1 bit off,
+  ** so curwhite()=0 during sweep: makewhite sets GRAY only (no WHITE).
+  ** otherwhite() has WHITE1, so isdead correctly detects dead objects. */
+  g->gc.currentwhite = (uint8_t)otherwhite(g);
+  g->strempty.marked = curwhite(g) | LJ_GC_GRAY | LJ_GC_FIXED | LJ_GC_SFIXED;
+#else
   g->gc.currentwhite = (uint8_t)otherwhite(g);  /* Flip current white. */
   g->strempty.marked = g->gc.currentwhite;
+#endif
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
 #if LJ_HASGCMARK
-  g->gc.gcmarkflags |= GCF_BITMAPSWEEP;
+  g->gc.gcmarkflags |= GCF_BITMAPSWEEP | GCF_MARKALLOC;
+  g->gc.sweepa = 0;
+  g->gc.sweepw = UnusedBlockWords;
+  g->gc.sweepphase = SweepPhase_Bitmap;
 #endif
 }
 
@@ -740,8 +1134,21 @@ static size_t gc_onestep(lua_State *L)
     gc_mark_start(g);  /* Start a new GC cycle by marking all GC roots. */
     return 0;
   case GCSpropagate:
+#if LJ_HASGCMARK
+    if (gcref(g->gc.gray) != NULL) {
+      GCobj *o = gcref(g->gc.gray);
+      setgcrefr(g->gc.gray, o->gch.gclist);
+      return propagatemark(g, o);
+    }
+    {
+      GCArena *a = gc_grayarena_pop(g);
+      if (a != NULL)
+	return gc_propagate_arena(g, a);
+    }
+#else
     if (gcref(g->gc.gray) != NULL)
       return propagatemark(g);  /* Propagate one gray object. */
+#endif
     g->gc.state = GCSatomic;  /* End of mark phase. */
     return 0;
   case GCSatomic:
@@ -762,12 +1169,46 @@ static size_t gc_onestep(lua_State *L)
     }
   case GCSsweep: {
     GCSize old = g->gc.total;
+#if LJ_HASGCMARK
+    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP) {
+      if (g->gc.sweepphase == SweepPhase_Bitmap) {
+	gc_bitmap_sweep(g);
+      }
+      if (g->gc.sweepphase == SweepPhase_Rebuild) {
+	/* Restore currentwhite before rebuild so makewhite includes WHITE1.
+	** Without this, makewhite sets GRAY-only (curwhite=0 during sweep),
+	** and gc_marktv must accept gray-only objects — which then re-marks
+	** stale stack references that should be invisible to the next cycle. */
+	g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
+	gc_rebuild_rootchain(g);
+      }
+      lj_assertG(old >= g->gc.total, "sweep increased memory");
+      g->gc.estimate -= old - g->gc.total;
+      if (g->gc.sweepphase == SweepPhase_Done) {
+	g->gc.gcmarkflags = 0;
+	if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
+	  lj_str_resize(L, g->str.mask >> 1);
+	lj_arena_shrink(g);
+	if (gcref(g->gc.mmudata)) {
+	  g->gc.state = GCSfinalize;
+	} else {
+	  g->gc.state = GCSpause;
+	  g->gc.debt = 0;
+	}
+      }
+      return GCSWEEPMAX*GCSWEEPCOST;
+    }
+#endif
     setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
 #if LJ_HASGCMARK
       g->gc.gcmarkflags = 0;
+      g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
+#if LJ_HASFFI
+      gc_fullsweep(g, &g->gc.cdatavroot);
+#endif
 #endif
       if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	lj_str_resize(L, g->str.mask >> 1);  /* Shrink string table. */
@@ -887,8 +1328,13 @@ static void gc_arena_verify(global_State *g)
   ** them per-thread the same way). mainthread/strempty are not in any
   ** arena (dlmalloc) and are skipped by arena_obj_shadowmark. */
   for (o = gcref(g->gc.root); o != NULL; o = gcnext(o)) {
-    if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g)))
+    if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g))) {
       arena_obj_shadowmark(o);
+#if LJ_HASFFI
+      if (o->gch.gct == ~LJ_TCDATA && cdataisv(gco2cd(o)))
+	arena_obj_shadowmark(memcdatav(gco2cd(o)));
+#endif
+    }
     if (o->gch.gct == ~LJ_TTHREAD) {  /* Walk the thread's open upvalues. */
       GCobj *uv;
       for (uv = gcref(gco2th(o)->openupval); uv != NULL; uv = gcnext(uv))
@@ -896,6 +1342,15 @@ static void gc_arena_verify(global_State *g)
 	  arena_obj_shadowmark(uv);
     }
   }
+#if LJ_HASFFI
+  for (o = gcref(g->gc.cdatavroot); o != NULL; o = gcnext(o)) {
+    if (!lj_arena_ishuge(o)) {
+      arena_obj_shadowmark(o);
+      if (cdataisv(gco2cd(o)))
+	arena_obj_shadowmark(memcdatav(gco2cd(o)));
+    }
+  }
+#endif
   for (i = 0; i <= g->str.mask; i++) {
     GCRef r = g->str.tab[i];
     /* Chain head low bit is the hashalg flag; mask it off. */
@@ -924,14 +1379,60 @@ void lj_gc_fullgc(lua_State *L)
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
-    setmref(g->gc.sweep, &g->gc.root);  /* Sweep everything (preserving it). */
     setgcrefnull(g->gc.gray);  /* Reset lists from partial propagation. */
     setgcrefnull(g->gc.grayagain);
     setgcrefnull(g->gc.weak);
+#if LJ_HASGCMARK
+    /* Under single-white, the header-based sweep predicate can't reliably
+    ** distinguish alive-white from dead-white, so the preserving catch-up
+    ** sweep doesn't work.  Walk the root chain directly and makewhite every
+    ** object so the next full mark cycle can re-discover them all.
+    ** No objects are freed — the partial mark phase hasn't reached sweep. */
+    {
+      GCRef *p = &g->gc.root;
+      GCobj *o;
+      g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
+      while ((o = gcref(*p)) != NULL) {
+        makewhite(g, o);
+        p = &o->gch.nextgc;
+      }
+      /* Also makewhite strings in the intern table. */
+      {
+        MSize i;
+        for (i = 0; i <= g->str.mask; i++) {
+          GCRef *sp = &g->str.tab[i];
+          while ((o = gcref(*sp)) != NULL) {
+            makewhite(g, o);
+            sp = &o->gch.nextgc;
+          }
+        }
+      }
+#if LJ_HASFFI
+      /* Also makewhite VLA cdata on their separate chain. */
+      {
+        GCRef *cp = &g->gc.cdatavroot;
+        while ((o = gcref(*cp)) != NULL) {
+          makewhite(g, o);
+          cp = &o->gch.nextgc;
+        }
+      }
+#endif
+    }
+    g->gc.gcmarkflags = 0;
+    g->gc.grayastop = 0;
+    {
+      MSize ii;
+      for (ii = 0; ii < g->gc.arenastop; ii++) {
+	GCArena *aa = mref(g->gc.arenas, GCArena *)[ii];
+	if (mref(aa->greybase, GCCellID1) != NULL)
+	  arena_gray_reset(aa);
+      }
+    }
+    g->gc.state = GCSpause;
+#else
+    setmref(g->gc.sweep, &g->gc.root);  /* Sweep everything (preserving it). */
     g->gc.state = GCSsweepstring;  /* Fast forward to the sweep phase. */
     g->gc.sweepstr = 0;
-#if LJ_HASGCMARK
-    g->gc.gcmarkflags = 0;  /* Use header predicate; preserves all. */
 #endif
   }
   while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
@@ -950,11 +1451,39 @@ void lj_gc_fullgc(lua_State *L)
 
 /* -- Write barriers ------------------------------------------------------ */
 
+#if LJ_HASGCMARK
+/* Push an arena object onto its arena's gray stack (barrier back path). */
+void lj_gc_barrierback_arena(global_State *g, GCobj *o)
+{
+  arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
+}
+
+/* Notify that an arena's gray stack became non-empty. */
+void lj_gc_grayarena_notify(global_State *g, MSize idx)
+{
+  MSize *stack = mref(g->gc.grayastack, MSize);
+  if (g->gc.grayastop >= g->gc.grayasz) {
+    MSize oldsz = g->gc.grayasz;
+    MSize newsz = oldsz ? oldsz * 2 : 16;
+    stack = (MSize *)g->allocf(g->allocd, stack,
+	      oldsz * sizeof(MSize), newsz * sizeof(MSize));
+    setmref(g->gc.grayastack, stack);
+    g->gc.grayasz = newsz;
+  }
+  stack[g->gc.grayastop++] = idx;
+}
+#endif
+
 /* Move the GC propagation frontier forward. */
 void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 {
+#if LJ_HASGCMARK
+  lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !isdead(g, o),
+	     "bad object states for forward barrier");
+#else
   lj_assertG(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o),
 	     "bad object states for forward barrier");
+#endif
   lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
 	     "bad GC state");
   lj_assertG(o->gch.gct != ~LJ_TTAB, "barrier object is not a table");
@@ -973,7 +1502,12 @@ void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_mark(g, gcV(tv));
   else
-    TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~(LJ_GC_COLORS|LJ_GC_GRAY)) | curwhite(g);
+#if LJ_HASGCMARK
+    TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~(LJ_GC_COLORS|LJ_GC_GRAY))
+		     | curwhite(g) | LJ_GC_GRAY;
+#else
+    TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~LJ_GC_COLORS) | curwhite(g);
+#endif
 #undef TV2MARKED
 }
 
@@ -987,7 +1521,11 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
   uv->closed = 1;
   setgcrefr(o->gch.nextgc, g->gc.root);
   setgcref(g->gc.root, o);
+#if LJ_HASGCMARK
+  if ((o->gch.marked & LJ_GC_GRAY) && !iswhite(o)) {
+#else
   if (isgray(o)) {  /* A closed upvalue is never gray, so fix this. */
+#endif
     if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
       gray2black(o);  /* Make it black and preserve invariant. */
       if (tviswhite(&uv->tv))
@@ -1073,9 +1611,16 @@ void *lj_mem_newgco_slow(lua_State *L, GCSize size, int trav, int link)
   }
 #endif
   if (link) {
-    setgcrefr(o->gch.nextgc, g->gc.root);
-    setgcref(g->gc.root, o);
-    newwhite(g, o);
+#if LJ_HASGCMARK
+    if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_BITMAPSWEEP)) {
+      newwhite(g, o);
+    } else
+#endif
+    {
+      setgcrefr(o->gch.nextgc, g->gc.root);
+      setgcref(g->gc.root, o);
+      newwhite(g, o);
+    }
   }
   return o;
 }

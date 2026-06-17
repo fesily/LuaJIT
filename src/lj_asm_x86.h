@@ -1939,12 +1939,16 @@ static void asm_tbar(ASMState *as, IRIns *ir)
 #if LJ_HASGCMARK
   emit_i8(as, LJ_GC_GRAY);
   emit_rmro(as, XO_ARITHib, XOg_OR, tab, offsetof(GCtab, marked));
-#endif
+  emit_sjcc(as, CC_NZ, l_end);
+  emit_i8(as, LJ_GC_GRAY);
+  emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+#else
   emit_i8(as, ~LJ_GC_BLACK);
   emit_rmro(as, XO_ARITHib, XOg_AND, tab, offsetof(GCtab, marked));
   emit_sjcc(as, CC_Z, l_end);
   emit_i8(as, LJ_GC_BLACK);
   emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+#endif
 }
 
 static void asm_obar(ASMState *as, IRIns *ir)
@@ -1962,6 +1966,12 @@ static void asm_obar(ASMState *as, IRIns *ir)
   asm_gencall(as, ci, args);
   emit_loada(as, ra_releasetmp(as, ASMREF_TMP1), J2G(as->J));
   obj = IR(ir->op1)->r;
+#if LJ_HASGCMARK
+  emit_sjcc(as, CC_NZ, l_end);
+  emit_i8(as, LJ_GC_GRAY);
+  emit_rmro(as, XO_GROUP3b, XOg_TEST, obj,
+	    (int32_t)offsetof(GCupval, marked)-(int32_t)offsetof(GCupval, tv));
+#else
   emit_sjcc(as, CC_Z, l_end);
   emit_i8(as, LJ_GC_WHITES);
   if (irref_isk(ir->op2)) {
@@ -1975,6 +1985,7 @@ static void asm_obar(ASMState *as, IRIns *ir)
   emit_i8(as, LJ_GC_BLACK);
   emit_rmro(as, XO_GROUP3b, XOg_TEST, obj,
 	    (int32_t)offsetof(GCupval, marked)-(int32_t)offsetof(GCupval, tv));
+#endif
 }
 
 /* -- FP/int arithmetic and logic operations ------------------------------ */

@@ -19,6 +19,14 @@
 #error "build with -DLUAJIT_ENABLE_GCARENA"
 #endif
 
+/* Stub: the allocator's gray-stack grow path calls lj_err_mem on OOM. */
+void lj_err_mem(lua_State *L);
+void lj_err_mem(lua_State *L) {
+  (void)L;
+  fprintf(stderr, "FAIL: out of memory in gray stack grow\n");
+  exit(1);
+}
+
 /* Tracking lua_Alloc wrapper. */
 static size_t aux_bytes = 0;
 static void *test_alloc(void *ud, void *ptr, size_t osize, size_t nsize)

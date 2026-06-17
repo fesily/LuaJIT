@@ -22,9 +22,16 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   /* NOBARRIER: The GCudata is new (marked white). */
   setgcrefnull(ud->metatable);
   setgcref(ud->env, obj2gco(env));
-  /* Chain to userdata list (after main thread). */
-  setgcrefr(ud->nextgc, mainthread(g)->nextgc);
-  setgcref(mainthread(g)->nextgc, obj2gco(ud));
+  /* Chain to userdata list (after main thread).
+  ** During bitmap sweep the root/udata chains are stale — rebuild
+  ** reconstructs them, so skip linking here to avoid double-linking. */
+#if LJ_HASGCMARK
+  if (LJ_LIKELY(!(g->gc.gcmarkflags & GCF_BITMAPSWEEP)))
+#endif
+  {
+    setgcrefr(ud->nextgc, mainthread(g)->nextgc);
+    setgcref(mainthread(g)->nextgc, obj2gco(ud));
+  }
   return ud;
 }
 

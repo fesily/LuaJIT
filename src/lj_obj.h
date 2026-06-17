@@ -628,6 +628,18 @@ typedef struct GCState {
   MSize arenastop;	/* Number of arenas. */
   MSize hugenum;	/* Number of huge blocks. */
   GCSize hugemem;	/* Memory in huge blocks (rounded to arena size). */
+#if LJ_HASGCMARK
+  MSize sweepa;		/* Bitmap sweep: current arena index. */
+  uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */
+  uint8_t sweepphase;	/* 0=bitmap sweep, 1=rebuild chain, 2=done. */
+  uint8_t unused2;
+  MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
+  MSize grayastop;	/* Gray arena stack: number of entries. */
+  MSize grayasz;	/* Gray arena stack: allocated capacity. */
+#if LJ_HASFFI
+  GCRef cdatavroot;	/* Separate chain for VLA cdata (bitmap sweep). */
+#endif
+#endif
 #endif
 } GCState;
 
@@ -925,7 +937,11 @@ static LJ_AINLINE void checklivetv(lua_State *L, TValue *o, const char *msg)
 	       "mismatch of TValue type %d vs GC type %d",
 	       ~itype(o), gcval(o)->gch.gct);
     /* Copy of isdead check from lj_gc.h to avoid circular include. */
+#if LJ_HASGCMARK
+    lj_assertL(!(gcval(o)->gch.marked & (G(L)->gc.currentwhite ^ 2) & 2), msg);
+#else
     lj_assertL(!(gcval(o)->gch.marked & (G(L)->gc.currentwhite ^ 3) & 3), msg);
+#endif
   }
 #endif
 }

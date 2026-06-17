@@ -138,9 +138,10 @@ typedef union GCArena {
 	uint32_t freegen;	/* Incremented on every block free. */
 	MRef freelist;		/* ArenaFreeList *, lazily allocated. */
 	MRef chunk;		/* ArenaChunk this arena was carved from. */
-	/* Reserved for a future arena-aware GC. */
-	MRef greytop;
-	MRef greybase;
+	/* Per-arena gray stack for mark propagation (LJ_HASGCMARK). */
+	MRef greytop;		/* GCCellID1 *, next free slot. */
+	MRef greybase;		/* GCCellID1 *, buffer start. */
+	MRef greyend;		/* GCCellID1 *, buffer end (overflow check). */
       };
       GCBlockword mark[MaxBlockWord];
     };
@@ -220,7 +221,45 @@ static LJ_AINLINE void arena_obj_shadowmark(void *o)
 }
 #endif
 
-/* -- Bump allocation fast path ------------------------------------------- */
+#if LJ_HASGCMARK
+/* -- Per-arena gray stack ------------------------------------------------- */
+
+enum {
+  ArenaGrayInitSize = 256	/* Initial gray stack capacity (entries). */
+};
+
+LJ_FUNC GCCellID1 *lj_arena_gray_grow(global_State *g, GCArena *a);
+LJ_FUNC void lj_gc_grayarena_notify(global_State *g, MSize idx);
+
+static LJ_AINLINE void arena_gray_reset(GCArena *a)
+{
+  setmref(a->greytop, mref(a->greybase, GCCellID1));
+}
+
+static LJ_AINLINE int arena_gray_empty(GCArena *a)
+{
+  return mref(a->greytop, GCCellID1) <= mref(a->greybase, GCCellID1);
+}
+
+static LJ_AINLINE void arena_gray_push(global_State *g, GCArena *a, GCCellID1 cellid)
+{
+  GCCellID1 *top = mref(a->greytop, GCCellID1);
+  if (LJ_UNLIKELY(top == NULL || top >= mref(a->greyend, GCCellID1)))
+    top = lj_arena_gray_grow(g, a);
+  *top = cellid;
+  setmref(a->greytop, top + 1);
+  if (LJ_UNLIKELY(top == mref(a->greybase, GCCellID1)))
+    lj_gc_grayarena_notify(g, (MSize)a->id);
+}
+
+static LJ_AINLINE GCCellID1 arena_gray_pop(GCArena *a)
+{
+  GCCellID1 *top = mref(a->greytop, GCCellID1);
+  top--;
+  setmref(a->greytop, top);
+  return *top;
+}
+#endif
 
 static LJ_AINLINE void *arena_alloc(GCArena *a, size_t size)
 {
@@ -284,6 +323,7 @@ LJ_FUNC void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud);
 */
 LJ_FUNC void lj_arena_gcprepare(global_State *g);
 LJ_FUNC void lj_arena_gc_markinit(global_State *g);
+LJ_FUNC void lj_arena_gray_free(global_State *g, GCArena *a);
 #endif
 
 LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);

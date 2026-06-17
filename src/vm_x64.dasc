@@ -376,9 +376,10 @@
 |
 |// Move table write barrier back. Overwrites reg.
 |.macro barrierback, tab, reg
-|  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
 |.if LJ_HASGCMARK
-|  or byte tab->marked, LJ_GC_GRAY
+|  or byte tab->marked, LJ_GC_GRAY			// black2gray(tab)
+|.else
+|  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
 |.endif
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
 |  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
@@ -1287,8 +1288,13 @@ static void build_subroutines(BuildCtx *ctx)
   |  mov TAB:RB->metatable, TAB:RA
   |  mov PC, [BASE-8]
   |  mov [BASE-16], TAB:TMPR			// Return original table.
+  |.if LJ_HASGCMARK
+  |  test byte TAB:RB->marked, LJ_GC_GRAY	// !isgray(table)
+  |  jnz >1
+  |.else
   |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
   |  jz >1
+  |.endif
   |  // Possible write barrier. Table is black, but skip iswhite(mt) check.
   |  barrierback TAB:RB, RC
   |1:
@@ -3564,12 +3570,18 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov [RB], RA
     |  jz >1
     |  // Check barrier for closed upvalue.
+    |.if LJ_HASGCMARK
+    |  test byte [RB+TV2MARKOFS], LJ_GC_GRAY		// !isgray(uv)
+    |  jz >2
+    |.else
     |  test byte [RB+TV2MARKOFS], LJ_GC_BLACK		// isblack(uv)
     |  jnz >2
+    |.endif
     |1:
     |  ins_next
     |
     |2:  // Upvalue is black. Check if new value is collectable and white.
+    |.if not LJ_HASGCMARK
     |  mov RD, RA
     |  sar RD, 47
     |  sub RDd, LJ_TISGCV
@@ -3578,6 +3590,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cleartp GCOBJ:RA
     |  test byte GCOBJ:RA->gch.marked, LJ_GC_WHITES	// iswhite(v)
     |  jz <1
+    |.endif
     |  // Crossed a write barrier. Move the barrier forward.
     |.if not X64WIN
     |  mov CARG2, RB
@@ -3600,14 +3613,21 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov RD, UPVAL:RB->v
     |  settp STR:ITYPE, STR:RA, LJ_TSTR
     |  mov [RD], STR:ITYPE
+    |.if LJ_HASGCMARK
+    |  test byte UPVAL:RB->marked, LJ_GC_GRAY		// !isgray(uv)
+    |  jz >2
+    |.else
     |  test byte UPVAL:RB->marked, LJ_GC_BLACK		// isblack(uv)
     |  jnz >2
+    |.endif
     |1:
     |  ins_next
     |
     |2:  // Check if string is white and ensure upvalue is closed.
+    |.if not LJ_HASGCMARK
     |  test byte GCOBJ:RA->gch.marked, LJ_GC_WHITES	// iswhite(str)
     |  jz <1
+    |.endif
     |  cmp byte UPVAL:RB->closed, 0
     |  jz <1
     |  // Crossed a write barrier. Move the barrier forward.
@@ -3902,8 +3922,13 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp aword [RC], LJ_TNIL
     |  je >3				// Previous value is nil?
     |1:
+    |.if LJ_HASGCMARK
+    |  test byte TAB:RB->marked, LJ_GC_GRAY	// !isgray(table)
+    |  jz >7
+    |.else
     |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
     |  jnz >7
+    |.endif
     |2:  // Set array slot.
     |  mov RB, [BASE+RA*8]
     |  mov [RC], RB
@@ -3946,8 +3971,13 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp aword [TMPR], LJ_TNIL
     |  je >4				// Previous value is nil?
     |2:
+    |.if LJ_HASGCMARK
+    |  test byte TAB:RB->marked, LJ_GC_GRAY	// !isgray(table)
+    |  jz >7
+    |.else
     |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
     |  jnz >7
+    |.endif
     |3:  // Set node value.
     |  mov ITYPE, [BASE+RA*8]
     |  mov [TMPR], ITYPE
@@ -4003,8 +4033,13 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp aword [RC], LJ_TNIL
     |  je >3				// Previous value is nil?
     |1:
+    |.if LJ_HASGCMARK
+    |  test byte TAB:RB->marked, LJ_GC_GRAY	// !isgray(table)
+    |  jz >7
+    |.else
     |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
     |  jnz >7
+    |.endif
     |2:	 // Set array slot.
     |  mov ITYPE, [BASE+RA*8]
     |  mov [RC], ITYPE
@@ -4031,8 +4066,13 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |.else
     |  cvttsd2si RCd, qword [BASE+RC*8]
     |.endif
+    |.if LJ_HASGCMARK
+    |  test byte TAB:RB->marked, LJ_GC_GRAY	// !isgray(table)
+    |  jz >7
+    |.else
     |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
     |  jnz >7
+    |.endif
     |2:
     |  cmp RCd, TAB:RB->asize
     |  jae ->vmeta_tsetr
@@ -4056,8 +4096,13 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  lea RA, [BASE+RA*8]
     |  mov TAB:RB, [RA-8]		// Guaranteed to be a table.
     |  cleartp TAB:RB
+    |.if LJ_HASGCMARK
+    |  test byte TAB:RB->marked, LJ_GC_GRAY	// !isgray(table)
+    |  jz >7
+    |.else
     |  test byte TAB:RB->marked, LJ_GC_BLACK	// isblack(table)
     |  jnz >7
+    |.endif
     |2:
     |  mov RDd, MULTRES
     |  sub RDd, 1
