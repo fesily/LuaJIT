@@ -469,8 +469,19 @@ LJLIB_CF(gcinfo)
 LJLIB_CF(collectgarbage)
 {
   int opt = lj_lib_checkopt(L, 1, LUA_GCCOLLECT,  /* ORDER LUA_GC* */
-    "\4stop\7restart\7collect\5count\1\377\4step\10setpause\12setstepmul\1\377\11isrunning");
+    "\4stop\7restart\7collect\5count\1\377\4step\10setpause\12setstepmul\1\377\11isrunning"
+#if LJ_HASGCARENA
+    "\11checkheap"  /* opt 10: read-only arena heap consistency check. */
+#endif
+    );
   int32_t data = lj_lib_optint(L, 2, 0);
+#if LJ_HASGCARENA
+  if (opt == 10) {  /* checkheap: returns violation count (0 == healthy). */
+    setintV(L->top, lj_gc_checkheap(G(L)));
+    L->top++;
+    return 1;
+  }
+#endif
   if (opt == LUA_GCCOUNT) {
     setnumV(L->top, (lua_Number)G(L)->gc.total/1024.0);
   } else {

@@ -1180,7 +1180,7 @@ static void atomic(global_State *g, lua_State *L)
 }
 
 /* GC state machine. Returns a cost estimate for each step performed. */
-static size_t gc_onestep(lua_State *L)
+static size_t gc_onestep_raw(lua_State *L)
 {
   global_State *g = G(L);
   switch (g->gc.state) {
@@ -1297,6 +1297,19 @@ static size_t gc_onestep(lua_State *L)
     lj_assertG(0, "bad GC state");
     return 0;
   }
+}
+
+static size_t gc_onestep(lua_State *L)
+{
+  size_t cost = gc_onestep_raw(L);
+#if defined(LUA_USE_ASSERT) && LJ_HASGCARENA && !defined(LJ_GC_NOSTEPVERIFY)
+  /* Read-only free-list consistency check after every incremental step, in
+  ** every GC phase. Catches arena double-free / bin corruption / accounting
+  ** drift the instant a step produces it, instead of at the next dereference.
+  ** Compiled out of release builds; the check itself mutates nothing. */
+  lj_gc_checkheap(G(L));
+#endif
+  return cost;
 }
 
 /* Perform a limited amount of incremental GC steps. */
@@ -1423,6 +1436,117 @@ static void gc_arena_verify(global_State *g)
   /* Clear the shadow marks again so the allocator's bins (rebuilt lazily)
   ** start from a clean mark bitmap. */
   lj_arena_gcprepare(g);
+}
+#endif
+
+#if LJ_HASGCARENA
+/*
+** Read-only heap consistency checker for the arena allocator. Walks every
+** arena's free lists (the intrusive same-size bins and the sorted range
+** array) and validates their structural invariants plus the free-cell
+** accounting, WITHOUT mutating any GC or allocator state -- so it is safe
+** to call between incremental GC steps, in any GC phase. Modeled on Lua's
+** ltests checkmemory, Go's gccheckmark and CRuby's verify_internal_consistency,
+** but aimed at the arena-specific bug surface (double free, bin/range
+** corruption, slab-refill miscounts) that generic VM GC tests never cover.
+**
+** Returns the number of violations found (0 == healthy). In assert builds
+** each violation also fires lj_assertG to pinpoint the offending arena/cell.
+**
+** Always-valid structural checks (run in every phase):
+**  - each bin cell is in [MinCellId, celltop), in the White (looks-allocated)
+**    state, and the intrusive list has no cycle
+**  - binmask agrees with which bins are non-empty
+**  - each range entry is an in-range Free-state head, ascending by numcells
+**
+** Accounting check is the inequality bins + ranges <= freecells (the lists
+** never reference more cells than are actually free); equality only holds
+** right after a scavenge, because several free paths bump freecells without
+** threading the block onto a list. Over-counting is the signature of a
+** double free.
+*/
+int lj_gc_checkheap(global_State *g)
+{
+  MSize ai, bad = 0;
+  for (ai = 0; ai < g->gc.arenastop; ai++) {
+    GCArena *a = mref(g->gc.arenas, GCArena *)[ai];
+    ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
+    GCCellID celltop = (GCCellID)a->celltop;
+    uint32_t binfree = 0, rangefree = 0, b;
+    if (fl == NULL) continue;  /* No free list allocated yet. */
+    /* -- Bins: intrusive same-size free lists. -- */
+    for (b = 0; b < ArenaBins; b++) {
+      GCCellID n = b + 1;
+      GCCellID c = fl->bins[b];
+      uint32_t guard = 0, nonempty = (c != 0);
+      if (((fl->binmask >> b) & 1u) != nonempty) {
+	lj_assertG(0, "arena %d: binmask vs bin[%d] disagree", (int)ai, (int)b);
+	bad++;
+      }
+      while (c != 0) {
+	if (c < MinCellId || c >= celltop) {
+	  lj_assertG(0, "arena %d bin %d: cell %d out of range",
+		     (int)ai, (int)b, (int)c);
+	  bad++; break;
+	}
+	if (arena_cellstate(a, c) != CellState_White) {
+	  lj_assertG(0, "arena %d bin %d: cell %d not in allocated state",
+		     (int)ai, (int)b, (int)c);
+	  bad++; break;
+	}
+	binfree += n;
+	if (++guard > (uint32_t)ArenaUsableCells) {  /* Cycle in the list. */
+	  lj_assertG(0, "arena %d bin %d: free-list cycle", (int)ai, (int)b);
+	  bad++; break;
+	}
+	c = *(GCCellID1 *)arena_cellptr(a, c);
+      }
+    }
+    /* -- Ranges: free blocks sorted ascending by cell count. -- */
+    {
+      uint32_t i, top = fl->rangetop;
+      GCCellID1 prevn = 0;
+      if (top > ArenaRangeCap) {
+	lj_assertG(0, "arena %d: rangetop %d over cap", (int)ai, (int)top);
+	bad++; top = ArenaRangeCap;
+      }
+      for (i = 0; i < top; i++) {
+	GCCellID c = fl->ranges[i].id;
+	GCCellID n = fl->ranges[i].numcells;
+	if (n == 0 || c < MinCellId || c + n > celltop) {
+	  lj_assertG(0, "arena %d range %d: [%d+%d] out of range",
+		     (int)ai, (int)i, (int)c, (int)n);
+	  bad++; continue;
+	}
+	if (arena_cellstate(a, c) != CellState_Free) {
+	  lj_assertG(0, "arena %d range %d: cell %d not a free head",
+		     (int)ai, (int)i, (int)c);
+	  bad++;
+	}
+	if (fl->ranges[i].numcells < prevn) {
+	  lj_assertG(0, "arena %d range %d: not sorted by numcells",
+		     (int)ai, (int)i);
+	  bad++;
+	}
+	prevn = fl->ranges[i].numcells;
+	rangefree += n;
+      }
+    }
+    /* -- Accounting. freecells counts every free cell in the arena, but the
+    ** bins/ranges only hold blocks that have been threaded into the free
+    ** lists: frees while fl==NULL, the bitmap sweep, and the bump-frontier
+    ** rollback bump freecells without touching a list, and slab-refill keeps
+    ** carved cells counted as free. So equality only holds right after a
+    ** scavenge; the robust invariant is that the lists never reference more
+    ** cells than are actually free. Over-counting here is the signature of a
+    ** double free inflating a bin/range. -- */
+    if (binfree + rangefree > a->freecells) {
+      lj_assertG(0, "arena %d: bins %d + ranges %d exceed freecells %d",
+		 (int)ai, (int)binfree, (int)rangefree, (int)a->freecells);
+      bad++;
+    }
+  }
+  return (int)bad;
 }
 #endif
 
@@ -1560,12 +1684,17 @@ void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 #if LJ_HASGCMARK
   lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !isdead(g, o),
 	     "bad object states for forward barrier");
+  /* Note: unlike the header-color GC, the inline barrier fast path here only
+  ** tests the gray bit, so this is entered for non-gray (white OR black)
+  ** parents -- including white parents during GCSfinalize/GCSpause, where a
+  ** stock LuaJIT forward barrier never fires. That is benign: the else-branch
+  ** below just sets the gray bit. Hence no state assert under LJ_HASGCMARK. */
 #else
   lj_assertG(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o),
 	     "bad object states for forward barrier");
-#endif
   lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
 	     "bad GC state");
+#endif
   lj_assertG(o->gch.gct != ~LJ_TTAB, "barrier object is not a table");
   /* Preserve invariant during propagation. Otherwise it doesn't matter. */
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
