@@ -200,6 +200,15 @@ static TValue *cpluaopen(lua_State *L, lua_CFunction dummy, void *ud)
   fixstring(lj_err_str(L, LJ_ERR_ERRMEM));  /* Preallocate memory error msg. */
   fixstring(lj_err_str(L, LJ_ERR_ERRERR));  /* Preallocate err in err msg. */
   g->gc.threshold = 4*g->gc.total;
+#if LJ_HASGCMARK
+  {
+    MSize ssbsz = 1024;
+    GCobj **ssb = lj_mem_newvec(L, ssbsz, GCobj *);
+    setmref(g->gc.ssb, ssb);
+    setmref(g->gc.ssbtop, ssb);
+    setmref(g->gc.ssblim, ssb + ssbsz);
+  }
+#endif
 #if LJ_HASFFI
   lj_ctype_initfin(L);
 #endif
@@ -223,6 +232,9 @@ static void close_state(lua_State *L)
 #endif
   lj_str_freetab(g);
   lj_buf_free(g, &g->tmpbuf);
+#if LJ_HASGCMARK
+  lj_mem_freevec(g, mref(g->gc.ssb, GCobj *), 1024, GCobj *);
+#endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
 #if LJ_64
   if (mref(g->gc.lightudseg, uint32_t)) {

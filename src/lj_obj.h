@@ -610,6 +610,13 @@ typedef struct GCState {
   MRef sweep;		/* Sweep position in root list. */
   GCRef gray;		/* List of gray objects. */
   GCRef grayagain;	/* List of objects for atomic traversal. */
+#if LJ_HASGCMARK
+  MRef ssb;		/* GCobj **: SSB base. */
+  MRef ssbtop;		/* GCobj **: SSB write pointer. */
+  MRef ssblim;		/* GCobj **: SSB limit. */
+#else
+  MRef unused_ssb[3];
+#endif
   GCRef weak;		/* List of weak tables (to be cleared). */
   GCRef mmudata;	/* List of userdata (to be finalized). */
   GCSize debt;		/* Debt (how much GC is behind schedule). */

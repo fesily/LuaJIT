@@ -278,6 +278,7 @@ typedef enum {
   XO_MOVSXd =	XO_(63),
   XO_BSWAP =	XO_0f(c8),
   XO_CMOV =	XO_0f(40),
+  XO_BT =	XO_0f(a3),  /* bt r/m, r — test bit (CF=bit). Used by asm_tbar. */
 
   XO_MOVSD =	XO_f20f(10),
   XO_MOVSDto =	XO_f20f(11),

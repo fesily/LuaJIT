@@ -123,6 +123,30 @@
 
 最终形态下:flush bin 后 allocated 对象 (block,mark)=(1,0)=White,free 块=(0,1)。mark 阶段把存活对象 mark 位置 1 →(1,1)=Black。sweep 用图纸公式 `block'=block&mark`。gray 位放 `0x01`(white 腾出位)。
 
+#### Quad-color 状态转移有向图(已实现)
+
+```mermaid
+stateDiagram-v2
+    [*] --> light_gray : new (newwhite = curwhite|GRAY)
+
+    light_gray --> dark_gray : gc_mark push (white2gray + setmark)
+    white --> dark_gray : gc_mark push (white2gray + setmark)
+
+    dark_gray --> black : propagate pop (gray2black)
+
+    black --> white : sweep makewhite (清 GRAY+COLORS, 设 curwhite)
+    white --> [*] : sweep free (mark=0, dead)
+    light_gray --> [*] : sweep free (mark=0, dead)
+
+    white --> light_gray : barrier write (设 GRAY, mark=0 不 push SSB)
+    black --> dark_gray : barrier write (设 GRAY, mark=1 push SSB)
+```
+
+**关键设计点:**
+- **pure white**: sweep 后存活对象为纯 white(无 GRAY 位),区别于新分配的 light-gray。
+- **barrier 区分两种转移**: 检查 arena mark 位 — mark=1(black)则 push SSB(dark-gray); mark=0(white)只设 GRAY(light-gray),避免无效 SSB 占用。
+- **新分配 = light-gray**: `newwhite` 始终设 GRAY,barrier 不触发,GC 下轮 mark 时处理。
+
 ### 1.1' 颜色编码(本轮过渡形态,Step 1)
 
 本轮 white/black 仍在 header,arena mark 位图**不表颜色**(仍是分配器的 Free 判别),只有 gray 位是新的:
@@ -254,6 +278,35 @@ LuaJIT 是**单架构构建**:`make` 只编译当前 TARGET 的一份 dasc(x64�
 2. **性能**:mark/sweep 吞吐 vs 旧 tri-color GC(同 arena 分配器下);gray queue 缓存局部性收益量化;barrier 开销(JIT 退化 C 调用的代价)。
 3. **JIT inline barrier 优化**(可选,若 C 调用退化代价大):把 gray stack push 的 fast path inline 回 dasc/asm。
 
+#### Phase V 性能基线数据 (2026-06-18, inline barrier mark-check)
+
+测试环境: x64 Linux, `-DLUAJIT_ENABLE_GCARENA -DLUA_USE_ASSERT -g`, static build.
+
+**解释器 barrier 微基准** (隔离 barrier 开销, `-joff`, 2000 tables × 500 rounds):
+| 测试 | 基线 (tri-color) | Arena GC | 差异 |
+|------|-----------|-----------|------|
+| Barrier (C call) | 0.022s | 0.040s | +81% |
+| Barrier (inline bt) | 0.022s | 0.024s | **+4%** |
+
+**综合基准** (median, 含 GC step 交互, 方差较大):
+| 测试 | 基线 (tri-color) | Arena GC | 差异 |
+|------|-----------|-----------|------|
+| B1 mark 50K live tables | 0.431s | 0.529s | +23% |
+| B2 sweep 100K dead | 0.002s | 0.002s | **-27%** |
+| B3 deep chain 10K | 0.012s | 0.020s | +72% |
+| B4 alloc 1M tables | 0.041s | 0.048s | +18% |
+| B5 barrier 500K writes | 0.057s | 0.085s | +49% ← was +81% |
+| B6 string churn 500K | 0.040s | 0.041s | +2% |
+| B7 mixed 50% survival | 0.084s | 0.102s | +21% |
+| B8 weak table 100K | 0.000s | 0.000s | 0% |
+| B9 cdata 200K | 0.036s | 0.044s | +24% |
+| B10 incr step 10K | 0.008s | 0.011s | +37% |
+| B11 10 tables×10K keys | 0.881s | 0.604s | **-31%** |
+
+**已完成优化**: 解释器+JIT SSB barrier, SSB flush→per-arena gray stack, 二叉堆优先队列, gc_mark SFIXED fast path, IRCALLCOND_GCMARK 条件编译, pure white makewhite + barrier mark-check(区分 white→light-gray / black→dark-gray), **解释器 inline barrier**(用 `bt` 指令检查 arena mark bitmap,消除 C call 开销, B5 barrier 从 +81% 降至 +4%).
+**JIT barrier**: `asm_tbar` 仍走 C call `lj_gc_barrierback_arena`(JIT emit 层无 `bt` 指令支持,需新增 opcode 才能 inline; "skip if gray" 快速路径已保护热路径)。
+**待做**: gc_mark/traverse 批量预取, B3 深链标记开销, B1 mark 遍历开销, JIT inline barrier(需在 lj_target_x86.h 新增 XO_BT).
+
 ---
 
 ## 3. 风险登记
@@ -285,7 +338,7 @@ Phase 0 (原语+宏抽象) ──┬─→ Phase M (mark+barrier) ──→ Phas
 
 - **非 x64 架构的 dasc/asm 适配**(vm_x86/arm/arm64/ppc/mips* + lj_asm_arm64/arm/ppc/mips.h)。x64 验证清楚后照搬,属后续阶段。本轮非 x64 编译时新 GC 关闭、走原 tri-color(§1.5)。
 - 分代 minor/major 自动切换、对象 aging、跨代 barrier(下一独立阶段;位图公式已预留)。
-- SSB(sequential store buffer)——图纸的 barrier 优化,本阶段 barrier 先走简单 push,SSB 留作性能阶段。
+- ~~SSB(sequential store buffer)——图纸的 barrier 优化~~ → **已完成**,解释器+JIT 均已实现 SSB push,flush 在 atomic 前执行。
 - 与你之前 gen-gc 分支工作的合并(trace 必须 OLD 等问题属分代范畴)。
-- x64 JIT inline barrier 的极致优化(先 C 调用退化,跑通再说)。
+- ~~x64 JIT inline barrier 的极致优化~~ → **已完成**,asm_tbar 已 inline SSB push(callee-save 寄存器分配,overflow 走 C call)。
 - **sweep 的整字位图归还公式 + free 函数拆分**(§0.4):本阶段 sweep 逐对象调原 free 函数,只用位图定位。整字 `block'=block&mark` 归还公式留作后续性能优化,仅当 profiling 显示类别 3(proto/func/udata)的逐对象归还是瓶颈时才做。

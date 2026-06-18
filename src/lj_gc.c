@@ -67,11 +67,11 @@
 
 /* Mark a TValue (if needed). */
 #if LJ_HASGCMARK
-/* Under single-white + bitmap, makewhite during sweep produces objects with
-** gray=1,whites=0 (curwhite=0 after flip). These must be re-marked next cycle.
-** Check both white and gray; compiler optimizes to: test byte marked, 0x03. */
+/* Under quad-color, makewhite produces pure white (no GRAY, no WHITE1 when
+** curwhite=0 during sweep). gc_mark has its own arena_obj_ismarked / BLACK
+** early-return, so we call it unconditionally for GC values. */
 #define gc_marktv(g, tv) \
-  { if (tvisgcv(tv) && (iswhite(gcV(tv)) || isgray(gcV(tv)))) gc_mark(g, gcV(tv)); }
+  { if (tvisgcv(tv)) gc_mark(g, gcV(tv)); }
 #else
 #define gc_marktv(g, tv) \
   { if (tviswhite(tv)) gc_mark(g, gcV(tv)); }
@@ -80,8 +80,7 @@
 /* Mark a GCobj (if needed). */
 
 #if LJ_HASGCMARK
-#define gc_markobj(g, o) \
-  { if (iswhite(obj2gco(o)) || isgray(obj2gco(o))) gc_mark(g, obj2gco(o)); }
+#define gc_markobj(g, o)	gc_mark(g, obj2gco(o))
 #else
 #define gc_markobj(g, o) \
   { if (iswhite(obj2gco(o))) gc_mark(g, obj2gco(o)); }
@@ -119,7 +118,13 @@ static void gc_mark(global_State *g, GCobj *o)
       return;
   }
 #endif
+#if LJ_HASGCMARK
+  lj_assertG(inarena || iswhite(o) || isgray(o) ||
+	     !(o->gch.marked & (LJ_GC_WHITES|LJ_GC_BLACK|LJ_GC_GRAY)),
+	     "mark of already-black non-arena object");
+#else
   lj_assertG(iswhite(o) || isgray(o), "mark of non-white/gray object");
+#endif
   white2gray(o);
 #if LJ_HASGCMARK
   if (inarena)
@@ -186,6 +191,7 @@ static void gc_mark_start(global_State *g)
   ** and newwhite()=WHITE1|GRAY for newly allocated objects. */
   g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
   g->gc.grayastop = 0;
+  setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));
   {
     MSize i;
     for (i = 0; i < g->gc.arenastop; i++) {
@@ -495,17 +501,64 @@ static size_t propagatemark(global_State *g
 }
 
 #if LJ_HASGCMARK
-/* Find the next arena with a non-empty gray stack, starting from cursor. */
+/* Gray arena priority: number of entries on the arena's gray stack. */
+static LJ_AINLINE MSize grayarena_prio(global_State *g, MSize idx)
+{
+  GCArena *a = mref(g->gc.arenas, GCArena *)[idx];
+  GCCellID1 *top = mref(a->greytop, GCCellID1);
+  GCCellID1 *base = mref(a->greybase, GCCellID1);
+  if (top == NULL || top <= base) return 0;
+  return (MSize)(top - base);
+}
+
+/* Sift a heap entry up (toward the root). */
+static void grayheap_siftup(global_State *g, MSize *heap, MSize pos)
+{
+  MSize val = heap[pos];
+  MSize prio = grayarena_prio(g, val);
+  while (pos > 0) {
+    MSize parent = (pos - 1) >> 1;
+    if (grayarena_prio(g, heap[parent]) >= prio) break;
+    heap[pos] = heap[parent];
+    pos = parent;
+  }
+  heap[pos] = val;
+}
+
+/* Sift a heap entry down (toward the leaves). */
+static void grayheap_siftdown(global_State *g, MSize *heap, MSize n, MSize pos)
+{
+  MSize val = heap[pos];
+  MSize prio = grayarena_prio(g, val);
+  for (;;) {
+    MSize child = (pos << 1) + 1;
+    if (child >= n) break;
+    if (child + 1 < n &&
+	grayarena_prio(g, heap[child + 1]) > grayarena_prio(g, heap[child]))
+      child++;
+    if (prio >= grayarena_prio(g, heap[child])) break;
+    heap[pos] = heap[child];
+    pos = child;
+  }
+  heap[pos] = val;
+}
+
+/* Pop the arena with the largest gray stack from the heap. */
 static GCArena *gc_grayarena_pop(global_State *g)
 {
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
-  MSize *stack = mref(g->gc.grayastack, MSize);
+  MSize *heap = mref(g->gc.grayastack, MSize);
   while (g->gc.grayastop > 0) {
-    MSize idx = stack[g->gc.grayastop - 1];
+    MSize idx = heap[0];
     GCArena *a = arenas[idx];
     if ((a->flags & ArenaFlag_TravObjs) && !arena_gray_empty(a))
       return a;
-    g->gc.grayastop--;  /* Stale entry — discard. */
+    /* Stale entry — remove from heap. */
+    g->gc.grayastop--;
+    if (g->gc.grayastop > 0) {
+      heap[0] = heap[g->gc.grayastop];
+      grayheap_siftdown(g, heap, g->gc.grayastop, 0);
+    }
   }
   return NULL;
 }
@@ -1073,8 +1126,9 @@ static void atomic(global_State *g, lua_State *L)
   gc_propagate_gray(g);  /* Propagate all of the above. */
 
 #if LJ_HASGCMARK
-  /* Drain grayagain: redirect arena objects to arena gray stacks,
-  ** non-arena objects to the global gray list. */
+  lj_gc_ssb_flush(g);  /* Drain SSB into per-arena gray stacks. */
+  /* Drain grayagain (thread objects only): redirect arena objects to
+  ** arena gray stacks, non-arena objects to the global gray list. */
   {
     GCobj *o = gcref(g->gc.grayagain);
     setgcrefnull(g->gc.grayagain);
@@ -1107,10 +1161,10 @@ static void atomic(global_State *g, lua_State *L)
   /* Prepare for sweep phase. */
 #if LJ_HASGCMARK
   /* Flip current white. With single WHITE1, this toggles WHITE1 bit off,
-  ** so curwhite()=0 during sweep: makewhite sets GRAY only (no WHITE).
+  ** so curwhite()=0 during sweep: makewhite produces pure white (no bits).
   ** otherwhite() has WHITE1, so isdead correctly detects dead objects. */
   g->gc.currentwhite = (uint8_t)otherwhite(g);
-  g->strempty.marked = curwhite(g) | LJ_GC_GRAY | LJ_GC_FIXED | LJ_GC_SFIXED;
+  g->strempty.marked = curwhite(g) | LJ_GC_FIXED | LJ_GC_SFIXED;
 #else
   g->gc.currentwhite = (uint8_t)otherwhite(g);  /* Flip current white. */
   g->strempty.marked = g->gc.currentwhite;
@@ -1176,9 +1230,9 @@ static size_t gc_onestep(lua_State *L)
       }
       if (g->gc.sweepphase == SweepPhase_Rebuild) {
 	/* Restore currentwhite before rebuild so makewhite includes WHITE1.
-	** Without this, makewhite sets GRAY-only (curwhite=0 during sweep),
-	** and gc_marktv must accept gray-only objects — which then re-marks
-	** stale stack references that should be invisible to the next cycle. */
+	** Without this, makewhite produces pure white (curwhite=0 during
+	** sweep), and gc_marktv would re-mark stale stack references that
+	** should be invisible to the next cycle. */
 	g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
 	gc_rebuild_rootchain(g);
       }
@@ -1383,6 +1437,7 @@ void lj_gc_fullgc(lua_State *L)
     setgcrefnull(g->gc.grayagain);
     setgcrefnull(g->gc.weak);
 #if LJ_HASGCMARK
+    setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));  /* Discard SSB. */
     /* Under single-white, the header-based sweep predicate can't reliably
     ** distinguish alive-white from dead-white, so the preserving catch-up
     ** sweep doesn't work.  Walk the root chain directly and makewhite every
@@ -1452,25 +1507,50 @@ void lj_gc_fullgc(lua_State *L)
 /* -- Write barriers ------------------------------------------------------ */
 
 #if LJ_HASGCMARK
-/* Push an arena object onto its arena's gray stack (barrier back path). */
+/* Backward barrier for arena objects (called from interpreter/JIT).
+** Sets gray bit, then checks mark bitmap: black→dark-gray pushes to SSB,
+** white→light-gray just sets gray (no push needed). */
 void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
-  arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
+  o->gch.marked |= LJ_GC_GRAY;
+  if (arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
+    GCobj **top = mref(g->gc.ssbtop, GCobj *);
+    *top++ = o;
+    setmref(g->gc.ssbtop, top);
+    if (LJ_UNLIKELY(top >= mref(g->gc.ssblim, GCobj *)))
+      lj_gc_ssb_flush(g);
+  }
 }
 
-/* Notify that an arena's gray stack became non-empty. */
+/* Notify that an arena's gray stack became non-empty — insert into heap. */
 void lj_gc_grayarena_notify(global_State *g, MSize idx)
 {
-  MSize *stack = mref(g->gc.grayastack, MSize);
+  MSize *heap = mref(g->gc.grayastack, MSize);
   if (g->gc.grayastop >= g->gc.grayasz) {
     MSize oldsz = g->gc.grayasz;
     MSize newsz = oldsz ? oldsz * 2 : 16;
-    stack = (MSize *)g->allocf(g->allocd, stack,
+    heap = (MSize *)g->allocf(g->allocd, heap,
 	      oldsz * sizeof(MSize), newsz * sizeof(MSize));
-    setmref(g->gc.grayastack, stack);
+    setmref(g->gc.grayastack, heap);
     g->gc.grayasz = newsz;
   }
-  stack[g->gc.grayastop++] = idx;
+  heap[g->gc.grayastop] = idx;
+  grayheap_siftup(g, heap, g->gc.grayastop);
+  g->gc.grayastop++;
+}
+
+/* Flush the sequential store buffer into per-arena gray stacks. */
+void lj_gc_ssb_flush(global_State *g)
+{
+  GCobj **base = mref(g->gc.ssb, GCobj *);
+  GCobj **top = mref(g->gc.ssbtop, GCobj *);
+  setmref(g->gc.ssbtop, base);
+  while (base < top) {
+    GCobj *o = *base++;
+    if (o->gch.marked & LJ_GC_GRAY) {
+      arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
+    }
+  }
 }
 #endif
 
@@ -1491,7 +1571,11 @@ void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_mark(g, v);  /* Move frontier forward. */
   else
+#if LJ_HASGCMARK
+    o->gch.marked |= LJ_GC_GRAY;  /* Set gray to avoid re-triggering barrier. */
+#else
     makewhite(g, o);  /* Make it white to avoid the following barrier. */
+#endif
 }
 
 /* Specialized barrier for closed upvalue. Pass &uv->tv. */
@@ -1503,8 +1587,7 @@ void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
     gc_mark(g, gcV(tv));
   else
 #if LJ_HASGCMARK
-    TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~(LJ_GC_COLORS|LJ_GC_GRAY))
-		     | curwhite(g) | LJ_GC_GRAY;
+    TV2MARKED(tv) |= LJ_GC_GRAY;  /* Set gray to avoid re-triggering barrier. */
 #else
     TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~LJ_GC_COLORS) | curwhite(g);
 #endif

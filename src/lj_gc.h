@@ -76,7 +76,7 @@ enum {
 #if LJ_HASGCMARK
 #define makewhite(g, x) \
   ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~(LJ_GC_COLORS|LJ_GC_GRAY)) \
-                      | curwhite(g) | LJ_GC_GRAY)
+                      | curwhite(g))
 #else
 #define makewhite(g, x) \
   ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_COLORS) | curwhite(g))
@@ -124,6 +124,7 @@ LJ_FUNC void lj_gc_barriertrace(global_State *g, uint32_t traceno);
 #if LJ_HASGCMARK
 LJ_FUNC void lj_gc_barrierback_arena(global_State *g, GCobj *o);
 LJ_FUNC void lj_gc_grayarena_notify(global_State *g, MSize idx);
+LJ_FUNCA void lj_gc_ssb_flush(global_State *g);
 #endif
 
 /* Move the GC propagation frontier back for tables (make it gray again). */
@@ -133,15 +134,16 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
 #if LJ_HASGCMARK
   lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !isdead(g, o),
 	     "bad object states for backward barrier");
+  lj_gc_barrierback_arena(g, o);
 #else
   lj_assertG(isblack(o) && !isdead(g, o),
 	     "bad object states for backward barrier");
-#endif
   lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
 	     "bad GC state");
   black2gray(o);
   setgcrefr(t->gclist, g->gc.grayagain);
   setgcref(g->gc.grayagain, o);
+#endif
 }
 
 /* Barrier for stores to table objects. TValue and GCobj variant. */

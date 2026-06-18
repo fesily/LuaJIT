@@ -377,13 +377,41 @@
 |// Move table write barrier back. Overwrites reg.
 |.macro barrierback, tab, reg
 |.if LJ_HASGCMARK
-|  or byte tab->marked, LJ_GC_GRAY			// black2gray(tab)
+|  // Inline quad-color barrier: set gray, check arena mark bit, push SSB.
+|  or byte tab->marked, LJ_GC_GRAY		// Always set gray bit first.
+|  push tab					// Save tab (need it for arena calc).
+|  mov reg, tab
+|  and reg, 0xFFFFF				// Isolate intra-arena offset.
+|  shr reg, 4					// reg = cell index (0..65535).
+|  and tab, ~0xFFFFF				// tab = arena base (mark[] at offset 0).
+|  bt [tab], reg				// Test mark bitmap bit (CF=1 if black).
+|  pop tab					// Restore tab before branching.
+|  jnc >9					// CF=0: white→light-gray, skip SSB.
+|  // CF=1: black→dark-gray, push to SSB.
+|  mov reg, [DISPATCH+DISPATCH_GL(gc.ssbtop)]
+|  mov [reg], tab
+|  add reg, 8
+|  mov [DISPATCH+DISPATCH_GL(gc.ssbtop)], reg
+|  cmp reg, [DISPATCH+DISPATCH_GL(gc.ssblim)]
+|  jb >9
+|  // SSB overflow — flush via C call (cold).
+|  push BASE
+|  push RA
+|  push TMPR
+|  push RC
+|  lea CARG1, [DISPATCH+GG_DISP2G]
+|  call extern lj_gc_ssb_flush
+|  pop RC
+|  pop TMPR
+|  pop RA
+|  pop BASE
+|9:
 |.else
 |  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
-|.endif
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
 |  mov [DISPATCH+DISPATCH_GL(gc.grayagain)], tab
 |  mov tab->gclist, reg
+|.endif
 |.endmacro
 |
 |//-----------------------------------------------------------------------

@@ -1930,19 +1930,55 @@ static void asm_cnew(ASMState *as, IRIns *ir)
 
 static void asm_tbar(ASMState *as, IRIns *ir)
 {
+#if LJ_HASGCMARK
+  /* Inline quad-color backward barrier (mirrors the vm_x64.dasc macro):
+  ** set gray, test the arena mark bit; black -> push to SSB (cold flush on
+  ** overflow), white -> stay light-gray. Skip entirely if already gray. */
+  const CCallInfo *ci = &lj_ir_callinfo[IRCALL_lj_gc_ssb_flush];
+  IRRef args[1];
+  Reg tab, idx, abase, tmp;
+  MCLabel l_end;
+  ra_evictset(as, RSET_SCRATCH);
+  l_end = emit_label(as);
+  /* Cold path: SSB overflow -> lj_gc_ssb_flush(g). Falls through to l_end. */
+  args[0] = ASMREF_TMP1;  /* global_State *g */
+  asm_gencall(as, ci, args);
+  emit_loada(as, ra_releasetmp(as, ASMREF_TMP1), J2G(as->J));
+  /* Allocate the table reg and two GPR temps (tmp reuses idx after the bt). */
+  tab = ra_alloc1(as, ir->op1, RSET_GPR);
+  idx = ra_scratch(as, rset_exclude(RSET_GPR, tab));
+  abase = ra_scratch(as, rset_exclude(rset_exclude(RSET_GPR, tab), idx));
+  tmp = idx;  /* idx is dead after the bt; reuse it as the SSB cursor. */
+  /* SSB push: *ssbtop++ = tab; if (ssbtop >= ssblim) flush. */
+  emit_sjcc(as, CC_B, l_end);  /* ssbtop < ssblim: no overflow, skip flush. */
+  emit_opgl(as, XO_ARITH(XOg_CMP), tmp|REX_GC64, gc.ssblim);
+  emit_setgl(as, tmp, gc.ssbtop);
+  emit_gri(as, XG_ARITHi(XOg_ADD), tmp|REX_GC64, (int32_t)sizeof(GCobj *));
+  emit_movtomro(as, tab|REX_GC64, tmp, 0);  /* *ssbtop = tab */
+  emit_getgl(as, tmp, gc.ssbtop);           /* tmp = ssbtop */
+  /* Test the arena mark bitmap: white (CF=0) stays light-gray, no SSB push. */
+  emit_jcc(as, CC_NB, l_end);               /* jnc l_end (CF==0 -> not marked) */
+  emit_rmro(as, XO_BT, idx, abase, 0);      /* CF = arena mark[idx] (black?) */
+  emit_gri(as, XG_ARITHi(XOg_AND), abase|REX_GC64, ~(int32_t)ArenaCellMask);
+  emit_rr(as, XO_MOV, abase|REX_GC64, tab); /* abase = arena base */
+  emit_shifti(as, XOg_SHR, idx, CellSizeLog2);
+  emit_gri(as, XG_ARITHi(XOg_AND), idx, (int32_t)ArenaCellMask);
+  emit_rr(as, XO_MOV, idx, tab);            /* idx = cell index of tab */
+  /* Set the gray bit (only reached when tab was not already gray). */
+  emit_i8(as, LJ_GC_GRAY);
+  emit_rmro(as, XO_ARITHib, XOg_OR, tab, offsetof(GCtab, marked));
+  /* Hot path: skip the whole barrier if tab is already gray. */
+  emit_jcc(as, CC_NZ, l_end);
+  emit_i8(as, LJ_GC_GRAY);
+  emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+  checkmclim(as);
+#else
   Reg tab = ra_alloc1(as, ir->op1, RSET_GPR);
   Reg tmp = ra_scratch(as, rset_exclude(RSET_GPR, tab));
   MCLabel l_end = emit_label(as);
   emit_movtomro(as, tmp|REX_GC64, tab, offsetof(GCtab, gclist));
   emit_setgl(as, tab, gc.grayagain);
   emit_getgl(as, tmp, gc.grayagain);
-#if LJ_HASGCMARK
-  emit_i8(as, LJ_GC_GRAY);
-  emit_rmro(as, XO_ARITHib, XOg_OR, tab, offsetof(GCtab, marked));
-  emit_sjcc(as, CC_NZ, l_end);
-  emit_i8(as, LJ_GC_GRAY);
-  emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
-#else
   emit_i8(as, ~LJ_GC_BLACK);
   emit_rmro(as, XO_ARITHib, XOg_AND, tab, offsetof(GCtab, marked));
   emit_sjcc(as, CC_Z, l_end);
