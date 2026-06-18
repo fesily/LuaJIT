@@ -11,3 +11,4 @@
 *.swp
 .tags
 test/test_arena
+test/oom_inject
