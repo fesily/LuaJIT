@@ -894,6 +894,48 @@ static void gc_rebuild_rootchain(global_State *g)
     }
   }
 
+  /* Huge objects have no cell bitmap, so the arena scan above can't see them.
+  ** Scan the address-keyed huge set instead: free the dead (white), makewhite
+  ** survivors and re-link them onto the same chains as their arena peers.
+  ** Without this, huge survivors are dropped from every chain and leak (they
+  ** are in no bitmap and on no list).
+  **
+  ** Huge STRINGS are excluded here: they are interned and fully owned by
+  ** gc_sweepstr, which runs in the earlier GCSsweepstring phase and already
+  ** handles huge strings via their header mark (gc_sweepstr's bitmap branch
+  ** is gated on !lj_arena_ishuge). A live huge string is therefore already
+  ** white by the time we get here -- treating it as dead would double-free.
+  ** Upvalues are never huge (fixed small size). */
+  {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	GCobj *o;
+	if (u == 0 || u == 1) continue;  /* HUGESET_EMPTY / HUGESET_TOMB. */
+	o = (GCobj *)u;
+	if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
+	lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
+	if (iswhite(o)) {
+	  /* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
+	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+	} else {
+	  makewhite(g, o);
+	  if (o->gch.gct == ~LJ_TUDATA) {
+	    setgcref(*udtail, o);
+	    udtail = &o->gch.nextgc;
+	  } else {
+	    if (o->gch.gct == ~LJ_TTHREAD)
+	      gc_fullsweep(g, &gco2th(o)->openupval);
+	    setgcref(*roottail, o);
+	    roottail = &o->gch.nextgc;
+	  }
+	}
+      }
+    }
+  }
+
   /* Terminate the udata sub-chain with NULL. mainthread->nextgc points
   ** to the udata-only sub-chain, which lj_gc_separateudata walks. */
   setgcrefnull(*udtail);

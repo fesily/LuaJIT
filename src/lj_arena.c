@@ -579,6 +579,7 @@ void lj_arena_freeall(global_State *g)
     arena_os_release(c->base, ARENA_CHUNK_SIZE);
     g->allocf(g->allocd, c, sizeof(ArenaChunk), 0);
   }
+  lj_hugeset_free(g);  /* Huge objects already freed via gco free path. */
 }
 
 #if LJ_HASGCMARK
@@ -724,7 +725,113 @@ void lj_arena_gc_markinit(global_State *g)
 ** No header and no metadata: the (rounded) size is reconstructed from
 ** the object size passed to free, so they are distinguished from arena
 ** objects purely by their alignment.
+**
+** Huge objects have no cell bitmap, so they are invisible to the bitmap
+** sweep. To keep them enumerable (and thus sweepable), every live huge
+** object is registered in an address-keyed open-addressing hash set
+** (design doc: "Huge Blocks"). gc_rebuild_rootchain scans this set to free
+** dead huge objects and re-link survivors onto the GC chains -- the set is
+** effectively "the bitmap for huge objects". The set is backed by the raw
+** allocator, never GC memory, and stores addresses only: each huge object's
+** mark lives in its own GCobj header and its size is reconstructed on free.
 */
+
+#define HUGESET_EMPTY	((uintptr_t)0)	/* Never a valid arena-aligned addr. */
+#define HUGESET_TOMB	((uintptr_t)1)	/* Deleted slot (probe-through). */
+#define HUGESET_MINSZ	16		/* Initial capacity (power of two). */
+
+/* Fibonacci-hash the arena-index of a huge block address. */
+static LJ_AINLINE MSize hugeset_hash(void *p, MSize mask)
+{
+  uintptr_t k = (uintptr_t)p >> ArenaSizeLog2;  /* Low bits are always 0. */
+  return (MSize)((k * (uintptr_t)0x9e3779b97f4a7c15ull) >> 40) & mask;
+}
+
+/* Insert p into a slot array with spare capacity (reuses tombstones). */
+static void hugeset_put(GCRef *slots, MSize mask, void *p)
+{
+  MSize i = hugeset_hash(p, mask);
+  while (gcrefu(slots[i]) != HUGESET_EMPTY && gcrefu(slots[i]) != HUGESET_TOMB)
+    i = (i + 1) & mask;
+  setgcrefp(slots[i], p);
+}
+
+/* Allocate a fresh slot array of capacity newmask+1 and rehash live entries.
+** Returns 0 on OOM (the old table is left intact). */
+static int hugeset_resize(global_State *g, MSize newmask)
+{
+  GCRef *old = mref(g->gc.hugeset, GCRef);
+  MSize oldmask = g->gc.hugesetmask;
+  size_t bytes = (size_t)(newmask + 1) * sizeof(GCRef);
+  GCRef *neu = (GCRef *)g->allocf(g->allocd, NULL, 0, bytes);
+  if (neu == NULL)
+    return 0;
+  memset(neu, 0, bytes);
+  if (old != NULL) {
+    MSize i;
+    for (i = 0; i <= oldmask; i++) {
+      uintptr_t u = gcrefu(old[i]);
+      if (u != HUGESET_EMPTY && u != HUGESET_TOMB)
+	hugeset_put(neu, newmask, (void *)u);
+    }
+    g->allocf(g->allocd, old, (size_t)(oldmask + 1) * sizeof(GCRef), 0);
+  }
+  setmref(g->gc.hugeset, neu);
+  g->gc.hugesetmask = newmask;
+  g->gc.hugesettomb = 0;  /* Rehash drops all tombstones. */
+  return 1;
+}
+
+/* Register a newly allocated huge object. Returns 0 on OOM. */
+static int huge_register(global_State *g, void *p)
+{
+  if (mref(g->gc.hugeset, GCRef) == NULL) {
+    if (!hugeset_resize(g, HUGESET_MINSZ - 1))
+      return 0;
+  } else if ((g->gc.hugesetnum + g->gc.hugesettomb + 1) * 4 >
+	     (g->gc.hugesetmask + 1) * 3) {
+    /* Load over 3/4: grow to fit 2x the live count (also clears tombstones). */
+    MSize need = (g->gc.hugesetnum + 1) * 2, cap = HUGESET_MINSZ;
+    while (cap < need) cap <<= 1;
+    if (!hugeset_resize(g, cap - 1))
+      return 0;
+  }
+  hugeset_put(mref(g->gc.hugeset, GCRef), g->gc.hugesetmask, p);
+  g->gc.hugesetnum++;
+  return 1;
+}
+
+/* Unregister a huge object on free (tombstone its slot). */
+static void huge_unregister(global_State *g, void *p)
+{
+  GCRef *slots = mref(g->gc.hugeset, GCRef);
+  MSize mask = g->gc.hugesetmask;
+  MSize i = hugeset_hash(p, mask);
+  lj_assertG_(g, slots != NULL, "huge unregister with empty set");
+  while (gcrefu(slots[i]) != HUGESET_EMPTY) {
+    if (gcrefu(slots[i]) == (uintptr_t)p) {
+      setgcrefp(slots[i], (void *)HUGESET_TOMB);
+      g->gc.hugesetnum--;
+      g->gc.hugesettomb++;
+      return;
+    }
+    i = (i + 1) & mask;
+  }
+  lj_assertG_(g, 0, "huge unregister: address not found");
+}
+
+/* Free the huge-set backing store (shutdown). */
+void lj_hugeset_free(global_State *g)
+{
+  GCRef *slots = mref(g->gc.hugeset, GCRef);
+  if (slots != NULL)
+    g->allocf(g->allocd, slots, (size_t)(g->gc.hugesetmask + 1) * sizeof(GCRef),
+	      0);
+  setmref(g->gc.hugeset, NULL);
+  g->gc.hugesetmask = 0;
+  g->gc.hugesetnum = 0;
+  g->gc.hugesettomb = 0;
+}
 
 void *lj_hugeblock_alloc(global_State *g, size_t size)
 {
@@ -740,6 +847,10 @@ void *lj_hugeblock_alloc(global_State *g, size_t size)
     return NULL;
   }
   lj_assertG_(g, lj_arena_ishuge(p), "huge block is not arena-aligned");
+  if (!huge_register(g, p)) {  /* OOM growing the registry: undo allocation. */
+    arena_os_release(p, rsz);
+    return NULL;
+  }
   g->gc.hugemem += (GCSize)rsz;
   g->gc.hugenum++;
   return p;
@@ -749,6 +860,7 @@ void lj_hugeblock_free(global_State *g, void *p, size_t size)
 {
   size_t rsz = (size + ArenaCellMask) & ~(size_t)ArenaCellMask;
   lj_assertG_(g, g->gc.hugenum > 0, "huge block underflow");
+  huge_unregister(g, p);
   arena_os_release(p, rsz);
   g->gc.hugemem -= (GCSize)rsz;
   g->gc.hugenum--;

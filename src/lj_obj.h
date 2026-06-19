@@ -635,6 +635,10 @@ typedef struct GCState {
   MSize arenastop;	/* Number of arenas. */
   MSize hugenum;	/* Number of huge blocks. */
   GCSize hugemem;	/* Memory in huge blocks (rounded to arena size). */
+  MRef hugeset;		/* GCRef *: address-keyed set of live huge objects. */
+  MSize hugesetmask;	/* Capacity-1 (power of two); 0 when unallocated. */
+  MSize hugesetnum;	/* Live entries in the huge set. */
+  MSize hugesettomb;	/* Tombstone entries (drive rehash). */
 #if LJ_HASGCMARK
   MSize sweepa;		/* Bitmap sweep: current arena index. */
   uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */

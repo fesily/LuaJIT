@@ -328,6 +328,7 @@ LJ_FUNC void lj_arena_gray_free(global_State *g, GCArena *a);
 
 LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);
 LJ_FUNC void lj_hugeblock_free(global_State *g, void *p, size_t size);
+LJ_FUNC void lj_hugeset_free(global_State *g);
 
 #endif
 
