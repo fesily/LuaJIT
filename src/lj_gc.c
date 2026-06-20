@@ -809,20 +809,21 @@ static size_t gc_bitmap_sweep(global_State *g)
 }
 
 /*
-** Rebuild the root chain and mainthread->nextgc (udata) chain from
-** arena block bitmaps after bitmap sweep. Also makewhite surviving
-** objects and sweep each thread's open upvalue list.
+** Post-sweep pass: makewhite surviving objects, rebuild the udata sub-chain
+** (mainthread->nextgc) for lj_gc_separateudata, sweep each thread's open
+** upvalue list, free dead huge objects, and clear arena mark bits.
+**
+** The root chain (g->gc.root) is NOT rebuilt: all former consumers now
+** enumerate arena objects via the block bitmaps directly. The root reference
+** is simply anchored on the (super-fixed) main thread.
 */
 static void gc_rebuild_rootchain(global_State *g)
 {
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
-  GCRef newroot;
-  GCRef *roottail = &newroot;
   GCRef newud;
   GCRef *udtail = &newud;
   MSize i;
 
-  setgcrefnull(newroot);
   setgcrefnull(newud);
 
 #if LJ_HASFFI
@@ -884,11 +885,8 @@ static void gc_rebuild_rootchain(global_State *g)
 	if (o->gch.gct == ~LJ_TUDATA) {
 	  setgcref(*udtail, o);
 	  udtail = &o->gch.nextgc;
-	} else {
-	  if (o->gch.gct == ~LJ_TTHREAD)
-	    gc_fullsweep(g, &gco2th(o)->openupval);
-	  setgcref(*roottail, o);
-	  roottail = &o->gch.nextgc;
+	} else if (o->gch.gct == ~LJ_TTHREAD) {
+	  gc_fullsweep(g, &gco2th(o)->openupval);
 	}
       }
     }
@@ -896,9 +894,7 @@ static void gc_rebuild_rootchain(global_State *g)
 
   /* Huge objects have no cell bitmap, so the arena scan above can't see them.
   ** Scan the address-keyed huge set instead: free the dead (white), makewhite
-  ** survivors and re-link them onto the same chains as their arena peers.
-  ** Without this, huge survivors are dropped from every chain and leak (they
-  ** are in no bitmap and on no list).
+  ** survivors and re-link udata onto the udata sub-chain.
   **
   ** Huge STRINGS are excluded here: they are interned and fully owned by
   ** gc_sweepstr, which runs in the earlier GCSsweepstring phase and already
@@ -925,11 +921,8 @@ static void gc_rebuild_rootchain(global_State *g)
 	  if (o->gch.gct == ~LJ_TUDATA) {
 	    setgcref(*udtail, o);
 	    udtail = &o->gch.nextgc;
-	  } else {
-	    if (o->gch.gct == ~LJ_TTHREAD)
-	      gc_fullsweep(g, &gco2th(o)->openupval);
-	    setgcref(*roottail, o);
-	    roottail = &o->gch.nextgc;
+	  } else if (o->gch.gct == ~LJ_TTHREAD) {
+	    gc_fullsweep(g, &gco2th(o)->openupval);
 	  }
 	}
       }
@@ -941,18 +934,10 @@ static void gc_rebuild_rootchain(global_State *g)
   setgcrefnull(*udtail);
   setgcrefr(mainthread(g)->nextgc, newud);
 
-  /* Root chain: arena objects → mainthread → udata chain → NULL.
-  ** mainthread is NOT in any arena (dlmalloc), so we append it manually.
-  ** Sweep mainthread's openupvals BEFORE clearing marks (second pass). */
+  /* Anchor the root reference on mainthread. No other objects are chained. */
   makewhite(g, obj2gco(mainthread(g)));
   gc_fullsweep(g, &mainthread(g)->openupval);
-  if (gcref(newroot)) {
-    setgcref(g->gc.root, gcref(newroot));
-    /* Append mainthread at the end of the arena object chain. */
-    setgcref(*roottail, obj2gco(mainthread(g)));
-  } else {
-    setgcref(g->gc.root, obj2gco(mainthread(g)));
-  }
+  setgcref(g->gc.root, obj2gco(mainthread(g)));
 
   /* Second pass: clear mark bits on all arenas now that openupval sweeps
   ** are done and no longer need to read them. */
@@ -1123,9 +1108,78 @@ void lj_gc_freeall(global_State *g)
   MSize i;
   /* Free everything, except super-fixed objects (the main thread). */
   g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_SFIXED;
+#if LJ_HASGCMARK
+  /*
+  ** Arena mode: the 根 chain (g->gc.root) is redundant with the arena block
+  ** bitmaps -- it is rebuilt from them after every bitmap sweep. Rather than
+  ** walk that chain, enumerate the live arena cells directly (the same scan
+  ** gc_rebuild_rootchain uses to relink survivors) and free each object. This
+  ** removes the last shutdown reader of the 根 chain.
+  **
+  ** Coverage:
+  **  - Traversable arenas: tables, funcs, protos, threads, upvalues, regular
+  **    cdata, traces and udata. All freed by the cell scan below.
+  **  - Non-traversable arenas: only strings (freed via the intern table) and
+  **    VLA cdata (freed via cdatavroot). Their gct cannot be read from a
+  **    bitmap cell, so these arenas are skipped here.
+  **  - Huge objects: no cell bitmap; freed via the address-keyed huge set.
+  */
+  {
+    GCArena **arenas = mref(g->gc.arenas, GCArena *);
+#if LJ_HASFFI
+    /* VLA cdata first: freeing a huge VLA cdata tombstones its huge-set slot,
+    ** so the huge-set scan below won't see (and double-free) it. */
+    gc_fullsweep(g, &g->gc.cdatavroot);
+#endif
+    for (i = 0; i < g->gc.arenastop; i++) {
+      GCArena *a = arenas[i];
+      uint32_t w, wtop;
+      if (!(a->flags & ArenaFlag_TravObjs)) continue;
+      /* Flush bins so a cleared block bit means "free": binned free blocks
+      ** otherwise keep their allocated bitmap state (block=1). */
+      lj_arena_flushbins(a);
+      wtop = arena_blockidx((GCCellID)a->celltop - 1);
+      for (w = UnusedBlockWords; w <= wtop; w++) {
+	GCBlockword alive = a->block[w];
+	while (alive) {
+	  uint32_t bitidx = lj_ffs(alive);
+	  GCCellID c = (w << 5) + bitidx;
+	  GCobj *o = (GCobj *)arena_cellptr(a, c);
+	  alive &= alive - 1;
+	  /* Open upvalues are freed through their owning thread's openupval
+	  ** chain (below); skip them here. Safe even if a thread already freed
+	  ** this cell: freeing never overwrites the gct/closed header bytes. */
+	  if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
+	    continue;
+	  if (o->gch.gct == ~LJ_TTHREAD)
+	    gc_fullsweep(g, &gco2th(o)->openupval);
+	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+	}
+      }
+    }
+    /* Huge non-string objects: walk the huge set (no cell bitmap exists for
+    ** them). Strings are owned by gc_sweepstr; VLA cdata were freed above. */
+    {
+      GCRef *slots = mref(g->gc.hugeset, GCRef);
+      if (slots != NULL) {
+	MSize hi, hmask = g->gc.hugesetmask;
+	for (hi = 0; hi <= hmask; hi++) {
+	  uintptr_t u = gcrefu(slots[hi]);
+	  GCobj *o;
+	  if (u == 0 || u == 1) continue;  /* HUGESET_EMPTY / HUGESET_TOMB. */
+	  o = (GCobj *)u;
+	  if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
+	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+	}
+      }
+    }
+    /* Re-anchor the 根 reference on the (super-fixed) main thread: every other
+    ** object is gone, and the stale chain must never be walked again. */
+    setgcrefnull(mainthread(g)->nextgc);
+    setgcref(g->gc.root, obj2gco(mainthread(g)));
+  }
+#else
   gc_fullsweep(g, &g->gc.root);
-#if LJ_HASGCMARK && LJ_HASFFI
-  gc_fullsweep(g, &g->gc.cdatavroot);
 #endif
   for (i = g->str.mask; i != ~(MSize)0; i--)  /* Free all string hash chains. */
     gc_sweepstr(g, &g->str.tab[i]);
@@ -1429,26 +1483,53 @@ static void gc_arena_verify(global_State *g)
   MSize i, dead = 0;
   /* Flush bins + clear all GC mark bits: clean slate, allocator-truthful. */
   lj_arena_gcprepare(g);
-  /* Shadow-mark every live object reachable from the GC roots. The root
-  ** chain holds all non-string collectable objects; strings live in the
-  ** intern table; finalizable udata hang off the mainthread chain (already
-  ** part of the root chain via nextgc). Open upvalues are NOT on the root
-  ** chain -- they hang off each thread's openupval list (gc_sweep sweeps
-  ** them per-thread the same way). mainthread/strempty are not in any
-  ** arena (dlmalloc) and are skipped by arena_obj_shadowmark. */
-  for (o = gcref(g->gc.root); o != NULL; o = gcnext(o)) {
-    if (!lj_arena_ishuge(o) && o != obj2gco(mainthread(g))) {
-      arena_obj_shadowmark(o);
+  /* Shadow-mark every allocated arena object by scanning the block bitmaps
+  ** directly, instead of walking the gc.root chain (which is being eliminated).
+  ** Trav arenas hold tables, funcs, protos, threads, upvalues, regular cdata,
+  ** traces and udata. The bitmap scan finds all of them -- including open
+  ** upvalues, which the root chain can't enumerate without per-thread walks.
+  ** Huge non-string objects are in the address-keyed huge set, not in any
+  ** arena bitmap. mainthread/strempty are dlmalloc (not in arenas). */
+  {
+    GCArena **arenas = mref(g->gc.arenas, GCArena *);
+    for (i = 0; i < g->gc.arenastop; i++) {
+      GCArena *a = arenas[i];
+      uint32_t w, wtop;
+      if (!(a->flags & ArenaFlag_TravObjs)) continue;
+      lj_arena_flushbins(a);
+      wtop = arena_blockidx((GCCellID)a->celltop - 1);
+      for (w = UnusedBlockWords; w <= wtop; w++) {
+	GCBlockword alive = a->block[w];
+	while (alive) {
+	  uint32_t bitidx = lj_ffs(alive);
+	  GCCellID c = (w << 5) + bitidx;
+	  GCobj *o2 = (GCobj *)arena_cellptr(a, c);
+	  alive &= alive - 1;
+	  arena_obj_setmark(a, c);
 #if LJ_HASFFI
-      if (o->gch.gct == ~LJ_TCDATA && cdataisv(gco2cd(o)))
-	arena_obj_shadowmark(memcdatav(gco2cd(o)));
+	  if (o2->gch.gct == ~LJ_TCDATA && cdataisv(gco2cd(o2)))
+	    arena_obj_shadowmark(memcdatav(gco2cd(o2)));
 #endif
+	}
+      }
     }
-    if (o->gch.gct == ~LJ_TTHREAD) {  /* Walk the thread's open upvalues. */
-      GCobj *uv;
-      for (uv = gcref(gco2th(o)->openupval); uv != NULL; uv = gcnext(uv))
-	if (!lj_arena_ishuge(uv))
-	  arena_obj_shadowmark(uv);
+    /* Huge non-string objects have no cell bitmap. */
+    {
+      GCRef *slots = mref(g->gc.hugeset, GCRef);
+      if (slots != NULL) {
+	MSize hi, hmask = g->gc.hugesetmask;
+	for (hi = 0; hi <= hmask; hi++) {
+	  uintptr_t u = gcrefu(slots[hi]);
+	  if (u == 0 || u == 1) continue;
+	  o = (GCobj *)u;
+	  if (o->gch.gct == ~LJ_TSTR) continue;
+	  arena_obj_shadowmark(o);
+#if LJ_HASFFI
+	  if (o->gch.gct == ~LJ_TCDATA && cdataisv(gco2cd(o)))
+	    arena_obj_shadowmark(memcdatav(gco2cd(o)));
+#endif
+	}
+      }
     }
   }
 #if LJ_HASFFI
@@ -1606,17 +1687,52 @@ void lj_gc_fullgc(lua_State *L)
     setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));  /* Discard SSB. */
     /* Under single-white, the header-based sweep predicate can't reliably
     ** distinguish alive-white from dead-white, so the preserving catch-up
-    ** sweep doesn't work.  Walk the root chain directly and makewhite every
-    ** object so the next full mark cycle can re-discover them all.
+    ** sweep doesn't work.  Enumerate all arena objects via the block bitmaps
+    ** and makewhite every one so the next full mark cycle can re-discover them.
     ** No objects are freed — the partial mark phase hasn't reached sweep. */
     {
-      GCRef *p = &g->gc.root;
+      GCArena **arenas = mref(g->gc.arenas, GCArena *);
       GCobj *o;
+      MSize ii;
       g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
-      while ((o = gcref(*p)) != NULL) {
-        makewhite(g, o);
-        p = &o->gch.nextgc;
+      /* Trav arenas: tables, funcs, protos, threads, upvalues, regular cdata,
+      ** traces and udata.  Strings are handled by the intern table walk below.
+      ** Open upvalues are found directly by the bitmap scan (no per-thread
+      ** walk needed). */
+      for (ii = 0; ii < g->gc.arenastop; ii++) {
+	GCArena *a = arenas[ii];
+	uint32_t w, wtop;
+	if (!(a->flags & ArenaFlag_TravObjs)) continue;
+	lj_arena_flushbins(a);
+	wtop = arena_blockidx((GCCellID)a->celltop - 1);
+	for (w = UnusedBlockWords; w <= wtop; w++) {
+	  GCBlockword alive = a->block[w];
+	  while (alive) {
+	    uint32_t bitidx = lj_ffs(alive);
+	    GCCellID c = (w << 5) + bitidx;
+	    o = (GCobj *)arena_cellptr(a, c);
+	    alive &= alive - 1;
+	    if (o->gch.gct == ~LJ_TSTR) continue;
+	    makewhite(g, o);
+	  }
+	}
       }
+      /* Huge non-string objects have no cell bitmap. */
+      {
+	GCRef *slots = mref(g->gc.hugeset, GCRef);
+	if (slots != NULL) {
+	  MSize hi, hmask = g->gc.hugesetmask;
+	  for (hi = 0; hi <= hmask; hi++) {
+	    uintptr_t u = gcrefu(slots[hi]);
+	    if (u == 0 || u == 1) continue;
+	    o = (GCobj *)u;
+	    if (o->gch.gct == ~LJ_TSTR) continue;
+	    makewhite(g, o);
+	  }
+	}
+      }
+      /* mainthread is not in any arena (dlmalloc). */
+      makewhite(g, obj2gco(mainthread(g)));
       /* Also makewhite strings in the intern table. */
       {
         MSize i;
