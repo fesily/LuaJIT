@@ -77,42 +77,46 @@
 
 ## 1. 总体架构决策
 
-### 1.0 颜色迁移分两小步(已与用户确认)
+### 1.0 颜色迁移 ✅ 已完成
 
-完整 quad-color 要 white/black 在 arena 位图、gray 位 inline 在 header。但 `marked` 字节 8 位全满(§0.2-D + Phase 0 核实:`0x80` 被 cdata `cdataisv` 占用)。为降低单步风险,**禁用 FFI** 腾出 `0x80`,拆成两步:
+~~完整 quad-color 要 white/black 在 arena 位图、gray 位 inline 在 header。~~
 
-- **Step 1(本轮 Phase M)**:`LUAJIT_DISABLE_FFI` + **white/black 迁入 arena 位图**(复用 Phase 0 的 `arena_obj_setmark`/`ismarked`/`clearmark`)+ **gray 位 = `0x80`**(`LJ_GC_GRAY`)。mark/sweep/barrier 全部改走新表示。**关键依赖顺序**:white/black 必须和 gray 位一起迁——因为只有 black 进了位图(查它要访问元数据),"barrier 只查 inline gray 位"才有性能意义;若 white/black 留 header,`isblack` 本就 inline 便宜,单加 gray 位是纯增风险无收益(已与用户确认此依赖)。
-- **Step 2(后续)**:gray 位从 `0x80` 搬到 `0x01`(white 腾出位),重新启用 FFI(cdata 走完整 quad-color)。
+**已完成(2026-06-19):** gray 位直接落在 `0x01`(复用 WHITE0 位),与 `cdataisv`(`0x80`)不冲突,FFI 从未需要禁用。原计划的 Step 1/Step 2 两步合为一步完成:
 
-→ 本轮一步拿到完整 quad-color 收益(barrier 查 gray 位、mark/sweep 走位图),只是 cdata/FFI 暂缺席、gray 位暂栖 `0x80`。
+- `LJ_GC_GRAY = 0x01`(`lj_gc.h:27`),复用 WHITE0 槽位
+- `LJ_GC_WHITES = LJ_GC_WHITE1`(单白机制,`lj_gc.h:35`)
+- `cdataisv` 仍用 `0x80`(`lj_obj.h:361`),与 gray 位无冲突
+- FFI 完全启用,cdata 对象(常规+VLA+finalizer)在 quad-color GC 下验证通过
 
-#### Step 1 的颜色表示
+#### 当前颜色表示(最终形态)
 
-`marked` 字节本轮布局(FFI 禁用,`0x80` 空出给 gray):
+`marked` 字节布局:
 ```
-0x01/0x02 WHITE0/1  → 迁出,header 不再表 white(位空出,Step2 给 gray)
-0x04 BLACK          → 迁出,header 不再表 black(可达性改由位图 mark 表示)
-0x08 FINALIZED   0x10 WEAKVAL   0x20 FIXED   0x40 SFIXED   0x80 GRAY(本轮新增)
+0x01 GRAY          ← quad-color inline gray 位(复用 WHITE0)
+0x02 WHITE1        ← 单白(bitmap GC 下 LJ_GC_WHITES = WHITE1)
+0x04 BLACK         ← 非 arena 对象仍用 header(arena 对象走位图)
+0x08 FINALIZED/WEAKKEY   0x10 WEAKVAL/CDATA_FIN
+0x20 FIXED   0x40 SFIXED   0x80 cdataisv(VLA cdata)
 ```
 
-**white/black 迁入位图的具体编码**(arena 内对象,flush bin 后):
-| 状态 | block | mark | gray(header 0x80) |
+**quad-color 编码**(arena 内对象,flush bin 后):
+| 状态 | block | mark | gray(header 0x01) |
 |------|-------|------|-------------------|
 | White(未标记) | 1 | 0 | 0 |
 | Light-gray(新分配/被写) | 1 | 0 | 1 |
 | Dark-gray(已入 gray list) | 1 | 1 | 1 |
 | Black(已遍历) | 1 | 1 | 0 |
 
-- "可达" = mark 位(arena `mark[]`)。"待遍历" = gray 位(header `0x80`)。
-- `iswhite(o)` = `!mark位 && !gray位`;`isblack(o)` = `mark位 && !gray位`;`isgray(o)` = `gray位`。
-- **双白机制消失**:颜色在位图,不需要 WHITE0/WHITE1 翻转。sweep 末尾整字清 mark 位即"翻白"。`currentwhite`/`otherwhite`/`isdead` 语义需重新定义(见 Phase M)。
-- **huge block / 非 arena 对象**:huge block 无位图,mark/gray 状态存独立 hash(本轮 FFI 禁用后 huge 对象只有超大 string/table/proto,数量少,可先简单处理)。
+- "可达" = mark 位(arena `mark[]`)。"待遍历" = gray 位(header `0x01`)。
+- `iswhite(o)` = `marked & WHITE1`;`isblack(o)` = `!gray && !white`;`isgray(o)` = `marked & GRAY`。
+- **单白机制**:`LJ_GC_WHITES = LJ_GC_WHITE1` 仅用于区分 sweep 存活(curwhite)和 dead(otherwhite),颜色状态主要由位图决定。
+- **huge block / 非 arena 对象**:huge block 无位图,mark/gray 状态走地址键 huge set + header `marked` 字节(含 cdata)。
 
 
 
-### 1.1 颜色编码(最终形态,Step 2 目标)
+### 1.1 颜色编码(最终形态) ✅ 已实现
 
-图纸 quad-color = 4 态,由 **segregated mark 位**(arena 位图,表"已标记/可达")+ **inline gray 位**(对象头 1 bit,表"在 gray stack 上待遍历")组合:
+图纸 quad-color = 4 态,由 **segregated mark 位**(arena 位图,表"已标记/可达")+ **inline gray 位**(对象头 `0x01`,表"在 gray stack 上待遍历")组合:
 
 | 状态 | mark 位(位图) | gray 位(header) | 含义 |
 |------|--------------|----------------|------|
@@ -121,7 +125,7 @@
 | Dark-gray | 1 | 1 | 已入 gray stack 待遍历 |
 | Black | 1 | 0 | 已遍历完 |
 
-最终形态下:flush bin 后 allocated 对象 (block,mark)=(1,0)=White,free 块=(0,1)。mark 阶段把存活对象 mark 位置 1 →(1,1)=Black。sweep 用图纸公式 `block'=block&mark`。gray 位放 `0x01`(white 腾出位)。
+最终形态下:flush bin 后 allocated 对象 (block,mark)=(1,0)=White,free 块=(0,1)。mark 阶段把存活对象 mark 位置 1 →(1,1)=Black。sweep 用图纸公式 `block'=block&mark`。gray 位 = `0x01`(复用 WHITE0 槽位)。
 
 #### Quad-color 状态转移有向图(已实现)
 
@@ -147,29 +151,18 @@ stateDiagram-v2
 - **barrier 区分两种转移**: 检查 arena mark 位 — mark=1(black)则 push SSB(dark-gray); mark=0(white)只设 GRAY(light-gray),避免无效 SSB 占用。
 - **新分配 = light-gray**: `newwhite` 始终设 GRAY,barrier 不触发,GC 下轮 mark 时处理。
 
-### 1.1' 颜色编码(本轮过渡形态,Step 1)
+### ~~1.1' 颜色编码(过渡形态)~~ → 已跳过,直接到最终形态
 
-本轮 white/black 仍在 header,arena mark 位图**不表颜色**(仍是分配器的 Free 判别),只有 gray 位是新的:
+原计划的过渡形态(gray 位 `0x80`、FFI 禁用)未实际使用。gray 位直接落在 `0x01`,FFI 始终启用,一步到位最终形态。
 
-| 状态 | header white/black | header gray 位(`0x80`) | 含义 |
-|------|-------------------|----------------------|------|
-| White | WHITE0/1 | 0 | 未标记 |
-| Light-gray | WHITE0/1 | 1 | 新分配/被写;barrier 不触发(图纸 light-gray) |
-| Dark-gray | (WHITE,在 gray stack) | 1 | 已 push 到 arena gray stack 待遍历 |
-| Black | BLACK | 0 | 已遍历完 |
-
-- **gray 位 = `marked & 0x80`**(`LJ_GC_GRAY`),仅 `LJ_HASGCMARK`(x64+arena,且本轮要求 FFI 禁用)下定义。
-- mark/black 仍走 header(复用现有 `isblack`/`makewhite` 逻辑);**新增的是 gray 位的置位/清除 + push 到对象所在 arena 的 gray stack**(替代现有 `g->gc.gray` 全局链表)。
-- barrier 改为查 gray 位(图纸:gray 位已置则不触发),而非现有的查 black + white。
-
-### 1.2 gray 组织(per-arena gray stack + 优先级队列)
+### 1.2 gray 组织(per-arena gray stack + 优先级队列) ✅ 已实现
 
 - 每个 traversable arena 一个 gray stack,用预留的 `greytop`/`greybase`(`lj_arena.h`)。stack 向下生长,初始带哨兵。
 - **gray queue**:二叉堆优先队列,按各 arena gray stack 大小排序,优先处理最大的(图纸 §Gray Queue,缓存局部性)。
 - non-traversable arena(string/cdata,`ArenaFlag_TravObjs`=0)**没有 gray stack**:它们的对象 mark 时直接 white→black(置 mark 位),不入栈,不遍历。
 - huge block:无位图,用独立 hash table 存 {mark, gray} 元数据(图纸 §Huge Blocks)。本阶段 huge block 数量少,可先用线性数组或复用 arena 注册表式结构。
 
-### 1.3 与现有链表的共存策略(关键风险控制)
+### 1.3 与现有链表的共存策略 ✅ 根链已消除
 
 **不一次性删除 `nextgc` 链和 `gclist`**。分两步:
 1. **Phase M(mark)先并存**:mark 改用位图+gray stack,但 sweep 仍可走链表(过渡)。验证 mark 正确性独立于 sweep 改动。
@@ -201,7 +194,7 @@ LuaJIT 是**单架构构建**:`make` 只编译当前 TARGET 的一份 dasc(x64�
 
 ## 2. 分阶段实现计划
 
-### Phase 0 — 位图原语与 GC/分配器接口对齐(地基,低风险)
+### Phase 0 — 位图原语与 GC/分配器接口对齐 ✅ 已完成 (c4ba3158)
 
 **目标**:把 mark/sweep 要用的位图操作做成 GC 和分配器共用的原语,并建立"mark 前 flush bin"不变量。
 
@@ -217,7 +210,7 @@ LuaJIT 是**单架构构建**:`make` 只编译当前 TARGET 的一份 dasc(x64�
 
 ---
 
-### Phase M — Mark 阶段改造(高风险核心 1)
+### Phase M — Mark 阶段改造 ✅ 已完成 (e301f01b, 7d40c545)
 
 **目标**:mark 阶段用位图+per-arena gray stack+优先级队列,sweep 暂仍走链表(过渡验证)。
 
@@ -242,7 +235,7 @@ LuaJIT 是**单架构构建**:`make` 只编译当前 TARGET 的一份 dasc(x64�
 
 ---
 
-### Phase S — Sweep 阶段改造(位图定位 + 逐对象释放,简化版)
+### Phase S — Sweep 阶段改造 ✅ 已完成 (9baa5296)
 
 **目标**:sweep 用位图**快速定位** dead 对象,逐对象调用**原样不动的** free 函数。停用 root 链表遍历。
 
@@ -269,7 +262,7 @@ LuaJIT 是**单架构构建**:`make` 只编译当前 TARGET 的一份 dasc(x64�
 ---
 
 
-### Phase V — 验证、性能、收尾
+### Phase V — 验证、性能、收尾(进行中)
 
 1. **正确性**:
    - 扩展 `test/test_arena.c` → `test/test_gc.c`:构造对象图,跑 mark/sweep,对照朴素 GC。
@@ -303,9 +296,23 @@ LuaJIT 是**单架构构建**:`make` 只编译当前 TARGET 的一份 dasc(x64�
 | B10 incr step 10K | 0.008s | 0.011s | +37% |
 | B11 10 tables×10K keys | 0.881s | 0.604s | **-31%** |
 
-**已完成优化**: 解释器+JIT SSB barrier, SSB flush→per-arena gray stack, 二叉堆优先队列, gc_mark SFIXED fast path, IRCALLCOND_GCMARK 条件编译, pure white makewhite + barrier mark-check(区分 white→light-gray / black→dark-gray), **解释器 inline barrier**(用 `bt` 指令检查 arena mark bitmap,消除 C call 开销, B5 barrier 从 +81% 降至 +4%).
-**JIT barrier**: `asm_tbar` 仍走 C call `lj_gc_barrierback_arena`(JIT emit 层无 `bt` 指令支持,需新增 opcode 才能 inline; "skip if gray" 快速路径已保护热路径)。
-**待做**: gc_mark/traverse 批量预取, B3 深链标记开销, B1 mark 遍历开销, JIT inline barrier(需在 lj_target_x86.h 新增 XO_BT).
+**已完成优化**: 解释器+JIT SSB barrier, SSB flush→per-arena gray stack, 二叉堆优先队列, gc_mark SFIXED fast path, IRCALLCOND_GCMARK 条件编译, pure white makewhite + barrier mark-check(区分 white→light-gray / black→dark-gray), **解释器 inline barrier**(用 `bt` 指令检查 arena mark bitmap,消除 C call 开销, B5 barrier 从 +81% 降至 +4%), **JIT inline barrier**(asm_tbar 新增 XO_BT,完全 inline SSB push,6f397f36), **根链消除**(gc.root 4 处消费者全部改位图枚举,9baa5296), **软件 prefetch 探索**(结论:无收益,已否决——子表顺序分配被硬件预取器覆盖,深链为串行指针追逐)。
+**FFI**: 已完全启用,gray 位 `0x01` 与 `cdataisv` `0x80` 不冲突,cdata(常规+VLA+finalizer)验证通过。
+**待做**: B1/B3/B10 mark traversal 退化是 quad-color 固有代价(位图访问 + gray stack 操作 vs 原 header + 全局链表);后续可探索的方向——分代 GC(minor collection 跳过老对象)、整字位图归还公式。
+
+#### Phase V 根链消除后性能数据 (2026-06-20)
+
+测试环境: x64 Linux, `-DLUAJIT_ENABLE_GCARENA -O2`, static build, `-joff`, 每项 7 轮取 median,3 组取最佳 median。
+
+**与根链消除前对比** (同为 arena GC,仅消除 gc_rebuild_rootchain 非 udata 部分):
+| 测试 | 消除前 | 消除后 | 差异 |
+|------|--------|--------|------|
+| B1 mark 50K live tables | 0.506s | 0.506s | 0% |
+| B2 sweep 100K dead | 0.0016s | 0.0014s | -12% |
+| B3 deep chain 10K | 0.020s | 0.019s | -2% |
+| B7 mixed 50% survival | 0.102s | 0.091s | **-11%** |
+| B10 incr step 10K | 0.010s | 0.010s | 0% |
+| B11 10 tables×10K keys | 0.610s | 0.626s | +3% (noise) |
 
 ---
 
@@ -313,32 +320,36 @@ LuaJIT 是**单架构构建**:`make` 只编译当前 TARGET 的一份 dasc(x64�
 
 | 风险 | 等级 | 缓解 |
 |------|------|------|
-| x64 dasc + asm barrier 与 C 宏改不一致 → 悬垂指针 | **高** | 只需 3 处一致(vm_x64.dasc + lj_asm_x86.h + C 宏),非 7+5;Phase M 先让 x64 JIT barrier 退化为 C 调用,只改 dasc;barrier 压力测试 |
-| mark 位与分配器 Free 位语义纠缠 | 高 | Phase 0 建立 "mark 前 flush bin" 不变量 + 单测;图纸公式只在 flush 后成立 |
-| 增量 mark/sweep 中途暂停的着色不变量 | 高 | quad-color light-gray 保护新对象;verify 函数在每步后抽查 |
+| ~~x64 dasc + asm barrier 与 C 宏改不一致 → 悬垂指针~~ | ~~高~~ → **已消除** | vm_x64.dasc + lj_asm_x86.h + C 宏三处一致,barrier 压力测试通过,JIT inline barrier 已落地 |
+| ~~mark 位与分配器 Free 位语义纠缠~~ | ~~高~~ → **已消除** | "mark 前 flush bin" 不变量已建立 + 单测;位图 sweep 已验证 |
+| ~~增量 mark/sweep 中途暂停的着色不变量~~ | ~~高~~ → **已消除** | quad-color light-gray 保护新对象;shadow-verify + checkheap 在每步抽查 |
 | ~~free 函数双重改位图~~ → **已消除** | — | §0.4 决策:sweep 不拆 free、不用整字归还公式,逐对象走原 free 函数,free 仍是唯一改位图处 |
-| huge block 无位图的 mark/sweep | 中 | 独立 hash table 元数据;本阶段数量少,可先简单实现 |
-| 弱表/finalize/复活与位图交互 | 中 | 保留 mmudata/udata 链不动;复活对象 mark 位显式置 1 |
+| ~~huge block 无位图的 mark/sweep~~ | ~~中~~ → **已消除** | 地址键 huge set 已实现(90970c97),sweep/freeall/verify/abort 全部枚举 huge set |
+| ~~弱表/finalize/复活与位图交互~~ | ~~中~~ → **已消除** | mmudata/udata 链保留不动;复活对象 mark 位显式置 1;cdata finalizer 测试通过 |
 | 分代未做 → 单代 major-only 性能不如预期 | 低 | 已与用户确认单代先行;minor/major 位图公式已在 Phase 0 预留 |
 
 ## 4. 里程碑与依赖
 
 ```
-Phase 0 (原语+宏抽象) ──┬─→ Phase M (mark+barrier) ──→ Phase S (位图sweep) ──→ Phase V (验证/性能)
-                        │         ↑ 最高风险              ↑ 次高风险
-                        └─ 单测先行,每 Phase 独立可验证(sweep 暂走链表 / mark 已切位图)
+Phase 0 (原语+宏抽象) ✅ ──→ Phase M (mark+barrier) ✅ ──→ Phase S (位图sweep) ✅ ──→ Phase V (验证/性能) 🔄
+                                                                                       ↑ 进行中
 ```
 
-- **Phase 0** 可独立合入(不改 GC 行为)。
-- **Phase M** 完成即可验证 mark 正确性(sweep 仍链表),是天然的中间可交付点。
-- **Phase S** 才真正切到位图 sweep。
+- **Phase 0** ✅ 合入 c4ba3158(不改 GC 行为)。
+- **Phase M** ✅ 合入 e301f01b + 7d40c545(mark 正确性经 shadow-verify 验证)。
+- **Phase S** ✅ 合入 9baa5296(位图 sweep + 根链消除)。
+- **Phase V** 🔄 正确性验证通过(test suite/oom_inject/test_arena/ASAN);性能优化已完成 inline barrier + 根链消除;残余退化(B1/B3/B10)属 quad-color 固有代价,需分代 GC 解决。
 - 每个 Phase 都保持 `LUAJIT_ENABLE_GCARENA` 关闭时行为不变(旧 GC 完整保留)。
 
-## 5. 本计划不含(明确排除)
+## 5. 本计划不含(明确排除)/ 后续方向
 
 - **非 x64 架构的 dasc/asm 适配**(vm_x86/arm/arm64/ppc/mips* + lj_asm_arm64/arm/ppc/mips.h)。x64 验证清楚后照搬,属后续阶段。本轮非 x64 编译时新 GC 关闭、走原 tri-color(§1.5)。
 - 分代 minor/major 自动切换、对象 aging、跨代 barrier(下一独立阶段;位图公式已预留)。
-- ~~SSB(sequential store buffer)——图纸的 barrier 优化~~ → **已完成**,解释器+JIT 均已实现 SSB push,flush 在 atomic 前执行。
-- 与你之前 gen-gc 分支工作的合并(trace 必须 OLD 等问题属分代范畴)。
-- ~~x64 JIT inline barrier 的极致优化~~ → **已完成**,asm_tbar 已 inline SSB push(callee-save 寄存器分配,overflow 走 C call)。
+- ~~SSB(sequential store buffer)~~ → **已完成**,解释器+JIT 均已实现 SSB push,flush 在 atomic 前执行。
+- ~~x64 JIT inline barrier~~ → **已完成**,asm_tbar 已 inline SSB push(新增 XO_BT,6f397f36)。
+- ~~FFI 重新启用~~ → **已完成**,gray 位直接落在 `0x01`,FFI 从未需要禁用。
+- ~~根链消除~~ → **已完成**,gc.root 4 处消费者全部改位图枚举(9baa5296)。
+- ~~软件 prefetch~~ → **已否决**,实测无收益(子表被硬件预取器覆盖,深链为串行指针追逐)。
+- 与 gen-gc 分支工作的合并(trace 必须 OLD 等问题属分代范畴)。
 - **sweep 的整字位图归还公式 + free 函数拆分**(§0.4):本阶段 sweep 逐对象调原 free 函数,只用位图定位。整字 `block'=block&mark` 归还公式留作后续性能优化,仅当 profiling 显示类别 3(proto/func/udata)的逐对象归还是瓶颈时才做。
+- **清除分配时写 gc.root 的冗余代码**(lj_gc.h:245-246 等):当前无害但冗余,可作为清理项。
