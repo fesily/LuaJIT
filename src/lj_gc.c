@@ -1461,7 +1461,7 @@ int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps)
 }
 #endif
 
-#if LJ_HASGCMARK
+#if LJ_HASGCMARK && defined(LUA_USE_ASSERT)
 /*
 ** Phase M shadow-verify: with header colors still authoritative, rebuild
 ** the arena mark bitmap from the live object set and assert it matches.
@@ -1560,7 +1560,7 @@ static void gc_arena_verify(global_State *g)
   ** start from a clean mark bitmap. */
   lj_arena_gcprepare(g);
 }
-#endif
+#endif /* LJ_HASGCMARK && LUA_USE_ASSERT */
 
 #if LJ_HASGCARENA
 /*
@@ -1781,7 +1781,7 @@ void lj_gc_fullgc(lua_State *L)
   do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
   g->vmstate = ostate;
-#if LJ_HASGCMARK
+#if LJ_HASGCMARK && defined(LUA_USE_ASSERT)
   gc_arena_verify(g);  /* Phase M: cross-check the arena mark bitmap. */
 #endif
 }
