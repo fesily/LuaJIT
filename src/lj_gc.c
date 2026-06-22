@@ -1798,6 +1798,30 @@ int lj_gc_checkheap(global_State *g)
     ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
     GCCellID celltop = (GCCellID)a->celltop;
     uint32_t binfree = 0, rangefree = 0, b;
+    /* -- POD arena purity: every live object must be word-parallel-sweepable
+    ** (no external backing, no globals, no finalizer). Only protos are routed
+    ** here so far; closures will join later. Catches a mis-routed alloc the
+    ** instant it lands, before the word-parallel sweep frees it blindly.
+    ** Runs before the fl==NULL skip below: a fresh bump-only POD arena has no
+    ** free list yet but still holds live objects to validate. Read-only: scans
+    ** only block&mark (marked-live cells are always valid GCobjs); binned/free
+    ** cells have mark=0 and are excluded, so the arena is not mutated. -- */
+    if (a->flags & ArenaFlag_PODOnly) {
+      uint32_t w, wtop = arena_blockidx(celltop - 1);
+      for (w = UnusedBlockWords; w <= wtop; w++) {
+	GCBlockword alive = a->block[w] & a->mark[w];
+	while (alive) {
+	  uint32_t bitidx = lj_ffs(alive);
+	  GCobj *o = (GCobj *)arena_cellptr(a, (w << 5) + bitidx);
+	  alive &= alive - 1;
+	  if (o->gch.gct != ~LJ_TPROTO) {
+	    lj_assertG(0, "POD arena %d: non-POD object gct=%d at cell %d",
+		       (int)ai, o->gch.gct, (int)((w << 5) + bitidx));
+	    bad++;
+	  }
+	}
+      }
+    }
     if (fl == NULL) continue;  /* No free list allocated yet. */
     /* -- Bins: intrusive same-size free lists. -- */
     for (b = 0; b < ArenaBins; b++) {
