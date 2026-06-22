@@ -216,19 +216,22 @@ static LJ_AINLINE void lj_mem_free(global_State *g, void *p, size_t osize)
 #if LJ_HASGCARENA
 #include "lj_arena.h"
 
-LJ_FUNC void *lj_mem_newgco_slow(lua_State *L, GCSize size, int trav,
+LJ_FUNC void *lj_mem_newgco_slow(lua_State *L, GCSize size, int cls,
 				 int link);
 
 /*
 ** Inline fast path: bump-allocate from the current arena.
-** trav and link are compile-time constants at all call sites.
+** cls (ArenaClass_*) and link are compile-time constants at all call sites,
+** so the class->pointer selection folds to a single load.
 */
 static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
-					    int trav, int link)
+					    int cls, int link)
 {
   global_State *g = G(L);
   if (LJ_LIKELY(size < ArenaHugeThreshold)) {
-    GCArena *a = mref(trav ? g->gc.travarena : g->gc.arena, GCArena);
+    GCArena *a = mref(cls == ArenaClass_POD ? g->gc.podarena :
+		      cls == ArenaClass_Trav ? g->gc.travarena : g->gc.arena,
+		      GCArena);
     GCobj *o = a ? (GCobj *)arena_alloc(a, size) : NULL;
     if (LJ_LIKELY(o != NULL)) {
       g->gc.total += size;
@@ -251,7 +254,7 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
       return o;
     }
   }
-  return lj_mem_newgco_slow(L, size, trav, link);
+  return lj_mem_newgco_slow(L, size, cls, link);
 }
 
 /* Free a GC object allocated by lj_mem_newgco_arena(). */
@@ -293,8 +296,15 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
   }
 }
 
-#define lj_mem_newgcot(L, s)	lj_mem_newgco_arena(L, (GCSize)(s), 1, 1)
-#define lj_mem_newagco(L, s, trav)  lj_mem_newgco_arena(L, (GCSize)(s), (trav), 0)
+#define lj_mem_newgcot(L, s) \
+  lj_mem_newgco_arena(L, (GCSize)(s), ArenaClass_Trav, 1)
+#define lj_mem_newagco(L, s, trav) \
+  lj_mem_newgco_arena(L, (GCSize)(s), \
+		      (trav) ? ArenaClass_Trav : ArenaClass_NonTrav, 0)
+/* POD-only traversable allocation (closures, protos): routed to the POD
+** arena so the word-parallel sweep can reclaim it without per-object frees. */
+#define lj_mem_newgcot_pod(L, s) \
+  lj_mem_newgco_arena(L, (GCSize)(s), ArenaClass_POD, 1)
 #define lj_mem_freegco(g, p, s)	lj_mem_freegco_(g, (p), (s))
 #else
 #define lj_mem_newgcot(L, s)	lj_mem_newgco(L, (GCSize)(s))

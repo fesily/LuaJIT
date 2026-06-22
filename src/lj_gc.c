@@ -2173,12 +2173,12 @@ void * LJ_FASTCALL lj_mem_newgco(lua_State *L, GCSize size)
 ** Out-of-line continuation of lj_mem_newgco_arena(): the current arena
 ** had no bump space (or the size calls for a huge block).
 */
-void *lj_mem_newgco_slow(lua_State *L, GCSize size, int trav, int link)
+void *lj_mem_newgco_slow(lua_State *L, GCSize size, int cls, int link)
 {
   global_State *g = G(L);
   GCobj *o;
   if (LJ_LIKELY(size < ArenaHugeThreshold)) {
-    o = (GCobj *)lj_arena_findspace(g, size, trav);
+    o = (GCobj *)lj_arena_findspace(g, size, cls);
   } else {
     o = (GCobj *)lj_hugeblock_alloc(g, size);
   }

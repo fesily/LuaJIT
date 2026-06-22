@@ -404,8 +404,28 @@ static int arena_registry_grow(global_State *g)
   return 1;
 }
 
+/* Map an arena class to its initial flags. */
+static LJ_AINLINE uint32_t arena_classflags(int cls)
+{
+  switch (cls) {
+  case ArenaClass_Trav: return ArenaFlag_TravObjs;
+  case ArenaClass_POD:  return ArenaFlag_TravObjs | ArenaFlag_PODOnly;
+  default:              return 0;  /* ArenaClass_NonTrav. */
+  }
+}
+
+/* Map an arena class to its current-arena GCState pointer. */
+static LJ_AINLINE MRef *arena_classcur(global_State *g, int cls)
+{
+  switch (cls) {
+  case ArenaClass_Trav: return &g->gc.travarena;
+  case ArenaClass_POD:  return &g->gc.podarena;
+  default:              return &g->gc.arena;  /* ArenaClass_NonTrav. */
+  }
+}
+
 /* Create a new arena and register it. */
-static GCArena *arena_create(global_State *g, int trav)
+static GCArena *arena_create(global_State *g, int cls)
 {
   ArenaChunk *c;
   GCArena *a;
@@ -435,7 +455,7 @@ static GCArena *arena_create(global_State *g, int trav)
   memset(a, 0, sizeof(GCArena));  /* Clear header and bitmaps. */
   a->celltop = (GCCellID1)MinCellId;
   a->celltopmax = (GCCellID1)MaxUsableCellId;
-  a->flags = trav ? ArenaFlag_TravObjs : 0;
+  a->flags = (uint16_t)arena_classflags(cls);
   a->id = g->gc.arenastop;
   setmref(a->chunk, c);
   mref(g->gc.arenas, GCArena *)[g->gc.arenastop++] = a;
@@ -477,14 +497,13 @@ static void arena_destroy(global_State *g, GCArena *a)
 /*
 ** The current arena is full (bump) and its free list missed.
 ** Try its slow path, then other arenas, then create a new arena.
-** Returns NULL on out-of-memory.
+** Returns NULL on out-of-memory. cls is an ArenaClass_*.
 */
-void *lj_arena_findspace(global_State *g, size_t size, int trav)
+void *lj_arena_findspace(global_State *g, size_t size, int cls)
 {
-  MRef *curref = trav ? &g->gc.travarena : &g->gc.arena;
+  MRef *curref = arena_classcur(g, cls);
   GCArena *cur = mref(*curref, GCArena);
-  GCArena *other = mref(trav ? g->gc.arena : g->gc.travarena, GCArena);
-  uint32_t want = trav ? ArenaFlag_TravObjs : 0;
+  uint32_t want = arena_classflags(cls);
   void *p;
   MSize i;
   if (cur != NULL && (p = lj_arena_allocslow(g, cur, size)) != NULL)
@@ -493,9 +512,13 @@ void *lj_arena_findspace(global_State *g, size_t size, int trav)
     GCArena *a = mref(g->gc.arenas, GCArena *)[i];
     if (a == cur)
       continue;
-    if ((a->flags ^ want) & ArenaFlag_TravObjs) {
-      /* Repurpose an empty arena of the other mode. */
-      if (a == other || !arena_isempty(a))
+    if ((a->flags & (ArenaFlag_TravObjs|ArenaFlag_PODOnly)) != want) {
+      /* Repurpose an empty arena of another class. Never steal another
+      ** class's current arena (it may be mid-bump). */
+      if (a == mref(g->gc.arena, GCArena) ||
+	  a == mref(g->gc.travarena, GCArena) ||
+	  a == mref(g->gc.podarena, GCArena) ||
+	  !arena_isempty(a))
 	continue;
       arena_reinit(a, want);
     }
@@ -511,7 +534,7 @@ void *lj_arena_findspace(global_State *g, size_t size, int trav)
     }
   }
   {
-    GCArena *a = arena_create(g, trav);
+    GCArena *a = arena_create(g, cls);
     if (a == NULL)
       return NULL;
     setmref(*curref, a);
@@ -529,6 +552,7 @@ void lj_arena_shrink(global_State *g)
 {
   GCArena *cura = mref(g->gc.arena, GCArena);
   GCArena *curt = mref(g->gc.travarena, GCArena);
+  GCArena *curp = mref(g->gc.podarena, GCArena);
   /* Keep some empty arenas committed to absorb the next allocation */
   /* burst; releasing them all causes page fault churn in steady state. */
   MSize keepempty = 1 + (g->gc.arenastop >> 2);
@@ -541,7 +565,7 @@ void lj_arena_shrink(global_State *g)
     if (fl != NULL && fl->scavgen != a->freegen &&
 	(fl->dropped || a->freecells >= ArenaUsableCells/8))
       arena_scavenge(a, fl);  /* Coalesce and roll back the frontier. */
-    if (a != cura && a != curt && arena_isempty(a)) {
+    if (a != cura && a != curt && a != curp && arena_isempty(a)) {
       if (keepempty == 0) {
 	arena_destroy(g, a);
 	continue;  /* Do not advance: the slot was swap-filled. */
@@ -566,6 +590,7 @@ void lj_arena_freeall(global_State *g)
   g->gc.arenassz = 0;
   setmref(g->gc.arena, NULL);
   setmref(g->gc.travarena, NULL);
+  setmref(g->gc.podarena, NULL);
 #if LJ_HASGCMARK
   if (mref(g->gc.grayastack, MSize) != NULL)
     g->allocf(g->allocd, mref(g->gc.grayastack, MSize),

@@ -82,7 +82,23 @@ typedef uint16_t GCCellID1;
 
 /* Arena flags. */
 enum {
-  ArenaFlag_TravObjs = 0x01	/* Arena holds traversable objects. */
+  ArenaFlag_TravObjs = 0x01,	/* Arena holds traversable objects. */
+  ArenaFlag_PODOnly  = 0x02	/* Arena holds only POD types (closures,
+				** protos): no external backing, no globals,
+				** no finalizers. Always set together with
+				** ArenaFlag_TravObjs (POD objects are still
+				** traversable). Enables word-parallel sweep. */
+};
+
+/*
+** Arena allocation classes. The current arena per class is held in a
+** dedicated GCState pointer (arena / travarena / podarena). The class
+** determines the arena flags and which current pointer is updated.
+*/
+enum {
+  ArenaClass_NonTrav = 0,	/* Non-traversable: strings, VLA cdata. */
+  ArenaClass_Trav    = 1,	/* Traversable, mixed (tables, threads, ...). */
+  ArenaClass_POD     = 2	/* Traversable, POD-only (closures, protos). */
 };
 
 /* A free block range in the sorted range array. */
@@ -294,7 +310,7 @@ LJ_FUNC void lj_arena_freeblock(global_State *g, GCArena *a, void *p,
 				size_t size);
 LJ_FUNC void lj_arena_freerange(GCArena *a, ArenaFreeList *fl, GCCellID c,
 				GCCellID n);
-LJ_FUNC void *lj_arena_findspace(global_State *g, size_t size, int trav);
+LJ_FUNC void *lj_arena_findspace(global_State *g, size_t size, int cls);
 LJ_FUNC void lj_arena_shrink(global_State *g);
 LJ_FUNC void lj_arena_freeall(global_State *g);
 
