@@ -1941,14 +1941,16 @@ void lj_gc_fullgc(lua_State *L)
       }
       /* mainthread is not in any arena (dlmalloc). */
       makewhite(g, obj2gco(mainthread(g)));
-      /* Also makewhite strings in the intern table. */
+      /* Also makewhite strings in the intern table. The chain HEAD stores the
+      ** per-bucket hashalg marker in bit 0 (lj_str.c), so mask it off before
+      ** dereferencing; subsequent nextgc links carry no marker. */
       {
         MSize i;
         for (i = 0; i <= g->str.mask; i++) {
-          GCRef *sp = &g->str.tab[i];
-          while ((o = gcref(*sp)) != NULL) {
-            makewhite(g, o);
-            sp = &o->gch.nextgc;
+          GCobj *o2 = (GCobj *)(gcrefu(g->str.tab[i]) & ~(uintptr_t)1);
+          while (o2 != NULL) {
+            makewhite(g, o2);
+            o2 = gcref(o2->gch.nextgc);
           }
         }
       }
