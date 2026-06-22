@@ -950,6 +950,21 @@ static size_t gc_bitmap_sweep(global_State *g)
       w = UnusedBlockWords;
       continue;
     }
+    /* POD-only arena (closures, protos): word-parallel sweep. One linear
+    ** metadata pass frees all dead objects and recolors survivors white,
+    ** touching no object data. Whole-arena atomic (the transform + scavenge
+    ** must pair without an intervening allocation), so it ignores the per-word
+    ** cursor and bills its cost as a fixed chunk of the GCSWEEPMAX budget.
+    ** Cell-space accounting: freed cells * CellSize, derived from the bitmap
+    ** by lj_arena_podsweep, matches the cell-space alloc accounting. */
+    if (a->flags & ArenaFlag_PODOnly) {
+      GCCellID fcells = lj_arena_podsweep(g, a);
+      g->gc.total -= (GCSize)fcells << CellSizeLog2;
+      freed += GCSWEEPMAX/2;  /* Bill ~half a step's worth per POD arena. */
+      ai++;
+      w = UnusedBlockWords;
+      continue;
+    }
     /* Flush free-list bins before scanning: binned free blocks keep the
     ** allocated bitmap state (block=1, mark=0) for hot-path performance.
     ** Without flushing, bitmap sweep would see them as dead objects.
@@ -1062,6 +1077,10 @@ static void gc_rebuild_rootchain(global_State *g)
     GCArena *a = arenas[i];
     uint32_t w, wtop;
     if (!(a->flags & ArenaFlag_TravObjs)) continue;
+    /* POD arenas were fully handled by lj_arena_podsweep: dead objects freed,
+    ** survivors already recolored white, mark bits cleared. They hold no
+    ** udata/thread/openupval to relink, so skip them here. */
+    if (a->flags & ArenaFlag_PODOnly) continue;
     lj_arena_flushbins(a);
     wtop = arena_blockidx((GCCellID)a->celltop - 1);
     for (w = UnusedBlockWords; w <= wtop; w++) {
@@ -1134,10 +1153,13 @@ static void gc_rebuild_rootchain(global_State *g)
   setgcref(g->gc.root, obj2gco(mainthread(g)));
 
   /* Second pass: clear mark bits on all arenas now that openupval sweeps
-  ** are done and no longer need to read them. */
+  ** are done and no longer need to read them. POD arenas were already left
+  ** in final state by lj_arena_podsweep (survivors white, free cells Free),
+  ** so skip them. */
   for (i = 0; i < g->gc.arenastop; i++) {
     GCArena *a = arenas[i];
     uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    if (a->flags & ArenaFlag_PODOnly) continue;
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
@@ -2212,7 +2234,13 @@ void *lj_mem_newgco_slow(lua_State *L, GCSize size, int cls, int link)
     lj_err_mem(L);
   lj_assertG(checkptrGC(o),
 	     "allocated memory address %p outside required range", o);
-  g->gc.total += size;
+  /* POD arenas account cell-space bytes (matches lj_mem_newgco_arena and the
+  ** word-parallel sweep). A POD object never goes huge (protos are small), so
+  ** the cell-space form only applies to the in-arena case. */
+  if (cls == ArenaClass_POD && !lj_arena_ishuge(o))
+    g->gc.total += (GCSize)arena_roundcells(size) << CellSizeLog2;
+  else
+    g->gc.total += size;
 #if LJ_HASGCMARK
   if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC) &&
       !lj_arena_ishuge(o)) {

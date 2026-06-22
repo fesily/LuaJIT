@@ -247,6 +247,108 @@ static void arena_scavenge(GCArena *a, ArenaFreeList *fl)
   fl->scavgen = a->freegen;
 }
 
+#if LJ_HASGCMARK
+/*
+** Count all free cells directly from the block/mark bitmaps (no frontier
+** rollback, no list building). A free block head is Free state (block=0,
+** mark=1); its run extends over the following Extent cells (block=0, mark=0)
+** up to the next allocated head or celltop. The topmost run that borders
+** celltop is included; arena_scavenge rolls that back afterwards.
+*/
+static GCCellID arena_count_freecells(GCArena *a)
+{
+  GCCellID top = a->celltop;
+  uint32_t w, wtop = arena_blockidx(top - 1);
+  GCCellID free_total = 0, runstart = 0;
+  int infree = 0;
+  for (w = UnusedBlockWords; w <= wtop; w++) {
+    GCBlockword heads = a->block[w] | a->mark[w];
+    while (heads) {
+      uint32_t bitidx = lj_ffs(heads);
+      GCBlockword bit = (GCBlockword)1 << bitidx;
+      GCCellID c = (w << 5) + bitidx;
+      heads &= heads - 1;
+      if (a->block[w] & bit) {  /* Allocated head: closes any free run. */
+	if (infree) { free_total += c - runstart; infree = 0; }
+      } else {  /* Free head. */
+	if (!infree) { infree = 1; runstart = c; }
+      }
+    }
+  }
+  if (infree)  /* Topmost free run borders celltop (scavenge rolls it back). */
+    free_total += top - runstart;
+  return free_total;
+}
+
+/*
+** Word-parallel sweep of a POD-only arena (closures, protos): the design
+** doc's bitmap-trick sweep. Applies the major-collection transform to every
+** bitmap word in one linear metadata pass, with NO access to the object data
+** area at all (the design's core promise):
+**
+**   block' = block & mark   mark' = block ^ mark
+**
+** Per cell this maps:  Black(11)->White(10)  [survivor demoted to white]
+**                      White(10)->Free(01)   [dead head freed]
+**                      Free(01)->Free(01)    Extent(00)->Extent(00)
+**
+** So a single pass frees all dead objects AND recolors survivors black->white,
+** fusing what the per-object path does as separate free + makewhite + mark
+** clear passes. Multi-cell objects keep their extent (00) cells; the run
+** lengths are rediscovered by arena_scavenge from the bitmap alone.
+**
+** Returns the number of cells freed, computed as the drop in allocated cells
+** (block-bitmap based, cross-cycle stable) for cell-space gc.total accounting.
+*/
+GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
+{
+  ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
+  uint32_t w, wtop;
+  GCCellID free_pre, free_post, freed;
+  UNUSED(g);
+  lj_assertX((a->flags & ArenaFlag_PODOnly) == ArenaFlag_PODOnly,
+	     "podsweep of non-POD arena");
+  /* Flush binned free cells: they carry the allocated bitmap state (block=1,
+  ** mark=0 White), so without flushing they'd be invisible to the free-cell
+  ** count and the transform would mis-free them. After flushing they are Free
+  ** (block=0, mark=1). */
+  if (fl != NULL)
+    arena_flushbins(a, fl);
+  /* Freed cells = (free heads after the transform) - (free heads before).
+  ** Both counts use the same Free (block=0, mark=1) head encoding, so any free
+  ** space that the cross-cycle mark-bit resets (gcprepare/markinit) collapsed
+  ** to Extent (0,0) is invisible to BOTH and cancels out -- making the delta
+  ** exactly the cells newly freed by this sweep, independent of the unstable
+  ** old-free encoding. The trusted, allocator-maintained freecells counter is
+  ** then advanced by that delta. */
+  free_pre = arena_count_freecells(a);
+  wtop = arena_blockidx((GCCellID)a->celltop - 1);
+  for (w = UnusedBlockWords; w <= wtop; w++) {
+    GCBlockword b = a->block[w], m = a->mark[w];
+    a->block[w] = b & m;
+    a->mark[w]  = b ^ m;
+  }
+  free_post = arena_count_freecells(a);
+  lj_assertX(free_post >= free_pre, "podsweep freed negative cells");
+  freed = free_post - free_pre;
+  /* Set freecells to the absolute post-transform count. Now that the free-head
+  ** encoding is stable across cycles (gcprepare/markinit preserve it), the
+  ** bitmap recount is authoritative and matches the freed delta. */
+  a->freecells = free_post;
+  a->freegen++;
+  /* Rebuild the free list and roll the bump frontier back so the freed runs
+  ** are reusable -- without this the arena could only bump-allocate and would
+  ** grow unbounded. scavenge derives everything from the bitmap; its only
+  ** freecells mutation is the frontier-rollback subtraction, correct now that
+  ** freecells counts every free cell. */
+  if (fl != NULL)
+    arena_scavenge(a, fl);
+  lj_assertX(a->freecells <= (GCCellID)a->celltop - MinCellId,
+	     "podsweep freecells over capacity");
+  return freed;
+}
+#endif
+
 /* -- Fit allocation ------------------------------------------------------ */
 
 /* Allocate n cells from the free list. */
@@ -695,9 +797,12 @@ void lj_arena_gray_free(global_State *g, GCArena *a)
 
 /*
 ** Prepare every arena for a fresh GC mark cycle: flush bins so the block
-** map is authoritative, then clear all GC mark bits (so nothing reads as
-** reachable until the collector marks it). After this an allocated object
-** is White=(block=1,mark=0) and free space is (block=0,mark=0/1).
+** map is authoritative, then clear GC mark bits for allocated cells only.
+** Allocated objects become White=(block=1,mark=0); free blocks preserve their
+** Free=(block=0,mark=1) head encoding so the allocator's bitmap free state
+** stays stable across the reset (the POD word-sweep relies on this to recount
+** free cells across GC cycles). Using mark[w]&=~block[w] (not mark[w]=0) is
+** what preserves the free heads.
 */
 void lj_arena_gcprepare(global_State *g)
 {
@@ -711,9 +816,9 @@ void lj_arena_gcprepare(global_State *g)
       freelist_reset(fl);
       fl->scavgen = a->freegen - 1;  /* Force rescan on next allocslow. */
     }
-    /* Clear GC mark bits for allocated cells; free blocks keep mark=0 too. */
+    /* Clear GC mark bits for allocated cells; free blocks keep Free=(0,1). */
     for (w = UnusedBlockWords; w <= wtop; w++)
-      a->mark[w] = 0;
+      a->mark[w] &= ~a->block[w];
   }
 }
 

@@ -340,6 +340,8 @@ LJ_FUNC void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud);
 LJ_FUNC void lj_arena_gcprepare(global_State *g);
 LJ_FUNC void lj_arena_gc_markinit(global_State *g);
 LJ_FUNC void lj_arena_gray_free(global_State *g, GCArena *a);
+/* Word-parallel sweep of one POD-only arena. Returns cells freed. */
+LJ_FUNC GCCellID lj_arena_podsweep(global_State *g, GCArena *a);
 #endif
 
 LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);

@@ -234,7 +234,14 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
 		      GCArena);
     GCobj *o = a ? (GCobj *)arena_alloc(a, size) : NULL;
     if (LJ_LIKELY(o != NULL)) {
-      g->gc.total += size;
+      /* POD arenas account cell-space bytes (roundcells*CellSize), not the
+      ** requested size, so the word-parallel sweep can subtract freed memory
+      ** purely from the bitmap cell delta without reading any object header.
+      ** The matching cell-space subtraction is in lj_mem_freegco_ (per-object
+      ** path) and the POD branch of gc_bitmap_sweep (bulk path); all three
+      ** stay balanced for the shutdown total assertion. */
+      g->gc.total += (cls == ArenaClass_POD) ?
+		     ((GCSize)arena_roundcells(size) << CellSizeLog2) : size;
 #if LJ_HASGCMARK
       if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC))
 	arena_obj_setmark(a, ptr2cell(o));
@@ -260,12 +267,15 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
 /* Free a GC object allocated by lj_mem_newgco_arena(). */
 static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 {
-  g->gc.total -= (GCSize)osize;
   if (LJ_LIKELY(!lj_arena_ishuge(p))) {
     GCArena *a = ptr2arena(p);
     GCCellID c = ptr2cell(p);
     GCCellID n = arena_roundcells(osize);
     ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
+    /* POD arenas account cell-space (see lj_mem_newgco_arena); everything
+    ** else accounts the requested size. */
+    g->gc.total -= (a->flags & ArenaFlag_PODOnly) ?
+		   ((GCSize)n << CellSizeLog2) : (GCSize)osize;
     a->freegen++;
     if (c + n == (GCCellID)a->celltop) {  /* Roll back the bump frontier. */
       a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
@@ -292,6 +302,7 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
       a->mark[arena_blockidx(c)] |= arena_blockbit(c);
     }
   } else {
+    g->gc.total -= (GCSize)osize;
     lj_hugeblock_free(g, p, osize);
   }
 }
