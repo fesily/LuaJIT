@@ -222,6 +222,9 @@ static void close_state(lua_State *L)
 {
   global_State *g = G(L);
   lj_func_closeuv(L, tvref(L->stack));
+#if LJ_HASGCMARK
+  lj_gc_graywork_free(g);  /* Discard stale gray worklists before freeall. */
+#endif
   lj_gc_freeall(g);
   lj_assertG(gcref(g->gc.root) == obj2gco(L),
 	     "main thread is not first GC object");
@@ -407,6 +410,14 @@ lua_State *lj_state_new(lua_State *L)
 void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
 {
   lj_assertG(L != mainthread(g), "free of main thread");
+#if LJ_HASGCMARK && defined(LUA_USE_ASSERT)
+  {
+    GCobj **graythread = mref(g->gc.graythread, GCobj *);
+    MSize i;
+    for (i = 0; i < g->gc.graythreadtop; i++)
+      lj_assertG(graythread[i] != obj2gco(L), "free of thread on graythread stack");
+  }
+#endif
   if (obj2gco(L) == gcref(g->cur_L))
     setgcrefnull(g->cur_L);
 #if LJ_HASFFI

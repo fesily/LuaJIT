@@ -647,6 +647,26 @@ typedef struct GCState {
   MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
   MSize grayastop;	/* Gray arena stack: number of entries. */
   MSize grayasz;	/* Gray arena stack: allocated capacity. */
+  /* Contiguous worklists that replace the global gclist gray/grayagain lists.
+  ** Both are raw-allocated (g->allocf), never GC memory; see lj_gc.c. The
+  ** mainthread and huge objects are intentionally outside the per-arena gray
+  ** stacks: the mainthread is SFIXED and pre-arena; huge objects live in the
+  ** address-keyed hugeset (design doc), not in any arena. */
+  MRef hugegray;	/* GCobj **: worklist of gray huge traversable objects. */
+  MSize hugegraytop;	/* Huge gray stack: number of entries. */
+  MSize hugegraysz;	/* Huge gray stack: allocated capacity. */
+  MRef graythread;	/* GCobj **: threads greyed this cycle (atomic re-scan). */
+  MSize graythreadtop;	/* Thread gray stack: number of entries. */
+  MSize graythreadsz;	/* Thread gray stack: allocated capacity. */
+  MRef weakkey;		/* GCobj **: tables with weak keys only. */
+  MSize weakkeytop;	/* Weak-key stack: number of entries. */
+  MSize weakkeysz;	/* Weak-key stack: allocated capacity. */
+  MRef weakval;		/* GCobj **: tables with weak values only. */
+  MSize weakvaltop;	/* Weak-value stack: number of entries. */
+  MSize weakvalsz;	/* Weak-value stack: allocated capacity. */
+  MRef weakall;		/* GCobj **: tables with weak keys and values. */
+  MSize weakalltop;	/* All-weak stack: number of entries. */
+  MSize weakallsz;	/* All-weak stack: allocated capacity. */
 #if LJ_HASFFI
   GCRef cdatavroot;	/* Separate chain for VLA cdata (bitmap sweep). */
 #endif

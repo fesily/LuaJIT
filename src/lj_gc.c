@@ -100,6 +100,22 @@
 #define gc_mark_str(g, s)	((s)->marked &= (uint8_t)~LJ_GC_WHITES)
 #endif
 
+#if LJ_HASGCMARK
+static void gc_hugegray_push(global_State *g, GCobj *o);
+static int gc_hugegray_empty(global_State *g);
+static GCobj *gc_hugegray_pop(global_State *g);
+static void gc_hugegray_reset(global_State *g);
+static void gc_graythread_push(global_State *g, GCobj *o);
+static int gc_graythread_empty(global_State *g);
+static GCobj *gc_graythread_pop(global_State *g);
+static void gc_graythread_reset(global_State *g);
+static void gc_weak_push(global_State *g, GCobj *o, int weak);
+static void gc_weak_reset(global_State *g);
+static void gc_weak_redirect_all(global_State *g);
+static void gc_clearweak_stacks(global_State *g);
+static void gc_traverse_mainthread(global_State *g);
+#endif
+
 /* Mark a GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
 {
@@ -161,12 +177,20 @@ static void gc_mark(global_State *g, GCobj *o)
       o->gch.gct, o->gch.marked);
     if (inarena) {
       arena_gray_push(g, a, (GCCellID1)c);
-    } else
-#endif
+    } else {
+      if (o == obj2gco(mainthread(g))) {
+	lj_assertG(gct == ~LJ_TTHREAD, "mainthread is not a thread");
+      } else {
+	lj_assertG(lj_arena_ishuge(o), "non-arena traversable object is not huge");
+	gc_hugegray_push(g, o);
+      }
+    }
+#else
     {
       setgcrefr(o->gch.gclist, g->gc.gray);
       setgcref(g->gc.gray, o);
     }
+#endif
   }
 }
 
@@ -182,9 +206,15 @@ static void gc_mark_gcroot(global_State *g)
 /* Start a GC cycle and mark the root set. */
 static void gc_mark_start(global_State *g)
 {
+#if LJ_HASGCMARK
+  gc_hugegray_reset(g);
+  gc_graythread_reset(g);
+  gc_weak_reset(g);
+#else
   setgcrefnull(g->gc.gray);
   setgcrefnull(g->gc.grayagain);
   setgcrefnull(g->gc.weak);
+#endif
 #if LJ_HASGCMARK
   /* Restore currentwhite for the new cycle. After sweep, currentwhite had
   ** no WHITE1 bit (flipped at atomic). Restore it so curwhite()=WHITE1
@@ -207,6 +237,9 @@ static void gc_mark_start(global_State *g)
   gc_markobj(g, vmthread(g));
   gc_marktv(g, &g->registrytv);
   gc_mark_gcroot(g);
+#if LJ_HASGCMARK
+  gc_traverse_mainthread(g);
+#endif
   g->gc.state = GCSpropagate;
 }
 
@@ -292,8 +325,12 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
 #endif
       {
 	t->marked = (uint8_t)((t->marked & ~LJ_GC_WEAK) | weak);
+#if LJ_HASGCMARK
+	gc_weak_push(g, obj2gco(t), weak);
+#else
 	setgcrefr(t->gclist, g->gc.weak);
 	setgcref(g->gc.weak, obj2gco(t));
+#endif
       }
     }
   }
@@ -353,8 +390,8 @@ static void gc_marktrace(global_State *g, TraceNo traceno)
       arena_gray_push(g, a, (GCCellID1)c);
     } else {
       o->gch.marked |= LJ_GC_BLACK;
-      setgcrefr(o->gch.gclist, g->gc.gray);
-      setgcref(g->gc.gray, o);
+      lj_assertG(lj_arena_ishuge(o), "non-arena trace is not huge");
+      gc_hugegray_push(g, o);
     }
 #else
     setgcrefr(o->gch.gclist, g->gc.gray);
@@ -442,6 +479,15 @@ static void gc_traverse_thread(global_State *g, lua_State *th)
   lj_state_shrinkstack(th, gc_traverse_frames(g, th));
 }
 
+#if LJ_HASGCMARK
+/* Traverse the host-allocated main thread directly: it is SFIXED and cannot
+** live in an arena or on a per-arena gray stack. */
+static void gc_traverse_mainthread(global_State *g)
+{
+  gc_traverse_thread(g, mainthread(g));
+}
+#endif
+
 /* Propagate one gray object. Traverse it and turn it black. */
 static size_t propagatemark(global_State *g
 #if LJ_HASGCMARK
@@ -482,8 +528,12 @@ static size_t propagatemark(global_State *g
     return pt->sizept;
   } else if (LJ_LIKELY(gct == ~LJ_TTHREAD)) {
     lua_State *th = gco2th(o);
+#if LJ_HASGCMARK
+    gc_graythread_push(g, o);
+#else
     setgcrefr(th->gclist, g->gc.grayagain);
     setgcref(g->gc.grayagain, o);
+#endif
     black2gray(o);  /* Threads are never black. */
     gc_traverse_thread(g, th);
     return sizeof(lua_State) + sizeof(TValue) * th->stacksize;
@@ -572,6 +622,156 @@ static size_t gc_propagate_arena(global_State *g, GCArena *a)
     (unsigned)cellid, o->gch.gct, o->gch.marked);
   return propagatemark(g, o);
 }
+
+/* -- Non-arena gray worklists (huge objects + threads) ------------------- */
+/*
+** Two contiguous GCobj* stacks that replace the former global gclist-threaded
+** gray/grayagain lists. They are raw-allocated via g->allocf (never GC memory)
+** and grown on demand, exactly like the per-arena gray stack. Occupancy is
+** bounded: hugegray by the count of live huge traversable objects (rare),
+** graythread by the count of live coroutine threads. OOM throws via
+** lj_err_mem, matching lj_arena_gray_grow -- no graceful degradation, since
+** these worklists are tiny in practice and the per-arena stack does the same.
+*/
+
+#define GC_PTRSTACK_INIT	16	/* Initial worklist capacity (entries). */
+
+/* Grow (or initially allocate) a GCobj* worklist. Returns the (possibly
+** moved) base, guaranteed to have room for one more entry. */
+static GCobj **gc_ptrstack_grow(global_State *g, MRef *base, MSize *sz)
+{
+  GCobj **old = mref(*base, GCobj *);
+  MSize oldsz = *sz;
+  MSize newsz = oldsz ? oldsz * 2 : GC_PTRSTACK_INIT;
+  GCobj **buf = (GCobj **)g->allocf(g->allocd, old,
+				    (size_t)oldsz * sizeof(GCobj *),
+				    (size_t)newsz * sizeof(GCobj *));
+  if (LJ_UNLIKELY(buf == NULL)) lj_err_mem(mainthread(g));
+  setmref(*base, buf);
+  *sz = newsz;
+  return buf;
+}
+
+static LJ_AINLINE void gc_ptrstack_push(global_State *g, MRef *base,
+					MSize *top, MSize *sz, GCobj *o)
+{
+  GCobj **buf = mref(*base, GCobj *);
+  if (LJ_UNLIKELY(*top >= *sz))
+    buf = gc_ptrstack_grow(g, base, sz);
+  buf[(*top)++] = o;
+}
+
+/* Huge gray worklist: gray huge traversable objects awaiting propagation. */
+static LJ_AINLINE void gc_hugegray_push(global_State *g, GCobj *o)
+{
+  gc_ptrstack_push(g, &g->gc.hugegray, &g->gc.hugegraytop, &g->gc.hugegraysz, o);
+}
+static LJ_AINLINE int gc_hugegray_empty(global_State *g)
+{
+  return g->gc.hugegraytop == 0;
+}
+static LJ_AINLINE GCobj *gc_hugegray_pop(global_State *g)
+{
+  return mref(g->gc.hugegray, GCobj *)[--g->gc.hugegraytop];
+}
+static LJ_AINLINE void gc_hugegray_reset(global_State *g)
+{
+  g->gc.hugegraytop = 0;
+}
+
+/* Thread gray worklist: coroutine threads greyed this cycle, re-scanned at
+** the atomic phase (replaces the former grayagain list). */
+static LJ_AINLINE void gc_graythread_push(global_State *g, GCobj *o)
+{
+  gc_ptrstack_push(g, &g->gc.graythread, &g->gc.graythreadtop,
+		   &g->gc.graythreadsz, o);
+}
+static LJ_AINLINE int gc_graythread_empty(global_State *g)
+{
+  return g->gc.graythreadtop == 0;
+}
+static LJ_AINLINE GCobj *gc_graythread_pop(global_State *g)
+{
+  return mref(g->gc.graythread, GCobj *)[--g->gc.graythreadtop];
+}
+static LJ_AINLINE void gc_graythread_reset(global_State *g)
+{
+  g->gc.graythreadtop = 0;
+}
+
+/* Weak table worklists: split by mode for clearer atomic processing. */
+static LJ_AINLINE void gc_weak_push(global_State *g, GCobj *o, int weak)
+{
+  if ((weak & LJ_GC_WEAK) == LJ_GC_WEAK) {
+    gc_ptrstack_push(g, &g->gc.weakall, &g->gc.weakalltop, &g->gc.weakallsz, o);
+  } else if (weak & LJ_GC_WEAKKEY) {
+    gc_ptrstack_push(g, &g->gc.weakkey, &g->gc.weakkeytop, &g->gc.weakkeysz, o);
+  } else {
+    lj_assertG(weak & LJ_GC_WEAKVAL, "weak table without weak mode");
+    gc_ptrstack_push(g, &g->gc.weakval, &g->gc.weakvaltop, &g->gc.weakvalsz, o);
+  }
+}
+
+static LJ_AINLINE void gc_weak_reset(global_State *g)
+{
+  g->gc.weakkeytop = 0;
+  g->gc.weakvaltop = 0;
+  g->gc.weakalltop = 0;
+}
+
+static LJ_AINLINE void gc_weak_redirect_obj(global_State *g, GCobj *o)
+{
+  lj_assertG(o->gch.gct == ~LJ_TTAB, "weak stack contains non-table");
+  if (gc_inarena(g, o))
+    arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
+  else {
+    lj_assertG(lj_arena_ishuge(o), "non-arena weak table is not huge");
+    gc_hugegray_push(g, o);
+  }
+}
+
+static void gc_weak_redirect_stack(global_State *g, MRef stack, MSize top)
+{
+  GCobj **base = mref(stack, GCobj *);
+  MSize i;
+  for (i = 0; i < top; i++)
+    gc_weak_redirect_obj(g, base[i]);
+}
+
+static void gc_weak_redirect_all(global_State *g)
+{
+  MSize keytop = g->gc.weakkeytop;
+  MSize valtop = g->gc.weakvaltop;
+  MSize alltop = g->gc.weakalltop;
+  gc_weak_reset(g);
+  gc_weak_redirect_stack(g, g->gc.weakkey, keytop);
+  gc_weak_redirect_stack(g, g->gc.weakval, valtop);
+  gc_weak_redirect_stack(g, g->gc.weakall, alltop);
+}
+
+static void gc_ptrstack_free(global_State *g, MRef *base, MSize *top, MSize *sz)
+{
+  if (*sz != 0)
+    g->allocf(g->allocd, mref(*base, GCobj *),
+	      (size_t)*sz * sizeof(GCobj *), 0);
+  setmref(*base, NULL);
+  *top = 0;
+  *sz = 0;
+}
+
+void lj_gc_graywork_free(global_State *g)
+{
+  gc_ptrstack_free(g, &g->gc.hugegray, &g->gc.hugegraytop,
+		   &g->gc.hugegraysz);
+  gc_ptrstack_free(g, &g->gc.graythread, &g->gc.graythreadtop,
+		   &g->gc.graythreadsz);
+  gc_ptrstack_free(g, &g->gc.weakkey, &g->gc.weakkeytop,
+		   &g->gc.weakkeysz);
+  gc_ptrstack_free(g, &g->gc.weakval, &g->gc.weakvaltop,
+		   &g->gc.weakvalsz);
+  gc_ptrstack_free(g, &g->gc.weakall, &g->gc.weakalltop,
+		   &g->gc.weakallsz);
+}
 #endif
 
 /* Propagate all gray objects. */
@@ -579,24 +779,18 @@ static size_t gc_propagate_gray(global_State *g)
 {
   size_t m = 0;
 #if LJ_HASGCMARK
-  /* Drain global gray list (non-arena objects). */
-  while (gcref(g->gc.gray) != NULL) {
-    GCobj *o = gcref(g->gc.gray);
-    setgcrefr(g->gc.gray, o->gch.gclist);
-    m += propagatemark(g, o);
-  }
+  /* Drain huge gray objects (non-arena worklist). */
+  while (!gc_hugegray_empty(g))
+    m += propagatemark(g, gc_hugegray_pop(g));
   /* Drain all arena gray stacks. */
   {
     GCArena *a;
     while ((a = gc_grayarena_pop(g)) != NULL) {
       while (!arena_gray_empty(a))
 	m += gc_propagate_arena(g, a);
-      /* Also drain any objects pushed to global gray during traversal. */
-      while (gcref(g->gc.gray) != NULL) {
-	GCobj *o = gcref(g->gc.gray);
-	setgcrefr(g->gc.gray, o->gch.gclist);
-	m += propagatemark(g, o);
-      }
+      /* Also drain any huge objects pushed during arena traversal. */
+      while (!gc_hugegray_empty(g))
+	m += propagatemark(g, gc_hugegray_pop(g));
     }
   }
 #else
@@ -969,36 +1163,61 @@ static int gc_mayclear(global_State *g, cTValue *o, int val)
   return 0;  /* Cannot clear. */
 }
 
-/* Clear collected entries from weak tables. */
+/* Clear collected entries from one weak table. */
+static void gc_clearweak_tab(global_State *g, GCtab *t)
+{
+  lj_assertG((t->marked & LJ_GC_WEAK), "clear of non-weak table");
+  if ((t->marked & LJ_GC_WEAKVAL)) {
+    MSize i, asize = t->asize;
+    for (i = 0; i < asize; i++) {
+      /* Clear array slot when value is about to be collected. */
+      TValue *tv = arrayslot(t, i);
+      if (gc_mayclear(g, tv, 1))
+	setnilV(tv);
+    }
+  }
+  if (t->hmask > 0) {
+    Node *node = noderef(t->node);
+    MSize i, hmask = t->hmask;
+    for (i = 0; i <= hmask; i++) {
+      Node *n = &node[i];
+      /* Clear hash slot when key or value is about to be collected. */
+      if (!tvisnil(&n->val) && (gc_mayclear(g, &n->key, 0) ||
+				gc_mayclear(g, &n->val, 1)))
+	setnilV(&n->val);
+    }
+  }
+}
+
+#if !LJ_HASGCMARK
+/* Clear collected entries from weak tables in a gclist (classic GC). */
 static void gc_clearweak(global_State *g, GCobj *o)
 {
-  UNUSED(g);
   while (o) {
     GCtab *t = gco2tab(o);
-    lj_assertG((t->marked & LJ_GC_WEAK), "clear of non-weak table");
-    if ((t->marked & LJ_GC_WEAKVAL)) {
-      MSize i, asize = t->asize;
-      for (i = 0; i < asize; i++) {
-	/* Clear array slot when value is about to be collected. */
-	TValue *tv = arrayslot(t, i);
-	if (gc_mayclear(g, tv, 1))
-	  setnilV(tv);
-      }
-    }
-    if (t->hmask > 0) {
-      Node *node = noderef(t->node);
-      MSize i, hmask = t->hmask;
-      for (i = 0; i <= hmask; i++) {
-	Node *n = &node[i];
-	/* Clear hash slot when key or value is about to be collected. */
-	if (!tvisnil(&n->val) && (gc_mayclear(g, &n->key, 0) ||
-				  gc_mayclear(g, &n->val, 1)))
-	  setnilV(&n->val);
-      }
-    }
+    gc_clearweak_tab(g, t);
     o = gcref(t->gclist);
   }
 }
+#endif
+
+#if LJ_HASGCMARK
+static void gc_clearweak_stack(global_State *g, MRef stack, MSize top)
+{
+  GCobj **base = mref(stack, GCobj *);
+  MSize i;
+  for (i = 0; i < top; i++)
+    gc_clearweak_tab(g, gco2tab(base[i]));
+}
+
+static void gc_clearweak_stacks(global_State *g)
+{
+  gc_clearweak_stack(g, g->gc.weakkey, g->gc.weakkeytop);
+  gc_clearweak_stack(g, g->gc.weakval, g->gc.weakvaltop);
+  gc_clearweak_stack(g, g->gc.weakall, g->gc.weakalltop);
+  gc_weak_reset(g);
+}
+#endif
 
 /* Call a userdata or cdata finalizer. */
 static void gc_call_finalizer(global_State *g, lua_State *L,
@@ -1196,48 +1415,29 @@ static void atomic(global_State *g, lua_State *L)
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
 #if LJ_HASGCMARK
-  /* Redirect weak tables to arena gray stacks. */
-  {
-    GCobj *o = gcref(g->gc.weak);
-    setgcrefnull(g->gc.weak);
-    while (o != NULL) {
-      GCobj *next = gcref(o->gch.gclist);
-      if (gc_inarena(g, o)) {
-	arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
-      } else {
-	setgcrefr(o->gch.gclist, g->gc.gray);
-	setgcref(g->gc.gray, o);
-      }
-      o = next;
-    }
-  }
+  gc_weak_redirect_all(g);  /* Redirect weak tables to arena/huge gray stacks. */
 #else
   setgcrefr(g->gc.gray, g->gc.weak);  /* Empty the list of weak tables. */
   setgcrefnull(g->gc.weak);
 #endif
   lj_assertG(!iswhite(obj2gco(mainthread(g))), "main thread turned white");
   gc_markobj(g, L);  /* Mark running thread. */
+#if LJ_HASGCMARK
+  gc_traverse_mainthread(g);  /* Stack slots have no barriers. */
+#endif
   gc_traverse_curtrace(g);  /* Traverse current trace. */
   gc_mark_gcroot(g);  /* Mark GC roots (again). */
   gc_propagate_gray(g);  /* Propagate all of the above. */
 
 #if LJ_HASGCMARK
   lj_gc_ssb_flush(g);  /* Drain SSB into per-arena gray stacks. */
-  /* Drain grayagain (thread objects only): redirect arena objects to
-  ** arena gray stacks, non-arena objects to the global gray list. */
-  {
-    GCobj *o = gcref(g->gc.grayagain);
-    setgcrefnull(g->gc.grayagain);
-    while (o != NULL) {
-      GCobj *next = gcref(o->gch.gclist);
-      if (gc_inarena(g, o)) {
-	arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
-      } else {
-	setgcrefr(o->gch.gclist, g->gc.gray);
-	setgcref(g->gc.gray, o);
-      }
-      o = next;
-    }
+  /* Drain graythread (thread objects only): redirect arena threads to arena
+  ** gray stacks for the atomic re-scan. The mainthread is handled directly. */
+  while (!gc_graythread_empty(g)) {
+    GCobj *o = gc_graythread_pop(g);
+    lj_assertG(o->gch.gct == ~LJ_TTHREAD, "graythread contains non-thread");
+    lj_assertG(gc_inarena(g, o), "non-arena thread in graythread");
+    arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
   }
 #else
   setgcrefr(g->gc.gray, g->gc.grayagain);  /* Empty the 2nd chance list. */
@@ -1250,7 +1450,11 @@ static void atomic(global_State *g, lua_State *L)
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
 
   /* All marking done, clear weak tables. */
+#if LJ_HASGCMARK
+  gc_clearweak_stacks(g);
+#else
   gc_clearweak(g, gcref(g->gc.weak));
+#endif
 
   lj_buf_shrink(L, &g->tmpbuf);  /* Shrink temp buffer. */
 
@@ -1285,11 +1489,8 @@ static size_t gc_onestep_raw(lua_State *L)
     return 0;
   case GCSpropagate:
 #if LJ_HASGCMARK
-    if (gcref(g->gc.gray) != NULL) {
-      GCobj *o = gcref(g->gc.gray);
-      setgcrefr(g->gc.gray, o->gch.gclist);
-      return propagatemark(g, o);
-    }
+    if (!gc_hugegray_empty(g))
+      return propagatemark(g, gc_hugegray_pop(g));
     {
       GCArena *a = gc_grayarena_pop(g);
       if (a != NULL)
@@ -1481,6 +1682,7 @@ static void gc_arena_verify(global_State *g)
 {
   GCobj *o;
   MSize i, dead = 0;
+  lj_assertG(gc_hugegray_empty(g), "arena verify with pending huge gray objects");
   /* Flush bins + clear all GC mark bits: clean slate, allocator-truthful. */
   lj_arena_gcprepare(g);
   /* Shadow-mark every allocated arena object by scanning the block bitmaps
@@ -1680,9 +1882,15 @@ void lj_gc_fullgc(lua_State *L)
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
+#if LJ_HASGCMARK
+    gc_hugegray_reset(g);  /* Reset worklists from partial propagation. */
+    gc_graythread_reset(g);
+    gc_weak_reset(g);
+#else
     setgcrefnull(g->gc.gray);  /* Reset lists from partial propagation. */
     setgcrefnull(g->gc.grayagain);
     setgcrefnull(g->gc.weak);
+#endif
 #if LJ_HASGCMARK
     setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));  /* Discard SSB. */
     /* Under single-white, the header-based sweep predicate can't reliably
@@ -1795,6 +2003,11 @@ void lj_gc_fullgc(lua_State *L)
 void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
   o->gch.marked |= LJ_GC_GRAY;
+  if (lj_arena_ishuge(o)) {
+    if (o->gch.marked & LJ_GC_BLACK)
+      gc_hugegray_push(g, o);
+    return;
+  }
   if (arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
     GCobj **top = mref(g->gc.ssbtop, GCobj *);
     *top++ = o;

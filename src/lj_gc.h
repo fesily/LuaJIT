@@ -127,6 +127,7 @@ LJ_FUNC void lj_gc_barriertrace(global_State *g, uint32_t traceno);
 #if LJ_HASGCMARK
 LJ_FUNC void lj_gc_barrierback_arena(global_State *g, GCobj *o);
 LJ_FUNC void lj_gc_grayarena_notify(global_State *g, MSize idx);
+LJ_FUNC void lj_gc_graywork_free(global_State *g);
 LJ_FUNCA void lj_gc_ssb_flush(global_State *g);
 #endif
 
