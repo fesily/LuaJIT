@@ -305,7 +305,6 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
   uint32_t w, wtop;
   GCCellID free_pre, free_post, freed;
-  int hasdead = 0;
   UNUSED(g);
   lj_assertX((a->flags & ArenaFlag_PODOnly) == ArenaFlag_PODOnly,
 	     "podsweep of non-POD arena");
@@ -315,28 +314,6 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   ** (block=0, mark=1). */
   if (fl != NULL)
     arena_flushbins(a, fl);
-  wtop = arena_blockidx((GCCellID)a->celltop - 1);
-  for (w = UnusedBlockWords; w <= wtop; w++) {
-    if (a->block[w] & ~a->mark[w]) {
-      hasdead = 1;
-      break;
-    }
-  }
-  if (!hasdead) {
-    /* Fast path for all-live POD arenas: no White(1,0) allocated heads, so the
-    ** major-sweep transform would only demote Black(1,1)->White(1,0) and keep
-    ** Free(0,1)/Extent(0,0) unchanged. This needs just mark &= ~block. It avoids
-    ** the expensive free-cell recount and scavenge on P3-style live-heavy full
-    ** GC. If bins were flushed above, their intrusive lists are now stale (the
-    ** cells are Free in the bitmap), so reset them and force lazy rescan. */
-    for (w = UnusedBlockWords; w <= wtop; w++)
-      a->mark[w] &= ~a->block[w];
-    if (fl != NULL) {
-      freelist_reset(fl);
-      fl->scavgen = a->freegen - 1;
-    }
-    return 0;
-  }
   /* Freed cells = (free heads after the transform) - (free heads before).
   ** Both counts use the same Free (block=0, mark=1) head encoding, so any free
   ** space that the cross-cycle mark-bit resets (gcprepare/markinit) collapsed
@@ -345,6 +322,7 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   ** old-free encoding. The trusted, allocator-maintained freecells counter is
   ** then advanced by that delta. */
   free_pre = arena_count_freecells(a);
+  wtop = arena_blockidx((GCCellID)a->celltop - 1);
   for (w = UnusedBlockWords; w <= wtop; w++) {
     GCBlockword b = a->block[w], m = a->mark[w];
     a->block[w] = b & m;
