@@ -21,16 +21,17 @@
 --     collectgarbage(); report the run-to-run spread so noisy rows are visible.
 --
 -- Representative result (x86-64, -joff, 4 aggregated runs, median of medians),
--- comparing the per-object sweep (commit 8f9e5675, no POD routing) against the
--- word-parallel POD sweep (HEAD). Negative = word-sweep faster:
---   P1 20x sweep 30K dead protos      -10%  (run-to-run noise ~30%: inconclusive)
---   P2 20x sweep 50K dead closures    -17%  (noise ~28%, but stable across runs)
---   P3 200 fullgc, 40K live closures   ~0%  (mark-dominated: word-sweep neutral)
---   P4 600K mixed proto+closure churn -19%  (noise ~9%: the cleanest signal)
---   P5 alloc 1.5M closures, auto GC    -3%  (within noise; alloc path ~neutral)
--- Takeaway: the word transform wins where the sweep phase is on the critical
--- path (P2, P4); it is neutral for mark-bound and allocation-bound workloads,
--- as expected -- it only changes how dead POD objects are reclaimed.
+-- comparing v2.1 mainline default GC against the final arena/POD word-sweep
+-- build. Negative = arena/POD faster:
+--   P1 20x sweep 30K dead protos      -44%  (run-to-run noise ~33%: noisy)
+--   P2 20x sweep 50K dead closures    -43%  (noise ~25%: noisy but consistent)
+--   P3 200 fullgc, 40K live closures  +43%  (noise ~4%: arena/POD slower)
+--   P4 600K mixed proto+closure churn +76%  (noise ~6%: arena/POD slower)
+--   P5 alloc 1.5M closures, auto GC   +30%  (noise ~66%: inconclusive)
+-- Takeaway: relative to v2.1 mainline, the POD word-sweep does make the pure
+-- sweep phase faster, but the arena/bitmap collector is still much slower on
+-- live-marking and mixed mutator+GC workloads. This benchmark is therefore a
+-- phase diagnostic, not an end-to-end claim of superiority.
 
 local clock = os.clock
 local RUNS = 11
