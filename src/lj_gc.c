@@ -67,20 +67,17 @@
 
 /* Mark a TValue (if needed). */
 #if LJ_HASGCMARK
-/* Under quad-color, makewhite produces pure white (no GRAY, no WHITE1 when
-** curwhite=0 during sweep). gc_mark has its own arena_obj_ismarked / BLACK
-** early-return, so we call it unconditionally for GC values. */
 #define gc_marktv(g, tv) \
-  { if (tvisgcv(tv)) gc_mark(g, gcV(tv)); }
+  { if (tvisgcv(tv) && gc_obj_iswhite((g), gcV(tv))) gc_mark(g, gcV(tv)); }
 #else
 #define gc_marktv(g, tv) \
   { if (tviswhite(tv)) gc_mark(g, gcV(tv)); }
 #endif
 
 /* Mark a GCobj (if needed). */
-
 #if LJ_HASGCMARK
-#define gc_markobj(g, o)	gc_mark(g, obj2gco(o))
+#define gc_markobj(g, o) \
+  { GCobj *mo_ = obj2gco(o); if (gc_obj_iswhite((g), mo_)) gc_mark(g, mo_); }
 #else
 #define gc_markobj(g, o) \
   { if (iswhite(obj2gco(o))) gc_mark(g, obj2gco(o)); }
@@ -263,7 +260,7 @@ static void gc_mark_mmudata(global_State *g)
   if (u) {
     do {
       u = gcnext(u);
-      makewhite(g, u);  /* Could be from previous GC. */
+      gc_obj_makewhite(g, u);  /* Could be from previous GC. */
       gc_mark(g, u);
     } while (u != root);
   }
@@ -276,7 +273,7 @@ size_t lj_gc_separateudata(global_State *g, int all)
   GCRef *p = &mainthread(g)->nextgc;
   GCobj *o;
   while ((o = gcref(*p)) != NULL) {
-    if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
+    if (!(gc_obj_iswhite(g, o) || all) || isfinalized(gco2ud(o))) {
       p = &o->gch.nextgc;  /* Nothing to do. */
     } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
       markfinalized(o);  /* Done, as there's no __gc metamethod. */
@@ -995,8 +992,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 	/* Under HASGCMARK, gray-only objects (from sweep makewhite with
 	** curwhite=0) may not pass isdead() but are genuinely dead
 	** when the bitmap says block=1, mark=0. */
-	lj_assertG(isdead(g, o) || (o->gch.marked & LJ_GC_FIXED)
-		   || (LJ_HASGCMARK && !iswhite(o)),
+	lj_assertG(gc_obj_isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		   "bitmap sweep freeing non-dead object: o=%p gct=%d marked=0x%02x",
 		   (void*)o, o->gch.gct, o->gch.marked);
 	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
@@ -1094,7 +1090,7 @@ static void gc_rebuild_rootchain(global_State *g)
 	  continue;
 	if (o->gch.gct == ~LJ_TSTR)
 	  continue;
-	makewhite(g, o);
+	gc_obj_makewhite(g, o);
 	if (o->gch.gct == ~LJ_TUDATA) {
 	  setgcref(*udtail, o);
 	  udtail = &o->gch.nextgc;
@@ -1177,7 +1173,7 @@ static int gc_mayclear(global_State *g, cTValue *o, int val)
       gc_mark_str(g, strV(o));  /* And need to be marked. */
       return 0;
     }
-    if (iswhite(gcV(o)))
+    if (gc_obj_iswhite(g, gcV(o)))
       return 1;  /* Object is about to be collected. */
     if (tvisudata(o) && val && isfinalized(udataV(o)))
       return 1;  /* Finalized userdata is dropped only from values. */
@@ -1291,7 +1287,7 @@ static void gc_finalize(lua_State *L)
     /* Add cdata back to the GC list and make it white. */
     setgcrefr(o->gch.nextgc, g->gc.root);
     setgcref(g->gc.root, o);
-    makewhite(g, o);
+    gc_obj_makewhite(g, o);
     o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
     /* Resolve finalizer. */
     setcdataV(L, &tmp, gco2cd(o));
@@ -1307,7 +1303,7 @@ static void gc_finalize(lua_State *L)
   /* Add userdata back to the main userdata list and make it white. */
   setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
   setgcref(mainthread(g)->nextgc, o);
-  makewhite(g, o);
+  gc_obj_makewhite(g, o);
   /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
   if (mo)
@@ -1334,7 +1330,7 @@ void lj_gc_finalize_cdata(lua_State *L)
     if (!tvisnil(&node[i].val) && tviscdata(&node[i].key)) {
       GCobj *o = gcV(&node[i].key);
       TValue tmp;
-      makewhite(g, o);
+      gc_obj_makewhite(g, o);
       o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
       copyTV(L, &tmp, &node[i].val);
       setnilV(&node[i].val);
@@ -1700,11 +1696,53 @@ static void gcverify_count_dead(void *o, int gct, void *ud)
   (*(MSize *)ud)++;
 }
 
+static void gc_arena_verify_color(global_State *g, GCArena *a)
+{
+  uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+  lj_arena_flushbins(a);
+  for (w = UnusedBlockWords; w <= wtop; w++) {
+    GCBlockword heads = a->block[w];
+    while (heads) {
+      uint32_t bitidx = lj_ffs(heads);
+      GCCellID c = (w << 5) + bitidx;
+      GCobj *o = (GCobj *)arena_cellptr(a, c);
+      heads &= heads - 1;
+      /* Called at the tail of lj_gc_fullgc (state == GCSpause), after the mark
+      ** phase blackened every survivor and gc_rebuild_rootchain re-whitened the
+      ** bitmap. With the bitmap authoritative for arena color, every allocated
+      ** object must read back as bitmap-white here. A surviving mark bit means
+      ** the cycle ended with a stuck-black object -- a rebuild re-whitening
+      ** regression (the next cycle's white-reset would then be wrong).
+      **
+      ** A header cross-check is deliberately NOT done: gc_mark writes
+      ** white2gray(header) and arena_obj_setmark(bitmap) in lockstep, and
+      ** allocation co-writes newwhite(header) with the unmarked bitmap, so the
+      ** header WHITES bit can never diverge from the bitmap at a mutation site.
+      ** Asserting their agreement would be vacuous; the live invariant is the
+      ** bitmap reaching the clean all-white state the next cycle depends on.
+      ** Verified reachable: defeating the rebuild whitening leaves objects
+      ** bitmap-black here and this assert fires. */
+      lj_assertG(!arena_obj_ismarked(a, c),
+		 "arena object still bitmap-black after full GC rebuild: "
+		 "ptr=%p gct=%d marked=0x%02x cell=%d",
+		 (void *)o, o->gch.gct, o->gch.marked, (int)c);
+    }
+  }
+}
+
 static void gc_arena_verify(global_State *g)
 {
   GCobj *o;
   MSize i, dead = 0;
   lj_assertG(gc_hugegray_empty(g), "arena verify with pending huge gray objects");
+  {
+    GCArena **arenas = mref(g->gc.arenas, GCArena *);
+    for (i = 0; i < g->gc.arenastop; i++) {
+      GCArena *a = arenas[i];
+      if (a->flags & ArenaFlag_TravObjs)
+	gc_arena_verify_color(g, a);
+    }
+  }
   /* Flush bins + clear all GC mark bits: clean slate, allocator-truthful. */
   lj_arena_gcprepare(g);
   /* Shadow-mark every allocated arena object by scanning the block bitmaps

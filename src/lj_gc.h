@@ -7,6 +7,9 @@
 #define _LJ_GC_H
 
 #include "lj_obj.h"
+#if LJ_HASGCMARK
+#include "lj_arena.h"
+#endif
 
 /* Garbage collector states. Order matters. */
 enum {
@@ -89,6 +92,78 @@ enum {
 #endif
 #define fixstring(s)	((s)->marked |= LJ_GC_FIXED)
 #define markfinalized(x)	((x)->gch.marked |= LJ_GC_FINALIZED)
+
+#if LJ_HASGCMARK
+/* Arena-aware color seam. Phase 1 keeps the legacy header color bits coherent
+** with the arena mark bitmap; later phases can make the bitmap authoritative
+** for arena objects without changing call sites again. */
+static LJ_AINLINE int gc_obj_inarena(global_State *g, GCobj *o)
+{
+  return !lj_arena_ishuge(o) && o != obj2gco(mainthread(g)) &&
+	 o != obj2gco(&g->strempty);
+}
+
+static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
+{
+  if (gc_obj_inarena(g, o))
+    return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+  return iswhite(o) != 0;
+}
+
+static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
+{
+  if (gc_obj_inarena(g, o))
+    return arena_obj_ismarked(ptr2arena(o), ptr2cell(o)) && !isgray(o);
+  return (o->gch.marked & LJ_GC_BLACK) != 0;
+}
+
+static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
+{
+  if (gc_obj_inarena(g, o)) {
+    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
+      return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+    return isdead(g, o) != 0;
+  }
+  return isdead(g, o) != 0;
+}
+
+static LJ_AINLINE void gc_obj_markblack(global_State *g, GCobj *o)
+{
+  if (gc_obj_inarena(g, o)) {
+    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+    o->gch.marked = (uint8_t)(o->gch.marked & (uint8_t)~LJ_GC_WHITES);
+  } else {
+    o->gch.marked |= LJ_GC_BLACK;
+  }
+}
+
+static LJ_AINLINE void gc_obj_makewhite(global_State *g, GCobj *o)
+{
+  if (gc_obj_inarena(g, o)) {
+    arena_obj_clearmark(ptr2arena(o), ptr2cell(o));
+    makewhite(g, o);
+  } else {
+    makewhite(g, o);
+  }
+}
+
+static LJ_AINLINE void gc_obj_resurrect(global_State *g, GCobj *o)
+{
+  if (gc_obj_inarena(g, o)) {
+    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+    flipwhite(o);
+  } else {
+    flipwhite(o);
+  }
+}
+#else
+#define gc_obj_iswhite(g, o)		(iswhite((o)) != 0)
+#define gc_obj_isblack(g, o)		(isblack((o)) != 0)
+#define gc_obj_isdead(g, o)		(isdead((g), (o)) != 0)
+#define gc_obj_markblack(g, o)		((o)->gch.marked |= LJ_GC_BLACK)
+#define gc_obj_makewhite(g, o)		makewhite((g), (o))
+#define gc_obj_resurrect(g, o)		flipwhite((o))
+#endif
 
 /* Collector. */
 LJ_FUNC size_t lj_gc_separateudata(global_State *g, int all);

@@ -332,14 +332,8 @@ GCstr *lj_str_new(lua_State *L, const char *str, size_t lenx)
       GCstr *sx = gco2str(o);
       if (sx->hash == hash && sx->len == len) {
 	if (memcmp(str, strdata(sx), len) == 0) {
-	  if (isdead(g, o)) {
-	    flipwhite(o);  /* Resurrect if dead. */
-#if LJ_HASGCMARK
-	    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
-		!lj_arena_ishuge(o) && o != obj2gco(&g->strempty))
-	      arena_obj_setmark(ptr2arena(o), ptr2cell(o));
-#endif
-	  }
+	  if (gc_obj_isdead(g, o))
+	    gc_obj_resurrect(g, o);  /* Resurrect if dead. */
 	  return sx;  /* Return existing string. */
 	}
 	coll++;

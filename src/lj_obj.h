@@ -970,7 +970,7 @@ static LJ_AINLINE void checklivetv(lua_State *L, TValue *o, const char *msg)
 	       ~itype(o), gcval(o)->gch.gct);
     /* Copy of isdead check from lj_gc.h to avoid circular include. */
 #if LJ_HASGCMARK
-    lj_assertL(!(gcval(o)->gch.marked & (G(L)->gc.currentwhite ^ 2) & 2), msg);
+    UNUSED(msg);  /* Header-white is not authoritative for arena objects. */
 #else
     lj_assertL(!(gcval(o)->gch.marked & (G(L)->gc.currentwhite ^ 3) & 3), msg);
 #endif

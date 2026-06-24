@@ -44,8 +44,8 @@ static GCupval *func_finduv(lua_State *L, TValue *slot)
   while (gcref(*pp) != NULL && uvval((p = gco2uv(gcref(*pp)))) >= slot) {
     lj_assertG(!p->closed && uvval(p) != &p->tv, "closed upvalue in chain");
     if (uvval(p) == slot) {  /* Found open upvalue pointing to same slot? */
-      if (isdead(g, obj2gco(p)))  /* Resurrect it, if it's dead. */
-	flipwhite(obj2gco(p));
+      if (gc_obj_isdead(g, obj2gco(p)))  /* Resurrect it, if it's dead. */
+	gc_obj_resurrect(g, obj2gco(p));
       return p;
     }
     pp = &p->nextgc;
@@ -90,7 +90,7 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
     lj_assertG(!isblack(o), "bad black upvalue");
     lj_assertG(!uv->closed && uvval(uv) != &uv->tv, "closed upvalue in chain");
     setgcrefr(L->openupval, uv->nextgc);  /* No longer in open list. */
-    if (isdead(g, o)) {
+    if (gc_obj_isdead(g, o)) {
       lj_func_freeuv(g, uv);
     } else {
       unlinkuv(g, uv);
