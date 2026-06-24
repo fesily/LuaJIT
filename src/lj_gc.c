@@ -891,7 +891,9 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
 	o != obj2gco(&g->strempty)) {
       if ((o->gch.marked & LJ_GC_FIXED) ||
 	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
-	makewhite(g, o);
+	/* Live: bitmap (arena_obj_ismarked) is authoritative for arena string
+	** color. No header recolor needed -- the mark bit is reset per cycle by
+	** gc_rebuild_rootchain's second pass (mark[w] &= ~block[w]). */
 	p = &o->gch.nextgc;
       } else {
 	setgcrefr(*p, o->gch.nextgc);
