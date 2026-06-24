@@ -347,6 +347,18 @@ LJ_FUNC GCCellID lj_arena_podsweep(global_State *g, GCArena *a);
 LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);
 LJ_FUNC void lj_hugeblock_free(global_State *g, void *p, size_t size);
 LJ_FUNC void lj_hugeset_free(global_State *g);
+/* Hugeset slot encoding. A slot is EMPTY (0), TOMB (1), or a live arena-aligned
+** address with the MARK bit (1) optionally set in bit 1. The address bits
+** survive PTRMASK; EMPTY/TOMB have no address bits. */
+#define HUGESET_MARK	((uintptr_t)2)	/* Bit 1: reachable this GC cycle. */
+#define HUGESET_PTRMASK	(~(uintptr_t)3)	/* Strip TOMB|MARK to recover address. */
+#define hugeset_slot_addr(u)	((GCobj *)((u) & HUGESET_PTRMASK))
+#define hugeset_slot_live(u)	(((u) & HUGESET_PTRMASK) != 0)
+/* Huge-object mark bit, stored in the hugeset slot (bit 1). The argument is the
+** huge object's base address; the object must be registered and non-string. */
+LJ_FUNC void huge_obj_setmark(global_State *g, void *p);
+LJ_FUNC int huge_obj_ismarked(global_State *g, void *p);
+LJ_FUNC void huge_obj_clearmark(global_State *g, void *p);
 
 #endif
 

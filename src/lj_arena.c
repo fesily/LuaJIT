@@ -869,25 +869,49 @@ void lj_arena_gc_markinit(global_State *g)
 #define HUGESET_EMPTY	((uintptr_t)0)	/* Never a valid arena-aligned addr. */
 #define HUGESET_TOMB	((uintptr_t)1)	/* Deleted slot (probe-through). */
 #define HUGESET_MINSZ	16		/* Initial capacity (power of two). */
+/* HUGESET_MARK / HUGESET_PTRMASK live in lj_arena.h (shared with lj_gc.c). */
 
-/* Fibonacci-hash the arena-index of a huge block address. */
+/* A slot holds a live object iff its address bits are non-zero. EMPTY (0) and
+** TOMB (1) have all address bits clear; a real arena-aligned address has its
+** high bits set, and the low bits (incl. the MARK bit) are stripped here. */
+#define hugeset_isaddr(u)	(((u) & HUGESET_PTRMASK) != 0)
+
+/* Fibonacci-hash the arena-index of a huge block address. The MARK bit lives
+** in bit 1, below ArenaSizeLog2 (>= 20), so it never perturbs the hash. */
 static LJ_AINLINE MSize hugeset_hash(void *p, MSize mask)
 {
   uintptr_t k = (uintptr_t)p >> ArenaSizeLog2;  /* Low bits are always 0. */
   return (MSize)((k * (uintptr_t)0x9e3779b97f4a7c15ull) >> 40) & mask;
 }
 
-/* Insert p into a slot array with spare capacity (reuses tombstones). */
-static void hugeset_put(GCRef *slots, MSize mask, void *p)
+/* Probe for p in the slot array; returns its index, or the mask+1 sentinel if
+** absent. Compares on the address bits only (ignores a set MARK bit), and
+** probes through tombstones. Shared by unregister and the mark accessors. */
+static MSize hugeset_find(GCRef *slots, MSize mask, void *p)
 {
   MSize i = hugeset_hash(p, mask);
+  uintptr_t key = (uintptr_t)p & HUGESET_PTRMASK;
+  while (gcrefu(slots[i]) != HUGESET_EMPTY) {
+    if ((gcrefu(slots[i]) & HUGESET_PTRMASK) == key)
+      return i;
+    i = (i + 1) & mask;
+  }
+  return mask + 1;  /* Not found. */
+}
+
+/* Insert p into a slot array with spare capacity (reuses tombstones).
+** Preserves p's MARK bit (callers pass the raw slot value on rehash). */
+static void hugeset_put(GCRef *slots, MSize mask, uintptr_t p)
+{
+  MSize i = hugeset_hash((void *)(p & HUGESET_PTRMASK), mask);
   while (gcrefu(slots[i]) != HUGESET_EMPTY && gcrefu(slots[i]) != HUGESET_TOMB)
     i = (i + 1) & mask;
-  setgcrefp(slots[i], p);
+  setgcrefp(slots[i], (void *)p);
 }
 
 /* Allocate a fresh slot array of capacity newmask+1 and rehash live entries.
-** Returns 0 on OOM (the old table is left intact). */
+** Returns 0 on OOM (the old table is left intact). The raw slot value
+** (address | MARK) is carried over so a mid-cycle resize keeps marks. */
 static int hugeset_resize(global_State *g, MSize newmask)
 {
   GCRef *old = mref(g->gc.hugeset, GCRef);
@@ -901,8 +925,8 @@ static int hugeset_resize(global_State *g, MSize newmask)
     MSize i;
     for (i = 0; i <= oldmask; i++) {
       uintptr_t u = gcrefu(old[i]);
-      if (u != HUGESET_EMPTY && u != HUGESET_TOMB)
-	hugeset_put(neu, newmask, (void *)u);
+      if (hugeset_isaddr(u))
+	hugeset_put(neu, newmask, u);  /* Carries the MARK bit. */
     }
     g->allocf(g->allocd, old, (size_t)(oldmask + 1) * sizeof(GCRef), 0);
   }
@@ -926,7 +950,7 @@ static int huge_register(global_State *g, void *p)
     if (!hugeset_resize(g, cap - 1))
       return 0;
   }
-  hugeset_put(mref(g->gc.hugeset, GCRef), g->gc.hugesetmask, p);
+  hugeset_put(mref(g->gc.hugeset, GCRef), g->gc.hugesetmask, (uintptr_t)p);
   g->gc.hugesetnum++;
   return 1;
 }
@@ -936,18 +960,45 @@ static void huge_unregister(global_State *g, void *p)
 {
   GCRef *slots = mref(g->gc.hugeset, GCRef);
   MSize mask = g->gc.hugesetmask;
-  MSize i = hugeset_hash(p, mask);
+  MSize i;
   lj_assertG_(g, slots != NULL, "huge unregister with empty set");
-  while (gcrefu(slots[i]) != HUGESET_EMPTY) {
-    if (gcrefu(slots[i]) == (uintptr_t)p) {
-      setgcrefp(slots[i], (void *)HUGESET_TOMB);
-      g->gc.hugesetnum--;
-      g->gc.hugesettomb++;
-      return;
-    }
-    i = (i + 1) & mask;
+  i = hugeset_find(slots, mask, p);
+  lj_assertG_(g, i <= mask, "huge unregister: address not found");
+  if (i <= mask) {
+    setgcrefp(slots[i], (void *)HUGESET_TOMB);
+    g->gc.hugesetnum--;
+    g->gc.hugesettomb++;
   }
-  lj_assertG_(g, 0, "huge unregister: address not found");
+}
+
+/* -- Huge object mark bit (lives in the hugeset slot, bit 1) --------------- */
+/* Huge objects have no cell bitmap, so their "reachable this cycle" bit lives
+** in the high free bit of their hugeset slot. The set already enumerates every
+** live huge object, so it serves as the huge analogue of the arena mark[].
+** Strings are excluded: huge interned strings keep their header mark (swept by
+** gc_sweepstr); only non-string huge objects use the slot mark. */
+void huge_obj_setmark(global_State *g, void *p)
+{
+  GCRef *slots = mref(g->gc.hugeset, GCRef);
+  MSize i = hugeset_find(slots, g->gc.hugesetmask, p);
+  lj_assertG_(g, i <= g->gc.hugesetmask, "huge setmark: address not found");
+  setgcrefp(slots[i], (void *)(gcrefu(slots[i]) | HUGESET_MARK));
+}
+
+int huge_obj_ismarked(global_State *g, void *p)
+{
+  GCRef *slots = mref(g->gc.hugeset, GCRef);
+  MSize i = hugeset_find(slots, g->gc.hugesetmask, p);
+  lj_assertG_(g, i <= g->gc.hugesetmask, "huge ismarked: address not found");
+  return (gcrefu(slots[i]) & HUGESET_MARK) != 0;
+}
+
+void huge_obj_clearmark(global_State *g, void *p)
+{
+  GCRef *slots = mref(g->gc.hugeset, GCRef);
+  MSize i = hugeset_find(slots, g->gc.hugesetmask, p);
+  lj_assertG_(g, i <= g->gc.hugesetmask, "huge clearmark: address not found");
+  setgcrefp(slots[i], (void *)(gcrefu(slots[i]) & ~HUGESET_MARK));
 }
 
 /* Free the huge-set backing store (shutdown). */

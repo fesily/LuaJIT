@@ -119,6 +119,7 @@ static void gc_mark(global_State *g, GCobj *o)
   int gct = o->gch.gct;
 #if LJ_HASGCMARK
   int inarena = gc_mark_inarena(o);
+  int inhuge = !inarena && gc_obj_inhugeset(g, o);  /* Huge non-string. */
   GCArena *a;
   GCCellID c;
   if (inarena) {
@@ -126,13 +127,16 @@ static void gc_mark(global_State *g, GCobj *o)
     c = ptr2cell(o);
     if (arena_obj_ismarked(a, c))
       return;
+  } else if (inhuge) {
+    if (huge_obj_ismarked(g, o))  /* Slot mark is the dedup gate. */
+      return;
   } else if (!iswhite(o)) {
     if (o->gch.marked & LJ_GC_BLACK)
       return;
   }
 #endif
 #if LJ_HASGCMARK
-  lj_assertG(inarena || iswhite(o) || isgray(o) ||
+  lj_assertG(inarena || inhuge || iswhite(o) || isgray(o) ||
 	     !(o->gch.marked & (LJ_GC_WHITES|LJ_GC_BLACK|LJ_GC_GRAY)),
 	     "mark of already-black non-arena object");
 #else
@@ -142,6 +146,8 @@ static void gc_mark(global_State *g, GCobj *o)
 #if LJ_HASGCMARK
   if (inarena)
     arena_obj_setmark(a, c);
+  else if (inhuge)
+    huge_obj_setmark(g, o);
   else
     o->gch.marked |= LJ_GC_BLACK;
 #endif
@@ -377,7 +383,7 @@ static void gc_marktrace(global_State *g, TraceNo traceno)
 {
   GCobj *o = obj2gco(traceref(G2J(g), traceno));
   lj_assertG(traceno != G2J(g)->cur.traceno, "active trace escaped");
-  if (iswhite(o)) {
+  if (gc_obj_iswhite(g, o)) {
     white2gray(o);
 #if LJ_HASGCMARK
     if (gc_inarena(g, o)) {
@@ -386,8 +392,8 @@ static void gc_marktrace(global_State *g, TraceNo traceno)
       arena_obj_setmark(a, c);
       arena_gray_push(g, a, (GCCellID1)c);
     } else {
-      o->gch.marked |= LJ_GC_BLACK;
       lj_assertG(lj_arena_ishuge(o), "non-arena trace is not huge");
+      huge_obj_setmark(g, o);  /* Traces are never strings: slot mark. */
       gc_hugegray_push(g, o);
     }
 #else
@@ -1118,14 +1124,16 @@ static void gc_rebuild_rootchain(global_State *g)
       for (hi = 0; hi <= hmask; hi++) {
 	uintptr_t u = gcrefu(slots[hi]);
 	GCobj *o;
-	if (u == 0 || u == 1) continue;  /* HUGESET_EMPTY / HUGESET_TOMB. */
-	o = (GCobj *)u;
+	if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
+	o = hugeset_slot_addr(u);
 	if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
 	lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
-	if (iswhite(o)) {
+	if (!(u & HUGESET_MARK)) {
 	  /* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
 	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
 	} else {
+	  /* Survivor: clear the slot mark (per-cycle white reset) + header. */
+	  huge_obj_clearmark(g, o);
 	  makewhite(g, o);
 	  if (o->gch.gct == ~LJ_TUDATA) {
 	    setgcref(*udtail, o);
@@ -1403,8 +1411,8 @@ void lj_gc_freeall(global_State *g)
 	for (hi = 0; hi <= hmask; hi++) {
 	  uintptr_t u = gcrefu(slots[hi]);
 	  GCobj *o;
-	  if (u == 0 || u == 1) continue;  /* HUGESET_EMPTY / HUGESET_TOMB. */
-	  o = (GCobj *)u;
+	  if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
+	  o = hugeset_slot_addr(u);
 	  if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
 	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
 	}
@@ -1743,6 +1751,27 @@ static void gc_arena_verify(global_State *g)
 	gc_arena_verify_color(g, a);
     }
   }
+  /* Huge color cross-check, mirroring gc_arena_verify_color: at GCSpause after
+  ** rebuild, every live huge non-string object must be slot-white (mark bit
+  ** cleared by the rebuild set-walk). A stuck slot mark means the per-cycle
+  ** reset regressed. Strings keep header color (swept by gc_sweepstr). */
+  {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	GCobj *o2;
+	if (!hugeset_slot_live(u)) continue;
+	o2 = hugeset_slot_addr(u);
+	if (o2->gch.gct == ~LJ_TSTR) continue;
+	lj_assertG(!(u & HUGESET_MARK),
+		   "huge object still slot-black after full GC rebuild: "
+		   "ptr=%p gct=%d marked=0x%02x", (void *)o2, o2->gch.gct,
+		   o2->gch.marked);
+      }
+    }
+  }
   /* Flush bins + clear all GC mark bits: clean slate, allocator-truthful. */
   lj_arena_gcprepare(g);
   /* Shadow-mark every allocated arena object by scanning the block bitmaps
@@ -1782,8 +1811,8 @@ static void gc_arena_verify(global_State *g)
 	MSize hi, hmask = g->gc.hugesetmask;
 	for (hi = 0; hi <= hmask; hi++) {
 	  uintptr_t u = gcrefu(slots[hi]);
-	  if (u == 0 || u == 1) continue;
-	  o = (GCobj *)u;
+	  if (!hugeset_slot_live(u)) continue;
+	  o = hugeset_slot_addr(u);
 	  if (o->gch.gct == ~LJ_TSTR) continue;
 	  arena_obj_shadowmark(o);
 #if LJ_HASFFI
@@ -2016,9 +2045,10 @@ void lj_gc_fullgc(lua_State *L)
 	  MSize hi, hmask = g->gc.hugesetmask;
 	  for (hi = 0; hi <= hmask; hi++) {
 	    uintptr_t u = gcrefu(slots[hi]);
-	    if (u == 0 || u == 1) continue;
-	    o = (GCobj *)u;
+	    if (!hugeset_slot_live(u)) continue;
+	    o = hugeset_slot_addr(u);
 	    if (o->gch.gct == ~LJ_TSTR) continue;
+	    huge_obj_clearmark(g, o);  /* Reset slot mark with the header. */
 	    makewhite(g, o);
 	  }
 	}
@@ -2090,7 +2120,9 @@ void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
   o->gch.marked |= LJ_GC_GRAY;
   if (lj_arena_ishuge(o)) {
-    if (o->gch.marked & LJ_GC_BLACK)
+    /* Huge non-string objects carry black in their hugeset slot; strings keep
+    ** the header bit (swept by gc_sweepstr, never reach this arena barrier). */
+    if (huge_obj_ismarked(g, o))
       gc_hugegray_push(g, o);
     return;
   }

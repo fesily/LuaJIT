@@ -103,10 +103,21 @@ static LJ_AINLINE int gc_obj_inarena(global_State *g, GCobj *o)
 	 o != obj2gco(&g->strempty);
 }
 
+/* Huge non-string objects carry white/black in their hugeset slot (bit 1),
+** not the header. Huge strings are excluded: they keep the header mark and are
+** swept by gc_sweepstr. mainthread/strempty are dlmalloc, not huge. */
+static LJ_AINLINE int gc_obj_inhugeset(global_State *g, GCobj *o)
+{
+  UNUSED(g);
+  return lj_arena_ishuge(o) && o->gch.gct != ~LJ_TSTR;
+}
+
 static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
 {
   if (gc_obj_inarena(g, o))
     return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+  if (gc_obj_inhugeset(g, o))
+    return !huge_obj_ismarked(g, o);
   return iswhite(o) != 0;
 }
 
@@ -114,6 +125,8 @@ static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
 {
   if (gc_obj_inarena(g, o))
     return arena_obj_ismarked(ptr2arena(o), ptr2cell(o)) && !isgray(o);
+  if (gc_obj_inhugeset(g, o))
+    return huge_obj_ismarked(g, o) && !isgray(o);
   return (o->gch.marked & LJ_GC_BLACK) != 0;
 }
 
@@ -124,6 +137,11 @@ static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
       return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
     return isdead(g, o) != 0;
   }
+  if (gc_obj_inhugeset(g, o)) {
+    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
+      return !huge_obj_ismarked(g, o);
+    return isdead(g, o) != 0;
+  }
   return isdead(g, o) != 0;
 }
 
@@ -131,6 +149,9 @@ static LJ_AINLINE void gc_obj_markblack(global_State *g, GCobj *o)
 {
   if (gc_obj_inarena(g, o)) {
     arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+    o->gch.marked = (uint8_t)(o->gch.marked & (uint8_t)~LJ_GC_WHITES);
+  } else if (gc_obj_inhugeset(g, o)) {
+    huge_obj_setmark(g, o);
     o->gch.marked = (uint8_t)(o->gch.marked & (uint8_t)~LJ_GC_WHITES);
   } else {
     o->gch.marked |= LJ_GC_BLACK;
@@ -142,6 +163,9 @@ static LJ_AINLINE void gc_obj_makewhite(global_State *g, GCobj *o)
   if (gc_obj_inarena(g, o)) {
     arena_obj_clearmark(ptr2arena(o), ptr2cell(o));
     makewhite(g, o);
+  } else if (gc_obj_inhugeset(g, o)) {
+    huge_obj_clearmark(g, o);
+    makewhite(g, o);
   } else {
     makewhite(g, o);
   }
@@ -151,6 +175,9 @@ static LJ_AINLINE void gc_obj_resurrect(global_State *g, GCobj *o)
 {
   if (gc_obj_inarena(g, o)) {
     arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+    flipwhite(o);
+  } else if (gc_obj_inhugeset(g, o)) {
+    huge_obj_setmark(g, o);
     flipwhite(o);
   } else {
     flipwhite(o);
