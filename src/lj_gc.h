@@ -103,13 +103,14 @@ static LJ_AINLINE int gc_obj_inarena(global_State *g, GCobj *o)
 	 o != obj2gco(&g->strempty);
 }
 
-/* Huge non-string objects carry white/black in their hugeset slot (bit 1),
-** not the header. Huge strings are excluded: they keep the header mark and are
-** swept by gc_sweepstr. mainthread/strempty are dlmalloc, not huge. */
+/* Every huge object (string and non-string) carries white/black in its
+** hugeset slot (bit 1), not the header. mainthread/strempty are dlmalloc, not
+** huge. Huge strings are still unlinked from the intern table by gc_sweepstr,
+** but their color authority is the slot. */
 static LJ_AINLINE int gc_obj_inhugeset(global_State *g, GCobj *o)
 {
   UNUSED(g);
-  return lj_arena_ishuge(o) && o->gch.gct != ~LJ_TSTR;
+  return lj_arena_ishuge(o);
 }
 
 static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)

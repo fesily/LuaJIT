@@ -88,6 +88,8 @@
 #define gc_mark_str(g, s) do { \
   if (gc_inarena(g, obj2gco(s))) \
     arena_obj_setmark(ptr2arena(s), ptr2cell(s)); \
+  else if (lj_arena_ishuge(obj2gco(s))) \
+    huge_obj_setmark(g, obj2gco(s)); \
   else { \
     (s)->marked &= (uint8_t)~LJ_GC_WHITES; \
     (s)->marked |= LJ_GC_BLACK; \
@@ -119,7 +121,7 @@ static void gc_mark(global_State *g, GCobj *o)
   int gct = o->gch.gct;
 #if LJ_HASGCMARK
   int inarena = gc_mark_inarena(o);
-  int inhuge = !inarena && gc_obj_inhugeset(g, o);  /* Huge non-string. */
+  int inhuge = !inarena && gc_obj_inhugeset(g, o);  /* Huge object (string or non-string). */
   GCArena *a;
   GCCellID c;
   if (inarena) {
@@ -887,13 +889,18 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
   setgcrefp(q, (u & ~(uintptr_t)1));
   while ((o = gcref(*p)) != NULL) {
 #if LJ_HASGCMARK
-    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) && !lj_arena_ishuge(o) &&
+    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
 	o != obj2gco(&g->strempty)) {
-      if ((o->gch.marked & LJ_GC_FIXED) ||
-	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
-	/* Live: bitmap (arena_obj_ismarked) is authoritative for arena string
-	** color. No header recolor needed -- the mark bit is reset per cycle by
-	** gc_rebuild_rootchain's second pass (mark[w] &= ~block[w]). */
+      int live = (o->gch.marked & LJ_GC_FIXED) ||
+		 (lj_arena_ishuge(o)
+		    ? huge_obj_ismarked(g, o)
+		    : arena_obj_ismarked(ptr2arena(o), ptr2cell(o)));
+      if (live) {
+	/* Live: the mark is authoritative for string color -- the cell bitmap
+	** for arena strings, the hugeset slot for huge strings. No header
+	** recolor needed; the mark is reset per cycle by gc_rebuild_rootchain
+	** (arena second pass mark[w] &= ~block[w] for cells, the ~LJ_TSTR slot
+	** clear for huge strings). */
 	p = &o->gch.nextgc;
       } else {
 	setgcrefr(*p, o->gch.nextgc);
@@ -1113,11 +1120,11 @@ static void gc_rebuild_rootchain(global_State *g)
   ** Scan the address-keyed huge set instead: free the dead (white), makewhite
   ** survivors and re-link udata onto the udata sub-chain.
   **
-  ** Huge STRINGS are excluded here: they are interned and fully owned by
-  ** gc_sweepstr, which runs in the earlier GCSsweepstring phase and already
-  ** handles huge strings via their header mark (gc_sweepstr's bitmap branch
-  ** is gated on !lj_arena_ishuge). A live huge string is therefore already
-  ** white by the time we get here -- treating it as dead would double-free.
+  ** Huge STRINGS are not freed here: they are interned and gc_sweepstr (in the
+  ** earlier GCSsweepstring phase) owns their life/death via the same hugeset
+  ** slot mark. By the time we get here a live huge string is already
+  ** slot-white, so treating it as dead would double-free. We still clear its
+  ** slot mark below to give it the per-cycle reset (see the ~LJ_TSTR branch).
   ** Upvalues are never huge (fixed small size). */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
@@ -1128,7 +1135,16 @@ static void gc_rebuild_rootchain(global_State *g)
 	GCobj *o;
 	if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
 	o = hugeset_slot_addr(u);
-	if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
+	if (o->gch.gct == ~LJ_TSTR) {
+	  /* Owned by gc_sweepstr for life/death, but its slot mark still needs
+	  ** the per-cycle reset that arena objects get from the second-pass
+	  ** mark[w] &= ~block[w] below. A huge string allocated mid-sweep into
+	  ** an already-swept bucket (or marked by GCF_MARKALLOC) is never
+	  ** revisited by gc_sweepstr this cycle, so clear it here -- never make
+	  ** the alive/dead decision (the string stays linked in the chain). */
+	  huge_obj_clearmark(g, o);
+	  continue;
+	}
 	lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
 	if (!(u & HUGESET_MARK)) {
 	  /* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
@@ -1404,8 +1420,8 @@ void lj_gc_freeall(global_State *g)
 	}
       }
     }
-    /* Huge non-string objects: walk the huge set (no cell bitmap exists for
-    ** them). Strings are owned by gc_sweepstr; VLA cdata were freed above. */
+    /* Huge objects: walk the huge set (no cell bitmap exists for them).
+    ** Strings are owned by gc_sweepstr; VLA cdata were freed above. */
     {
       GCRef *slots = mref(g->gc.hugeset, GCRef);
       if (slots != NULL) {
@@ -1754,9 +1770,10 @@ static void gc_arena_verify(global_State *g)
     }
   }
   /* Huge color cross-check, mirroring gc_arena_verify_color: at GCSpause after
-  ** rebuild, every live huge non-string object must be slot-white (mark bit
-  ** cleared by the rebuild set-walk). A stuck slot mark means the per-cycle
-  ** reset regressed. Strings keep header color (swept by gc_sweepstr). */
+  ** rebuild, every live huge object (string and non-string) must be slot-white.
+  ** Non-strings are cleared by the rebuild set-walk; huge strings by the
+  ** ~LJ_TSTR slot-clear in that same walk. A stuck slot mark means the
+  ** per-cycle reset regressed. */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -1766,7 +1783,6 @@ static void gc_arena_verify(global_State *g)
 	GCobj *o2;
 	if (!hugeset_slot_live(u)) continue;
 	o2 = hugeset_slot_addr(u);
-	if (o2->gch.gct == ~LJ_TSTR) continue;
 	lj_assertG(!(u & HUGESET_MARK),
 		   "huge object still slot-black after full GC rebuild: "
 		   "ptr=%p gct=%d marked=0x%02x", (void *)o2, o2->gch.gct,
@@ -1781,8 +1797,9 @@ static void gc_arena_verify(global_State *g)
   ** Trav arenas hold tables, funcs, protos, threads, upvalues, regular cdata,
   ** traces and udata. The bitmap scan finds all of them -- including open
   ** upvalues, which the root chain can't enumerate without per-thread walks.
-  ** Huge non-string objects are in the address-keyed huge set, not in any
-  ** arena bitmap. mainthread/strempty are dlmalloc (not in arenas). */
+    ** Huge objects are in the address-keyed huge set, not in any arena
+    ** bitmap. huge strings are still owned by gc_sweepstr. mainthread/strempty
+    ** are dlmalloc (not in arenas). */
   {
     GCArena **arenas = mref(g->gc.arenas, GCArena *);
     for (i = 0; i < g->gc.arenastop; i++) {
@@ -1806,7 +1823,8 @@ static void gc_arena_verify(global_State *g)
 	}
       }
     }
-    /* Huge non-string objects have no cell bitmap. */
+    /* Huge objects have no cell bitmap. Huge strings are still owned by
+    ** gc_sweepstr. */
     {
       GCRef *slots = mref(g->gc.hugeset, GCRef);
       if (slots != NULL) {
@@ -2040,7 +2058,8 @@ void lj_gc_fullgc(lua_State *L)
 	  }
 	}
       }
-      /* Huge non-string objects have no cell bitmap. */
+      /* Huge objects have no cell bitmap. Huge strings are made white via the
+      ** intern-table walk below. */
       {
 	GCRef *slots = mref(g->gc.hugeset, GCRef);
 	if (slots != NULL) {
@@ -2065,6 +2084,8 @@ void lj_gc_fullgc(lua_State *L)
         for (i = 0; i <= g->str.mask; i++) {
           GCobj *o2 = (GCobj *)(gcrefu(g->str.tab[i]) & ~(uintptr_t)1);
           while (o2 != NULL) {
+            if (lj_arena_ishuge(o2))
+              huge_obj_clearmark(g, o2);  /* Reset slot mark with the header. */
             makewhite(g, o2);
             o2 = gcref(o2->gch.nextgc);
           }
@@ -2122,8 +2143,9 @@ void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
   o->gch.marked |= LJ_GC_GRAY;
   if (lj_arena_ishuge(o)) {
-    /* Huge non-string objects carry black in their hugeset slot; strings keep
-    ** the header bit (swept by gc_sweepstr, never reach this arena barrier). */
+    /* Every huge object carries black in its hugeset slot; gc_sweepstr still
+    ** unlinks dead huge strings from the intern table, but the slot owns
+    ** their color. */
     if (huge_obj_ismarked(g, o))
       gc_hugegray_push(g, o);
     return;
@@ -2314,9 +2336,16 @@ void *lj_mem_newgco_slow(lua_State *L, GCSize size, int cls, int link)
   else
     g->gc.total += size;
 #if LJ_HASGCMARK
-  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC) &&
-      !lj_arena_ishuge(o)) {
-    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC)) {
+    /* An object allocated during the sweep window must be slot/bitmap-black so
+    ** the sweep does not free it under the caller's nose. Huge objects (string
+    ** and non-string) carry color in their hugeset slot, in-arena objects in
+    ** the cell bitmap -- mark whichever applies, symmetric with the in-arena
+    ** fast path in lj_mem_newgco_arena. */
+    if (lj_arena_ishuge(o))
+      huge_obj_setmark(g, o);
+    else
+      arena_obj_setmark(ptr2arena(o), ptr2cell(o));
   }
 #endif
   if (link) {
@@ -2348,4 +2377,3 @@ void *lj_mem_grow(lua_State *L, void *p, MSize *szp, MSize lim, MSize esz)
   *szp = sz;
   return p;
 }
-

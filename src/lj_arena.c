@@ -975,8 +975,8 @@ static void huge_unregister(global_State *g, void *p)
 /* Huge objects have no cell bitmap, so their "reachable this cycle" bit lives
 ** in the high free bit of their hugeset slot. The set already enumerates every
 ** live huge object, so it serves as the huge analogue of the arena mark[].
-** Strings are excluded: huge interned strings keep their header mark (swept by
-** gc_sweepstr); only non-string huge objects use the slot mark. */
+** Huge strings and non-strings alike keep their color in the slot mark; the
+** string table still unlinks dead huge strings during gc_sweepstr. */
 void huge_obj_setmark(global_State *g, void *p)
 {
   GCRef *slots = mref(g->gc.hugeset, GCRef);
