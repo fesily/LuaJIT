@@ -838,7 +838,9 @@ static const GCFreeFunc gc_freefunc[] = {
 static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 {
   /* Mask with other white and LJ_GC_FIXED. Or LJ_GC_SFIXED on shutdown. */
+#if !LJ_HASGCMARK
   int ow = otherwhite(g);
+#endif
   GCobj *o;
   while ((o = gcref(*p)) != NULL && lim-- > 0) {
     if (o->gch.gct == ~LJ_TTHREAD)  /* Need to sweep open upvalues, too. */
@@ -858,21 +860,35 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
       }
       continue;
     }
-#endif
+    /* Shutdown sweep (GCF_BITMAPSWEEP clear): the only way to reach here under
+    ** LJ_HASGCMARK, since a normal cycle keeps the flag set. Free by the fixed
+    ** SFIXED-root identity -- equal to the legacy test with ow == LJ_GC_SFIXED
+    ** since ((marked ^ WHITES) & SFIXED) == (marked & SFIXED) -- so shutdown
+    ** reads no currentwhite and no longer depends on the atomic white flip. */
+    if (o->gch.marked & LJ_GC_SFIXED) {  /* Super-fixed root: keep. */
+      p = &o->gch.nextgc;
+    } else {  /* Everything else dies at shutdown. */
+      setgcrefr(*p, o->gch.nextgc);
+      if (o == gcref(g->gc.root))
+	setgcrefr(g->gc.root, o->gch.nextgc);  /* Adjust list anchor. */
+      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+    }
+    continue;
+#else
     if (((o->gch.marked ^ LJ_GC_WHITES) & ow)) {  /* Black or current white? */
       lj_assertG(!isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		 "sweep of undead object");
       makewhite(g, o);  /* Value is alive, change to the current white. */
       p = &o->gch.nextgc;
     } else {  /* Otherwise value is dead, free it. */
-      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED
-		 || (LJ_HASGCMARK && !iswhite(o)),
+      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED,
 		 "sweep of unlive object");
       setgcrefr(*p, o->gch.nextgc);
       if (o == gcref(g->gc.root))
 	setgcrefr(g->gc.root, o->gch.nextgc);  /* Adjust list anchor. */
       gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
     }
+#endif
   }
   return p;
 }
@@ -881,7 +897,9 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 static void gc_sweepstr(global_State *g, GCRef *chain)
 {
   /* Mask with other white and LJ_GC_FIXED. Or LJ_GC_SFIXED on shutdown. */
+#if !LJ_HASGCMARK
   int ow = otherwhite(g);
+#endif
   uintptr_t u = gcrefu(*chain);
   GCRef q;
   GCRef *p = &q;
@@ -908,20 +926,33 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
       }
       continue;
     }
-#endif
+    /* Shutdown sweep (GCF_BITMAPSWEEP clear): the only way to reach here under
+    ** LJ_HASGCMARK. Free by the fixed SFIXED identity -- equal to the legacy
+    ** test with ow == LJ_GC_SFIXED since ((marked ^ WHITES) & SFIXED) ==
+    ** (marked & SFIXED) -- so shutdown reads no currentwhite. No interned
+    ** string is SFIXED (strempty is excluded above), so every string is freed,
+    ** matching lj_gc_freeall's "free everything except super-fixed" contract. */
+    if (o->gch.marked & LJ_GC_SFIXED) {  /* Super-fixed: keep. */
+      p = &o->gch.nextgc;
+    } else {  /* Otherwise free it. */
+      setgcrefr(*p, o->gch.nextgc);
+      lj_str_free(g, gco2str(o));
+    }
+    continue;
+#else
     if (((o->gch.marked ^ LJ_GC_WHITES) & ow)) {  /* Black or current white? */
       lj_assertG(!isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		 "sweep of undead string");
       makewhite(g, o);  /* String is alive, change to the current white. */
       p = &o->gch.nextgc;
     } else {  /* Otherwise string is dead, free it. */
-      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED
-		 || (LJ_HASGCMARK && !iswhite(o)),
+      lj_assertG(isdead(g, o) || ow == LJ_GC_SFIXED,
 		 "sweep of unlive string: marked=0x%02x ow=0x%02x cw=0x%02x",
 		 o->gch.marked, ow, g->gc.currentwhite);
       setgcrefr(*p, o->gch.nextgc);
       lj_str_free(g, gco2str(o));
     }
+#endif
   }
   setgcrefp(*chain, (gcrefu(q) | (u & 1)));
 }
@@ -1058,7 +1089,7 @@ static void gc_rebuild_rootchain(global_State *g)
     setgcrefnull(newcdatav);
     while (o != NULL) {
       GCobj *next = gcnext(o);
-      if (iswhite(o)) {
+      if (gc_obj_iswhite(g, o)) {
 	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
       } else {
 	makewhite(g, o);
@@ -1372,6 +1403,12 @@ void lj_gc_freeall(global_State *g)
   /* Free everything, except super-fixed objects (the main thread). */
   g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_SFIXED;
 #if LJ_HASGCMARK
+  /* Force the deterministic shutdown path: with GCF_BITMAPSWEEP clear, the
+  ** residual gc_sweep/gc_sweepstr calls below free by the SFIXED-root identity
+  ** (independent of currentwhite). The bitmap branch must NOT run here -- the
+  ** direct cell scan below frees arena objects, so reading their cell marks
+  ** afterwards would be a use-after-free. */
+  g->gc.gcmarkflags = 0;
   /*
   ** Arena mode: the 根 chain (g->gc.root) is redundant with the arena block
   ** bitmaps -- it is rebuilt from them after every bitmap sweep. Rather than

@@ -226,7 +226,14 @@ static LJ_NOINLINE GCstr *lj_str_rehash_chain(lua_State *L, StrHash hashc,
 					      const char *str, MSize len)
 {
   global_State *g = G(L);
+#if LJ_HASGCMARK
+  /* During GCSsweepstring the mark bitmap / hugeset slot is the sole liveness
+  ** authority (GCF_BITMAPSWEEP stays set throughout that state), so only the
+  ** "are we sweeping?" question remains -- no currentwhite read needed. */
+  int sweeping = (g->gc.state == GCSsweepstring);
+#else
   int ow = g->gc.state == GCSsweepstring ? otherwhite(g) : 0;  /* Sweeping? */
+#endif
   GCRef *strtab = g->str.tab;
   MSize strmask = g->str.mask;
   GCobj *o = gcref(strtab[hashc & strmask]);
@@ -237,27 +244,28 @@ static LJ_NOINLINE GCstr *lj_str_rehash_chain(lua_State *L, StrHash hashc,
     GCobj *next = gcnext(o);
     GCstr *s = gco2str(o);
     StrHash hash;
-    if (ow) {  /* Must sweep while rechaining. */
 #if LJ_HASGCMARK
-      if (g->gc.gcmarkflags & GCF_BITMAPSWEEP) {
-	/* Mark authority decides liveness, not the stale header white: cell
-	** bitmap for arena strings, hugeset slot for huge strings. strempty is
-	** dlmalloc (non-arena/huge) -- ptr2arena must not touch it. FIXED is
-	** never freed even if unmarked. */
-	int live = (o == obj2gco(&g->strempty)) ||
-		   (o->gch.marked & LJ_GC_FIXED) ||
-		   (lj_arena_ishuge(o)
-		      ? huge_obj_ismarked(g, o)
-		      : arena_obj_ismarked(ptr2arena(o), ptr2cell(o)));
-	lj_str_rehash_sweep_hits_counter++;  /* Count each branch entry. */
-	if (!live) {  /* Free dead string. */
-	  lj_str_free(g, s);
-	  o = next;
-	  continue;
-	}
-	/* Live: keep and rechain below. Mark is authoritative; no makewhite. */
-      } else
-#endif
+    if (sweeping) {  /* Must sweep while rechaining. */
+      /* Mark authority decides liveness, not the stale header white: cell
+      ** bitmap for arena strings, hugeset slot for huge strings. strempty is
+      ** dlmalloc (non-arena/huge) -- ptr2arena must not touch it. FIXED is
+      ** never freed even if unmarked. GCF_BITMAPSWEEP is invariably set during
+      ** GCSsweepstring, so the legacy header path is unreachable here. */
+      int live = (o == obj2gco(&g->strempty)) ||
+		 (o->gch.marked & LJ_GC_FIXED) ||
+		 (lj_arena_ishuge(o)
+		    ? huge_obj_ismarked(g, o)
+		    : arena_obj_ismarked(ptr2arena(o), ptr2cell(o)));
+      lj_str_rehash_sweep_hits_counter++;  /* Count each branch entry. */
+      if (!live) {  /* Free dead string. */
+	lj_str_free(g, s);
+	o = next;
+	continue;
+      }
+      /* Live: keep and rechain below. Mark is authoritative; no makewhite. */
+    }
+#else
+    if (ow) {  /* Must sweep while rechaining. */
       if (((o->gch.marked ^ LJ_GC_WHITES) & ow)) {  /* String alive? */
 	lj_assertG(!isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		   "sweep of undead string");
@@ -270,6 +278,7 @@ static LJ_NOINLINE GCstr *lj_str_rehash_chain(lua_State *L, StrHash hashc,
 	continue;
       }
     }
+#endif
     hash = s->hash;
     if (!s->hashalg) {  /* Rehash with secondary hash. */
       hash = hash_dense(g->str.seed, hash, strdata(s), s->len);
