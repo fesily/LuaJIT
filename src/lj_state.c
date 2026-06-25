@@ -300,7 +300,6 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   L->dummy_ffid = FF_C;
   setmref(L->glref, g);
 #if LJ_HASGCMARK
-  g->gc.currentwhite = LJ_GC_WHITE1 | LJ_GC_FIXED;
   g->strempty.marked = LJ_GC_WHITE1 | LJ_GC_GRAY | LJ_GC_FIXED | LJ_GC_SFIXED;
 #else
   g->gc.currentwhite = LJ_GC_WHITE0 | LJ_GC_FIXED;

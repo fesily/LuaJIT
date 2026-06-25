@@ -593,7 +593,11 @@ typedef enum {
 typedef struct GCState {
   GCSize total;		/* Memory currently allocated. */
   GCSize threshold;	/* Memory threshold. */
+#if LJ_HASGCMARK
+  uint8_t unused_currentwhite;	/* No currentwhite under bitmap GC. */
+#else
   uint8_t currentwhite;	/* Current white color. */
+#endif
   uint8_t state;	/* GC state. */
 #if LJ_HASGCMARK
   uint8_t gcmarkflags;	/* GC mark flags: bit 0=bitmapsweep, bit 1=markalloc. */

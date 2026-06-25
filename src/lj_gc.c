@@ -221,10 +221,6 @@ static void gc_mark_start(global_State *g)
   setgcrefnull(g->gc.weak);
 #endif
 #if LJ_HASGCMARK
-  /* Restore currentwhite for the new cycle. After sweep, currentwhite had
-  ** no WHITE1 bit (flipped at atomic). Restore it so curwhite()=WHITE1
-  ** and newwhite()=WHITE1|GRAY for newly allocated objects. */
-  g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
   g->gc.grayastop = 0;
   setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));
   {
@@ -1035,9 +1031,10 @@ static size_t gc_bitmap_sweep(global_State *g)
 	** them finalized + white) instead of releasing the cell. The cell
 	** stays allocated (block=1, mark=0) until gc_finalize runs the __gc
 	** callback and re-roots the object, exactly like the list sweep. */
-	/* Under HASGCMARK, gray-only objects (from sweep makewhite with
-	** curwhite=0) may not pass isdead() but are genuinely dead
-	** when the bitmap says block=1, mark=0. */
+	/* The bitmap (block=1, mark=0) is the sole dead test under HASGCMARK;
+	** the header white bit is vestigial. During GCF_BITMAPSWEEP
+	** gc_obj_isdead returns exactly !arena_obj_ismarked, so this assert is
+	** the mark-based dead invariant, independent of any header color. */
 	lj_assertG(gc_obj_isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		   "bitmap sweep freeing non-dead object: o=%p gct=%d marked=0x%02x",
 		   (void*)o, o->gch.gct, o->gch.marked);
@@ -1401,7 +1398,9 @@ void lj_gc_freeall(global_State *g)
 {
   MSize i;
   /* Free everything, except super-fixed objects (the main thread). */
+#if !LJ_HASGCMARK
   g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_SFIXED;
+#endif
 #if LJ_HASGCMARK
   /* Force the deterministic shutdown path: with GCF_BITMAPSWEEP clear, the
   ** residual gc_sweep/gc_sweepstr calls below free by the SFIXED-root identity
@@ -1541,11 +1540,11 @@ static void atomic(global_State *g, lua_State *L)
 
   /* Prepare for sweep phase. */
 #if LJ_HASGCMARK
-  /* Flip current white. With single WHITE1, this toggles WHITE1 bit off,
-  ** so curwhite()=0 during sweep: makewhite produces pure white (no bits).
-  ** otherwhite() has WHITE1, so isdead correctly detects dead objects. */
-  g->gc.currentwhite = (uint8_t)otherwhite(g);
-  g->strempty.marked = curwhite(g) | LJ_GC_FIXED | LJ_GC_SFIXED;
+  /* No white flip: liveness is the mark bitmap, not a flipping header white.
+  ** strempty is an SFIXED root, never swept; reset its vestigial header color
+  ** to the exact value the old post-flip path produced (curwhite was 0 during
+  ** sweep): FIXED|SFIXED with no white bit, so it reads as a reachable root. */
+  g->strempty.marked = LJ_GC_FIXED | LJ_GC_SFIXED;
 #else
   g->gc.currentwhite = (uint8_t)otherwhite(g);  /* Flip current white. */
   g->strempty.marked = g->gc.currentwhite;
@@ -1607,11 +1606,6 @@ static size_t gc_onestep_raw(lua_State *L)
 	gc_bitmap_sweep(g);
       }
       if (g->gc.sweepphase == SweepPhase_Rebuild) {
-	/* Restore currentwhite before rebuild so makewhite includes WHITE1.
-	** Without this, makewhite produces pure white (curwhite=0 during
-	** sweep), and gc_marktv would re-mark stale stack references that
-	** should be invisible to the next cycle. */
-	g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
 	gc_rebuild_rootchain(g);
       }
       lj_assertG(old >= g->gc.total, "sweep increased memory");
@@ -1637,7 +1631,6 @@ static size_t gc_onestep_raw(lua_State *L)
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
 #if LJ_HASGCMARK
       g->gc.gcmarkflags = 0;
-      g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
 #if LJ_HASFFI
       gc_fullsweep(g, &g->gc.cdatavroot);
 #endif
@@ -2072,7 +2065,6 @@ void lj_gc_fullgc(lua_State *L)
       GCArena **arenas = mref(g->gc.arenas, GCArena *);
       GCobj *o;
       MSize ii;
-      g->gc.currentwhite = LJ_GC_WHITES | LJ_GC_FIXED;
       /* Trav arenas: tables, funcs, protos, threads, upvalues, regular cdata,
       ** traces and udata.  Strings are handled by the intern table walk below.
       ** Open upvalues are found directly by the bitmap scan (no per-thread

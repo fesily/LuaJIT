@@ -67,10 +67,23 @@ enum {
 #define isgray(x)	(!((x)->gch.marked & (LJ_GC_BLACK|LJ_GC_WHITES)))
 #endif
 #define tviswhite(x)	(tvisgcv(x) && iswhite(gcV(x)))
+#if LJ_HASGCMARK
+/* Bitmap GC: no currentwhite field, no atomic white flip. The mark bitmap /
+** hugeset slot is the sole liveness authority for arena/huge objects, so their
+** header white bit is vestigial. The only header-resident objects are the
+** FIXED/SFIXED roots (mainthread, strempty), never collected. So curwhite is
+** the constant single white LJ_GC_WHITE1 (never flips); otherwhite/isdead --
+** reached only via gc_obj_isdead's non-arena fallback for those roots -- answer
+** "never dead" without per-cycle state. LJ_GC_WHITE1 stays defined so the
+** VM/JIT barrier WHITES tests keep their immediate encoding. */
+#define otherwhite(g)	(LJ_GC_WHITES)
+#define isdead(g, v)	(0)
+#define curwhite(g)	((void)(g), LJ_GC_WHITE1)
+#else
 #define otherwhite(g)	((g)->gc.currentwhite ^ LJ_GC_WHITES)
 #define isdead(g, v)	((v)->gch.marked & otherwhite(g) & LJ_GC_WHITES)
-
 #define curwhite(g)	((g)->gc.currentwhite & LJ_GC_WHITES)
+#endif
 #if LJ_HASGCMARK
 #define newwhite(g, x)	(obj2gco(x)->gch.marked = (uint8_t)(curwhite(g) | LJ_GC_GRAY))
 #else
@@ -171,11 +184,9 @@ __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
 ** only when (a) it is unmarked AND (b) the collector has reached the sweep
 ** window for it (GCF_BITMAPSWEEP). OUTSIDE that window -- in mark/pause, or
 ** outside any collection -- an arena/huge object is NEVER dead: returning 0
-** here makes the answer depend on the mark authority alone, not the header
-** white bits (this is a behavioral no-op today because currentwhite carries the
-** WHITES bit outside sweep, so the legacy isdead also reads 0; it removes the
-** currentwhite dependency the later teardown phase dismantles). Non-arena/
-** non-huge objects (mainthread, strempty, dlmalloc) keep the header path. */
+** makes the answer depend on the mark authority alone, not the header white
+** bits. Non-arena/non-huge objects are only the FIXED/SFIXED roots (mainthread,
+** strempty), never collected, so the isdead fallback is the constant 0 too. */
 static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
 {
   if (gc_obj_inarena(g, o)) {
