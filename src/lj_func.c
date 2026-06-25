@@ -87,7 +87,7 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
   while (gcref(L->openupval) != NULL &&
 	 uvval((uv = gco2uv(gcref(L->openupval)))) >= level) {
     GCobj *o = obj2gco(uv);
-    lj_assertG(!isblack(o), "bad black upvalue");
+    lj_assertG(!gc_obj_isblack(g, o), "bad black upvalue");
     lj_assertG(!uv->closed && uvval(uv) != &uv->tv, "closed upvalue in chain");
     setgcrefr(L->openupval, uv->nextgc);  /* No longer in open list. */
     if (gc_obj_isdead(g, o)) {

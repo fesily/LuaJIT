@@ -399,7 +399,7 @@ lua_State *lj_state_new(lua_State *L)
   setgcrefr(L1->env, L->env);
   stack_init(L1, L);  /* init stack */
 #if LJ_HASGCMARK
-  lj_assertL(iswhite(obj2gco(L1)) || isgray(obj2gco(L1)),
+  lj_assertL(gc_obj_iswhite(G(L), obj2gco(L1)) || isgray(obj2gco(L1)),
 	     "new thread object is not white or gray");
 #else
   lj_assertL(iswhite(obj2gco(L1)), "new thread object is not white");

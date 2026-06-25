@@ -2195,7 +2195,7 @@ void lj_gc_ssb_flush(global_State *g)
 void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 {
 #if LJ_HASGCMARK
-  lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !isdead(g, o),
+  lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !gc_obj_isdead(g, o),
 	     "bad object states for forward barrier");
   /* Note: unlike the header-color GC, the inline barrier fast path here only
   ** tests the gray bit, so this is entered for non-gray (white OR black)
@@ -2231,6 +2231,9 @@ void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
 #if LJ_HASGCMARK
     TV2MARKED(tv) |= LJ_GC_GRAY;  /* Set gray to avoid re-triggering barrier. */
 #else
+    /* Classic-only: this curwhite(g) recolor is compiled out under
+    ** LJ_HASGCMARK (the #if branch above runs instead), so the currentwhite
+    ** dependency here is dead on the arena/mark build. */
     TV2MARKED(tv) = (TV2MARKED(tv) & (uint8_t)~LJ_GC_COLORS) | curwhite(g);
 #endif
 #undef TV2MARKED
@@ -2247,13 +2250,13 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
   setgcrefr(o->gch.nextgc, g->gc.root);
   setgcref(g->gc.root, o);
 #if LJ_HASGCMARK
-  if ((o->gch.marked & LJ_GC_GRAY) && !iswhite(o)) {
+  if ((o->gch.marked & LJ_GC_GRAY) && !gc_obj_iswhite(g, o)) {
 #else
   if (isgray(o)) {  /* A closed upvalue is never gray, so fix this. */
 #endif
     if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
       gray2black(o);  /* Make it black and preserve invariant. */
-      if (tviswhite(&uv->tv))
+      if (tvisgcv(&uv->tv) && gc_obj_iswhite(g, gcV(&uv->tv)))
 	lj_gc_barrierf(g, o, gcV(&uv->tv));
     } else {
       makewhite(g, o);  /* Make it white, i.e. sweep the upvalue. */

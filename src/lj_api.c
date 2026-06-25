@@ -686,7 +686,7 @@ LUA_API void lua_pushcclosure(lua_State *L, lua_CFunction f, int n)
   while (n--)
     copyTV(L, &fn->c.upvalue[n], L->top+n);
   setfuncV(L, L->top, fn);
-  lj_assertL(iswhite(obj2gco(fn)), "new GC object is not white");
+  lj_assertL(gc_obj_iswhite(G(L), obj2gco(fn)), "new GC object is not white");
   incr_top(L);
 }
 

@@ -131,17 +131,68 @@ static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
   return (o->gch.marked & LJ_GC_BLACK) != 0;
 }
 
+#ifdef LUA_USE_ASSERT
+/* Assert-only test hook: counts entries into the NEW non-sweep arena/huge
+** branch of gc_obj_isdead -- i.e. an arena/huge object tested for death OUTSIDE
+** the GCF_BITMAPSWEEP window, where the authoritative answer is "never dead".
+** gc_obj_isdead is a header inline pulled into several TUs, so the counter and
+** its accessor use weak linkage to collapse the per-TU copies into one symbol
+** at link time. The accessor has default visibility (NOT LJ_FUNC, which is
+** hidden on ELF and absent from .dynsym) so test_gc_obj_isdead_authority.lua
+** resolves it via ffi.C -- mirrors lj_str_rehash_sweep_hits (lj_str.h). */
+#if defined(_WIN32)
+__declspec(selectany) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
+__declspec(dllexport) uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
+__declspec(selectany) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
+{
+  return lj_gc_obj_isdead_nonsweep_counter;
+}
+#else
+__attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
+#if defined(__ELF__) || defined(__MACH__)
+extern __attribute__((weak, visibility("default")))
+       uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
+__attribute__((weak, visibility("default")))
+uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
+{
+  return lj_gc_obj_isdead_nonsweep_counter;
+}
+#else
+extern __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
+__attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
+{
+  return lj_gc_obj_isdead_nonsweep_counter;
+}
+#endif
+#endif
+#endif
+
+/* Mark-authoritative death test for ALL GC phases. An arena/huge object is dead
+** only when (a) it is unmarked AND (b) the collector has reached the sweep
+** window for it (GCF_BITMAPSWEEP). OUTSIDE that window -- in mark/pause, or
+** outside any collection -- an arena/huge object is NEVER dead: returning 0
+** here makes the answer depend on the mark authority alone, not the header
+** white bits (this is a behavioral no-op today because currentwhite carries the
+** WHITES bit outside sweep, so the legacy isdead also reads 0; it removes the
+** currentwhite dependency the later teardown phase dismantles). Non-arena/
+** non-huge objects (mainthread, strempty, dlmalloc) keep the header path. */
 static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
 {
   if (gc_obj_inarena(g, o)) {
     if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
       return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
-    return isdead(g, o) != 0;
+#ifdef LUA_USE_ASSERT
+    lj_gc_obj_isdead_nonsweep_counter++;
+#endif
+    return 0;  /* Outside the sweep window an arena object is never dead. */
   }
   if (gc_obj_inhugeset(g, o)) {
     if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
       return !huge_obj_ismarked(g, o);
-    return isdead(g, o) != 0;
+#ifdef LUA_USE_ASSERT
+    lj_gc_obj_isdead_nonsweep_counter++;
+#endif
+    return 0;  /* Outside the sweep window a huge object is never dead. */
   }
   return isdead(g, o) != 0;
 }
@@ -239,7 +290,7 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
 {
   GCobj *o = obj2gco(t);
 #if LJ_HASGCMARK
-  lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !isdead(g, o),
+  lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !gc_obj_isdead(g, o),
 	     "bad object states for backward barrier");
   lj_gc_barrierback_arena(g, o);
 #else
