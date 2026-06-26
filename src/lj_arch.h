@@ -680,8 +680,15 @@
 #define LJ_64			1
 #endif
 
-/* Arena-based allocator for GC objects (depends on LJ_64/LJ_GC64). */
-#if defined(LUAJIT_ENABLE_GCARENA) && !defined(LUAJIT_USE_SYSMALLOC)
+/* Arena-based allocator for GC objects (depends on LJ_64/LJ_GC64).
+** Arena GC is x64-only: the write barrier and color bits are touched in the
+** x64 interpreter (vm_x64.dasc) and JIT backend (lj_asm_x86.h), and the arena
+** allocator and the bitmap mark/sweep collector are a single unit -- there is
+** no "arena allocator + classic tri-color GC" configuration. Hence
+** LJ_HASGCARENA and LJ_HASGCMARK are kept equivalent (see below).
+*/
+#if defined(LUAJIT_ENABLE_GCARENA) && !defined(LUAJIT_USE_SYSMALLOC) && \
+    LJ_TARGET_X64
 #if LJ_64 && !LJ_GC64
 #define LJ_HASGCARENA		0	/* Needs full-width GC refs on 64 bit. */
 #else
@@ -693,11 +700,12 @@
 
 /*
 ** Arena-based quad-color incremental GC (mark/sweep on the arena bitmap).
-** Currently x64 only: the write barrier and color bits are touched in the
-** x64 interpreter (vm_x64.dasc) and JIT backend (lj_asm_x86.h). Other
-** targets keep the arena allocator but run the tri-color linked-list GC.
+** x64 only and inseparable from the arena allocator: wherever arenas exist the
+** mark collector runs, so this is always equal to LJ_HASGCARENA. Non-x64
+** targets have neither arenas nor the mark collector -- they run the classic
+** tri-color linked-list GC (lj_gc_classic.c).
 */
-#if LJ_HASGCARENA && LJ_TARGET_X64
+#if LJ_HASGCARENA
 #define LJ_HASGCMARK		1
 #else
 #define LJ_HASGCMARK		0
