@@ -32,6 +32,26 @@ enum {
 /* gcmarkflags bits in GCState. */
 #define GCF_BITMAPSWEEP	0x01	/* Bitmap sweep active for this GC cycle. */
 #define GCF_MARKALLOC	0x02	/* Allocate-black: mark new arena objects. */
+#define GCF_DEADAUTH	0x04	/* Death-authority: arena/huge mark bits are the
+				** authoritative dead/alive test. Cleared at
+				** Bitmap->Rebuild so mutator barriers can't
+				** observe half-cleared marks. */
+#define GCF_UDLINK	0x08	/* Rebuild window: link new arena udata onto the
+				** udata sub-chain tail instead of suppressing,
+				** so an arena udata allocated behind the moving
+				** ArenaScan cursor is not orphaned (missed by
+				** next cycle's lj_gc_separateudata). Set after
+				** the sub-chain anchor is initialized; cleared
+				** at SweepPhase_Done. */
+#define GCF_HUGECLEAR	0x10	/* Rebuild HugeClear sub-phase: HugeScan is done,
+				** so lj_udata_new must NOT tag new huge udata
+				** LJ_GC_BLACK (the tag exists only to make
+				** HugeScan skip already-linked udata). Without
+				** this, a huge udata allocated behind the
+				** bounded HugeClear cursor would keep BLACK,
+				** leak past rebuild Done, and cause premature
+				** collection next cycle. Set at HugeScan->
+				** HugeClear; cleared at HugeClear->Epilogue. */
 #endif
 
 #if LJ_HASGCMARK
@@ -128,19 +148,35 @@ static LJ_AINLINE int gc_obj_inhugeset(global_State *g, GCobj *o)
 
 static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
 {
-  if (gc_obj_inarena(g, o))
+  if (gc_obj_inarena(g, o)) {
+    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
+	!(g->gc.gcmarkflags & GCF_DEADAUTH))
+      return 0;  /* Rebuild window: survivor marks torn down, not collectible. */
     return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
-  if (gc_obj_inhugeset(g, o))
+  }
+  if (gc_obj_inhugeset(g, o)) {
+    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
+	!(g->gc.gcmarkflags & GCF_DEADAUTH))
+      return 0;
     return !huge_obj_ismarked(g, o);
+  }
   return iswhite(o) != 0;
 }
 
 static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
 {
-  if (gc_obj_inarena(g, o))
+  if (gc_obj_inarena(g, o)) {
+    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
+	!(g->gc.gcmarkflags & GCF_DEADAUTH))
+      return 0;  /* Rebuild window: marks not trustworthy, treat as not black. */
     return arena_obj_ismarked(ptr2arena(o), ptr2cell(o)) && !isgray(o);
-  if (gc_obj_inhugeset(g, o))
+  }
+  if (gc_obj_inhugeset(g, o)) {
+    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
+	!(g->gc.gcmarkflags & GCF_DEADAUTH))
+      return 0;
     return huge_obj_ismarked(g, o) && !isgray(o);
+  }
   return (o->gch.marked & LJ_GC_BLACK) != 0;
 }
 
@@ -190,7 +226,7 @@ __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
 static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
 {
   if (gc_obj_inarena(g, o)) {
-    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
+    if (g->gc.gcmarkflags & GCF_DEADAUTH)
       return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
 #ifdef LUA_USE_ASSERT
     lj_gc_obj_isdead_nonsweep_counter++;
@@ -198,7 +234,7 @@ static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
     return 0;  /* Outside the sweep window an arena object is never dead. */
   }
   if (gc_obj_inhugeset(g, o)) {
-    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
+    if (g->gc.gcmarkflags & GCF_DEADAUTH)
       return !huge_obj_ismarked(g, o);
 #ifdef LUA_USE_ASSERT
     lj_gc_obj_isdead_nonsweep_counter++;
@@ -206,6 +242,19 @@ static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
     return 0;  /* Outside the sweep window a huge object is never dead. */
   }
   return isdead(g, o) != 0;
+}
+
+/* GC-internal raw mark-dead test. Reads the arena/huge mark DIRECTLY,
+** NOT gated on GCF_DEADAUTH. For rebuild-internal dead-checks that need
+** mark-truth during the rebuild window (after GCF_DEADAUTH is cleared).
+** Caller must be GC-internal (no mutator interleave). */
+static LJ_AINLINE int gc_mark_isdead_raw(global_State *g, GCobj *o)
+{
+  if (gc_obj_inarena(g, o))
+    return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+  if (gc_obj_inhugeset(g, o))
+    return !huge_obj_ismarked(g, o);
+  return 0;  /* Non-arena/huge (FIXED roots): never dead here. */
 }
 
 static LJ_AINLINE void gc_obj_markblack(global_State *g, GCobj *o)
@@ -294,6 +343,7 @@ LJ_FUNC void lj_gc_barrierback_arena(global_State *g, GCobj *o);
 LJ_FUNC void lj_gc_grayarena_notify(global_State *g, MSize idx);
 LJ_FUNC void lj_gc_graywork_free(global_State *g);
 LJ_FUNCA void lj_gc_ssb_flush(global_State *g);
+LJ_FUNC void lj_gc_udchain_append(global_State *g, GCobj *o);
 #endif
 
 /* Move the GC propagation frontier back for tables (make it gray again). */

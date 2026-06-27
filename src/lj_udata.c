@@ -24,9 +24,30 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   setgcref(ud->env, obj2gco(env));
   /* Chain to userdata list (after main thread).
   ** During bitmap sweep the root/udata chains are stale — rebuild
-  ** reconstructs them, so skip linking here to avoid double-linking. */
+  ** reconstructs them, so skip linking here to avoid double-linking.
+  ** Exception (GCF_UDLINK, the rebuild ArenaScan+HugeScan window): a udata
+  ** allocated behind the moving cursor would never be relinked, so splice
+  ** it onto the sub-chain tail now. For arena udata, clear the cell mark so
+  ** the forward ArenaScan cursor (block & mark) does not revisit and
+  ** double-link it. For huge udata, set LJ_GC_BLACK as an "already linked"
+  ** flag — HugeScan checks BLACK before the dead/alive test and skips the
+  ** relink. The slot mark stays set (MARKALLOC); BLACK is cleared in the
+  ** bounded HugeClear sub-phase. GCF_HUGECLEAR (HugeScan done) suppresses
+  ** the BLACK tag: HugeScan will not revisit, so the tag is unneeded and
+  ** would leak past rebuild Done (the bounded HugeClear cursor could miss a
+  ** udata allocated behind it). */
 #if LJ_HASGCMARK
-  if (LJ_LIKELY(!(g->gc.gcmarkflags & GCF_BITMAPSWEEP)))
+  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_BITMAPSWEEP)) {
+    if (g->gc.gcmarkflags & GCF_UDLINK) {
+      GCobj *o = obj2gco(ud);
+      if (!lj_arena_ishuge(o)) {
+	arena_obj_clearmark(ptr2arena(o), ptr2cell(o));
+      } else if (!(g->gc.gcmarkflags & GCF_HUGECLEAR)) {
+	o->gch.marked |= LJ_GC_BLACK;
+      }
+      lj_gc_udchain_append(g, o);
+    }
+  } else
 #endif
   {
     setgcrefr(ud->nextgc, mainthread(g)->nextgc);

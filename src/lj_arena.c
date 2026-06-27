@@ -845,6 +845,21 @@ void lj_arena_gc_markinit(global_State *g)
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
+  /* Clear huge-set slot marks: stale MARKALLOC marks from the previous sweep
+  ** window must not persist into this mark cycle (gc_mark dedup at
+  ** lj_gc_arena.c would skip tracing references of objects with a stale slot
+  ** mark). Symmetric counterpart to the arena mark clearing above. */
+  {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	if (hugeset_slot_live(u))
+	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
+      }
+    }
+  }
 }
 #endif
 
@@ -917,7 +932,9 @@ static int hugeset_resize(global_State *g, MSize newmask)
   GCRef *old = mref(g->gc.hugeset, GCRef);
   MSize oldmask = g->gc.hugesetmask;
   size_t bytes = (size_t)(newmask + 1) * sizeof(GCRef);
-  GCRef *neu = (GCRef *)g->allocf(g->allocd, NULL, 0, bytes);
+  GCRef *neu;
+  g->gc.hugesetgen++;  /* Monotonic rehash generation (HugeScan restart key). */
+  neu = (GCRef *)g->allocf(g->allocd, NULL, 0, bytes);
   if (neu == NULL)
     return 0;
   memset(neu, 0, bytes);
