@@ -635,6 +635,7 @@ typedef struct GCState {
   MRef travarena;	/* Current traversable allocation arena. */
   MRef podarena;	/* Current POD-only allocation arena (closures, protos). */
   MRef udatarena;	/* Current userdata-only allocation arena (GCudata). */
+  MRef cdatavarena;	/* Current VLA/over-aligned cdata arena (GCcdataVar). */
   MRef arenas;		/* Vector of all arenas (GCArena **). */
   MRef chunks;		/* List of reserved OS memory chunks. */
   MSize arenassz;	/* Size of arena vector. */
