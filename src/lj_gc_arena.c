@@ -129,6 +129,40 @@ static LJ_AINLINE void hugeset_slot_assert(global_State *g, uintptr_t u)
 #define hugeset_slot_assert(g, u)	((void)0)
 #endif
 
+/* LUA_USE_ASSERT: invariant check for one allocated cell in a CdataV arena.
+** Mirrors hugeset_slot_assert for arena-resident VLA cdata. The cell base p is
+** a GCcdataVar prefix; cd = p + GCcdataVar.offset is the GCobj. Asserts the
+** base<->object translation B2+B3 relies on: cd is a VLA cdata, memcdatav
+** round-trips back to p, and the offset fits uint16_t (matches lj_cdata_newv's
+** allocation-time assert). Entire body gated by LUA_USE_ASSERT; release builds
+** pay nothing. */
+#ifdef LUA_USE_ASSERT
+static LJ_AINLINE void cdatav_cell_assert(global_State *g, void *p_)
+{
+#if LJ_HASFFI
+  char *p = (char *)p_;
+  GCcdataVar *cv = (GCcdataVar *)p;
+  GCcdata *cd = (GCcdata *)(p + cv->offset);
+  lj_assertG(cd->gct == ~LJ_TCDATA,
+	     "CdataV arena cell: cd gct mismatch (base=%p cd=%p gct=0x%02x)",
+	     (void *)p, (void *)cd, cd->gct);
+  lj_assertG(cdataisv(cd),
+	     "CdataV arena cell: cd not a VLA cdata (base=%p cd=%p marked=0x%02x)",
+	     (void *)p, (void *)cd, cd->marked);
+  lj_assertG(memcdatav(cd) == (void *)p,
+	     "CdataV arena cell: memcdatav(cd) != base (base=%p cd=%p mem=%p)",
+	     (void *)p, (void *)cd, memcdatav(cd));
+  lj_assertG((char *)cd - p < 65536,
+	     "CdataV arena cell: offset exceeds uint16_t (base=%p cd=%p off=%d)",
+	     (void *)p, (void *)cd, (int)((char *)cd - p));
+#else
+  (void)g; (void)p_;
+#endif
+}
+#else
+#define cdatav_cell_assert(g, p)	((void)0)
+#endif
+
 /* Mark a GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
 {
@@ -1112,9 +1146,7 @@ static int rebuild_prologue_cdatav(global_State *g)
 	GCcdata *cd;
 	alloc &= alloc - 1;
 	cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
-	lj_assertG(cd->gct == ~LJ_TCDATA && cdataisv(cd),
-		   "CdataV arena cell not a VLA cdata: gct=%d cell=%d",
-		   (int)cd->gct, (int)c);
+	cdatav_cell_assert(g, p);
 	if (!arena_obj_ismarked(a, c)) {
 	  gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
 	  freed++;
@@ -1690,6 +1722,7 @@ void lj_gc_freeall(global_State *g)
 	    GCcdata *cd;
 	    alloc &= alloc - 1;
 	    cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
+	    cdatav_cell_assert(g, p);
 	    gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
 	  }
 	}
@@ -2241,9 +2274,7 @@ static void gc_arena_verify(global_State *g)
 	  GCcdata *cd;
 	  heads &= heads - 1;
 	  cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
-	  lj_assertG(cd->gct == ~LJ_TCDATA && cdataisv(cd),
-		     "CdataV arena verify: non-VLA gct=%d cell=%d",
-		     (int)cd->gct, (int)c);
+	  cdatav_cell_assert(g, p);
 	  arena_obj_shadowmark(p);
 	}
       }
@@ -2505,6 +2536,7 @@ void lj_gc_fullgc(lua_State *L)
 	      GCcdata *cd;
 	      alloc &= alloc - 1;
 	      cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
+	      cdatav_cell_assert(g, p);
 	      makewhite(g, obj2gco(cd));
 	    }
 	  }
