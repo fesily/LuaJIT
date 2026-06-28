@@ -224,30 +224,87 @@ static void gc_mark_mmudata(global_State *g)
   }
 }
 
-/* Separate userdata objects to be finalized to mmudata list. */
+/* Per-udata predicate + mmudata ring splice, factored out so the arena
+** bitmap scan and the hugeset scan share the IDENTICAL logic that the old
+** mainthread->nextgc chain walk applied. Returns the sizeudata bytes counted
+** toward the finalize budget (matching the legacy return accounting). */
+static size_t sepudata_one(global_State *g, GCobj *o, int all)
+{
+  if (!(gc_obj_iswhite(g, o) || all) || isfinalized(gco2ud(o)))
+    return 0;  /* Nothing to do. */
+  if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
+    markfinalized(o);  /* No __gc metamethod: mark finalized, leave in place. */
+    return 0;
+  }
+  /* Has __gc: move to mmudata ring. markfinalized before splice so a
+  ** re-encounter during this same scan (ring members live in udata arenas)
+  ** is skipped by the isfinalized test above. */
+  size_t sz = sizeudata(gco2ud(o));
+  markfinalized(o);
+  if (gcref(g->gc.mmudata)) {  /* Link to end of circular mmudata list. */
+    GCobj *root = gcref(g->gc.mmudata);
+    setgcrefr(o->gch.nextgc, root->gch.nextgc);
+    setgcref(root->gch.nextgc, o);
+    setgcref(g->gc.mmudata, o);
+  } else {  /* Create circular list. */
+    setgcref(o->gch.nextgc, o);
+    setgcref(g->gc.mmudata, o);
+  }
+  return sz;
+}
+
+/* Separate userdata objects to be finalized to mmudata list.
+**
+** T4: enumerates udata by scanning the ArenaFlag_UdataOnly arenas' block
+** bitmaps (every allocated cell is a GCudata by class invariant) plus the
+** hugeset slots whose gct == ~LJ_TUDATA. This replaces the old
+** mainthread->nextgc chain walk, which is no longer maintained at alloc
+** time (T3). The predicate is identical to the legacy chain walk — only
+** the enumeration source changed.
+**
+** Preconditions (hold at the atomic() call site, before GCF_BITMAPSWEEP):
+**   - gc_obj_iswhite(arena obj) == !arena_obj_ismarked (mark is authoritative).
+**   - lj_arena_flushbins(a) is called per arena so binned free blocks read as
+**     Free (block=0,mark=1), not Allocated (1,0) — a free block's payload is
+**     a freelist cell ID, not a valid GCudata header. */
 size_t lj_gc_separateudata(global_State *g, int all)
 {
   size_t m = 0;
-  GCRef *p = &mainthread(g)->nextgc;
-  GCobj *o;
-  while ((o = gcref(*p)) != NULL) {
-    if (!(gc_obj_iswhite(g, o) || all) || isfinalized(gco2ud(o))) {
-      p = &o->gch.nextgc;  /* Nothing to do. */
-    } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
-      markfinalized(o);  /* Done, as there's no __gc metamethod. */
-      p = &o->gch.nextgc;
-    } else {  /* Otherwise move userdata to be finalized to mmudata list. */
-      m += sizeudata(gco2ud(o));
-      markfinalized(o);
-      *p = o->gch.nextgc;
-      if (gcref(g->gc.mmudata)) {  /* Link to end of mmudata list. */
-	GCobj *root = gcref(g->gc.mmudata);
-	setgcrefr(o->gch.nextgc, root->gch.nextgc);
-	setgcref(root->gch.nextgc, o);
-	setgcref(g->gc.mmudata, o);
-      } else {  /* Create circular list. */
-	setgcref(o->gch.nextgc, o);
-	setgcref(g->gc.mmudata, o);
+  MSize i;
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  /* Scan udata arenas: every allocated cell is a GCudata (class invariant). */
+  for (i = 0; i < g->gc.arenastop; i++) {
+    GCArena *a = arenas[i];
+    uint32_t w, wtop;
+    if (!(a->flags & ArenaFlag_UdataOnly)) continue;
+    lj_arena_flushbins(a);  /* Free blocks read as Free, not Allocated. */
+    wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    for (w = UnusedBlockWords; w <= wtop; w++) {
+      GCBlockword heads = a->block[w];
+      while (heads) {
+	uint32_t bitidx = lj_ffs(heads);
+	GCCellID c = (w << 5) + bitidx;
+	GCobj *o = (GCobj *)arena_cellptr(a, c);
+	heads &= heads - 1;
+	lj_assertG(o->gch.gct == ~LJ_TUDATA,
+		   "non-udata in Udata arena: gct=%d cell=%d",
+		   (int)o->gch.gct, (int)c);
+	m += sepudata_one(g, o, all);
+      }
+    }
+  }
+  /* Scan hugeset for huge udata (huge objects have no arena class). */
+  {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	GCobj *o;
+	if (!hugeset_slot_live(u)) continue;
+	o = hugeset_slot_addr(u);
+	if (o->gch.gct != ~LJ_TUDATA) continue;
+	m += sepudata_one(g, o, all);
       }
     }
   }

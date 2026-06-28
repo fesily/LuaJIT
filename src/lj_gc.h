@@ -528,6 +528,11 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 #define lj_mem_newagco(L, s, trav) \
   lj_mem_newgco_arena(L, (GCSize)(s), \
 		      (trav) ? ArenaClass_Trav : ArenaClass_NonTrav, 0)
+/* Userdata: dedicated ArenaClass_Udata arena, NOT linked to g->gc.root
+** (udata are enumerated by separateudata via the udata-arena bitmaps +
+** hugeset, not the root nextgc chain). link=0 keeps nextgc untouched. */
+#define lj_mem_newgcou(L, s) \
+  lj_mem_newgco_arena(L, (GCSize)(s), ArenaClass_Udata, 0)
 /* POD-only traversable allocation (closures, protos): routed to the POD
 ** arena so the word-parallel sweep can reclaim it without per-object frees. */
 #define lj_mem_newgcot_pod(L, s) \
@@ -537,6 +542,7 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 #define lj_mem_newgcot(L, s)	lj_mem_newgco(L, (GCSize)(s))
 #define lj_mem_newgcot_pod(L, s)	lj_mem_newgco(L, (GCSize)(s))
 #define lj_mem_newagco(L, s, trav)  lj_mem_new(L, (GCSize)(s))
+#define lj_mem_newgcou(L, s)	lj_mem_newgco(L, (GCSize)(s))
 #define lj_mem_freegco(g, p, s)	lj_mem_free(g, (p), (s))
 #endif
 
