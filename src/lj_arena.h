@@ -83,11 +83,20 @@ typedef uint16_t GCCellID1;
 /* Arena flags. */
 enum {
   ArenaFlag_TravObjs = 0x01,	/* Arena holds traversable objects. */
-  ArenaFlag_PODOnly  = 0x02	/* Arena holds only POD types (closures,
+  ArenaFlag_PODOnly  = 0x02,	/* Arena holds only POD types (closures,
 				** protos): no external backing, no globals,
 				** no finalizers. Always set together with
 				** ArenaFlag_TravObjs (POD objects are still
 				** traversable). Enables word-parallel sweep. */
+  ArenaFlag_InGrayHeap = 0x04	/* Arena currently has an entry in the gray
+				** priority heap (grayastack). Dedup guard:
+				** arena_gray_push -> notify skips re-inserting
+				** an arena already queued, so a 1-wide mark
+				** frontier oscillating empty<->nonempty in one
+				** arena does not churn the heap. Set on heap
+				** insert, cleared on stale-root eviction and at
+				** every wholesale grayastop=0 reset. Invariant:
+				** set <=> the arena's index is in grayastack. */
 };
 
 /*

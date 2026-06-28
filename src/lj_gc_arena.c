@@ -183,6 +183,7 @@ static void gc_mark_start(global_State *g)
     MSize i;
     for (i = 0; i < g->gc.arenastop; i++) {
       GCArena *a = mref(g->gc.arenas, GCArena *)[i];
+      a->flags &= (uint16_t)~ArenaFlag_InGrayHeap;  /* Heap drained above. */
       if (mref(a->greybase, GCCellID1) != NULL)
 	arena_gray_reset(a);
     }
@@ -522,7 +523,8 @@ static GCArena *gc_grayarena_pop(global_State *g)
     GCArena *a = arenas[idx];
     if ((a->flags & ArenaFlag_TravObjs) && !arena_gray_empty(a))
       return a;
-    /* Stale entry — remove from heap. */
+    /* Stale entry — remove from heap and drop its membership flag. */
+    a->flags &= (uint16_t)~ArenaFlag_InGrayHeap;
     g->gc.grayastop--;
     if (g->gc.grayastop > 0) {
       heap[0] = heap[g->gc.grayastop];
@@ -2283,6 +2285,7 @@ void lj_gc_fullgc(lua_State *L)
       MSize ii;
       for (ii = 0; ii < g->gc.arenastop; ii++) {
 	GCArena *aa = mref(g->gc.arenas, GCArena *)[ii];
+	aa->flags &= (uint16_t)~ArenaFlag_InGrayHeap;  /* grayastop=0 above. */
 	if (mref(aa->greybase, GCCellID1) != NULL)
 	  arena_gray_reset(aa);
       }
@@ -2338,7 +2341,11 @@ void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 /* Notify that an arena's gray stack became non-empty — insert into heap. */
 void lj_gc_grayarena_notify(global_State *g, MSize idx)
 {
-  MSize *heap = mref(g->gc.grayastack, MSize);
+  MSize *heap;
+  GCArena *a = mref(g->gc.arenas, GCArena *)[idx];
+  if (a->flags & ArenaFlag_InGrayHeap)
+    return;  /* Already queued: skip duplicate insert (dedup guard). */
+  heap = mref(g->gc.grayastack, MSize);
   if (g->gc.grayastop >= g->gc.grayasz) {
     MSize oldsz = g->gc.grayasz;
     MSize newsz = oldsz ? oldsz * 2 : 16;
@@ -2350,6 +2357,7 @@ void lj_gc_grayarena_notify(global_State *g, MSize idx)
   heap[g->gc.grayastop] = idx;
   grayheap_siftup(g, heap, g->gc.grayastop);
   g->gc.grayastop++;
+  a->flags |= ArenaFlag_InGrayHeap;  /* Set only after the insert succeeds. */
 }
 
 /* Flush the sequential store buffer into per-arena gray stacks. */

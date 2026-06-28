@@ -480,6 +480,8 @@ static void arena_reinit(GCArena *a, uint32_t flags)
   uint32_t w, wtop = arena_blockidx(a->celltop - 1);
   ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
   lj_assertX(arena_isempty(a), "reinit of non-empty arena");
+  lj_assertX(!(a->flags & ArenaFlag_InGrayHeap),
+	     "reinit of arena still in gray heap");
   for (w = UnusedBlockWords; w <= wtop; w++) {
     a->block[w] = 0;
     a->mark[w] = 0;
