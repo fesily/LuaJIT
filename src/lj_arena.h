@@ -88,7 +88,7 @@ enum {
 				** no finalizers. Always set together with
 				** ArenaFlag_TravObjs (POD objects are still
 				** traversable). Enables word-parallel sweep. */
-  ArenaFlag_InGrayHeap = 0x04	/* Arena currently has an entry in the gray
+  ArenaFlag_InGrayHeap = 0x04,	/* Arena currently has an entry in the gray
 				** priority heap (grayastack). Dedup guard:
 				** arena_gray_push -> notify skips re-inserting
 				** an arena already queued, so a 1-wide mark
@@ -97,17 +97,21 @@ enum {
 				** insert, cleared on stale-root eviction and at
 				** every wholesale grayastop=0 reset. Invariant:
 				** set <=> the arena's index is in grayastack. */
+  ArenaFlag_UdataOnly = 0x08	/* Arena holds only userdata. Set together with
+				** ArenaFlag_TravObjs (userdata are traversable).
+				** Enables separateudata bitmap-scan enumeration. */
 };
 
 /*
 ** Arena allocation classes. The current arena per class is held in a
-** dedicated GCState pointer (arena / travarena / podarena). The class
-** determines the arena flags and which current pointer is updated.
+** dedicated GCState pointer (arena / travarena / podarena / udatarena). The
+** class determines the arena flags and which current pointer is updated.
 */
 enum {
   ArenaClass_NonTrav = 0,	/* Non-traversable: strings, VLA cdata. */
   ArenaClass_Trav    = 1,	/* Traversable, mixed (tables, threads, ...). */
-  ArenaClass_POD     = 2	/* Traversable, POD-only (closures, protos). */
+  ArenaClass_POD     = 2,	/* Traversable, POD-only (closures, protos). */
+  ArenaClass_Udata   = 3	/* Userdata-only traversable (GCudata). */
 };
 
 /* A free block range in the sorted range array. */

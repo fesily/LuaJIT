@@ -445,7 +445,8 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
   global_State *g = G(L);
   if (LJ_LIKELY(size < ArenaHugeThreshold)) {
     GCArena *a = mref(cls == ArenaClass_POD ? g->gc.podarena :
-		      cls == ArenaClass_Trav ? g->gc.travarena : g->gc.arena,
+		      cls == ArenaClass_Trav ? g->gc.travarena :
+		      cls == ArenaClass_Udata ? g->gc.udatarena : g->gc.arena,
 		      GCArena);
     GCobj *o = a ? (GCobj *)arena_alloc(a, size) : NULL;
     if (LJ_LIKELY(o != NULL)) {
