@@ -88,6 +88,47 @@ static void gc_weak_redirect_all(global_State *g);
 static void gc_clearweak_stacks(global_State *g);
 static void gc_traverse_mainthread(global_State *g);
 
+/* LUA_USE_ASSERT: invariant check for a live hugeset slot. Verifies the
+** CDATAV discriminator agrees with the on-block metadata:
+**  - CDATAV slot: base is a GCcdataVar prefix; cd = base + GCcdataVar.offset
+**    must be a VLA cdata whose memcdatav(cd) points back to base.
+**  - non-CDATAV slot: a cdata at base must NOT be a VLA prefix (a VLA
+**    registered without the CDATAV flag would regress the A2+A3 fix).
+** Entire body gated by LUA_USE_ASSERT; release builds pay nothing. */
+#ifdef LUA_USE_ASSERT
+static LJ_AINLINE void hugeset_slot_assert(global_State *g, uintptr_t u)
+{
+#if LJ_HASFFI
+  GCobj *base = hugeset_slot_addr(u);
+  if (u & HUGESET_CDATAV) {
+    GCcdata *cd = (GCcdata *)((char *)base + ((GCcdataVar *)base)->offset);
+    lj_assertG(cd->gct == ~LJ_TCDATA,
+	       "hugeset CDATAV slot: cd gct mismatch (base=%p cd=%p gct=0x%02x)",
+	       (void *)base, (void *)cd, cd->gct);
+    lj_assertG(cdataisv(cd),
+	       "hugeset CDATAV slot: cd not a VLA cdata (base=%p cd=%p marked=0x%02x)",
+	       (void *)base, (void *)cd, cd->marked);
+    lj_assertG(memcdatav(cd) == (void *)base,
+	       "hugeset CDATAV slot: memcdatav(cd) != base (base=%p cd=%p mem=%p)",
+	       (void *)base, (void *)cd, memcdatav(cd));
+  } else if (base->gch.gct == ~LJ_TCDATA) {
+    /* A non-VLA huge cdata (lj_cdata_new) has its GCobj at base: gct is CDATA
+    ** but cdataisv is false. A VLA prefix at an unflagged slot would read
+    ** garbage in the gct/marked bytes; if those happen to look like CDATA+VLA
+    ** it is a missing-CDATAV-flag regression. */
+    GCcdata *cd = (GCcdata *)base;
+    lj_assertG(!cdataisv(cd),
+	       "hugeset unflagged slot is a VLA cdata prefix -- missing CDATAV flag "
+	       "(base=%p marked=0x%02x)", (void *)base, cd->marked);
+  }
+#else
+  (void)g; (void)u;
+#endif
+}
+#else
+#define hugeset_slot_assert(g, u)	((void)0)
+#endif
+
 /* Mark a GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
 {
@@ -300,6 +341,7 @@ size_t lj_gc_separateudata(global_State *g, int all)
 	uintptr_t u = gcrefu(slots[hi]);
 	GCobj *o;
 	if (!hugeset_slot_live(u)) continue;
+	hugeset_slot_assert(g, u);
 	o = hugeset_slot_obj(u);
 	if (o->gch.gct != ~LJ_TUDATA) continue;
 	m += sepudata_one(g, o, all);
@@ -1249,6 +1291,7 @@ static void rebuild_hugescan(global_State *g)
     g->gc.rebuild_hugehi++;
     budget--;
     if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
+    hugeset_slot_assert(g, u);
     { /* base = slot address (mark authority); o = GCobj (cd for CDATAV slots). */
       GCobj *base = hugeset_slot_addr(u);
       o = hugeset_slot_obj(u);
@@ -1318,6 +1361,7 @@ static void rebuild_hugeclear(global_State *g)
     g->gc.rebuild_hugehi++;
     budget--;
     if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
+    hugeset_slot_assert(g, u);
     o = hugeset_slot_obj(u);
     if (o->gch.gct != ~LJ_TSTR)
       o->gch.marked &= (uint8_t)~LJ_GC_BLACK;
@@ -1662,6 +1706,7 @@ void lj_gc_freeall(global_State *g)
 	  uintptr_t u = gcrefu(slots[hi]);
 	  GCobj *o;
 	  if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
+	  hugeset_slot_assert(g, u);
 	  o = hugeset_slot_obj(u);
 	  if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
 	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
@@ -1746,6 +1791,7 @@ static void atomic(global_State *g, lua_State *L)
 	  uintptr_t u = gcrefu(slots[hi]);
 	  GCobj *vo;
 	  if (!hugeset_slot_live(u)) continue;
+	  hugeset_slot_assert(g, u);
 	  vo = hugeset_slot_obj(u);
 	  if (vo->gch.gct != ~LJ_TUDATA) continue;
 	  if (gc_obj_iswhite(g, vo) && !isfinalized(gco2ud(vo)) &&
@@ -2042,6 +2088,7 @@ static void gc_arena_verify(global_State *g)
 	uintptr_t u = gcrefu(slots[hi]);
 	GCobj *o2;
 	if (!hugeset_slot_live(u)) continue;
+	hugeset_slot_assert(g, u);
 	o2 = hugeset_slot_obj(u);
 	lj_assertG(!(u & HUGESET_MARK),
 		   "huge object still slot-black after full GC rebuild: "
@@ -2128,6 +2175,7 @@ static void gc_arena_verify(global_State *g)
 	for (hi = 0; hi <= hmask; hi++) {
 	  uintptr_t u = gcrefu(slots[hi]);
 	  if (!hugeset_slot_live(u)) continue;
+	  hugeset_slot_assert(g, u);
 	  { /* base is huge (no arena bitmap): shadowmark is a no-op; the slot mark
 	    ** set by rebuild is the authority. o = cd for CDATAV slots, to read gct. */
 	    GCobj *base = hugeset_slot_addr(u);
@@ -2360,6 +2408,7 @@ void lj_gc_fullgc(lua_State *L)
 	  for (hi = 0; hi <= hmask; hi++) {
 	    uintptr_t u = gcrefu(slots[hi]);
 	    if (!hugeset_slot_live(u)) continue;
+	    hugeset_slot_assert(g, u);
 	    { /* base owns the slot mark; o = cd carries the GCcdata header. */
 	      GCobj *base = hugeset_slot_addr(u);
 	      o = hugeset_slot_obj(u);
