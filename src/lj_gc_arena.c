@@ -1702,6 +1702,58 @@ static void atomic(global_State *g, lua_State *L)
   gc_propagate_gray(g);  /* Propagate it. */
 
   udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
+#if defined(LUA_USE_ASSERT)
+  /* Invariant 4 (T7): post-separateudata(g,0), no white + unfinalized + __gc
+  ** udata remains outside the mmudata ring. Read-only re-scan of udata arenas
+  ** + hugeset — must NOT mutate any state (no flushbins/markfinalized/splice).
+  ** Bins are already flushed from separateudata's per-arena flushbins call,
+  ** so a->block[w] reads only true allocated heads. GCF_BITMAPSWEEP is not yet
+  ** set (armed below), so gc_obj_iswhite(arena) == !arena_obj_ismarked. */
+  {
+    MSize vi;
+    GCArena **varenas = mref(g->gc.arenas, GCArena *);
+    for (vi = 0; vi < g->gc.arenastop; vi++) {
+      GCArena *a = varenas[vi];
+      uint32_t w, wtop;
+      if (!(a->flags & ArenaFlag_UdataOnly)) continue;
+      wtop = arena_blockidx((GCCellID)a->celltop - 1);
+      for (w = UnusedBlockWords; w <= wtop; w++) {
+	GCBlockword heads = a->block[w];
+	while (heads) {
+	  uint32_t bitidx = lj_ffs(heads);
+	  GCCellID c = (w << 5) + bitidx;
+	  GCobj *vo = (GCobj *)arena_cellptr(a, c);
+	  heads &= heads - 1;
+	  if (gc_obj_iswhite(g, vo) && !isfinalized(gco2ud(vo)) &&
+	      lj_meta_fastg(g, tabref(gco2ud(vo)->metatable), MM_gc))
+	    lj_assertG(0,
+		       "post-separateudata: white unfinalized __gc udata missed: "
+		       "ptr=%p gct=%d marked=0x%02x cell=%d",
+		       (void *)vo, vo->gch.gct, vo->gch.marked, (int)c);
+	}
+      }
+    }
+    {
+      GCRef *slots = mref(g->gc.hugeset, GCRef);
+      if (slots != NULL) {
+	MSize hi, hmask = g->gc.hugesetmask;
+	for (hi = 0; hi <= hmask; hi++) {
+	  uintptr_t u = gcrefu(slots[hi]);
+	  GCobj *vo;
+	  if (!hugeset_slot_live(u)) continue;
+	  vo = hugeset_slot_addr(u);
+	  if (vo->gch.gct != ~LJ_TUDATA) continue;
+	  if (gc_obj_iswhite(g, vo) && !isfinalized(gco2ud(vo)) &&
+	      lj_meta_fastg(g, tabref(gco2ud(vo)->metatable), MM_gc))
+	    lj_assertG(0,
+		       "post-separateudata: white unfinalized __gc huge udata missed: "
+		       "ptr=%p gct=%d marked=0x%02x",
+		       (void *)vo, vo->gch.gct, vo->gch.marked);
+	}
+      }
+    }
+  }
+#endif
   gc_mark_mmudata(g);  /* Mark them. */
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
 
@@ -1948,6 +2000,22 @@ static void gc_arena_verify(global_State *g)
   GCobj *o;
   MSize i, dead = 0;
   lj_assertG(gc_hugegray_empty(g), "arena verify with pending huge gray objects");
+  /* Invariant 5 (T7): every mmudata ring member is finalized. The ring holds
+  ** udata (spliced by sepudata_one with markfinalized) and cdata (spliced by
+  ** lj_cdata_free with markfinalized). Both paths set LJ_GC_FINALIZED before
+  ** linking, so a non-finalized member means a ring splice regressed. */
+  {
+    GCobj *mroot = gcref(g->gc.mmudata);
+    if (mroot != NULL) {
+      GCobj *mu = mroot;
+      do {
+	mu = gcnext(mu);
+	lj_assertG(mu->gch.marked & LJ_GC_FINALIZED,
+		   "mmudata ring member not finalized: ptr=%p gct=%d marked=0x%02x",
+		   (void *)mu, mu->gch.gct, mu->gch.marked);
+      } while (mu != mroot);
+    }
+  }
   {
     GCArena **arenas = mref(g->gc.arenas, GCArena *);
     for (i = 0; i < g->gc.arenastop; i++) {
@@ -2002,11 +2070,47 @@ static void gc_arena_verify(global_State *g)
 	  GCCellID c = (w << 5) + bitidx;
 	  GCobj *o2 = (GCobj *)arena_cellptr(a, c);
 	  alive &= alive - 1;
+	  /* Invariants 1a/1b (T7): a cell is udata iff its arena is
+	  ** ArenaFlag_UdataOnly. 1a locks the class invariant for udata arenas
+	  ** (every allocated cell is a GCudata, continuous from T4's one-shot
+	  ** assert inside separateudata). 1b catches a udata mis-routed into a
+	  ** Trav/POD arena (a T3 routing regression). */
+	  if (a->flags & ArenaFlag_UdataOnly) {
+	    lj_assertG(o2->gch.gct == ~LJ_TUDATA,
+		       "non-udata in Udata arena: gct=%d marked=0x%02x cell=%d flags=0x%x",
+		       (int)o2->gch.gct, o2->gch.marked, (int)c, a->flags);
+	  } else {
+	    lj_assertG(o2->gch.gct != ~LJ_TUDATA,
+		       "udata in non-Udata arena: gct=%d marked=0x%02x cell=%d flags=0x%x",
+		       (int)o2->gch.gct, o2->gch.marked, (int)c, a->flags);
+	  }
 	  arena_obj_setmark(a, c);
 #if LJ_HASFFI
 	  if (o2->gch.gct == ~LJ_TCDATA && cdataisv(gco2cd(o2)))
 	    arena_obj_shadowmark(memcdatav(gco2cd(o2)));
 #endif
+	}
+      }
+    }
+    /* Invariant 1b extended (T7): NonTrav arenas (strings, VLA cdata) must
+    ** never hold a udata. The shadow-mark loop above only covers TravObjs
+    ** arenas, so scan NonTrav arenas separately for a mis-routed udata. */
+    for (i = 0; i < g->gc.arenastop; i++) {
+      GCArena *a = arenas[i];
+      uint32_t w, wtop;
+      if (a->flags & ArenaFlag_TravObjs) continue;
+      lj_arena_flushbins(a);
+      wtop = arena_blockidx((GCCellID)a->celltop - 1);
+      for (w = UnusedBlockWords; w <= wtop; w++) {
+	GCBlockword heads = a->block[w];
+	while (heads) {
+	  uint32_t bitidx = lj_ffs(heads);
+	  GCCellID c = (w << 5) + bitidx;
+	  GCobj *o2 = (GCobj *)arena_cellptr(a, c);
+	  heads &= heads - 1;
+	  lj_assertG(o2->gch.gct != ~LJ_TUDATA,
+		     "udata in NonTrav arena: gct=%d marked=0x%02x cell=%d flags=0x%x",
+		     (int)o2->gch.gct, o2->gch.marked, (int)c, a->flags);
 	}
       }
     }
