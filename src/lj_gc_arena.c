@@ -1020,8 +1020,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 }
 
 /*
-** Post-sweep pass: makewhite surviving objects, rebuild the udata sub-chain
-** (mainthread->nextgc) for lj_gc_separateudata, sweep each thread's open
+** Post-sweep pass: makewhite surviving objects, sweep each thread's open
 ** upvalue list, free dead huge objects, and clear arena mark bits.
 **
 ** The root chain (g->gc.root) is NOT rebuilt: all former consumers now
@@ -1037,28 +1036,8 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** cursor; the arena/huge scans use the (sweepa, sweepw) / rebuild_hugehi
 ** cursors). Epilogue (T7) is O(1) and ClearMarks (T8) is one-shot — neither
 ** yields; they run to Done in the dispatcher's internal loop in the same
-** onestep. This is deliberate: GCF_UDLINK is cleared inside rebuild_epilogue,
-** so a mutator gap between Epilogue and ClearMarks would orphan a udata
-** allocated in that gap (lj_udata_new suppresses linking once UDLINK clears).
-** The udata sub-chain tail persists across calls via
-** g->gc.rebuild_udtail / rebuild_ud_at_sentinel, anchored on mainthread->nextgc
-** from the start so it never points at a stack local.
+** onestep.
 */
-
-/* Append a survivor onto the persisted udata sub-chain tail. Exposed so
-** lj_udata_new can splice a freshly allocated arena udata onto the same tail
-** during the rebuild window (GCF_UDLINK), avoiding the orphan that link
-** suppression would otherwise cause for a udata allocated behind the moving
-** ArenaScan cursor. */
-void lj_gc_udchain_append(global_State *g, GCobj *o)
-{
-  if (g->gc.rebuild_ud_at_sentinel)
-    setgcref(mainthread(g)->nextgc, o);
-  else
-    setgcref(gcref(g->gc.rebuild_udtail)->gch.nextgc, o);
-  setgcref(g->gc.rebuild_udtail, o);
-  g->gc.rebuild_ud_at_sentinel = 0;
-}
 
 /* Resumable cdatavroot sweep slice. Returns nonzero while the walk is still
 ** in progress (more slices needed). The VLA-cdata chain is detached on the
@@ -1147,11 +1126,8 @@ static void rebuild_prologue(global_State *g)
 {
   lj_assertG(g->gc.state == GCSsweep, "rebuild prologue outside GCSsweep");
   if (!g->gc.rebuild_mmu_started) {
-    /* The udata sub-chain anchor + cdatavroot walk run before the mmudata
-    ** clear starts (rebuild_mmu_started is the cross-slice phase marker). */
-    setgcrefnull(mainthread(g)->nextgc);
-    setgcrefnull(g->gc.rebuild_udtail);
-    g->gc.rebuild_ud_at_sentinel = 1;
+    /* The cdatavroot walk runs before the mmudata clear starts
+    ** (rebuild_mmu_started is the cross-slice phase marker). */
 #if LJ_HASFFI
     if (rebuild_prologue_cdatav(g))
       return;  /* cdatavroot walk not finished: yield. */
@@ -1160,28 +1136,20 @@ static void rebuild_prologue(global_State *g)
   if (rebuild_prologue_mmu(g))
     return;  /* mmudata walk not finished: yield. */
 
-  /* Prologue done. Open the sub-chain link window and arm the ArenaScan cursor.
-  ** GCF_UDLINK makes lj_udata_new splice a new arena udata onto the sub-chain
-  ** tail (and clear its cell mark) during the chunked ArenaScan, so a udata
-  ** allocated behind the moving cursor is not orphaned. It is set only here --
-  ** after the anchor reached its final init state -- because the anchor is
-  ** re-nulled on every cdatav slice above, which would wipe an early link. */
-  g->gc.gcmarkflags |= GCF_UDLINK;
+  /* Prologue done. Arm the ArenaScan cursor. */
   g->gc.sweepa = 0;
   g->gc.sweepw = UnusedBlockWords;
   g->gc.rebuildphase = Rebuild_ArenaScan;
 }
 
-/* Pass-1 arena scan, resumable. Recolors live cells white and rebuilds the
-** udata sub-chain (+ per-thread openupval sweep). Formerly a single O(live)
-** pass -- the source of the incremental-GC pause spike -- now sliced via the
-** (sweepa, sweepw) cursor exactly like gc_bitmap_sweep: at most GCSWEEPMAX live
-** cells per call, then yield. The arenas base is reloaded every call (the
-** vector can realloc across yields) and the LIVE g->gc.arenastop bounds the
-** walk (arenas appended mid-scan hold MARKALLOC-live cells the forward cursor
-** reaches and recolors correctly). A udata allocated behind the cursor during
-** a yield is spliced onto the sub-chain by lj_udata_new (GCF_UDLINK), so the
-** forward-only cursor never orphans it. */
+/* Pass-1 arena scan, resumable. Recolors live cells white and sweeps each
+** thread's openupval list. Formerly a single O(live) pass -- the source of
+** the incremental-GC pause spike -- now sliced via the (sweepa, sweepw)
+** cursor exactly like gc_bitmap_sweep: at most GCSWEEPMAX live cells per
+** call, then yield. The arenas base is reloaded every call (the vector can
+** realloc across yields) and the LIVE g->gc.arenastop bounds the walk
+** (arenas appended mid-scan hold MARKALLOC-live cells the forward cursor
+** reaches and recolors correctly). */
 static void rebuild_arenascan(global_State *g)
 {
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
@@ -1217,9 +1185,7 @@ static void rebuild_arenascan(global_State *g)
 	if (o->gch.gct == ~LJ_TSTR)
 	  continue;
 	gc_obj_makewhite(g, o);
-	if (o->gch.gct == ~LJ_TUDATA) {
-	  lj_gc_udchain_append(g, o);
-	} else if (o->gch.gct == ~LJ_TTHREAD) {
+	if (o->gch.gct == ~LJ_TTHREAD) {
 	  gc_fullsweep(g, &gco2th(o)->openupval);
 	}
 	done++;
@@ -1255,10 +1221,9 @@ static void rebuild_hugescan(global_State *g)
   ** unused for huge objects under HASGCMARK — color lives in the slot). On
   ** restart, BLACK-tagged objects are skipped BEFORE the dead/alive test (a
   ** cleared slot mark would otherwise look dead → use-after-free). Freed
-  ** dead objects tombstone their slots → skipped. New udata linked by
-  ** lj_udata_new under GCF_UDLINK also carry BLACK — HugeScan skips them,
-  ** avoiding double-linking. A final pass clears BLACK once the cursor
-  ** completes (no mutator gap before Epilogue in T6 → no stale BLACK).
+  ** dead objects tombstone their slots → skipped. A final pass clears BLACK
+  ** once the cursor completes (no mutator gap before Epilogue in T6 → no
+  ** stale BLACK).
   **
   ** Huge STRINGS are not freed here (owned by gc_sweepstr); their slot mark
   ** is cleared for the per-cycle reset. Upvalues are never huge. */
@@ -1290,7 +1255,7 @@ static void rebuild_hugescan(global_State *g)
     }
     lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
     if (o->gch.marked & LJ_GC_BLACK)
-      continue;  /* Already processed or already linked (GCF_UDLINK). */
+      continue;  /* Already processed (restart safety). */
     if (!(u & HUGESET_MARK)) {
       /* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
       gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
@@ -1299,22 +1264,17 @@ static void rebuild_hugescan(global_State *g)
       huge_obj_clearmark(g, o);
       makewhite(g, o);
       o->gch.marked |= LJ_GC_BLACK;  /* Tag as processed (restart safety). */
-      if (o->gch.gct == ~LJ_TUDATA) {
-	lj_gc_udchain_append(g, o);
-      } else if (o->gch.gct == ~LJ_TTHREAD) {
+      if (o->gch.gct == ~LJ_TTHREAD) {
 	gc_fullsweep(g, &gco2th(o)->openupval);
       }
     }
   }
   if (g->gc.rebuild_hugehi > hmask) {
-    /* Main walk done. BLACK bits (set on survivors at line above AND on
-    ** new udata by lj_udata_new under GCF_UDLINK) are cleared by a bounded
-    ** second pass — Rebuild_HugeClear — NOT an unbounded final loop (A2).
-    ** Re-snapshot the generation so the clear pass detects a rehash between
-    ** its own slices and restarts from 0 (clearing is idempotent). Arm
-    ** GCF_HUGECLEAR so lj_udata_new stops tagging new huge udata BLACK —
-    ** HugeScan won't revisit them, and a tag set behind the bounded
-    ** HugeClear cursor would leak past Done (premature collection). */
+    /* Main walk done. BLACK bits (set on survivors at line above) are cleared
+    ** by a bounded second pass — Rebuild_HugeClear — NOT an unbounded final
+    ** loop (A2). Re-snapshot the generation so the clear pass detects a
+    ** rehash between its own slices and restarts from 0 (clearing is
+    ** idempotent). */
     g->gc.rebuild_hugehi = 0;
     g->gc.rebuild_hugegen = g->gc.hugesetgen;
     g->gc.gcmarkflags |= GCF_HUGECLEAR;
@@ -1323,11 +1283,10 @@ static void rebuild_hugescan(global_State *g)
 }
 
 /* Bounded BLACK-clear tail pass for the huge set. BLACK is set during the
-** main HugeScan walk (restart-skip tag on survivors) and by lj_udata_new
-** under GCF_UDLINK (already-linked tag on new huge udata). Every live
-** non-string huge object must have BLACK cleared before rebuild Done, or the
-** next mark cycle would treat a stale BLACK as "already marked" and skip
-** tracing it (premature collection). The old form was an unbounded
+** main HugeScan walk (restart-skip tag on survivors). Every live non-string
+** huge object must have BLACK cleared before rebuild Done, or the next mark
+** cycle would treat a stale BLACK as "already marked" and skip tracing it
+** (premature collection). The old form was an unbounded
 ** for(hi=0; hi<=hmask; hi++) loop in one slice — O(hugesetmask), violating A2.
 ** This resumable form clears GCSWEEPMAX slots per slice and yields. A rehash
 ** between slices (hugesetgen changed) just restarts the cursor from 0 —
@@ -1366,22 +1325,12 @@ static void rebuild_hugeclear(global_State *g)
 
 static void rebuild_epilogue(global_State *g)
 {
-  /* Terminate the udata sub-chain with NULL. mainthread->nextgc points
-  ** to the udata-only sub-chain, which lj_gc_separateudata walks.
+  /* Anchor the root reference on mainthread. No other objects are chained.
   ** O(1): a single bounded slice — no cursor needed. The dispatcher yields
   ** after this slice (T7) so the mutator runs before ClearMarks. */
-  if (g->gc.rebuild_ud_at_sentinel)
-    setgcrefnull(mainthread(g)->nextgc);
-  else
-    setgcrefnull(gcref(g->gc.rebuild_udtail)->gch.nextgc);
-
-  /* Anchor the root reference on mainthread. No other objects are chained. */
   makewhite(g, obj2gco(mainthread(g)));
   gc_fullsweep(g, &mainthread(g)->openupval);
   setgcref(g->gc.root, obj2gco(mainthread(g)));
-
-  /* Close the GCF_UDLINK window opened at Prologue→ArenaScan. */
-  g->gc.gcmarkflags &= ~GCF_UDLINK;
 
   g->gc.rebuildphase = Rebuild_ClearMarks;
 }
@@ -1469,13 +1418,7 @@ static void gc_rebuild_rootchain(global_State *g)
     ** mid-phase (staying on the same phase) via their persisted cursors.
     ** Epilogue (T7) is O(1) and ClearMarks (T8) is one-shot — neither
     ** yields. They run to Done in the same onestep as the dispatcher's
-    ** internal loop. This is deliberate: GCF_UDLINK is cleared inside
-    ** rebuild_epilogue, so a mutator gap between Epilogue and ClearMarks
-    ** would let lj_udata_new suppress linking (UDLINK clear) and orphan a
-    ** udata allocated in that gap. Running Epilogue→ClearMarks→Done with
-    ** no gap keeps UDLINK-clear and the sub-chain termination atomic from
-    ** the mutator's view. GCF_UDLINK stays active through ArenaScan and
-    ** HugeScan and is cleared at the Epilogue->ClearMarks transition. */
+    ** internal loop. */
     if ((phase == Rebuild_Prologue || phase == Rebuild_ArenaScan ||
 	 phase == Rebuild_HugeScan || phase == Rebuild_HugeClear) &&
 	g->gc.rebuildphase == phase)
@@ -1606,9 +1549,9 @@ static void gc_finalize(lua_State *L)
     return;
   }
 #endif
-  /* Add userdata back to the main userdata list and make it white. */
-  setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
-  setgcref(mainthread(g)->nextgc, o);
+  /* Make the resurrected userdata white for the next cycle. Its arena cell
+  ** stays in the udata arena (no chain to re-link onto); isfinalized prevents
+  ** re-finalization. */
   gc_obj_makewhite(g, o);
   /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);

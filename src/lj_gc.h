@@ -36,13 +36,6 @@ enum {
 				** authoritative dead/alive test. Cleared at
 				** Bitmap->Rebuild so mutator barriers can't
 				** observe half-cleared marks. */
-#define GCF_UDLINK	0x08	/* Rebuild window: link new arena udata onto the
-				** udata sub-chain tail instead of suppressing,
-				** so an arena udata allocated behind the moving
-				** ArenaScan cursor is not orphaned (missed by
-				** next cycle's lj_gc_separateudata). Set after
-				** the sub-chain anchor is initialized; cleared
-				** at SweepPhase_Done. */
 #define GCF_HUGECLEAR	0x10	/* Rebuild HugeClear sub-phase: HugeScan is done,
 				** so lj_udata_new must NOT tag new huge udata
 				** LJ_GC_BLACK (the tag exists only to make
@@ -343,7 +336,6 @@ LJ_FUNC void lj_gc_barrierback_arena(global_State *g, GCobj *o);
 LJ_FUNC void lj_gc_grayarena_notify(global_State *g, MSize idx);
 LJ_FUNC void lj_gc_graywork_free(global_State *g);
 LJ_FUNCA void lj_gc_ssb_flush(global_State *g);
-LJ_FUNC void lj_gc_udchain_append(global_State *g, GCobj *o);
 #endif
 
 /* Move the GC propagation frontier back for tables (make it gray again). */
