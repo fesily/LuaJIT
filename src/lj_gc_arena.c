@@ -945,7 +945,7 @@ enum {
 ** to completion (no chunking yet) and advances to the next; the GCSsweep
 ** driver re-enters the dispatcher until Rebuild_Done. */
 enum {
-  Rebuild_Prologue,	/* cdatavroot sweep + mmudata mark-clear. */
+  Rebuild_Prologue,	/* CdataV-arena scan + mmudata mark-clear. */
   Rebuild_ArenaScan,	/* Pass-1 arena scan: makewhite + relink udata/threads. */
   Rebuild_HugeScan,	/* Huge-set scan: free dead, makewhite survivors. */
   Rebuild_HugeClear,	/* Huge-set BLACK clear: bounded tail pass (A2). */
@@ -1046,13 +1046,10 @@ static size_t gc_bitmap_sweep(global_State *g)
     g->gc.gcmarkflags &= ~GCF_DEADAUTH;
     g->gc.sweepphase = SweepPhase_Rebuild;
     g->gc.rebuildphase = Rebuild_Prologue;
-    /* Reset the resumable-prologue cursors for a fresh rebuild: the cdatavroot
-    ** walk detects its first slice by rebuild_cdatav_input == NULL, and the
-    ** mmudata walk by rebuild_mmu_started == 0. */
-    setgcrefnull(g->gc.rebuild_cdatav_input);
-    setgcrefnull(g->gc.rebuild_cdatav_cursor);
-    setgcrefnull(g->gc.rebuild_cdatav_out);
-    setgcrefnull(g->gc.rebuild_cdatav_tail);
+    /* Arm the CdataV-arena scan cursor (sweepa, sweepw) for the prologue's
+    ** first slice; the mmudata walk is gated by rebuild_mmu_started == 0. */
+    g->gc.sweepa = 0;
+    g->gc.sweepw = UnusedBlockWords;
     g->gc.rebuild_mmu_started = 0;
     setgcrefnull(g->gc.rebuild_mmu_cursor);
   }
@@ -1070,68 +1067,71 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** The work is split into ordered sub-phases (RebuildPhase) driven by
 ** g->gc.rebuildphase. gc_rebuild_rootchain is a dispatcher that runs one
 ** sub-phase per call and the GCSsweep driver re-enters it once per onestep.
-** Prologue (T4), ArenaScan (T5), and HugeScan (T6) are chunked: they yield
-** mid-phase via their persisted cursors (the cdatavroot walk detaches its
-** input on the first slice; the mmudata ring uses a snapshot-root + persisted
-** cursor; the arena/huge scans use the (sweepa, sweepw) / rebuild_hugehi
-** cursors). Epilogue (T7) is O(1) and ClearMarks (T8) is one-shot — neither
-** yields; they run to Done in the dispatcher's internal loop in the same
-** onestep.
+ ** Prologue (T4), ArenaScan (T5), and HugeScan (T6) are chunked: they yield
+ ** mid-phase via their persisted cursors (the CdataV-arena scan and the
+ ** arena/huge scans use the (sweepa, sweepw) / rebuild_hugehi cursors; the
+ ** mmudata ring uses a snapshot-root + persisted cursor). Epilogue (T7) is
+ ** O(1) and ClearMarks (T8) is one-shot — neither yields; they run to Done
+ ** in the dispatcher's internal loop in the same onestep.
 */
 
-/* Resumable cdatavroot sweep slice. Returns nonzero while the walk is still
-** in progress (more slices needed). The VLA-cdata chain is detached on the
-** first slice so new VLA cdata allocated by the mutator between slices prepend
-** to the now-empty live g->gc.cdatavroot (MARKALLOC-live, never freed this
-** cycle); survivors of the detached chain are spliced back at the end. */
+/* Resumable CdataV-arena bitmap scan slice. Replaces the legacy VLA-cdata
+** chain walk. Scans ArenaFlag_CdataVOnly arenas via the (sweepa, sweepw)
+** cursor (same shape as gc_bitmap_sweep), and for each allocated cell base p
+** computes cd = p + GCcdataVar.offset (base->cd translation), then frees
+** dead (block=1, mark=0) via gc_freefunc and makewhites survivors
+** (block=1, mark=1). Mark authority is on the BASE cell (ptr2arena(p),
+** ptr2cell(p)), matching MARKALLOC and gc_obj_key; header reads (gct) and
+** the makewhite recolor use cd, which carries the valid GCcdata header.
+** Bounded by GCSWEEPMAX cells per slice, then yields. Returns nonzero while
+** the scan is still in progress. */
 #if LJ_HASFFI
 static int rebuild_prologue_cdatav(global_State *g)
 {
-  MSize budget = GCSWEEPMAX;
-  GCobj *o;
-  if (!gcref(g->gc.rebuild_cdatav_input) &&
-      !gcref(g->gc.rebuild_cdatav_cursor) && gcref(g->gc.cdatavroot)) {
-    /* First slice: atomically detach the whole VLA-cdata chain. */
-    setgcrefr(g->gc.rebuild_cdatav_input, g->gc.cdatavroot);
-    setgcrefnull(g->gc.cdatavroot);
-    setgcrefr(g->gc.rebuild_cdatav_cursor, g->gc.rebuild_cdatav_input);
-    setgcrefnull(g->gc.rebuild_cdatav_out);
-    setgcrefnull(g->gc.rebuild_cdatav_tail);
-  }
-  o = gcref(g->gc.rebuild_cdatav_cursor);
-  while (o != NULL && budget-- > 0) {
-    GCobj *next = gcnext(o);
-    if (gc_mark_isdead_raw(g, o)) {
-      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
-    } else {
-      makewhite(g, o);
-      /* Append to the survivor output tail so the final splice is O(1):
-      ** no tail-walk (A2: no sub-phase loops unbounded over cdatavroot in
-      ** a single onestep). */
-      setgcrefnull(o->gch.nextgc);
-      if (gcref(g->gc.rebuild_cdatav_tail))
-	setgcref(gcref(g->gc.rebuild_cdatav_tail)->gch.nextgc, o);
-      else
-	setgcref(g->gc.rebuild_cdatav_out, o);
-      setgcref(g->gc.rebuild_cdatav_tail, o);
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  MSize ai = g->gc.sweepa;
+  uint32_t w = g->gc.sweepw;
+  uint32_t freed = 0;
+  lj_assertG(g->gc.state == GCSsweep, "CdataV scan outside GCSsweep");
+  while (ai < g->gc.arenastop && freed < GCSWEEPMAX) {
+    GCArena *a = arenas[ai];
+    uint32_t wtop;
+    if (!(a->flags & ArenaFlag_CdataVOnly)) {
+      ai++;
+      w = UnusedBlockWords;
+      continue;
     }
-    o = next;
+    lj_arena_flushbins(a);
+    wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    while (w <= wtop && freed < GCSWEEPMAX) {
+      GCBlockword alloc = a->block[w];
+      while (alloc) {
+	uint32_t bitidx = lj_ffs(alloc);
+	GCCellID c = (w << 5) + bitidx;
+	char *p = (char *)arena_cellptr(a, c);
+	GCcdata *cd;
+	alloc &= alloc - 1;
+	cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
+	lj_assertG(cd->gct == ~LJ_TCDATA && cdataisv(cd),
+		   "CdataV arena cell not a VLA cdata: gct=%d cell=%d",
+		   (int)cd->gct, (int)c);
+	if (!arena_obj_ismarked(a, c)) {
+	  gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
+	  freed++;
+	} else {
+	  makewhite(g, obj2gco(cd));
+	}
+      }
+      w++;
+    }
+    if (w > wtop) {
+      ai++;
+      w = UnusedBlockWords;
+    }
   }
-  setgcref(g->gc.rebuild_cdatav_cursor, o);
-  if (o != NULL)
-    return 1;  /* Budget hit, more nodes remain. */
-  /* Walk done: splice survivors in front of any VLA cdata allocated meanwhile
-  ** (those went onto the live cdatavroot, which the detach left NULL). The
-  ** tail is tracked across slices, so the splice is O(1) — no tail-walk. */
-  if (gcref(g->gc.rebuild_cdatav_out)) {
-    setgcrefr(gcref(g->gc.rebuild_cdatav_tail)->gch.nextgc, g->gc.cdatavroot);
-    setgcrefr(g->gc.cdatavroot, g->gc.rebuild_cdatav_out);
-  }
-  setgcrefnull(g->gc.rebuild_cdatav_input);  /* Signal cdatavroot done. */
-  setgcrefnull(g->gc.rebuild_cdatav_cursor);
-  setgcrefnull(g->gc.rebuild_cdatav_out);
-  setgcrefnull(g->gc.rebuild_cdatav_tail);
-  return 0;
+  g->gc.sweepa = ai;
+  g->gc.sweepw = (uint16_t)w;
+  return ai < g->gc.arenastop;
 }
 #endif
 
@@ -1170,11 +1170,11 @@ static void rebuild_prologue(global_State *g)
 {
   lj_assertG(g->gc.state == GCSsweep, "rebuild prologue outside GCSsweep");
   if (!g->gc.rebuild_mmu_started) {
-    /* The cdatavroot walk runs before the mmudata clear starts
+    /* The CdataV-arena scan runs before the mmudata clear starts
     ** (rebuild_mmu_started is the cross-slice phase marker). */
 #if LJ_HASFFI
     if (rebuild_prologue_cdatav(g))
-      return;  /* cdatavroot walk not finished: yield. */
+      return;  /* CdataV scan not finished: yield. */
 #endif
   }
   if (rebuild_prologue_mmu(g))
@@ -1658,17 +1658,43 @@ void lj_gc_freeall(global_State *g)
   ** Coverage:
   **  - Traversable arenas: tables, funcs, protos, threads, upvalues, regular
   **    cdata, traces and udata. All freed by the cell scan below.
-  **  - Non-traversable arenas: only strings (freed via the intern table) and
-  **    VLA cdata (freed via cdatavroot). Their gct cannot be read from a
-  **    bitmap cell, so these arenas are skipped here.
+  **  - CdataV arenas: VLA/over-aligned cdata. Cell base is a GCcdataVar; the
+  **    GCobj cd = base + offset. Freed by the separate CdataV scan below
+  **    (before the huge-set scan, so a huge VLA tombstone is not re-seen).
+  **  - Non-traversable arenas: only strings (freed via the intern table).
+  **    Their gct cannot be read from a bitmap cell, so these arenas are
+  **    skipped here.
   **  - Huge objects: no cell bitmap; freed via the address-keyed huge set.
   */
   {
     GCArena **arenas = mref(g->gc.arenas, GCArena *);
 #if LJ_HASFFI
     /* VLA cdata first: freeing a huge VLA cdata tombstones its huge-set slot,
-    ** so the huge-set scan below won't see (and double-free) it. */
-    gc_fullsweep(g, &g->gc.cdatavroot);
+    ** so the huge-set scan below won't see (and double-free) it. Small VLA
+    ** cdata live in CdataV arenas; huge VLA are in the hugeset (the CdataV
+    ** arena scan skips them — they have no cell bitmap). */
+    {
+      MSize ci;
+      for (ci = 0; ci < g->gc.arenastop; ci++) {
+	GCArena *a = arenas[ci];
+	uint32_t cw, cwtop;
+	if (!(a->flags & ArenaFlag_CdataVOnly)) continue;
+	lj_arena_flushbins(a);
+	cwtop = arena_blockidx((GCCellID)a->celltop - 1);
+	for (cw = UnusedBlockWords; cw <= cwtop; cw++) {
+	  GCBlockword alloc = a->block[cw];
+	  while (alloc) {
+	    uint32_t bitidx = lj_ffs(alloc);
+	    GCCellID c = (cw << 5) + bitidx;
+	    char *p = (char *)arena_cellptr(a, c);
+	    GCcdata *cd;
+	    alloc &= alloc - 1;
+	    cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
+	    gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
+	  }
+	}
+      }
+    }
 #endif
     for (i = 0; i < g->gc.arenastop; i++) {
       GCArena *a = arenas[i];
@@ -1894,9 +1920,6 @@ static size_t gc_onestep_raw(lua_State *L)
     g->gc.estimate -= old - g->gc.total;
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
       g->gc.gcmarkflags = 0;
-#if LJ_HASFFI
-      gc_fullsweep(g, &g->gc.cdatavroot);
-#endif
       if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	lj_str_resize(L, g->str.mask >> 1);  /* Shrink string table. */
       lj_arena_shrink(g);  /* Coalesce free space, release empty arenas. */
@@ -2144,13 +2167,16 @@ static void gc_arena_verify(global_State *g)
 	}
       }
     }
-    /* Invariant 1b extended (T7): NonTrav arenas (strings, VLA cdata) must
-    ** never hold a udata. The shadow-mark loop above only covers TravObjs
-    ** arenas, so scan NonTrav arenas separately for a mis-routed udata. */
+    /* Invariant 1b extended (T7): NonTrav arenas (strings) must never hold a
+    ** udata. The shadow-mark loop above only covers TravObjs arenas, so scan
+    ** NonTrav arenas separately for a mis-routed udata. CdataV arenas are
+    ** skipped here (their cell base is a GCcdataVar, not a GCobj — reading
+    ** gct from it would be a type-punning read; the CdataV scan below
+    ** verifies the class invariant with the base->cd translation). */
     for (i = 0; i < g->gc.arenastop; i++) {
       GCArena *a = arenas[i];
       uint32_t w, wtop;
-      if (a->flags & ArenaFlag_TravObjs) continue;
+      if (a->flags & (ArenaFlag_TravObjs | ArenaFlag_CdataVOnly)) continue;
       lj_arena_flushbins(a);
       wtop = arena_blockidx((GCCellID)a->celltop - 1);
       for (w = UnusedBlockWords; w <= wtop; w++) {
@@ -2192,14 +2218,35 @@ static void gc_arena_verify(global_State *g)
     }
   }
 #if LJ_HASFFI
-  for (o = gcref(g->gc.cdatavroot); o != NULL; o = gcnext(o)) {
-    /* Classify by block base (gc_obj_key): a huge VLA cdata's cd is not
-    ** arena-aligned, so ishuge(cd) wrongly reports arena. The base owns the
-    ** mark site (arena cell / hugeset slot). */
-    if (!lj_arena_ishuge(gc_obj_key(o))) {
-      arena_obj_shadowmark(gc_obj_key(o));
-      if (cdataisv(gco2cd(o)))
-	arena_obj_shadowmark(memcdatav(gco2cd(o)));
+  /* VLA cdata in CdataV arenas: shadow-mark the base cell (the allocation
+  ** base = GCcdataVar prefix, which is what ptr2cell(p) refers to). Huge VLA
+  ** were shadow-marked by the hugeset walk above (arena_obj_shadowmark is a
+  ** no-op on huge). Cell base is a GCcdataVar; cd = base + offset carries the
+  ** header, but the mark site is the base cell. */
+  {
+    GCArena **varenas = mref(g->gc.arenas, GCArena *);
+    MSize vi;
+    for (vi = 0; vi < g->gc.arenastop; vi++) {
+      GCArena *a = varenas[vi];
+      uint32_t vw, vwtop;
+      if (!(a->flags & ArenaFlag_CdataVOnly)) continue;
+      lj_arena_flushbins(a);
+      vwtop = arena_blockidx((GCCellID)a->celltop - 1);
+      for (vw = UnusedBlockWords; vw <= vwtop; vw++) {
+	GCBlockword heads = a->block[vw];
+	while (heads) {
+	  uint32_t bitidx = lj_ffs(heads);
+	  GCCellID c = (vw << 5) + bitidx;
+	  char *p = (char *)arena_cellptr(a, c);
+	  GCcdata *cd;
+	  heads &= heads - 1;
+	  cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
+	  lj_assertG(cd->gct == ~LJ_TCDATA && cdataisv(cd),
+		     "CdataV arena verify: non-VLA gct=%d cell=%d",
+		     (int)cd->gct, (int)c);
+	  arena_obj_shadowmark(p);
+	}
+      }
     }
   }
 #endif
@@ -2437,13 +2484,31 @@ void lj_gc_fullgc(lua_State *L)
         }
       }
 #if LJ_HASFFI
-      /* Also makewhite VLA cdata on their separate chain. */
+      /* Also makewhite VLA cdata in CdataV arenas (small VLA). Huge VLA
+      ** were makewhite by the hugeset walk above. Cell base is a GCcdataVar;
+      ** cd = base + offset carries the GCcdata header. */
       {
-        GCRef *cp = &g->gc.cdatavroot;
-        while ((o = gcref(*cp)) != NULL) {
-          makewhite(g, o);
-          cp = &o->gch.nextgc;
-        }
+	GCArena **cva = mref(g->gc.arenas, GCArena *);
+	MSize ci;
+	for (ci = 0; ci < g->gc.arenastop; ci++) {
+	  GCArena *a = cva[ci];
+	  uint32_t cw, cwtop;
+	  if (!(a->flags & ArenaFlag_CdataVOnly)) continue;
+	  lj_arena_flushbins(a);
+	  cwtop = arena_blockidx((GCCellID)a->celltop - 1);
+	  for (cw = UnusedBlockWords; cw <= cwtop; cw++) {
+	    GCBlockword alloc = a->block[cw];
+	    while (alloc) {
+	      uint32_t bitidx = lj_ffs(alloc);
+	      GCCellID c = (cw << 5) + bitidx;
+	      char *p = (char *)arena_cellptr(a, c);
+	      GCcdata *cd;
+	      alloc &= alloc - 1;
+	      cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
+	      makewhite(g, obj2gco(cd));
+	    }
+	  }
+	}
       }
 #endif
     }

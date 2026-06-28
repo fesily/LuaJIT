@@ -655,10 +655,6 @@ typedef struct GCState {
   MSize rebuild_hugehi;	/* HugeScan: current slot index cursor. */
   MSize rebuild_hugegen;	/* HugeScan: hugesetgen snapshot for rehash restart. */
   MSize hugesetgen;	/* Monotonic huge-set rehash generation. */
-  GCRef rebuild_cdatav_input;	/* Detached VLA-cdata input list head. */
-  GCRef rebuild_cdatav_cursor;	/* Current node in the detached cdata walk. */
-  GCRef rebuild_cdatav_out;	/* Rebuilt cdata-survivor output head. */
-  GCRef rebuild_cdatav_tail;	/* Rebuilt cdata-survivor output tail (append). */
   GCRef rebuild_mmu_cursor;	/* mmudata ring walk cursor. */
   MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
   MSize grayastop;	/* Gray arena stack: number of entries. */
@@ -683,9 +679,6 @@ typedef struct GCState {
   MRef weakall;		/* GCobj **: tables with weak keys and values. */
   MSize weakalltop;	/* All-weak stack: number of entries. */
   MSize weakallsz;	/* All-weak stack: allocated capacity. */
-#if LJ_HASFFI
-  GCRef cdatavroot;	/* Separate chain for VLA cdata (bitmap sweep). */
-#endif
 #endif
 #endif
 } GCState;

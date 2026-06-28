@@ -553,6 +553,14 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 ** hugeset, not the root nextgc chain). link=0 keeps nextgc untouched. */
 #define lj_mem_newgcou(L, s) \
   lj_mem_newgco_arena(L, (GCSize)(s), ArenaClass_Udata, 0)
+/* VLA/over-aligned cdata: dedicated ArenaClass_CdataV arena, NOT linked
+** to any nextgc chain (VLA cdata are enumerated by the rebuild prologue
+** CdataV-arena bitmap scan + hugeset, not a chain). link=0 keeps nextgc
+** untouched. lj_mem_newgco_arena routes size >= ArenaHugeThreshold
+** to the hugeblock path, so a single call handles both small (CdataV arena)
+** and huge (hugeset + lj_huge_set_cdatav) VLA cdata. */
+#define lj_mem_newgcocv(L, s) \
+  lj_mem_newgco_arena(L, (GCSize)(s), ArenaClass_CdataV, 0)
 /* POD-only traversable allocation (closures, protos): routed to the POD
 ** arena so the word-parallel sweep can reclaim it without per-object frees. */
 #define lj_mem_newgcot_pod(L, s) \
@@ -563,6 +571,7 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 #define lj_mem_newgcot_pod(L, s)	lj_mem_newgco(L, (GCSize)(s))
 #define lj_mem_newagco(L, s, trav)  lj_mem_new(L, (GCSize)(s))
 #define lj_mem_newgcou(L, s)	lj_mem_new(L, (GCSize)(s))
+#define lj_mem_newgcocv(L, s)	lj_mem_new(L, (GCSize)(s))
 #define lj_mem_freegco(g, p, s)	lj_mem_free(g, (p), (s))
 #endif
 

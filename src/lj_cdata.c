@@ -31,7 +31,7 @@ GCcdata *lj_cdata_newv(lua_State *L, CTypeID id, CTSize sz, CTSize align)
   global_State *g;
   MSize extra = sizeof(GCcdataVar) + sizeof(GCcdata) +
 		(align > CT_MEMALIGN ? (1u<<align) - (1u<<CT_MEMALIGN) : 0);
-  char *p = (char *)lj_mem_newagco(L, extra + sz, 0);
+  char *p = (char *)lj_mem_newgcocv(L, extra + sz);
   uintptr_t adata = (uintptr_t)p + sizeof(GCcdataVar) + sizeof(GCcdata);
   uintptr_t almask = (1u << align) - 1u;
   GCcdata *cd = (GCcdata *)(((adata + almask) & ~almask) - sizeof(GCcdata));
@@ -41,11 +41,12 @@ GCcdata *lj_cdata_newv(lua_State *L, CTypeID id, CTSize sz, CTSize align)
   cdatav(cd)->len = sz;
   g = G(L);
 #if LJ_HASGCMARK
-  setgcrefr(cd->nextgc, g->gc.cdatavroot);
-  setgcref(g->gc.cdatavroot, obj2gco(cd));
-  /* A huge VLA block is registered in the hugeset by its BASE p (a GCcdataVar
-  ** prefix), but the GCobj is cd = p + offset. Tag the slot so GC consumers
-  ** translate base->cd; otherwise makewhite(g, p) clobbers cd->nextgc. */
+  /* VLA cdata live in CdataV arenas (small) or the hugeset (huge), enumerated
+  ** by the rebuild prologue CdataV-arena bitmap scan + hugeset CDATAV slots.
+  ** No nextgc chain link in either branch. A huge VLA block is registered in
+  ** the hugeset by its BASE p (a GCcdataVar prefix), but the GCobj is
+  ** cd = p + offset. Tag the slot so GC consumers translate base->cd;
+  ** otherwise makewhite(g, p) clobbers cd->nextgc. */
   if (lj_arena_ishuge(p))
     lj_huge_set_cdatav(g, p);
 #else
