@@ -534,7 +534,7 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 #define lj_mem_newgcot(L, s)	lj_mem_newgco(L, (GCSize)(s))
 #define lj_mem_newgcot_pod(L, s)	lj_mem_newgco(L, (GCSize)(s))
 #define lj_mem_newagco(L, s, trav)  lj_mem_new(L, (GCSize)(s))
-#define lj_mem_newgcou(L, s)	lj_mem_newgco(L, (GCSize)(s))
+#define lj_mem_newgcou(L, s)	lj_mem_new(L, (GCSize)(s))
 #define lj_mem_freegco(g, p, s)	lj_mem_free(g, (p), (s))
 #endif
 

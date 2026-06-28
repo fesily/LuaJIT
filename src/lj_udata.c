@@ -22,6 +22,13 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   /* NOBARRIER: The GCudata is new (marked white). */
   setgcrefnull(ud->metatable);
   setgcref(ud->env, obj2gco(env));
+#if !LJ_HASGCMARK
+  /* Classic GC: chain to mainthread->nextgc for lj_gc_separateudata.
+  ** Arena GC (LJ_HASGCMARK) enumerates udata via the udata-arena bitmaps
+  ** instead, so no chain link is needed there. */
+  setgcrefr(ud->nextgc, mainthread(g)->nextgc);
+  setgcref(mainthread(g)->nextgc, obj2gco(ud));
+#endif
   return ud;
 }
 
@@ -56,4 +63,3 @@ void *lj_lightud_intern(lua_State *L, void *p)
   return (void *)(((uint64_t)segnum << LJ_LIGHTUD_BITS_LO) | lightudlo(u));
 }
 #endif
-
