@@ -361,17 +361,43 @@ LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);
 LJ_FUNC void lj_hugeblock_free(global_State *g, void *p, size_t size);
 LJ_FUNC void lj_hugeset_free(global_State *g);
 /* Hugeset slot encoding. A slot is EMPTY (0), TOMB (1), or a live arena-aligned
-** address with the MARK bit (1) optionally set in bit 1. The address bits
-** survive PTRMASK; EMPTY/TOMB have no address bits. */
+** address with the MARK bit (1) optionally set in bit 1 and the CDATAV bit (2)
+** optionally set in bit 2. The address bits survive PTRMASK; EMPTY/TOMB have no
+** address bits. Huge blocks are ArenaSize (1MB)-aligned, so their low 20 bits
+** are zero -- bits 0-2 are free for the TOMB/MARK/CDATAV flags. */
 #define HUGESET_MARK	((uintptr_t)2)	/* Bit 1: reachable this GC cycle. */
-#define HUGESET_PTRMASK	(~(uintptr_t)3)	/* Strip TOMB|MARK to recover address. */
+/* Bit 2: slot base is a GCcdataVar prefix; the GCobj is at
+** base + GCcdataVar.offset (a VLA cdata whose block went huge). The GC must
+** translate base->cd at every consumer; mark/color authority stays keyed on
+** the base address (the slot). */
+#define HUGESET_CDATAV	((uintptr_t)4)
+#define HUGESET_PTRMASK	(~(uintptr_t)7)	/* Strip TOMB|MARK|CDATAV to recover addr. */
 #define hugeset_slot_addr(u)	((GCobj *)((u) & HUGESET_PTRMASK))
 #define hugeset_slot_live(u)	(((u) & HUGESET_PTRMASK) != 0)
+/* Return the GCobj carried by a hugeset slot. For a CDATAV slot the stored
+** address is the block BASE (a GCcdataVar prefix); the actual GCobj (GCcdata)
+** lives at base + GCcdataVar.offset. For every other slot the stored address
+** IS the GCobj. Use this at any consumer that reads gct, recolors, or
+** dispatches a freefunc on the object; keep using hugeset_slot_addr + the
+** slot value for mark/COLOR authority (hugeset_find/huge_obj_* key on base). */
+static LJ_AINLINE GCobj *hugeset_slot_obj(uintptr_t u)
+{
+  GCobj *base = hugeset_slot_addr(u);
+#if LJ_HASFFI
+  if (u & HUGESET_CDATAV)
+    return (GCobj *)((char *)base + ((GCcdataVar *)base)->offset);
+#endif
+  return base;
+}
 /* Huge-object mark bit, stored in the hugeset slot (bit 1). The argument is the
 ** huge object's base address; the object must be registered and non-string. */
 LJ_FUNC void huge_obj_setmark(global_State *g, void *p);
 LJ_FUNC int huge_obj_ismarked(global_State *g, void *p);
 LJ_FUNC void huge_obj_clearmark(global_State *g, void *p);
+/* Mark a registered huge block base as carrying a VLA cdata prefix (CDATAV).
+** Called by lj_cdata_newv after a huge allocation so the GC can recover the
+** GCobj (cd = base + GCcdataVar.offset) when scanning the hugeset. */
+LJ_FUNC void lj_huge_set_cdatav(global_State *g, void *p);
 
 #endif
 

@@ -1025,6 +1025,18 @@ void huge_obj_clearmark(global_State *g, void *p)
   setgcrefp(slots[i], (void *)(gcrefu(slots[i]) & ~HUGESET_MARK));
 }
 
+/* Set the CDATAV flag on a registered huge block base: the block holds a VLA
+** cdata whose GCobj is at base + GCcdataVar.offset, not at base. The flag
+** survives rehash (hugeset_put carries the raw slot value) and is stripped by
+** HUGESET_PTRMASK from address comparisons, so lookup/clear are unaffected. */
+void lj_huge_set_cdatav(global_State *g, void *p)
+{
+  GCRef *slots = mref(g->gc.hugeset, GCRef);
+  MSize i = hugeset_find(slots, g->gc.hugesetmask, p);
+  lj_assertG_(g, i <= g->gc.hugesetmask, "lj_huge_set_cdatav: address not found");
+  setgcrefp(slots[i], (void *)(gcrefu(slots[i]) | HUGESET_CDATAV));
+}
+
 /* Free the huge-set backing store (shutdown). */
 void lj_hugeset_free(global_State *g)
 {

@@ -122,10 +122,29 @@ enum {
 #if LJ_HASGCMARK
 /* Arena-aware color seam. Phase 1 keeps the legacy header color bits coherent
 ** with the arena mark bitmap; later phases can make the bitmap authoritative
-** for arena objects without changing call sites again. */
+** for arena objects without changing call sites again.
+**
+** VLA cdata layout: [GCcdataVar][GCcdata cd][payload], allocated as one block
+** at base p. The GCobj is cd = p + GCcdataVar.offset, INTERIOR to the block.
+** The arena/huge address classification and the mark bitmap / hugeset slot key
+** on the BLOCK BASE p = memcdatav(cd), not on cd (a huge VLA block is registered
+** by p; ishuge(cd) is false because cd is not arena-aligned). gc_obj_key returns
+** that base for a VLA cdata and o for every other object; header reads (gct,
+** marked) and recolor macros (makewhite/flipwhite) still use o, which carries a
+** valid GCcdata header. This unifies small (in-arena) and huge VLA cdata: both
+** key on the cell base / hugeset base, matching the MARKALLOC mark site. */
+static LJ_AINLINE void *gc_obj_key(GCobj *o)
+{
+#if LJ_HASFFI
+  if (o->gch.gct == ~LJ_TCDATA && cdataisv((GCcdata *)o))
+    return memcdatav((GCcdata *)o);
+#endif
+  return (void *)o;
+}
+
 static LJ_AINLINE int gc_obj_inarena(global_State *g, GCobj *o)
 {
-  return !lj_arena_ishuge(o) && o != obj2gco(mainthread(g)) &&
+  return !lj_arena_ishuge(gc_obj_key(o)) && o != obj2gco(mainthread(g)) &&
 	 o != obj2gco(&g->strempty);
 }
 
@@ -136,39 +155,41 @@ static LJ_AINLINE int gc_obj_inarena(global_State *g, GCobj *o)
 static LJ_AINLINE int gc_obj_inhugeset(global_State *g, GCobj *o)
 {
   UNUSED(g);
-  return lj_arena_ishuge(o);
+  return lj_arena_ishuge(gc_obj_key(o));
 }
 
 static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
 {
+  void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
     if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
 	!(g->gc.gcmarkflags & GCF_DEADAUTH))
       return 0;  /* Rebuild window: survivor marks torn down, not collectible. */
-    return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+    return !arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
   }
   if (gc_obj_inhugeset(g, o)) {
     if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
 	!(g->gc.gcmarkflags & GCF_DEADAUTH))
       return 0;
-    return !huge_obj_ismarked(g, o);
+    return !huge_obj_ismarked(g, k);
   }
   return iswhite(o) != 0;
 }
 
 static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
 {
+  void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
     if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
 	!(g->gc.gcmarkflags & GCF_DEADAUTH))
       return 0;  /* Rebuild window: marks not trustworthy, treat as not black. */
-    return arena_obj_ismarked(ptr2arena(o), ptr2cell(o)) && !isgray(o);
+    return arena_obj_ismarked(ptr2arena(k), ptr2cell(k)) && !isgray(o);
   }
   if (gc_obj_inhugeset(g, o)) {
     if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
 	!(g->gc.gcmarkflags & GCF_DEADAUTH))
       return 0;
-    return huge_obj_ismarked(g, o) && !isgray(o);
+    return huge_obj_ismarked(g, k) && !isgray(o);
   }
   return (o->gch.marked & LJ_GC_BLACK) != 0;
 }
@@ -218,9 +239,10 @@ __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
 ** strempty), never collected, so the isdead fallback is the constant 0 too. */
 static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
 {
+  void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
     if (g->gc.gcmarkflags & GCF_DEADAUTH)
-      return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+      return !arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
 #ifdef LUA_USE_ASSERT
     lj_gc_obj_isdead_nonsweep_counter++;
 #endif
@@ -228,7 +250,7 @@ static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
   }
   if (gc_obj_inhugeset(g, o)) {
     if (g->gc.gcmarkflags & GCF_DEADAUTH)
-      return !huge_obj_ismarked(g, o);
+      return !huge_obj_ismarked(g, k);
 #ifdef LUA_USE_ASSERT
     lj_gc_obj_isdead_nonsweep_counter++;
 #endif
@@ -243,20 +265,22 @@ static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
 ** Caller must be GC-internal (no mutator interleave). */
 static LJ_AINLINE int gc_mark_isdead_raw(global_State *g, GCobj *o)
 {
+  void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o))
-    return !arena_obj_ismarked(ptr2arena(o), ptr2cell(o));
+    return !arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
   if (gc_obj_inhugeset(g, o))
-    return !huge_obj_ismarked(g, o);
+    return !huge_obj_ismarked(g, k);
   return 0;  /* Non-arena/huge (FIXED roots): never dead here. */
 }
 
 static LJ_AINLINE void gc_obj_markblack(global_State *g, GCobj *o)
 {
+  void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
-    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+    arena_obj_setmark(ptr2arena(k), ptr2cell(k));
     o->gch.marked = (uint8_t)(o->gch.marked & (uint8_t)~LJ_GC_WHITES);
   } else if (gc_obj_inhugeset(g, o)) {
-    huge_obj_setmark(g, o);
+    huge_obj_setmark(g, k);
     o->gch.marked = (uint8_t)(o->gch.marked & (uint8_t)~LJ_GC_WHITES);
   } else {
     o->gch.marked |= LJ_GC_BLACK;
@@ -265,11 +289,12 @@ static LJ_AINLINE void gc_obj_markblack(global_State *g, GCobj *o)
 
 static LJ_AINLINE void gc_obj_makewhite(global_State *g, GCobj *o)
 {
+  void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
-    arena_obj_clearmark(ptr2arena(o), ptr2cell(o));
+    arena_obj_clearmark(ptr2arena(k), ptr2cell(k));
     makewhite(g, o);
   } else if (gc_obj_inhugeset(g, o)) {
-    huge_obj_clearmark(g, o);
+    huge_obj_clearmark(g, k);
     makewhite(g, o);
   } else {
     makewhite(g, o);
@@ -278,11 +303,12 @@ static LJ_AINLINE void gc_obj_makewhite(global_State *g, GCobj *o)
 
 static LJ_AINLINE void gc_obj_resurrect(global_State *g, GCobj *o)
 {
+  void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
-    arena_obj_setmark(ptr2arena(o), ptr2cell(o));
+    arena_obj_setmark(ptr2arena(k), ptr2cell(k));
     flipwhite(o);
   } else if (gc_obj_inhugeset(g, o)) {
-    huge_obj_setmark(g, o);
+    huge_obj_setmark(g, k);
     flipwhite(o);
   } else {
     flipwhite(o);

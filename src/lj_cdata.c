@@ -43,6 +43,11 @@ GCcdata *lj_cdata_newv(lua_State *L, CTypeID id, CTSize sz, CTSize align)
 #if LJ_HASGCMARK
   setgcrefr(cd->nextgc, g->gc.cdatavroot);
   setgcref(g->gc.cdatavroot, obj2gco(cd));
+  /* A huge VLA block is registered in the hugeset by its BASE p (a GCcdataVar
+  ** prefix), but the GCobj is cd = p + offset. Tag the slot so GC consumers
+  ** translate base->cd; otherwise makewhite(g, p) clobbers cd->nextgc. */
+  if (lj_arena_ishuge(p))
+    lj_huge_set_cdatav(g, p);
 #else
   setgcrefr(cd->nextgc, g->gc.root);
   setgcref(g->gc.root, obj2gco(cd));

@@ -53,11 +53,6 @@
 #define gc_inarena(g, o)  \
   (!lj_arena_ishuge(o) && \
    (o) != obj2gco(mainthread(g)) && (o) != obj2gco(&(g)->strempty))
-/* Fast in-arena check for gc_mark hot path. Avoids two pointer comparisons
-** by using SFIXED bit: only mainthread and strempty have it (both set in
-** lj_state.c init + atomic). Huge blocks need the address-based check. */
-#define gc_mark_inarena(o) \
-  (!lj_arena_ishuge(o) && !((o)->gch.marked & LJ_GC_SFIXED))
 
 /* Mark a TValue (if needed). */
 #define gc_marktv(g, tv) \
@@ -97,17 +92,20 @@ static void gc_traverse_mainthread(global_State *g);
 static void gc_mark(global_State *g, GCobj *o)
 {
   int gct = o->gch.gct;
-  int inarena = gc_mark_inarena(o);
-  int inhuge = !inarena && gc_obj_inhugeset(g, o);  /* Huge object (string or non-string). */
+  /* VLA cdata: the block base (memcdatav) is the arena/huge classification key
+  ** and the mark site; o=cd carries the GCcdata header used below. */
+  void *key = gc_obj_key(o);
+  int inarena = !lj_arena_ishuge(key) && !(o->gch.marked & LJ_GC_SFIXED);
+  int inhuge = !inarena && lj_arena_ishuge(key);
   GCArena *a;
   GCCellID c;
   if (inarena) {
-    a = ptr2arena(o);
-    c = ptr2cell(o);
+    a = ptr2arena(key);
+    c = ptr2cell(key);
     if (arena_obj_ismarked(a, c))
       return;
   } else if (inhuge) {
-    if (huge_obj_ismarked(g, o))  /* Slot mark is the dedup gate. */
+    if (huge_obj_ismarked(g, key))  /* Slot mark is the dedup gate. */
       return;
   } else if (!iswhite(o)) {
     if (o->gch.marked & LJ_GC_BLACK)
@@ -120,7 +118,7 @@ static void gc_mark(global_State *g, GCobj *o)
   if (inarena)
     arena_obj_setmark(a, c);
   else if (inhuge)
-    huge_obj_setmark(g, o);
+    huge_obj_setmark(g, key);
   else
     o->gch.marked |= LJ_GC_BLACK;
   if (LJ_UNLIKELY(gct == ~LJ_TUDATA)) {
@@ -302,7 +300,7 @@ size_t lj_gc_separateudata(global_State *g, int all)
 	uintptr_t u = gcrefu(slots[hi]);
 	GCobj *o;
 	if (!hugeset_slot_live(u)) continue;
-	o = hugeset_slot_addr(u);
+	o = hugeset_slot_obj(u);
 	if (o->gch.gct != ~LJ_TUDATA) continue;
 	m += sepudata_one(g, o, all);
       }
@@ -1115,8 +1113,12 @@ static int rebuild_prologue_mmu(global_State *g)
   u = gcref(g->gc.rebuild_mmu_cursor);
   do {
     u = gcnext(u);
-    if (!lj_arena_ishuge(u))
-      arena_obj_clearmark(ptr2arena(u), ptr2cell(u));
+    { /* VLA cdata on the mmudata ring: classify by block base (gc_obj_key),
+      ** not the interior cd, or a huge VLA cdata would be misread as arena. */
+      void *k = gc_obj_key(u);
+      if (!lj_arena_ishuge(k))
+	arena_obj_clearmark(ptr2arena(k), ptr2cell(k));
+    }
     setgcref(g->gc.rebuild_mmu_cursor, u);
   } while (u != root && budget-- > 0);
   return u != root;  /* Done when the cursor returns to the ring root. */
@@ -1247,25 +1249,28 @@ static void rebuild_hugescan(global_State *g)
     g->gc.rebuild_hugehi++;
     budget--;
     if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
-    o = hugeset_slot_addr(u);
-    if (o->gch.gct == ~LJ_TSTR) {
-      if (u & HUGESET_MARK)
-	huge_obj_clearmark(g, o);
-      continue;
-    }
-    lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
-    if (o->gch.marked & LJ_GC_BLACK)
-      continue;  /* Already processed (restart safety). */
-    if (!(u & HUGESET_MARK)) {
-      /* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
-      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
-    } else {
-      /* Survivor: clear the slot mark (per-cycle white reset) + recolor. */
-      huge_obj_clearmark(g, o);
-      makewhite(g, o);
-      o->gch.marked |= LJ_GC_BLACK;  /* Tag as processed (restart safety). */
-      if (o->gch.gct == ~LJ_TTHREAD) {
-	gc_fullsweep(g, &gco2th(o)->openupval);
+    { /* base = slot address (mark authority); o = GCobj (cd for CDATAV slots). */
+      GCobj *base = hugeset_slot_addr(u);
+      o = hugeset_slot_obj(u);
+      if (o->gch.gct == ~LJ_TSTR) {
+	if (u & HUGESET_MARK)
+	  huge_obj_clearmark(g, base);
+	continue;
+      }
+      lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
+      if (o->gch.marked & LJ_GC_BLACK)
+	continue;  /* Already processed (restart safety). */
+      if (!(u & HUGESET_MARK)) {
+	/* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
+	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+      } else {
+	/* Survivor: clear the slot mark (per-cycle white reset) + recolor. */
+	huge_obj_clearmark(g, base);
+	makewhite(g, o);
+	o->gch.marked |= LJ_GC_BLACK;  /* Tag as processed (restart safety). */
+	if (o->gch.gct == ~LJ_TTHREAD) {
+	  gc_fullsweep(g, &gco2th(o)->openupval);
+	}
       }
     }
   }
@@ -1313,7 +1318,7 @@ static void rebuild_hugeclear(global_State *g)
     g->gc.rebuild_hugehi++;
     budget--;
     if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
-    o = hugeset_slot_addr(u);
+    o = hugeset_slot_obj(u);
     if (o->gch.gct != ~LJ_TSTR)
       o->gch.marked &= (uint8_t)~LJ_GC_BLACK;
   }
@@ -1657,7 +1662,7 @@ void lj_gc_freeall(global_State *g)
 	  uintptr_t u = gcrefu(slots[hi]);
 	  GCobj *o;
 	  if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
-	  o = hugeset_slot_addr(u);
+	  o = hugeset_slot_obj(u);
 	  if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
 	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
 	}
@@ -1741,7 +1746,7 @@ static void atomic(global_State *g, lua_State *L)
 	  uintptr_t u = gcrefu(slots[hi]);
 	  GCobj *vo;
 	  if (!hugeset_slot_live(u)) continue;
-	  vo = hugeset_slot_addr(u);
+	  vo = hugeset_slot_obj(u);
 	  if (vo->gch.gct != ~LJ_TUDATA) continue;
 	  if (gc_obj_iswhite(g, vo) && !isfinalized(gco2ud(vo)) &&
 	      lj_meta_fastg(g, tabref(gco2ud(vo)->metatable), MM_gc))
@@ -2037,7 +2042,7 @@ static void gc_arena_verify(global_State *g)
 	uintptr_t u = gcrefu(slots[hi]);
 	GCobj *o2;
 	if (!hugeset_slot_live(u)) continue;
-	o2 = hugeset_slot_addr(u);
+	o2 = hugeset_slot_obj(u);
 	lj_assertG(!(u & HUGESET_MARK),
 		   "huge object still slot-black after full GC rebuild: "
 		   "ptr=%p gct=%d marked=0x%02x", (void *)o2, o2->gch.gct,
@@ -2123,21 +2128,28 @@ static void gc_arena_verify(global_State *g)
 	for (hi = 0; hi <= hmask; hi++) {
 	  uintptr_t u = gcrefu(slots[hi]);
 	  if (!hugeset_slot_live(u)) continue;
-	  o = hugeset_slot_addr(u);
-	  if (o->gch.gct == ~LJ_TSTR) continue;
-	  arena_obj_shadowmark(o);
+	  { /* base is huge (no arena bitmap): shadowmark is a no-op; the slot mark
+	    ** set by rebuild is the authority. o = cd for CDATAV slots, to read gct. */
+	    GCobj *base = hugeset_slot_addr(u);
+	    o = hugeset_slot_obj(u);
+	    if (o->gch.gct == ~LJ_TSTR) continue;
+	    arena_obj_shadowmark(base);
 #if LJ_HASFFI
-	  if (o->gch.gct == ~LJ_TCDATA && cdataisv(gco2cd(o)))
-	    arena_obj_shadowmark(memcdatav(gco2cd(o)));
+	    if (o->gch.gct == ~LJ_TCDATA && cdataisv(gco2cd(o)))
+	      arena_obj_shadowmark(memcdatav(gco2cd(o)));  /* == base, no-op. */
 #endif
+	  }
 	}
       }
     }
   }
 #if LJ_HASFFI
   for (o = gcref(g->gc.cdatavroot); o != NULL; o = gcnext(o)) {
-    if (!lj_arena_ishuge(o)) {
-      arena_obj_shadowmark(o);
+    /* Classify by block base (gc_obj_key): a huge VLA cdata's cd is not
+    ** arena-aligned, so ishuge(cd) wrongly reports arena. The base owns the
+    ** mark site (arena cell / hugeset slot). */
+    if (!lj_arena_ishuge(gc_obj_key(o))) {
+      arena_obj_shadowmark(gc_obj_key(o));
       if (cdataisv(gco2cd(o)))
 	arena_obj_shadowmark(memcdatav(gco2cd(o)));
     }
@@ -2348,10 +2360,13 @@ void lj_gc_fullgc(lua_State *L)
 	  for (hi = 0; hi <= hmask; hi++) {
 	    uintptr_t u = gcrefu(slots[hi]);
 	    if (!hugeset_slot_live(u)) continue;
-	    o = hugeset_slot_addr(u);
-	    if (o->gch.gct == ~LJ_TSTR) continue;
-	    huge_obj_clearmark(g, o);  /* Reset slot mark with the header. */
-	    makewhite(g, o);
+	    { /* base owns the slot mark; o = cd carries the GCcdata header. */
+	      GCobj *base = hugeset_slot_addr(u);
+	      o = hugeset_slot_obj(u);
+	      if (o->gch.gct == ~LJ_TSTR) continue;
+	      huge_obj_clearmark(g, base);  /* Reset slot mark with the header. */
+	      makewhite(g, o);
+	    }
 	  }
 	}
       }
