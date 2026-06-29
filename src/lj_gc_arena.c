@@ -990,8 +990,6 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 	p = &o->gch.nextgc;
       } else {
 	setgcrefr(*p, o->gch.nextgc);
-	if (o == gcref(g->gc.root))
-	  setgcrefr(g->gc.root, o->gch.nextgc);
 	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
       }
       continue;
@@ -1005,8 +1003,6 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
       p = &o->gch.nextgc;
     } else {  /* Everything else dies at shutdown. */
       setgcrefr(*p, o->gch.nextgc);
-      if (o == gcref(g->gc.root))
-	setgcrefr(g->gc.root, o->gch.nextgc);  /* Adjust list anchor. */
       gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
     }
     continue;
