@@ -1511,6 +1511,7 @@ static void rebuild_epilogue(global_State *g)
   makewhite(g, obj2gco(mainthread(g)));
   gc_fullsweep(g, &mainthread(g)->openupval);
   setgcref(g->gc.root, obj2gco(mainthread(g)));
+  gc_assert_root_anchor_only(g);
 
   g->gc.rebuildphase = Rebuild_ClearMarks;
 }
@@ -1873,6 +1874,7 @@ void lj_gc_freeall(global_State *g)
     ** object is gone, and the stale chain must never be walked again. */
     setgcrefnull(mainthread(g)->nextgc);
     setgcref(g->gc.root, obj2gco(mainthread(g)));
+    gc_assert_root_anchor_only(g);
   }
   for (i = g->str.mask; i != ~(MSize)0; i--)  /* Free all string hash chains. */
     gc_sweepstr(g, &g->str.tab[i]);
