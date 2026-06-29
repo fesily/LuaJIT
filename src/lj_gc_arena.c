@@ -2859,16 +2859,8 @@ void *lj_mem_newgco_slow(lua_State *L, GCSize size, int cls, int link)
     else
       arena_obj_setmark(ptr2arena(o), ptr2cell(o));
   }
-  if (link) {
-    if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_BITMAPSWEEP)) {
-      newwhite(g, o);
-    } else
-    {
-      setgcrefr(o->gch.nextgc, g->gc.root);
-      setgcref(g->gc.root, o);
-      newwhite(g, o);
-    }
-  }
+  if (link)
+    newwhite(g, o);
   return o;
 }
 

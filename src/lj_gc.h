@@ -482,18 +482,8 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
       if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC))
 	arena_obj_setmark(a, ptr2cell(o));
 #endif
-      if (link) {
-#if LJ_HASGCMARK
-	if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_BITMAPSWEEP)) {
-	  newwhite(g, o);
-	} else
-#endif
-	{
-	  setgcrefr(o->gch.nextgc, g->gc.root);
-	  setgcref(g->gc.root, o);
-	  newwhite(g, o);
-	}
-      }
+      if (link)
+	newwhite(g, o);
       return o;
     }
   }
