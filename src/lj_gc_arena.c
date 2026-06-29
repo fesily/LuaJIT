@@ -1714,8 +1714,6 @@ static void gc_finalize(lua_State *L)
   if (o->gch.gct == ~LJ_TCDATA) {
     TValue tmp, *tv;
     /* Add cdata back to the GC list and make it white. */
-    setgcrefr(o->gch.nextgc, g->gc.root);
-    setgcref(g->gc.root, o);
     gc_obj_makewhite(g, o);
     o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
     /* Resolve finalizer. */
