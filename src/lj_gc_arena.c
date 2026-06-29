@@ -2780,8 +2780,6 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
   copyTV(mainthread(g), &uv->tv, uvval(uv));
   setmref(uv->v, &uv->tv);
   uv->closed = 1;
-  setgcrefr(o->gch.nextgc, g->gc.root);
-  setgcref(g->gc.root, o);
   if ((o->gch.marked & LJ_GC_GRAY) && !gc_obj_iswhite(g, o)) {
     if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
       gray2black(o);  /* Make it black and preserve invariant. */

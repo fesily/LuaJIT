@@ -148,8 +148,10 @@ static void trace_save(jit_State *J, GCtrace *T)
   size_t szins = (J->cur.nins-J->cur.nk)*sizeof(IRIns);
   char *p = (char *)T + sztr;
   memcpy(T, &J->cur, sizeof(GCtrace));
+#if !LJ_HASGCMARK
   setgcrefr(T->nextgc, J2G(J)->gc.root);
   setgcrefp(J2G(J)->gc.root, T);
+#endif
   newwhite(J2G(J), T);
   T->gct = ~LJ_TTRACE;
   T->ir = (IRIns *)p - J->cur.nk;  /* The IR has already been copied above. */
