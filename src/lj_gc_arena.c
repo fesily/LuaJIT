@@ -163,6 +163,105 @@ static LJ_AINLINE void cdatav_cell_assert(global_State *g, void *p_)
 #define cdatav_cell_assert(g, p)	((void)0)
 #endif
 
+/* LUA_USE_ASSERT: root-chain probe + anchor-only assertion for the arena
+** collector (T0 of the deprecate-arena-gc-root-chain plan). The root chain
+** (g->gc.root -> gch.nextgc -> ...) is being deprecated in favor of arena
+** bitmaps + the hugeset; these helpers measure the current writers so later
+** phases (T1-T6) can verify removal, and T5 can assert the final anchor-only
+** state globally.
+**
+** GC_ROOT_CHAIN_MAX bounds the walk so a corrupted chain cannot loop forever;
+** hitting the cap is itself an assertion failure.
+**
+** gc_root_chain_count(g)       -> bounded total length of g->gc.root chain.
+** gc_root_chain_probe_print(g) -> per-gct breakdown to stderr, gated by
+**   getenv("LUAJIT_GC_ROOT_CHAIN_PROBE") so normal assert runs are not spammed.
+**   Used by the baseline harness test/gc/root_chain_probe_assert.lua.
+** gc_assert_root_anchor_only(g)-> asserts the steady state reached after
+**   rebuild/freeall/init: g->gc.root == mainthread && mainthread->nextgc == NULL.
+**   T0 only DEFINES this helper; T5 wires the global call sites.
+**
+** Entirely gated by LUA_USE_ASSERT (and LJ_HASGCMARK via the file guard);
+** release builds pay nothing. */
+#define GC_ROOT_CHAIN_MAX	100000u
+
+#ifdef LUA_USE_ASSERT
+#include <stdio.h>
+#include <stdlib.h>
+
+static uint32_t gc_root_chain_count(global_State *g)
+{
+  GCobj *o = gcref(g->gc.root);
+  uint32_t n = 0;
+  while (o != NULL) {
+    n++;
+    if (n >= GC_ROOT_CHAIN_MAX) {
+      lj_assertG(0,
+		 "gc_root_chain_count: hit safety cap %u (corrupted chain?)",
+		 GC_ROOT_CHAIN_MAX);
+      return n;
+    }
+    o = gcref(o->gch.nextgc);
+  }
+  return n;
+}
+
+/* Per-gct breakdown printed to stderr when LUAJIT_GC_ROOT_CHAIN_PROBE is set.
+** Walks the same chain as gc_root_chain_count; the per-type counters reflect
+** which writers currently link to g->gc.root (strings/udata/VLA-cdata are
+** expected to be absent -- negative controls). */
+static void gc_root_chain_probe_print(global_State *g, const char *tag)
+{
+  if (LJ_UNLIKELY(getenv("LUAJIT_GC_ROOT_CHAIN_PROBE") != NULL)) {
+    GCobj *o = gcref(g->gc.root);
+    uint32_t total = 0;
+    uint32_t cstr = 0, cupval = 0, cthread = 0, cproto = 0, cfunc = 0;
+    uint32_t ctrace = 0, ccdata = 0, ctab = 0, cudata = 0, cother = 0;
+    while (o != NULL) {
+      if (total >= GC_ROOT_CHAIN_MAX) {
+	lj_assertG(0,
+		   "gc_root_chain_probe_print: hit safety cap %u (corrupted chain?)",
+		   GC_ROOT_CHAIN_MAX);
+	break;
+      }
+      total++;
+      if (o->gch.gct == ~LJ_TSTR) cstr++;
+      else if (o->gch.gct == ~LJ_TUPVAL) cupval++;
+      else if (o->gch.gct == ~LJ_TTHREAD) cthread++;
+      else if (o->gch.gct == ~LJ_TPROTO) cproto++;
+      else if (o->gch.gct == ~LJ_TFUNC) cfunc++;
+      else if (o->gch.gct == ~LJ_TTRACE) ctrace++;
+      else if (o->gch.gct == ~LJ_TCDATA) ccdata++;
+      else if (o->gch.gct == ~LJ_TTAB) ctab++;
+      else if (o->gch.gct == ~LJ_TUDATA) cudata++;
+      else cother++;
+      o = gcref(o->gch.nextgc);
+    }
+    fprintf(stderr,
+      "[gc_root_chain_probe] %s: total=%u str=%u upval=%u th=%u proto=%u "
+      "func=%u trace=%u cdata=%u tab=%u ud=%u other=%u\n",
+      tag ? tag : "?", total, cstr, cupval, cthread, cproto, cfunc, ctrace,
+      ccdata, ctab, cudata, cother);
+  }
+}
+
+static LJ_AINLINE void gc_assert_root_anchor_only(global_State *g)
+{
+  GCobj *root = gcref(g->gc.root);
+  GCobj *mt = obj2gco(mainthread(g));
+  lj_assertG(root == mt,
+	     "root chain not anchored on mainthread alone (root=%p mt=%p)",
+	     (void *)root, (void *)mt);
+  lj_assertG(gcref(mt->gch.nextgc) == NULL,
+	     "mainthread has a nextgc link (anchor-only invariant): nextgc=%p",
+	     (void *)gcref(mt->gch.nextgc));
+}
+#else
+#define gc_root_chain_count(g)			((uint32_t)0)
+#define gc_root_chain_probe_print(g, tag)	((void)0)
+#define gc_assert_root_anchor_only(g)		((void)0)
+#endif
+
 /* Mark a GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
 {
@@ -2441,6 +2540,10 @@ void lj_gc_fullgc(lua_State *L)
   global_State *g = G(L);
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
+  /* T0 root-chain baseline: snapshot the pre-collect chain so the harness can
+  ** observe which writers currently link to g->gc.root. No-op unless
+  ** LUAJIT_GC_ROOT_CHAIN_PROBE is set; release builds compile it out. */
+  gc_root_chain_probe_print(g, "fullgc-entry");
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
     gc_hugegray_reset(g);  /* Reset worklists from partial propagation. */
     gc_graythread_reset(g);
