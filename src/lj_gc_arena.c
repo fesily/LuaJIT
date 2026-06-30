@@ -40,7 +40,7 @@
 
 /* Macros to set GCobj colors and flags. */
 #define white2gray(x) \
-  ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_WHITES) | LJ_GC_GRAY)
+  ((x)->gch.marked |= LJ_GC_GRAY)
 #define gray2black(x) \
   ((x)->gch.marked &= (uint8_t)~LJ_GC_GRAY)
 #define isfinalized(u)		((u)->marked & LJ_GC_FINALIZED)
@@ -68,10 +68,8 @@
     arena_obj_setmark(ptr2arena(s), ptr2cell(s)); \
   else if (lj_arena_ishuge(obj2gco(s))) \
     huge_obj_setmark(g, obj2gco(s)); \
-  else { \
-    (s)->marked &= (uint8_t)~LJ_GC_WHITES; \
+  else \
     (s)->marked |= LJ_GC_BLACK; \
-  } \
   } while (0)
 
 static void gc_hugegray_push(global_State *g, GCobj *o);
@@ -281,12 +279,10 @@ static void gc_mark(global_State *g, GCobj *o)
   } else if (inhuge) {
     if (huge_obj_ismarked(g, key))  /* Slot mark is the dedup gate. */
       return;
-  } else if (!iswhite(o)) {
-    if (o->gch.marked & LJ_GC_BLACK)
-      return;
+  } else if (o->gch.marked & LJ_GC_BLACK) {
+    return;  /* Non-arena FIXED root already marked black this cycle. */
   }
-  lj_assertG(inarena || inhuge || iswhite(o) || isgray(o) ||
-	     !(o->gch.marked & (LJ_GC_WHITES|LJ_GC_BLACK|LJ_GC_GRAY)),
+  lj_assertG(inarena || inhuge || !(o->gch.marked & LJ_GC_BLACK),
 	     "mark of already-black non-arena object");
   white2gray(o);
   if (inarena)
@@ -1887,7 +1883,7 @@ static void atomic(global_State *g, lua_State *L)
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
   gc_weak_redirect_all(g);  /* Redirect weak tables to arena/huge gray stacks. */
-  lj_assertG(!iswhite(obj2gco(mainthread(g))), "main thread turned white");
+  lj_assertG(!gc_obj_iswhite(g, obj2gco(mainthread(g))), "main thread turned white");
   gc_markobj(g, L);  /* Mark running thread. */
   gc_traverse_mainthread(g);  /* Stack slots have no barriers. */
   gc_traverse_curtrace(g);  /* Traverse current trace. */

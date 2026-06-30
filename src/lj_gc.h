@@ -18,7 +18,9 @@ enum {
 
 /* Bitmasks for marked field of GCobj. */
 #define LJ_GC_WHITE0	0x01
+#if !LJ_HASGCMARK
 #define LJ_GC_WHITE1	0x02
+#endif
 #define LJ_GC_BLACK	0x04	/* Non-arena only under LJ_HASGCMARK. */
 #define LJ_GC_FINALIZED	0x08
 #define LJ_GC_WEAKKEY	0x08
@@ -48,12 +50,14 @@ enum {
 #endif
 
 #if LJ_HASGCMARK
-#define LJ_GC_WHITES	LJ_GC_WHITE1	/* Single-white under bitmap GC. */
+/* Bitmap GC: no header white bit. WHITES/COLORS are empty so any residual
+** mask-out of the white bits compiles to a no-op; 0x02 is a free slot. */
+#define LJ_GC_WHITES	0
 #else
 #define LJ_GC_WHITES	(LJ_GC_WHITE0 | LJ_GC_WHITE1)
 #endif
 #if LJ_HASGCMARK
-#define LJ_GC_COLORS	LJ_GC_WHITES	/* BLACK is in arena bitmap, not header. */
+#define LJ_GC_COLORS	0	/* No header white; BLACK lives in arena bitmap. */
 #else
 #define LJ_GC_COLORS	(LJ_GC_WHITES | LJ_GC_BLACK)
 #endif
@@ -71,8 +75,13 @@ enum {
 ** without touching the many call sites across the tree.
 */
 #if LJ_HASGCMARK
-#define iswhite(x)	((x)->gch.marked & LJ_GC_WHITES)
-#define isblack(x)	(!((x)->gch.marked & LJ_GC_GRAY) && !((x)->gch.marked & LJ_GC_WHITES))
+/* Bitmap GC: the header has no white bit and BLACK is arena-bitmap-resident, so
+** raw header color tests are meaningless. They are POISONED: any expansion is a
+** compile error naming the bitmap-aware replacement. Liveness/color MUST go
+** through gc_obj_iswhite / gc_obj_isblack / gc_obj_isdead. isgray stays valid:
+** the inline GRAY frontier bit is still header-resident. */
+#define iswhite(x)	LJ_GC_POISON_iswhite__use_gc_obj_iswhite
+#define isblack(x)	LJ_GC_POISON_isblack__use_gc_obj_isblack
 #define isgray(x)	((x)->gch.marked & LJ_GC_GRAY)
 #else
 #define iswhite(x)	((x)->gch.marked & LJ_GC_WHITES)
@@ -81,36 +90,40 @@ enum {
 #endif
 #define tviswhite(x)	(tvisgcv(x) && iswhite(gcV(x)))
 #if LJ_HASGCMARK
-/* Bitmap GC: no currentwhite field, no atomic white flip. The mark bitmap /
-** hugeset slot is the sole liveness authority for arena/huge objects, so their
-** header white bit is vestigial. The only header-resident objects are the
-** FIXED/SFIXED roots (mainthread, strempty), never collected. So curwhite is
-** the constant single white LJ_GC_WHITE1 (never flips); otherwhite/isdead --
-** reached only via gc_obj_isdead's non-arena fallback for those roots -- answer
-** "never dead" without per-cycle state. LJ_GC_WHITE1 stays defined so the
-** VM/JIT barrier WHITES tests keep their immediate encoding. */
-#define otherwhite(g)	(LJ_GC_WHITES)
+/* Bitmap GC: no currentwhite field, no atomic white flip, no header white bit.
+** Liveness for arena/huge objects is the mark bitmap / hugeset slot; the two
+** FIXED|SFIXED roots (mainthread, strempty) are constant-live. isdead is always
+** false (gc_obj_isdead is the real seam). curwhite/otherwhite have no meaning
+** here and are POISONED so any accidental expansion fails to compile. */
+#define otherwhite(g)	LJ_GC_POISON_otherwhite__no_white_under_bitmap_gc
 #define isdead(g, v)	(0)
-#define curwhite(g)	((void)(g), LJ_GC_WHITE1)
+#define curwhite(g)	LJ_GC_POISON_curwhite__no_white_under_bitmap_gc
 #else
 #define otherwhite(g)	((g)->gc.currentwhite ^ LJ_GC_WHITES)
 #define isdead(g, v)	((v)->gch.marked & otherwhite(g) & LJ_GC_WHITES)
 #define curwhite(g)	((g)->gc.currentwhite & LJ_GC_WHITES)
 #endif
 #if LJ_HASGCMARK
-#define newwhite(g, x)	(obj2gco(x)->gch.marked = (uint8_t)(curwhite(g) | LJ_GC_GRAY))
+/* Bitmap GC: liveness is the arena mark / hugeset slot; the header carries no
+** white bit (0x02 is free). A fresh object is light-gray (GRAY only). */
+#define newwhite(g, x)	(obj2gco(x)->gch.marked = (uint8_t)LJ_GC_GRAY)
 #else
 #define newwhite(g, x)	(obj2gco(x)->gch.marked = (uint8_t)curwhite(g))
 #endif
 #if LJ_HASGCMARK
+/* Pure white = clear the inline GRAY frontier bit. BLACK (0x04) is preserved:
+** it doubles as the huge-scan rebuild progress tag (lj_gc_arena.c). */
 #define makewhite(g, x) \
-  ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~(LJ_GC_COLORS|LJ_GC_GRAY)) \
-                      | curwhite(g))
+  ((void)(g), (x)->gch.marked &= (uint8_t)~LJ_GC_GRAY)
 #else
 #define makewhite(g, x) \
   ((x)->gch.marked = ((x)->gch.marked & (uint8_t)~LJ_GC_COLORS) | curwhite(g))
 #endif
+#if LJ_HASGCMARK
+#define flipwhite(x)	((x)->gch.marked ^= LJ_GC_GRAY)
+#else
 #define flipwhite(x)	((x)->gch.marked ^= LJ_GC_WHITES)
+#endif
 #if LJ_HASGCMARK
 #define black2gray(x)	((x)->gch.marked |= LJ_GC_GRAY)
 #else
@@ -173,7 +186,12 @@ static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
       return 0;
     return !huge_obj_ismarked(g, k);
   }
-  return iswhite(o) != 0;
+  /* Reached only by the two dlmalloc FIXED|SFIXED roots (mainthread, strempty):
+  ** they have no bitmap/slot and no header white bit under bitmap GC. Roots are
+  ** never collectible, hence never white. */
+  lj_assertG(o == obj2gco(mainthread(g)) || o == obj2gco(&g->strempty),
+	     "non-arena/non-huge object is not a FIXED root: gct=%d", o->gch.gct);
+  return 0;
 }
 
 static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
@@ -191,7 +209,11 @@ static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
       return 0;
     return huge_obj_ismarked(g, k) && !isgray(o);
   }
-  return (o->gch.marked & LJ_GC_BLACK) != 0;
+  /* The two dlmalloc FIXED|SFIXED roots are permanently reachable: report black
+  ** so barriers treat them as already-marked (never re-greyed via the header). */
+  lj_assertG(o == obj2gco(mainthread(g)) || o == obj2gco(&g->strempty),
+	     "non-arena/non-huge object is not a FIXED root: gct=%d", o->gch.gct);
+  return !isgray(o);
 }
 
 #ifdef LUA_USE_ASSERT
@@ -278,10 +300,8 @@ static LJ_AINLINE void gc_obj_markblack(global_State *g, GCobj *o)
   void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
     arena_obj_setmark(ptr2arena(k), ptr2cell(k));
-    o->gch.marked = (uint8_t)(o->gch.marked & (uint8_t)~LJ_GC_WHITES);
   } else if (gc_obj_inhugeset(g, o)) {
     huge_obj_setmark(g, k);
-    o->gch.marked = (uint8_t)(o->gch.marked & (uint8_t)~LJ_GC_WHITES);
   } else {
     o->gch.marked |= LJ_GC_BLACK;
   }
@@ -306,12 +326,11 @@ static LJ_AINLINE void gc_obj_resurrect(global_State *g, GCobj *o)
   void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
     arena_obj_setmark(ptr2arena(k), ptr2cell(k));
-    flipwhite(o);
   } else if (gc_obj_inhugeset(g, o)) {
     huge_obj_setmark(g, k);
-    flipwhite(o);
   } else {
-    flipwhite(o);
+    lj_assertG(0, "resurrect of a non-arena/non-huge FIXED root: gct=%d",
+	       o->gch.gct);
   }
 }
 #else

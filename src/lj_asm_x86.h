@@ -1914,13 +1914,11 @@ static void asm_cnew(ASMState *as, IRIns *ir)
 
   /* Combine initialization of marked, gct and ctypeid. */
 #if LJ_HASGCMARK
-  /* Arena/bitmap GC: the new cdata's header white bit is vestigial (all live
-  ** readers use the arena mark bitmap, not the header), so emit a constant
-  ** header instead of reading the flipping gc.currentwhite. The marked byte
-  ** matches the C allocator's newwhite() = curwhite(g)|LJ_GC_GRAY: curwhite is
-  ** the single white LJ_GC_WHITE1 under bitmap GC, plus the inline gray bit. */
+  /* Arena/bitmap GC: header carries no white bit (liveness is the arena mark
+  ** bitmap). New cdata is light-gray, matching the C allocator's newwhite()
+  ** under bitmap GC = LJ_GC_GRAY only. */
   emit_movmroi(as, RID_RET, (int32_t)offsetof(GCcdata, marked),
-	       (int32_t)((LJ_GC_WHITE1|LJ_GC_GRAY)+(~LJ_TCDATA<<8)+(id<<16)));
+	       (int32_t)((LJ_GC_GRAY)+(~LJ_TCDATA<<8)+(id<<16)));
 #else
   emit_movtomro(as, RID_ECX, RID_RET, offsetof(GCcdata, marked));
   emit_gri(as, XG_ARITHi(XOg_OR), RID_ECX,
