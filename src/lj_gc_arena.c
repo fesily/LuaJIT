@@ -62,14 +62,14 @@
 #define gc_markobj(g, o) \
   { GCobj *mo_ = obj2gco(o); if (gc_obj_iswhite((g), mo_)) gc_mark(g, mo_); }
 
-/* Mark a string object. */
+/* Mark a string object. The only non-arena/non-huge string is strempty, an
+** SFIXED constant-live root with no bitmap/slot and no header color -- nothing
+** to mark. */
 #define gc_mark_str(g, s) do { \
   if (gc_inarena(g, obj2gco(s))) \
     arena_obj_setmark(ptr2arena(s), ptr2cell(s)); \
   else if (lj_arena_ishuge(obj2gco(s))) \
     huge_obj_setmark(g, obj2gco(s)); \
-  else \
-    (s)->marked |= LJ_GC_BLACK; \
   } while (0)
 
 static void gc_hugegray_push(global_State *g, GCobj *o);
@@ -279,18 +279,17 @@ static void gc_mark(global_State *g, GCobj *o)
   } else if (inhuge) {
     if (huge_obj_ismarked(g, key))  /* Slot mark is the dedup gate. */
       return;
-  } else if (o->gch.marked & LJ_GC_BLACK) {
-    return;  /* Non-arena FIXED root already marked black this cycle. */
+  } else {
+    /* Non-arena/non-huge = SFIXED roots (mainthread, strempty). They are
+    ** constant-live and traversed explicitly, never reached through gc_mark. */
+    lj_assertG(0, "gc_mark of a non-arena/non-huge FIXED root: gct=%d", gct);
+    return;
   }
-  lj_assertG(inarena || inhuge || !(o->gch.marked & LJ_GC_BLACK),
-	     "mark of already-black non-arena object");
   white2gray(o);
   if (inarena)
     arena_obj_setmark(a, c);
-  else if (inhuge)
-    huge_obj_setmark(g, key);
   else
-    o->gch.marked |= LJ_GC_BLACK;
+    huge_obj_setmark(g, key);
   if (LJ_UNLIKELY(gct == ~LJ_TUDATA)) {
     GCtab *mt = tabref(gco2ud(o)->metatable);
     gray2black(o);  /* Userdata are never gray. */
