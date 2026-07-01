@@ -1,8 +1,30 @@
 -- Focused GC comparison benchmark: pure GC timings only
 -- Run: luajit -joff test/bench_gc_focused.lua
-local clock = os.clock
+--
+-- Cross-collector caveat: B5 and B10 drive the collector with
+-- collectgarbage("step", N). The N argument is a scheduler credit, not a fixed
+-- work unit -- the arena bitmap GC and the classic tri-color GC convert the
+-- same N into different amounts of actual marking/sweeping. Treat B5/B10 as
+-- within-build trend rows, NOT as apples-to-apples arena-vs-classic numbers;
+-- the full-cycle rows (B1/B2/B3/B7/B11) are the fair cross-collector compare.
 local ffi = require("ffi")
-ffi.cdef[[ typedef struct { int x; int y; int z; } Vec3f; ]]
+ffi.cdef[[
+typedef struct timespec { long tv_sec; long tv_nsec; } timespec;
+int clock_gettime(int clk_id, struct timespec *tp);
+typedef struct { int x; int y; int z; } Vec3f;
+]]
+
+-- Wall-clock (clock_gettime MONOTONIC), not os.clock: GC pauses are a
+-- wall-clock phenomenon and os.clock's process-CPU time (~2us granularity,
+-- excludes blocking) both under-reports pauses and floors small workloads to
+-- 0.0000s. clock() below is this monotonic reader, so each bench body's
+-- clock()-t0 measures real elapsed time.
+local CLOCK_MONOTONIC = 1
+local ts = ffi.new("timespec[1]")
+local function clock()
+  ffi.C.clock_gettime(CLOCK_MONOTONIC, ts)
+  return tonumber(ts[0].tv_sec) + tonumber(ts[0].tv_nsec) * 1e-9
+end
 
 local RUNS = 7
 
@@ -10,10 +32,12 @@ local function median(t)
   local s = {}
   for i = 1, #t do s[i] = t[i] end
   table.sort(s)
-  return s[math.ceil(#s / 2)]
+  local n = #s
+  return (n % 2 == 1) and s[(n + 1) / 2] or (s[n / 2] + s[n / 2 + 1]) / 2
 end
 
 local function bench(name, fn)
+  collectgarbage("collect"); collectgarbage("collect"); fn()  -- warm-up
   local times = {}
   for r = 1, RUNS do
     collectgarbage("collect")
@@ -22,8 +46,7 @@ local function bench(name, fn)
   end
   local med = median(times)
   io.write(string.format("%-45s  median=%.4fs  min=%.4fs  max=%.4fs\n",
-    name, med, times[1] < times[#times] and math.min(unpack(times)) or times[1],
-    math.max(unpack(times))))
+    name, med, math.min(unpack(times)), math.max(unpack(times))))
 end
 
 io.write("=== Focused GC Benchmark ===\n\n")

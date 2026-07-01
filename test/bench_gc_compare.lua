@@ -24,7 +24,9 @@ local function measure(name, setup_fn, fn)
     end
   end
   table.sort(results)
-  local median = results[math.ceil(#results / 2)]
+  local n = #results
+  local median = (n % 2 == 1) and results[(n + 1) / 2]
+    or (results[n / 2] + results[n / 2 + 1]) / 2
   local min_t = results[1]
   local max_t = results[#results]
   local avg_mem = 0
