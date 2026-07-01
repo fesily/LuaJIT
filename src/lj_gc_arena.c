@@ -1383,13 +1383,14 @@ static void rebuild_hugescan(global_State *g)
   ** was rehashed between slices, slot positions changed and the cursor
   ** restarts from 0 with the new generation.
   **
-  ** Restart idempotency: processed survivors get LJ_GC_BLACK (header bit,
-  ** unused for huge objects under HASGCMARK — color lives in the slot). On
-  ** restart, BLACK-tagged objects are skipped BEFORE the dead/alive test (a
-  ** cleared slot mark would otherwise look dead → use-after-free). Freed
-  ** dead objects tombstone their slots → skipped. A final pass clears BLACK
-  ** once the cursor completes (no mutator gap before Epilogue in T6 → no
-  ** stale BLACK).
+  ** Restart idempotency: processed survivors get the HUGESET_SWEPT slot bit
+  ** (bit 3, value 8) — NOT a header color bit. The slot is the entire GC
+  ** state of a huge object (color lives in the slot), so the restart tag is
+  ** slot-resident by construction. On restart, SWEPT-tagged slots are skipped
+  ** BEFORE the dead/alive test (a cleared slot MARK would otherwise look dead
+  ** → use-after-free). Freed dead objects tombstone their slots → skipped.
+  ** A bounded tail pass (Rebuild_HugeClear) clears SWEPT once the cursor
+  ** completes.
   **
   ** Huge STRINGS are not freed here (owned by gc_sweepstr); their slot mark
   ** is cleared for the per-cycle reset. Upvalues are never huge. */
@@ -1423,16 +1424,20 @@ static void rebuild_hugescan(global_State *g)
 	continue;
       }
       lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
-      if (o->gch.marked & LJ_GC_BLACK)
+      if (u & HUGESET_SWEPT)
 	continue;  /* Already processed (restart safety). */
       if (!(u & HUGESET_MARK)) {
 	/* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
 	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
       } else {
-	/* Survivor: clear the slot mark (per-cycle white reset) + recolor. */
-	huge_obj_clearmark(g, base);
+	/* Survivor: clear the slot mark (per-cycle white reset), set the
+	** slot SWEPT tag (restart safety), and recolor the header. The slot
+	** index is rebuild_hugehi-1 (rebuild_hugehi was incremented above).
+	** makewhite still clears the GRAY frontier bit; SWEPT lives in the
+	** slot, not the header, so it is untouched by makewhite. */
+	setgcrefp(slots[g->gc.rebuild_hugehi-1],
+		  (void *)((u & ~(uintptr_t)HUGESET_MARK) | (uintptr_t)HUGESET_SWEPT));
 	makewhite(g, o);
-	o->gch.marked |= LJ_GC_BLACK;  /* Tag as processed (restart safety). */
 	if (o->gch.gct == ~LJ_TTHREAD) {
 	  gc_fullsweep(g, &gco2th(o)->openupval);
 	}
@@ -1440,9 +1445,9 @@ static void rebuild_hugescan(global_State *g)
     }
   }
   if (g->gc.rebuild_hugehi > hmask) {
-    /* Main walk done. BLACK bits (set on survivors at line above) are cleared
-    ** by a bounded second pass — Rebuild_HugeClear — NOT an unbounded final
-    ** loop (A2). Re-snapshot the generation so the clear pass detects a
+    /* Main walk done. SWEPT slot bits (set on survivors at line above) are
+    ** cleared by a bounded second pass — Rebuild_HugeClear — NOT an unbounded
+    ** final loop (A2). Re-snapshot the generation so the clear pass detects a
     ** rehash between its own slices and restarts from 0 (clearing is
     ** idempotent). */
     g->gc.rebuild_hugehi = 0;
@@ -1452,16 +1457,18 @@ static void rebuild_hugescan(global_State *g)
   }
 }
 
-/* Bounded BLACK-clear tail pass for the huge set. BLACK is set during the
-** main HugeScan walk (restart-skip tag on survivors). Every live non-string
-** huge object must have BLACK cleared before rebuild Done, or the next mark
-** cycle would treat a stale BLACK as "already marked" and skip tracing it
-** (premature collection). The old form was an unbounded
-** for(hi=0; hi<=hmask; hi++) loop in one slice — O(hugesetmask), violating A2.
-** This resumable form clears GCSWEEPMAX slots per slice and yields. A rehash
-** between slices (hugesetgen changed) just restarts the cursor from 0 —
-** clearing is idempotent, so eventual completion only requires the rehash
-** storm to settle (same liveness assumption as the main walk). */
+  /* Bounded SWEPT-clear tail pass for the huge set. The HUGESET_SWEPT slot
+  ** bit is set during the main HugeScan walk (restart-skip tag on survivors).
+  ** Every live non-string huge object must have SWEPT cleared before rebuild
+  ** Done, or the next rebuild cycle would skip a still-tagged survivor as
+  ** "already processed" and never run the dead/alive test on it (the slot
+  ** MARK was cleared in HugeScan, so the survivor would look dead → premature
+  ** collection on the next rebuild). The old form was an unbounded
+  ** for(hi=0; hi<=hmask; hi++) loop in one slice — O(hugesetmask), violating
+  ** A2. This resumable form clears GCSWEEPMAX slots per slice and yields. A
+  ** rehash between slices (hugesetgen changed) just restarts the cursor from
+  ** 0 — clearing is idempotent, so eventual completion only requires the
+  ** rehash storm to settle (same liveness assumption as the main walk). */
 static void rebuild_hugeclear(global_State *g)
 {
   GCRef *slots = mref(g->gc.hugeset, GCRef);
@@ -1485,8 +1492,11 @@ static void rebuild_hugeclear(global_State *g)
     if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
     hugeset_slot_assert(g, u);
     o = hugeset_slot_obj(u);
-    if (o->gch.gct != ~LJ_TSTR)
-      o->gch.marked &= (uint8_t)~LJ_GC_BLACK;
+    if (o->gch.gct != ~LJ_TSTR) {
+      /* Slot index is rebuild_hugehi-1 (rebuild_hugehi was incremented above). */
+      setgcrefp(slots[g->gc.rebuild_hugehi-1],
+		(void *)(u & ~(uintptr_t)HUGESET_SWEPT));
+    }
   }
   if (g->gc.rebuild_hugehi > hmask) {
     g->gc.gcmarkflags &= ~GCF_HUGECLEAR;  /* HugeScan window fully closed. */
@@ -2222,9 +2232,10 @@ static void gc_arena_verify(global_State *g)
     }
   }
   /* Huge color cross-check, mirroring gc_arena_verify_color: at GCSpause after
-  ** rebuild, every live huge object (string and non-string) must be slot-white.
-  ** Non-strings are cleared by the rebuild set-walk; huge strings by the
-  ** ~LJ_TSTR slot-clear in that same walk. A stuck slot mark means the
+  ** rebuild, every live huge object (string and non-string) must be slot-white
+  ** and SWEPT-clear. Non-strings are cleared by the rebuild set-walk (MARK) and
+  ** the Rebuild_HugeClear tail pass (SWEPT); huge strings by the ~LJ_TSTR
+  ** slot-clear in that same walk. A stuck slot mark or SWEPT tag means the
   ** per-cycle reset regressed. */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
@@ -2236,8 +2247,8 @@ static void gc_arena_verify(global_State *g)
 	if (!hugeset_slot_live(u)) continue;
 	hugeset_slot_assert(g, u);
 	o2 = hugeset_slot_obj(u);
-	lj_assertG(!(u & HUGESET_MARK),
-		   "huge object still slot-black after full GC rebuild: "
+	lj_assertG(!(u & (HUGESET_MARK | HUGESET_SWEPT)),
+		   "huge object still slot-marked/swept after full GC rebuild: "
 		   "ptr=%p gct=%d marked=0x%02x", (void *)o2, o2->gch.gct,
 		   o2->gch.marked);
       }
