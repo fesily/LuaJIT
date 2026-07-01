@@ -658,9 +658,8 @@ static size_t propagatemark(global_State *g
   lj_assertG(o->gch.marked & LJ_GC_GRAY,
     "gray object missing gray bit: gct=%d marked=0x%02x ptr=%p state=%d",
     o->gch.gct, o->gch.marked, (void*)o, g->gc.state);
-  lj_assertG(!(o->gch.marked & LJ_GC_BLACK) || !gc_inarena(g, o),
-    "arena object has header BLACK bit: ptr=%p gct=%d marked=0x%02x",
-    (void*)o, o->gch.gct, o->gch.marked);
+  /* Header bit 0x04 (classic LJ_GC_BLACK) is a free slot under bitmap GC --
+  ** no writer remains, so there is nothing to assert here. */
   gray2black(o);
   if (LJ_LIKELY(gct == ~LJ_TTAB)) {
     GCtab *t = gco2tab(o);

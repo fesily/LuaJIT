@@ -20,8 +20,8 @@ enum {
 #define LJ_GC_WHITE0	0x01
 #if !LJ_HASGCMARK
 #define LJ_GC_WHITE1	0x02
+#define LJ_GC_BLACK	0x04	/* Classic tri-color header bit; unused under bitmap GC. */
 #endif
-#define LJ_GC_BLACK	0x04	/* Non-arena only under LJ_HASGCMARK. */
 #define LJ_GC_FINALIZED	0x08
 #define LJ_GC_WEAKKEY	0x08
 #define LJ_GC_WEAKVAL	0x10
@@ -102,8 +102,8 @@ enum {
 #define newwhite(g, x)	(obj2gco(x)->gch.marked = (uint8_t)curwhite(g))
 #endif
 #if LJ_HASGCMARK
-/* Pure white = clear the inline GRAY frontier bit. BLACK (0x04) is preserved:
-** it doubles as the huge-scan rebuild progress tag (lj_gc_arena.c). */
+/* Pure white = clear the inline GRAY frontier bit. The header has no BLACK
+** bit under bitmap GC (liveness lives in the arena mark / hugeset slot). */
 #define makewhite(g, x) \
   ((void)(g), (x)->gch.marked &= (uint8_t)~LJ_GC_GRAY)
 #else
@@ -286,18 +286,6 @@ static LJ_AINLINE int gc_mark_isdead_raw(global_State *g, GCobj *o)
   return 0;  /* Non-arena/huge (FIXED roots): never dead here. */
 }
 
-static LJ_AINLINE void gc_obj_markblack(global_State *g, GCobj *o)
-{
-  void *k = gc_obj_key(o);
-  if (gc_obj_inarena(g, o)) {
-    arena_obj_setmark(ptr2arena(k), ptr2cell(k));
-  } else if (gc_obj_inhugeset(g, o)) {
-    huge_obj_setmark(g, k);
-  } else {
-    o->gch.marked |= LJ_GC_BLACK;
-  }
-}
-
 static LJ_AINLINE void gc_obj_makewhite(global_State *g, GCobj *o)
 {
   void *k = gc_obj_key(o);
@@ -328,7 +316,6 @@ static LJ_AINLINE void gc_obj_resurrect(global_State *g, GCobj *o)
 #define gc_obj_iswhite(g, o)		(iswhite((o)) != 0)
 #define gc_obj_isblack(g, o)		(isblack((o)) != 0)
 #define gc_obj_isdead(g, o)		(isdead((g), (o)) != 0)
-#define gc_obj_markblack(g, o)		((o)->gch.marked |= LJ_GC_BLACK)
 #define gc_obj_makewhite(g, o)		makewhite((g), (o))
 #define gc_obj_resurrect(g, o)		flipwhite((o))
 #endif
