@@ -1348,14 +1348,17 @@ static void rebuild_arenascan(global_State *g)
 	  continue;
 	if (o->gch.gct == ~LJ_TSTR)
 	  continue;
-	/* Survivor recolor: flip the header GRAY frontier bit only. The arena
-	** mark bit is NOT cleared per-object here — rebuild_clearmarks clears it
-	** in bulk (mark[w]&=~block[w]) after this pass, and nothing reads a
-	** survivor's mark in between: gc_obj_iswhite/isblack and
-	** lj_gc_barrierback_arena all short-circuit while GCF_BITMAPSWEEP is set
-	** and GCF_DEADAUTH is clear. Dropping the redundant per-object mark clear
-	** removes an O(live) bitmap write from the high-survivor sweep path. */
-	makewhite(g, o);
+	/* No survivor recolor. Under bitmap GC the arena mark bitmap is the sole
+	** color authority: liveness is cleared in bulk by rebuild_clearmarks
+	** (mark[w]&=~block[w]) and reset next cycle by lj_arena_gc_markinit. The
+	** header color bits are vestigial for arena objects — LJ_GC_WHITES is 0,
+	** curwhite/otherwhite are poisoned, and gc_obj_iswhite/isblack read the
+	** bitmap, not the header. makewhite here would only clear the header GRAY
+	** frontier bit; leaving a survivor light-gray into the next cycle is
+	** benign (mark dedup is bitmap-based, barriers test raw GRAY and skip,
+	** gc_mark re-grays idempotently). Dropping it removes the O(live)
+	** per-survivor header write from the high-survivor sweep. The thread
+	** openupval sweep below is the only remaining per-survivor duty. */
 	if (o->gch.gct == ~LJ_TTHREAD) {
 	  gc_fullsweep(g, &gco2th(o)->openupval);
 	}
