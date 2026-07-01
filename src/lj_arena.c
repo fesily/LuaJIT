@@ -857,10 +857,14 @@ void lj_arena_gc_markinit(global_State *g)
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
-  /* Clear huge-set slot marks: stale MARKALLOC marks from the previous sweep
-  ** window must not persist into this mark cycle (gc_mark dedup at
-  ** lj_gc_arena.c would skip tracing references of objects with a stale slot
-  ** mark). Symmetric counterpart to the arena mark clearing above. */
+  /* Clear huge-set slot marks and the rebuild SWEPT tag: stale MARKALLOC
+  ** marks from the previous sweep window must not persist into this mark
+  ** cycle (gc_mark dedup at lj_gc_arena.c would skip tracing references of
+  ** objects with a stale slot mark). The HUGESET_SWEPT restart-skip tag is
+  ** cleared here too — the Rebuild_HugeClear sub-phase was folded into this
+  ** pass (Oracle F1): nothing reads SWEPT between rebuild Done and the next
+  ** markinit, so deferring the clear to here is safe and removes a resumable
+  ** sub-phase. Symmetric counterpart to the arena mark clearing above. */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -868,7 +872,7 @@ void lj_arena_gc_markinit(global_State *g)
       for (hi = 0; hi <= hmask; hi++) {
 	uintptr_t u = gcrefu(slots[hi]);
 	if (hugeset_slot_live(u))
-	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
+	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)(HUGESET_MARK|HUGESET_SWEPT)));
       }
     }
   }

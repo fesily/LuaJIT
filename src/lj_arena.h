@@ -410,8 +410,9 @@ LJ_FUNC void huge_obj_setmark(global_State *g, void *p);
 LJ_FUNC int huge_obj_ismarked(global_State *g, void *p);
 LJ_FUNC void huge_obj_clearmark(global_State *g, void *p);
 /* Huge-object rebuild-swept tag, stored in the hugeset slot (bit 3). Set on
-** survivors by rebuild_hugescan; read as the restart-skip tag; cleared by
-** rebuild_hugeclear. Keyed on the base address (same as the mark trio). */
+** survivors by rebuild_hugescan; read as the restart-skip tag; cleared at the
+** next lj_arena_gc_markinit (alongside HUGESET_MARK). Keyed on the base
+** address (same as the mark trio). */
 LJ_FUNC void huge_obj_set_swept(global_State *g, void *p);
 LJ_FUNC int huge_obj_is_swept(global_State *g, void *p);
 LJ_FUNC void huge_obj_clear_swept(global_State *g, void *p);

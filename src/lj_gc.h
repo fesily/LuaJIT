@@ -38,15 +38,6 @@ enum {
 				** authoritative dead/alive test. Cleared at
 				** Bitmap->Rebuild so mutator barriers can't
 				** observe half-cleared marks. */
-#define GCF_HUGECLEAR	0x10	/* Rebuild HugeClear sub-phase: HugeScan is done,
-				** so lj_udata_new must NOT tag new huge udata
-				** LJ_GC_BLACK (the tag exists only to make
-				** HugeScan skip already-linked udata). Without
-				** this, a huge udata allocated behind the
-				** bounded HugeClear cursor would keep BLACK,
-				** leak past rebuild Done, and cause premature
-				** collection next cycle. Set at HugeScan->
-				** HugeClear; cleared at HugeClear->Epilogue. */
 #endif
 
 #if LJ_HASGCMARK
