@@ -658,8 +658,8 @@ static size_t propagatemark(global_State *g
   lj_assertG(o->gch.marked & LJ_GC_GRAY,
     "gray object missing gray bit: gct=%d marked=0x%02x ptr=%p state=%d",
     o->gch.gct, o->gch.marked, (void*)o, g->gc.state);
-  /* Header bit 0x04 (classic LJ_GC_BLACK) is a free slot under bitmap GC --
-  ** no writer remains, so there is nothing to assert here. */
+  /* Header bit 0x04 is a free slot under bitmap GC (no writer remains),
+  ** so there is nothing to assert here. */
   gray2black(o);
   if (LJ_LIKELY(gct == ~LJ_TTAB)) {
     GCtab *t = gco2tab(o);
@@ -1447,8 +1447,8 @@ static void rebuild_hugescan(global_State *g)
   if (g->gc.rebuild_hugehi > hmask) {
     /* Main walk done. SWEPT slot bits (set on survivors above) persist past
     ** rebuild Done and are cleared at the next lj_arena_gc_markinit
-    ** (alongside HUGESET_MARK). The Rebuild_HugeClear sub-phase that used to
-    ** clear them here was eliminated — Oracle F1 proved nothing reads SWEPT
+    ** (alongside HUGESET_MARK). The old SWEPT-clear sub-phase that used to
+    ** run here was eliminated — Oracle F1 proved nothing reads SWEPT
     ** between rebuild Done and the next mark cycle start. */
     g->gc.rebuildphase = Rebuild_Epilogue;
   }
@@ -2187,7 +2187,7 @@ static void gc_arena_verify(global_State *g)
   ** A stuck slot mark means the per-cycle reset regressed.
   **
   ** HUGESET_SWEPT is NOT asserted here: it is intentionally allowed to
-  ** persist at GCSpause after rebuild, because the Rebuild_HugeClear sub-phase
+  ** persist at GCSpause after rebuild, because the old SWEPT-clear sub-phase
   ** was folded into lj_arena_gc_markinit (Oracle F1). SWEPT is cleared at the
   ** next mark cycle start alongside HUGESET_MARK — nothing reads it between
   ** rebuild Done and that markinit, so a stale SWEPT here is harmless. */
