@@ -670,6 +670,9 @@ typedef struct GCState {
   MRef graythread;	/* GCobj **: threads greyed this cycle (atomic re-scan). */
   MSize graythreadtop;	/* Thread gray stack: number of entries. */
   MSize graythreadsz;	/* Thread gray stack: allocated capacity. */
+  MRef sweepthreads;	/* GCobj **: live coroutine threads snapshot for sweep openupval walk (Design A). */
+  MSize sweepthreadstop; /* sweepthreads: number of entries. */
+  MSize sweepthreadssz;	/* sweepthreads: allocated capacity. */
   MRef weakkey;		/* GCobj **: tables with weak keys only. */
   MSize weakkeytop;	/* Weak-key stack: number of entries. */
   MSize weakkeysz;	/* Weak-key stack: allocated capacity. */

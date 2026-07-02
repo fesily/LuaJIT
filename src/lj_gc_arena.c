@@ -80,6 +80,7 @@ static void gc_graythread_push(global_State *g, GCobj *o);
 static int gc_graythread_empty(global_State *g);
 static GCobj *gc_graythread_pop(global_State *g);
 static void gc_graythread_reset(global_State *g);
+static void gc_sweepthreads_reset(global_State *g);
 static void gc_weak_push(global_State *g, GCobj *o, int weak);
 static void gc_weak_reset(global_State *g);
 static void gc_weak_redirect_all(global_State *g);
@@ -343,6 +344,7 @@ static void gc_mark_start(global_State *g)
 {
   gc_hugegray_reset(g);
   gc_graythread_reset(g);
+  gc_sweepthreads_reset(g);
   gc_weak_reset(g);
   g->gc.grayastop = 0;
   setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));
@@ -844,6 +846,19 @@ static LJ_AINLINE void gc_graythread_reset(global_State *g)
   g->gc.graythreadtop = 0;
 }
 
+/* Snapshot of live coroutine threads for the O(threads) sweep openupval walk
+** (replaces rebuild_arenascan's O(live) arena scan — consumed in T2).
+** Captured in atomic() from graythread after the final propagation. */
+static LJ_AINLINE void gc_sweepthreads_push(global_State *g, GCobj *o)
+{
+  gc_ptrstack_push(g, &g->gc.sweepthreads, &g->gc.sweepthreadstop,
+		   &g->gc.sweepthreadssz, o);
+}
+static LJ_AINLINE void gc_sweepthreads_reset(global_State *g)
+{
+  g->gc.sweepthreadstop = 0;
+}
+
 /* Weak table worklists: split by mode for clearer atomic processing. */
 static LJ_AINLINE void gc_weak_push(global_State *g, GCobj *o, int weak)
 {
@@ -910,6 +925,8 @@ void lj_gc_graywork_free(global_State *g)
 		   &g->gc.hugegraysz);
   gc_ptrstack_free(g, &g->gc.graythread, &g->gc.graythreadtop,
 		   &g->gc.graythreadsz);
+  gc_ptrstack_free(g, &g->gc.sweepthreads, &g->gc.sweepthreadstop,
+		   &g->gc.sweepthreadssz);
   gc_ptrstack_free(g, &g->gc.weakkey, &g->gc.weakkeytop,
 		   &g->gc.weakkeysz);
   gc_ptrstack_free(g, &g->gc.weakval, &g->gc.weakvaltop,
@@ -1925,6 +1942,25 @@ static void atomic(global_State *g, lua_State *L)
 #endif
   gc_mark_mmudata(g);  /* Mark them. */
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
+
+  /* Snapshot the live coroutine-thread set for the O(threads) sweep openupval
+  ** walk (replaces rebuild_arenascan's O(live) arena scan — consumed in T2).
+  ** graythread holds every marked thread after the final propagation; copy
+  ** the non-main entries (mainthread is swept by rebuild_epilogue). Oracle-
+  ** approved snapshot point: AFTER gc_mark_mmudata + final gc_propagate_gray,
+  ** so finalizer-reachable threads discovered late are included. No dedup:
+  ** gc_fullsweep on an openupval chain is idempotent (a second pass over an
+  ** already-cleaned chain is a no-op) and thread counts are tiny. */
+  gc_sweepthreads_reset(g);
+  {
+    GCobj **gt = mref(g->gc.graythread, GCobj *);
+    MSize gi, gtop = g->gc.graythreadtop;
+    for (gi = 0; gi < gtop; gi++) {
+      GCobj *o = gt[gi];
+      if (o == obj2gco(mainthread(g))) continue;  /* epilogue handles main. */
+      gc_sweepthreads_push(g, o);
+    }
+  }
 
   /* All marking done, clear weak tables. */
   gc_clearweak_stacks(g);
