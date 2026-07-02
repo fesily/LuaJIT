@@ -1224,6 +1224,9 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** the makewhite recolor use cd, which carries the valid GCcdata header.
 ** Bounded by GCSWEEPMAX cells per slice, then yields. Returns nonzero while
 ** the scan is still in progress. */
+/* Survivor liveness is the MARK bit on the base cell; stale GRAY is tolerated
+** across cycles (Oracle-verified). The per-survivor makewhite that used to
+** clear the header GRAY frontier bit is dropped — same class as eb71f9d3. */
 #if LJ_HASFFI
 static int rebuild_prologue_cdatav(global_State *g)
 {
@@ -1255,9 +1258,8 @@ static int rebuild_prologue_cdatav(global_State *g)
 	if (!arena_obj_ismarked(a, c)) {
 	  gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
 	  freed++;
-	} else {
-	  makewhite(g, obj2gco(cd));
 	}
+	/* Survivor: keep stale GRAY — liveness is the MARK bit, not the header. */
       }
       w++;
     }
@@ -1415,13 +1417,13 @@ static void rebuild_hugescan(global_State *g)
 	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
       } else {
 	/* Survivor: clear the slot mark (per-cycle white reset), set the
-	** slot SWEPT tag (restart safety), and recolor the header. The slot
-	** index is rebuild_hugehi-1 (rebuild_hugehi was incremented above).
-	** makewhite still clears the GRAY frontier bit; SWEPT lives in the
-	** slot, not the header, so it is untouched by makewhite. */
+	** slot SWEPT tag (restart safety). The slot index is
+	** rebuild_hugehi-1 (rebuild_hugehi was incremented above). The header
+	** GRAY frontier bit is left stale — survivor liveness is the MARK
+	** bit/slot, not the header; stale GRAY is tolerated across cycles
+	** (Oracle-verified). SWEPT lives in the slot, not the header. */
 	setgcrefp(slots[g->gc.rebuild_hugehi-1],
 		  (void *)((u & ~(uintptr_t)HUGESET_MARK) | (uintptr_t)HUGESET_SWEPT));
-	makewhite(g, o);
 	if (o->gch.gct == ~LJ_TTHREAD) {
 	  gc_fullsweep(g, &gco2th(o)->openupval);
 	}
@@ -1442,8 +1444,10 @@ static void rebuild_epilogue(global_State *g)
 {
   /* Anchor the root reference on mainthread. No other objects are chained.
   ** O(1): a single bounded slice — no cursor needed. The dispatcher yields
-  ** after this slice (T7) so the mutator runs before ClearMarks. */
-  makewhite(g, obj2gco(mainthread(g)));
+  ** after this slice (T7) so the mutator runs before ClearMarks.
+  ** mainthread's header GRAY is left stale — survivor liveness is the
+  ** MARK bit/slot, not the header; stale GRAY is tolerated across cycles
+  ** (Oracle-verified). */
   gc_fullsweep(g, &mainthread(g)->openupval);
   setgcref(g->gc.root, obj2gco(mainthread(g)));
   gc_assert_root_anchor_only(g);
