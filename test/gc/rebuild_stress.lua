@@ -20,7 +20,7 @@
 --   (a)  VLA cdata alloc during Prologue (and any rebuild sub-phase).
 --   (b)  huge alloc forcing hugeset_resize during HugeScan.
 --   (b2) SAME-MASK tombstone-clearing rehash during HugeScan (Momus-3/B3).
---   (c)  arena growth during ArenaScan.
+--   (c)  arena growth during ThreadScan.
 --   (d)  closeuv during rebuild.
 --   (e)  udata-with-__gc across a cycle boundary.
 --   (f)  thousands of finalizable udata spanning chunked mmudata (Momus-2/B2).
@@ -237,14 +237,14 @@ scenario(
   100)
 
 -----------------------------------------------------------------------------
--- Scenario (c): arena growth during ArenaScan.
+-- Scenario (c): arena growth during ThreadScan.
 --
 -- Hazard: allocate many small tables (Trav arena) between steps so the
 -- arena class fills and a new arena is allocated and linked during a step
--- that may be inside ArenaScan of the previous arena.
+-- that may be inside ThreadScan of the previous arena.
 -----------------------------------------------------------------------------
 scenario(
-  "c_arena_growth_during_arenascan",
+  "c_arena_growth_during_threadscan",
   function(counter)
     return build_finalizables(counter, 200)
   end,
@@ -369,7 +369,7 @@ scenario(
 -- into `t`. Once `t` is marked by a step, subsequent stores of white
 -- children trigger lj_gc_barrierback_arena (the unconditional mark reader
 -- at lj_gc_arena.c:1975-1992). Over many steps the back-barrier fires at
--- every rebuild sub-phase boundary (Prologue/ArenaScan/HugeScan/Epilogue
+-- every rebuild sub-phase boundary (Prologue/ThreadScan/HugeScan/Epilogue
 -- yields; ClearMarks is non-yielding by T7 design).
 -----------------------------------------------------------------------------
 scenario(

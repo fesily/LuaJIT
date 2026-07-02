@@ -1,4 +1,4 @@
--- Failing-first invariant test for rebuild_arenascan's thread openupval
+-- Failing-first invariant test for rebuild_threadscan's thread openupval
 -- sweep (src/lj_gc_arena.c:1363: gc_fullsweep(g, &gco2th(o)->openupval)).
 --
 -- This is the ONLY mechanism that frees dead OPEN upvalues on LIVE
@@ -34,7 +34,7 @@
 -- RED/GREEN:
 --   GREEN (current HEAD, eb71f9d3): thread sweep frees dead open upvalues
 --     -> dead-chain count == 0 after GC, control count unchanged.
---   RED (stub rebuild_arenascan L1363 -- remove gc_fullsweep call):
+--   RED (stub rebuild_threadscan L1363 -- remove gc_fullsweep call):
 --     dead open upvalue leaks -> count == N after GC.
 --
 -- Build: make clean && make -j4 XCFLAGS="-DLUAJIT_ENABLE_GCARENA -DLUAJIT_SECURITY_STRHASH=1 -DLUA_USE_ASSERT"
@@ -239,13 +239,13 @@ do
   end
 
   -- THE RED ASSERTION: all dead open upvalues freed -> count == 0.
-  -- RED when rebuild_arenascan L1363 is stubbed (upvalues leak -> count == N_CO*N_UPV).
+-- RED when rebuild_threadscan L1363 is stubbed (upvalues leak -> count == N_CO*N_UPV).
   ok(after_total == 0,
      string.format("group1 after GC: dead open upvalues freed (expected 0, found %d) "
                    .. "-- thread sweep is load-bearing", after_total))
   if after_total > 0 then
     print(string.format("RED PROOF: %d dead open upvalues leaked on %d live coroutines "
-                        .. "after full GC -- rebuild_arenascan thread sweep missing",
+.. "after full GC -- rebuild_threadscan thread sweep missing",
                         after_total, N_CO))
   end
 end

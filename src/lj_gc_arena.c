@@ -847,7 +847,7 @@ static LJ_AINLINE void gc_graythread_reset(global_State *g)
 }
 
 /* Snapshot of live coroutine threads for the O(threads) sweep openupval walk
-** (replaces rebuild_arenascan's O(live) arena scan — consumed in T2).
+** (replaces rebuild_threadscan's O(threads) thread scan — consumed in T2).
 ** Captured in atomic() from graythread after the final propagation. */
 static LJ_AINLINE void gc_sweepthreads_push(global_State *g, GCobj *o)
 {
@@ -1086,7 +1086,7 @@ enum {
 ** driver re-enters the dispatcher until Rebuild_Done. */
 enum {
   Rebuild_Prologue,	/* CdataV-arena scan + mmudata mark-clear. */
-  Rebuild_ArenaScan,	/* Pass-1: O(threads) sweep of live coroutine openupval chains (snapshot from atomic). */
+  Rebuild_ThreadScan,	/* Pass-1: O(threads) sweep of live coroutine openupval chains (snapshot from atomic). */
   Rebuild_HugeScan,	/* Huge-set scan: free dead, makewhite survivors. */
   Rebuild_Epilogue,	/* Terminate udata sub-chain + anchor root on mainthread. */
   Rebuild_ClearMarks,	/* Pass-2: clear arena mark bits. */
@@ -1206,7 +1206,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** The work is split into ordered sub-phases (RebuildPhase) driven by
 ** g->gc.rebuildphase. gc_rebuild_rootchain is a dispatcher that runs one
 ** sub-phase per call and the GCSsweep driver re-enters it once per onestep.
- ** Prologue (T4), ArenaScan (T5), and HugeScan (T6) are chunked: they yield
+ ** Prologue (T4), ThreadScan (T5), and HugeScan (T6) are chunked: they yield
  ** mid-phase via their persisted cursors (the CdataV-arena scan and the
  ** arena/huge scans use the (sweepa, sweepw) / rebuild_hugehi cursors; the
  ** mmudata ring uses a snapshot-root + persisted cursor). Epilogue (T7) is
@@ -1317,10 +1317,10 @@ static void rebuild_prologue(global_State *g)
   if (rebuild_prologue_mmu(g))
     return;  /* mmudata walk not finished: yield. */
 
-  /* Prologue done. Arm the ArenaScan cursor. */
+  /* Prologue done. Arm the ThreadScan cursor. */
   g->gc.sweepa = 0;
   g->gc.sweepw = UnusedBlockWords;
-  g->gc.rebuildphase = Rebuild_ArenaScan;
+  g->gc.rebuildphase = Rebuild_ThreadScan;
 }
 
 /* Pass-1 thread openupval sweep, one-shot O(threads). The live coroutine
@@ -1333,13 +1333,13 @@ static void rebuild_prologue(global_State *g)
 ** Snapshot entries are guaranteed still arena-marked here: atomic-live
 ** => survives this cycle (bitmap_sweep frees only mark=0), so no entry is
 ** freed during the sweep window. */
-static void rebuild_arenascan(global_State *g)
+static void rebuild_threadscan(global_State *g)
 {
   GCobj **thr = mref(g->gc.sweepthreads, GCobj *);
   MSize i, n = g->gc.sweepthreadstop;
-  lj_assertG(g->gc.state == GCSsweep, "arena scan outside GCSsweep");
+  lj_assertG(g->gc.state == GCSsweep, "thread scan outside GCSsweep");
   lj_assertG(!(g->gc.gcmarkflags & GCF_DEADAUTH),
-	     "arena scan with death-authority still held");
+             "thread scan with death-authority still held");
   for (i = 0; i < n; i++) {
     GCobj *o = thr[i];
     lj_assertG(o->gch.gct == ~LJ_TTHREAD, "sweepthreads non-thread");
@@ -1456,7 +1456,7 @@ static void rebuild_clearmarks(global_State *g)
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
   MSize i;
   GCSize total_before;
-  /* Monotonicity (G11): ClearMarks is reached only after ArenaScan+HugeScan+
+  /* Monotonicity (G11): ClearMarks is reached only after ThreadScan+HugeScan+
   ** Epilogue. Rebuild_ClearMarks is set exclusively by rebuild_epilogue, so the
   ** dispatcher arriving here proves the ordered predecessors already completed. */
   lj_assertG(g->gc.rebuildphase == Rebuild_ClearMarks,
@@ -1474,7 +1474,7 @@ static void rebuild_clearmarks(global_State *g)
   ** don't chunk." The one-shot form is the simplest correct change; T3 made
   ** chunking the escape hatch should a future pathological heap push pass-2
   ** over budget -- not needed today. This is NOT the incremental-GC spike
-  ** (that was pass-1 ArenaScan, fixed by T5). */
+  ** (that was pass-1 ThreadScan, fixed by T5). */
   /* No-free assert (G7): ClearMarks only clears bitmap words, never frees. The
   ** total memory counter must be unchanged across this call -- any decrease
   ** would indicate a gc_freefunc was invoked, which this pass must never do. */
@@ -1511,7 +1511,7 @@ static void gc_rebuild_rootchain(global_State *g)
     uint8_t phase = g->gc.rebuildphase;
     switch (phase) {
     case Rebuild_Prologue:   rebuild_prologue(g);   break;
-    case Rebuild_ArenaScan:  rebuild_arenascan(g);  break;
+    case Rebuild_ThreadScan:  rebuild_threadscan(g);  break;
     case Rebuild_HugeScan:   rebuild_hugescan(g);   break;
     case Rebuild_Epilogue:   rebuild_epilogue(g);   break;
     case Rebuild_ClearMarks: rebuild_clearmarks(g); break;
@@ -1530,7 +1530,7 @@ static void gc_rebuild_rootchain(global_State *g)
     }
     /* Yield the onestep so the mutator runs between sub-phases. Prologue
     ** (T4) and HugeScan (T6) are chunked — they yield mid-phase (staying
-    ** on the same phase) via their persisted cursors. ArenaScan (T5) is
+    ** on the same phase) via their persisted cursors. ThreadScan (T5) is
     ** one-shot O(threads) and always advances to HugeScan in one call, so
     ** it never yields. Epilogue (T7) is O(1) and ClearMarks (T8) is one-
     ** shot — neither yields. They run to Done in the same onestep as the
@@ -1901,7 +1901,7 @@ static void atomic(global_State *g, lua_State *L)
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
 
   /* Snapshot the live coroutine-thread set for the O(threads) sweep openupval
-  ** walk (replaces rebuild_arenascan's O(live) arena scan — consumed in T2).
+** walk (replaces rebuild_threadscan's O(threads) thread scan — consumed in T2).
   ** graythread holds every marked thread after the final propagation; copy
   ** the non-main entries (mainthread is swept by rebuild_epilogue). Oracle-
   ** approved snapshot point: AFTER gc_mark_mmudata + final gc_propagate_gray,
@@ -1980,7 +1980,7 @@ static size_t gc_onestep_raw(lua_State *L)
       }
       if (g->gc.sweepphase == SweepPhase_Rebuild) {
 	/* Run one rebuild dispatch per onestep. The dispatcher yields after
-	** each chunked sub-phase (Prologue/ArenaScan/HugeScan); Epilogue and
+ ** each chunked sub-phase (Prologue/ThreadScan/HugeScan); Epilogue and
 	** ClearMarks run to Done in the same dispatch call. */
 	gc_rebuild_rootchain(g);
       }
