@@ -2516,8 +2516,10 @@ void lj_gc_fullgc(lua_State *L)
     /* Under single-white, the header-based sweep predicate can't reliably
     ** distinguish alive-white from dead-white, so the preserving catch-up
     ** sweep doesn't work.  Enumerate all arena objects via the block bitmaps
-    ** and makewhite every one so the next full mark cycle can re-discover them.
-    ** No objects are freed — the partial mark phase hasn't reached sweep. */
+    ** to reset MARK bits on huge objects (huge_obj_clearmark). The per-object
+    ** makewhite that used to clear the header GRAY frontier bit is dropped —
+    ** stale GRAY is tolerated across cycles (Oracle-verified). No objects are
+    ** freed — the partial mark phase hasn't reached sweep. */
     {
       GCArena **arenas = mref(g->gc.arenas, GCArena *);
       GCobj *o;
@@ -2540,7 +2542,7 @@ void lj_gc_fullgc(lua_State *L)
 	    o = (GCobj *)arena_cellptr(a, c);
 	    alive &= alive - 1;
 	    if (o->gch.gct == ~LJ_TSTR) continue;
-	    makewhite(g, o);
+	    /* Stale GRAY tolerated across cycles (Oracle-verified). */
 	  }
 	}
       }
@@ -2559,16 +2561,18 @@ void lj_gc_fullgc(lua_State *L)
 	      o = hugeset_slot_obj(u);
 	      if (o->gch.gct == ~LJ_TSTR) continue;
 	      huge_obj_clearmark(g, base);  /* Reset slot mark with the header. */
-	      makewhite(g, o);
+	      /* Stale GRAY tolerated across cycles (Oracle-verified). */
 	    }
 	  }
 	}
       }
-      /* mainthread is not in any arena (dlmalloc). */
-      makewhite(g, obj2gco(mainthread(g)));
-      /* Also makewhite strings in the intern table. The chain HEAD stores the
-      ** per-bucket hashalg marker in bit 0 (lj_str.c), so mask it off before
-      ** dereferencing; subsequent nextgc links carry no marker. */
+      /* mainthread is not in any arena (dlmalloc). Stale GRAY tolerated
+      ** across cycles (Oracle-verified). */
+      /* Reset MARK bits on huge strings via the intern table walk. The chain
+      ** HEAD stores the per-bucket hashalg marker in bit 0 (lj_str.c), so mask
+      ** it off before dereferencing; subsequent nextgc links carry no marker.
+      ** The per-string makewhite is dropped — stale GRAY is tolerated across
+      ** cycles (Oracle-verified). */
       {
         MSize i;
         for (i = 0; i <= g->str.mask; i++) {
@@ -2576,15 +2580,16 @@ void lj_gc_fullgc(lua_State *L)
           while (o2 != NULL) {
             if (lj_arena_ishuge(o2))
               huge_obj_clearmark(g, o2);  /* Reset slot mark with the header. */
-            makewhite(g, o2);
             o2 = gcref(o2->gch.nextgc);
           }
         }
       }
 #if LJ_HASFFI
-      /* Also makewhite VLA cdata in CdataV arenas (small VLA). Huge VLA
-      ** were makewhite by the hugeset walk above. Cell base is a GCcdataVar;
-      ** cd = base + offset carries the GCcdata header. */
+      /* Reset state for VLA cdata in CdataV arenas (small VLA). Huge VLA
+      ** were handled by the hugeset walk above. Cell base is a GCcdataVar;
+      ** cd = base + offset carries the GCcdata header. The per-cdata
+      ** makewhite is dropped — stale GRAY is tolerated across cycles
+      ** (Oracle-verified). */
       {
 	GCArena **cva = mref(g->gc.arenas, GCArena *);
 	MSize ci;
@@ -2604,7 +2609,7 @@ void lj_gc_fullgc(lua_State *L)
 	      alloc &= alloc - 1;
 	      cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
 	      cdatav_cell_assert(g, p);
-	      makewhite(g, obj2gco(cd));
+	      /* Stale GRAY tolerated across cycles (Oracle-verified). */
 	    }
 	  }
 	}
