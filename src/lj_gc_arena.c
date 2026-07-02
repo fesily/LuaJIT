@@ -1088,7 +1088,7 @@ enum {
 enum {
   Rebuild_Prologue,	/* CdataV-arena scan + mmudata mark-clear. */
   Rebuild_ThreadScan,	/* Pass-1: O(threads) sweep of live coroutine openupval chains (snapshot from atomic). */
-  Rebuild_HugeScan,	/* Huge-set scan: free dead, makewhite survivors. */
+  Rebuild_HugeScan,	/* Huge-set scan: free dead, keep survivors (stale GRAY OK). */
   Rebuild_Epilogue,	/* Terminate udata sub-chain + anchor root on mainthread. */
   Rebuild_ClearMarks,	/* Pass-2: clear arena mark bits. */
   Rebuild_Done		/* Rebuild complete. */
@@ -1197,8 +1197,9 @@ static size_t gc_bitmap_sweep(global_State *g)
 }
 
 /*
-** Post-sweep pass: makewhite surviving objects, sweep each thread's open
-** upvalue list, free dead huge objects, and clear arena mark bits.
+** Post-sweep pass: sweep each thread's open upvalue list, free dead huge
+** objects, and clear arena mark bits. Survivor header GRAY is left stale
+** (Oracle-verified: liveness is the MARK bit/slot, not the header).
 **
 ** The root chain (g->gc.root) is NOT rebuilt: all former consumers now
 ** enumerate arena objects via the block bitmaps directly. The root reference
@@ -1219,10 +1220,10 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** chain walk. Scans ArenaFlag_CdataVOnly arenas via the (sweepa, sweepw)
 ** cursor (same shape as gc_bitmap_sweep), and for each allocated cell base p
 ** computes cd = p + GCcdataVar.offset (base->cd translation), then frees
-** dead (block=1, mark=0) via gc_freefunc and makewhites survivors
+** dead (block=1, mark=0) via gc_freefunc; survivors keep stale GRAY
 ** (block=1, mark=1). Mark authority is on the BASE cell (ptr2arena(p),
-** ptr2cell(p)), matching MARKALLOC and gc_obj_key; header reads (gct) and
-** the makewhite recolor use cd, which carries the valid GCcdata header.
+** ptr2cell(p)), matching MARKALLOC and gc_obj_key; header reads (gct) use
+** cd, which carries the valid GCcdata header.
 ** Bounded by GCSWEEPMAX cells per slice, then yields. Returns nonzero while
 ** the scan is still in progress. */
 /* Survivor liveness is the MARK bit on the base cell; stale GRAY is tolerated
