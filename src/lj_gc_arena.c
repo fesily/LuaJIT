@@ -997,7 +997,8 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 	o != obj2gco(mainthread(g))) {
       if ((o->gch.marked & LJ_GC_FIXED) ||
 	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
-	makewhite(g, o);
+	/* Survivor: keep in the chain. Stale GRAY tolerated across cycles
+	** (Oracle-verified) — liveness is the MARK bit, not the header. */
 	p = &o->gch.nextgc;
       } else {
 	setgcrefr(*p, o->gch.nextgc);
