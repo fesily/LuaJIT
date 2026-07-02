@@ -1086,7 +1086,7 @@ enum {
 ** driver re-enters the dispatcher until Rebuild_Done. */
 enum {
   Rebuild_Prologue,	/* CdataV-arena scan + mmudata mark-clear. */
-  Rebuild_ArenaScan,	/* Pass-1 arena scan: makewhite + relink udata/threads. */
+  Rebuild_ArenaScan,	/* Pass-1: O(threads) sweep of live coroutine openupval chains (snapshot from atomic). */
   Rebuild_HugeScan,	/* Huge-set scan: free dead, makewhite survivors. */
   Rebuild_Epilogue,	/* Terminate udata sub-chain + anchor root on mainthread. */
   Rebuild_ClearMarks,	/* Pass-2: clear arena mark bits. */
@@ -1323,81 +1323,38 @@ static void rebuild_prologue(global_State *g)
   g->gc.rebuildphase = Rebuild_ArenaScan;
 }
 
-/* Pass-1 arena scan, resumable. Recolors live cells white and sweeps each
-** thread's openupval list. Formerly a single O(live) pass -- the source of
-** the incremental-GC pause spike -- now sliced via the (sweepa, sweepw)
-** cursor exactly like gc_bitmap_sweep: at most GCSWEEPMAX live cells per
-** call, then yield. The arenas base is reloaded every call (the vector can
-** realloc across yields) and the LIVE g->gc.arenastop bounds the walk
-** (arenas appended mid-scan hold MARKALLOC-live cells the forward cursor
-** reaches and recolors correctly). */
+/* Pass-1 thread openupval sweep, one-shot O(threads). The live coroutine
+** set was snapshotted at atomic (g->gc.sweepthreads, captured from the
+** graythread stack after the final gc_propagate_gray). Each entry's open-
+** upval chain is full-swept here to free dead open upvalues. This replaces
+** the former O(live) arena survivor scan which walked every live object
+** (~92% of sweep time at 16M objects) only to locate the few live threads.
+** mainthread is excluded from the snapshot (swept by rebuild_epilogue).
+** Snapshot entries are guaranteed still arena-marked here: atomic-live
+** => survives this cycle (bitmap_sweep frees only mark=0), so no entry is
+** freed during the sweep window. */
 static void rebuild_arenascan(global_State *g)
 {
-  GCArena **arenas = mref(g->gc.arenas, GCArena *);
-  MSize ai = g->gc.sweepa;
-  uint32_t w = g->gc.sweepw;
-  uint32_t done = 0;
+  GCobj **thr = mref(g->gc.sweepthreads, GCobj *);
+  MSize i, n = g->gc.sweepthreadstop;
   lj_assertG(g->gc.state == GCSsweep, "arena scan outside GCSsweep");
   lj_assertG(!(g->gc.gcmarkflags & GCF_DEADAUTH),
 	     "arena scan with death-authority still held");
-  while (ai < g->gc.arenastop && done < GCSWEEPMAX) {
-    GCArena *a = arenas[ai];
-    uint32_t wtop;
-    if (!(a->flags & ArenaFlag_TravObjs)) {
-      ai++; w = UnusedBlockWords; continue;
-    }
-    /* POD arenas were fully handled by lj_arena_podsweep: dead objects freed,
-    ** survivors already recolored white, mark bits cleared. They hold no
-    ** udata/thread/openupval to relink, so skip them here. */
-    if (a->flags & ArenaFlag_PODOnly) {
-      ai++; w = UnusedBlockWords; continue;
-    }
-    lj_arena_flushbins(a);
-    wtop = arena_blockidx((GCCellID)a->celltop - 1);
-    while (w <= wtop && done < GCSWEEPMAX) {
-      GCBlockword alive = a->block[w] & a->mark[w];
-      while (alive) {
-	uint32_t bitidx = lj_ffs(alive);
-	GCCellID c = (w << 5) + bitidx;
-	GCobj *o = (GCobj *)arena_cellptr(a, c);
-	alive &= alive - 1;
-	if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
-	  continue;
-	if (o->gch.gct == ~LJ_TSTR)
-	  continue;
-	/* No survivor recolor. Under bitmap GC the arena mark bitmap is the sole
-	** color authority: liveness is cleared in bulk by rebuild_clearmarks
-	** (mark[w]&=~block[w]) and reset next cycle by lj_arena_gc_markinit. The
-	** header color bits are vestigial for arena objects — LJ_GC_WHITES is 0,
-	** curwhite/otherwhite are poisoned, and gc_obj_iswhite/isblack read the
-	** bitmap, not the header. makewhite here would only clear the header GRAY
-	** frontier bit; leaving a survivor light-gray into the next cycle is
-	** benign (mark dedup is bitmap-based, barriers test raw GRAY and skip,
-	** gc_mark re-grays idempotently). Dropping it removes the O(live)
-	** per-survivor header write from the high-survivor sweep. The thread
-	** openupval sweep below is the only remaining per-survivor duty. */
-	if (o->gch.gct == ~LJ_TTHREAD) {
-	  gc_fullsweep(g, &gco2th(o)->openupval);
-	}
-	done++;
-      }
-      w++;
-    }
-    if (w > wtop) {
-      ai++; w = UnusedBlockWords;
-    }
+  for (i = 0; i < n; i++) {
+    GCobj *o = thr[i];
+    lj_assertG(o->gch.gct == ~LJ_TTHREAD, "sweepthreads non-thread");
+    lj_assertG(o != obj2gco(mainthread(g)), "mainthread in sweepthreads");
+    lj_assertG(arena_obj_ismarked(ptr2arena(o), ptr2cell(o)) ||
+	       lj_arena_ishuge(o), "sweepthreads entry not live at rebuild");
+    gc_fullsweep(g, &gco2th(o)->openupval);
   }
-  g->gc.sweepa = ai;
-  g->gc.sweepw = (uint16_t)w;
-  if (ai >= g->gc.arenastop) {
-    g->gc.sweepa = 0;
-    g->gc.sweepw = UnusedBlockWords;
-    /* Arm the HugeScan cursor: snapshot the hugeset generation so a rehash
-    ** between slices is detected (rebuild_hugegen != hugesetgen → restart). */
-    g->gc.rebuild_hugehi = 0;
-    g->gc.rebuild_hugegen = g->gc.hugesetgen;
-    g->gc.rebuildphase = Rebuild_HugeScan;
-  }
+  /* Arm the HugeScan cursor: snapshot the hugeset generation so a rehash
+  ** between slices is detected (rebuild_hugegen != hugesetgen -> restart). */
+  g->gc.sweepa = 0;
+  g->gc.sweepw = UnusedBlockWords;
+  g->gc.rebuild_hugehi = 0;
+  g->gc.rebuild_hugegen = g->gc.hugesetgen;
+  g->gc.rebuildphase = Rebuild_HugeScan;
 }
 
 static void rebuild_hugescan(global_State *g)
@@ -1572,13 +1529,13 @@ static void gc_rebuild_rootchain(global_State *g)
       return;
     }
     /* Yield the onestep so the mutator runs between sub-phases. Prologue
-    ** (T4), ArenaScan (T5), and HugeScan (T6) are chunked — they yield
-    ** mid-phase (staying on the same phase) via their persisted cursors.
-    ** Epilogue (T7) is O(1) and ClearMarks (T8) is one-shot — neither
-    ** yields. They run to Done in the same onestep as the dispatcher's
-    ** internal loop. */
-    if ((phase == Rebuild_Prologue || phase == Rebuild_ArenaScan ||
-	 phase == Rebuild_HugeScan) &&
+    ** (T4) and HugeScan (T6) are chunked — they yield mid-phase (staying
+    ** on the same phase) via their persisted cursors. ArenaScan (T5) is
+    ** one-shot O(threads) and always advances to HugeScan in one call, so
+    ** it never yields. Epilogue (T7) is O(1) and ClearMarks (T8) is one-
+    ** shot — neither yields. They run to Done in the same onestep as the
+    ** dispatcher's internal loop. */
+    if ((phase == Rebuild_Prologue || phase == Rebuild_HugeScan) &&
 	g->gc.rebuildphase == phase)
       return;  /* Chunked phase still mid-walk: yield. */
   }
@@ -2549,6 +2506,7 @@ void lj_gc_fullgc(lua_State *L)
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
     gc_hugegray_reset(g);  /* Reset worklists from partial propagation. */
     gc_graythread_reset(g);
+    gc_sweepthreads_reset(g);  /* Stale snapshot must not feed next cycle. */
     gc_weak_reset(g);
     setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));  /* Discard SSB. */
     /* Under single-white, the header-based sweep predicate can't reliably
