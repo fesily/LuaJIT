@@ -74,7 +74,18 @@ void LJ_FASTCALL lj_cdata_free(global_State *g, GCcdata *cd)
 {
   if (LJ_UNLIKELY(cd->marked & LJ_GC_CDATA_FIN)) {
     GCobj *root;
-    gc_obj_makewhite(g, obj2gco(cd));
+    /* T1: keep the arena/huge MARK SET (do NOT clear it). This object is
+    ** GC-reachable via the mmudata ring until gc_finalize runs its __gc.
+    ** Under raw-marks-authoritative-during-rebuild (T3/T4, DEADAUTH gone),
+    ** a mark0 pending-finalizer cdata would look dead to a HugeScan restart
+    ** after a hugeset rehash mid-yield and be RE-LINKED onto mmudata ->
+    ** double-link / double-finalize / ring corruption. gc_obj_resurrect
+    ** sets the MARK (live survivor); makewhite cleans the header (stale
+    ** gray/white from the dead cell). gc_finalize (~L1642) still makewhites
+    ** before invoking the finalizer, and the next cycle's markinit +
+    ** gc_mark_mmudata re-mark normally. */
+    gc_obj_resurrect(g, obj2gco(cd));
+    makewhite(g, obj2gco(cd));
     markfinalized(obj2gco(cd));
     if ((root = gcref(g->gc.mmudata)) != NULL) {
       setgcrefr(cd->nextgc, root->gch.nextgc);

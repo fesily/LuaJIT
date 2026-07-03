@@ -1155,10 +1155,13 @@ static size_t gc_bitmap_sweep(global_State *g)
 	if (o->gch.gct == ~LJ_TSTR)
 	  continue;
 	/* Dead finalized cdata are not freed here: lj_cdata_free detects the
-	** LJ_GC_CDATA_FIN flag and links them onto the mmudata ring (marking
-	** them finalized + white) instead of releasing the cell. The cell
-	** stays allocated (block=1, mark=0) until gc_finalize runs the __gc
-	** callback and re-roots the object, exactly like the list sweep. */
+	** LJ_GC_CDATA_FIN flag and links them onto the mmudata ring (resurrecting
+	** the mark + clearing the gray header + marking finalized) instead of
+	** releasing the cell. The cell stays allocated (block=1, mark=1) -- live
+	** to GC -- until rebuild_clearmarks / next markinit, then gc_finalize
+	** runs the __gc callback and re-roots the object. Keeping mark=1 through
+	** the rebuild window prevents a HugeScan restart from re-linking the
+	** same cdata onto mmudata (T1). */
 	/* The bitmap (block=1, mark=0) is the sole dead test under HASGCMARK;
 	** the header white bit is vestigial. During GCF_BITMAPSWEEP
 	** gc_obj_isdead returns exactly !arena_obj_ismarked, so this assert is
