@@ -1190,11 +1190,12 @@ static size_t gc_bitmap_sweep(global_State *g)
     g->gc.sweepphase = SweepPhase_Rebuild;
     g->gc.rebuildphase = Rebuild_Prologue;
     /* Arm the CdataV-arena scan cursor (sweepa, sweepw) for the prologue's
-    ** first slice; the mmudata walk is gated by rebuild_mmu_started == 0. */
+    ** first slice; rebuild_mmu_started == 0 gates the CdataV scan. (T2: the
+    ** mmudata ring mark-clear walk was removed -- vestigial, and clearing
+    ** mmudata marks would undo T1's finalized-cdata MARK set.) */
     g->gc.sweepa = 0;
     g->gc.sweepw = UnusedBlockWords;
     g->gc.rebuild_mmu_started = 0;
-    setgcrefnull(g->gc.rebuild_mmu_cursor);
   }
   return freed;
 }
@@ -1279,50 +1280,27 @@ static int rebuild_prologue_cdatav(global_State *g)
 }
 #endif
 
-/* Resumable mmudata ring mark-clear slice. Clears mark bits for udata on the
-** mmudata ring so the arena scan won't re-link them (gc_finalize owns their
-** lifecycle). The ring is immutable during rebuild (no separateudata/finalize
-** runs until SweepPhase_Done), so a snapshot-root + persisted cursor is safe.
-** Returns nonzero while the walk is still in progress. */
-static int rebuild_prologue_mmu(global_State *g)
-{
-  MSize budget = GCSWEEPMAX;
-  GCobj *root, *u;
-  if (!g->gc.rebuild_mmu_started) {
-    g->gc.rebuild_mmu_started = 1;
-    setgcrefr(g->gc.rebuild_mmu_cursor, g->gc.mmudata);
-    if (!gcref(g->gc.mmudata))
-      return 0;  /* Empty ring: nothing to clear. */
-  }
-  root = gcref(g->gc.mmudata);
-  lj_assertG(root != NULL, "mmudata ring emptied mid-rebuild");
-  u = gcref(g->gc.rebuild_mmu_cursor);
-  do {
-    u = gcnext(u);
-    { /* VLA cdata on the mmudata ring: classify by block base (gc_obj_key),
-      ** not the interior cd, or a huge VLA cdata would be misread as arena. */
-      void *k = gc_obj_key(u);
-      if (!lj_arena_ishuge(k))
-	arena_obj_clearmark(ptr2arena(k), ptr2cell(k));
-    }
-    setgcref(g->gc.rebuild_mmu_cursor, u);
-  } while (u != root && budget-- > 0);
-  return u != root;  /* Done when the cursor returns to the ring root. */
-}
+/* Prologue: sweep dead VLA cdata from CdataV arenas, then arm ThreadScan.
+** The former mmudata ring mark-clear walk (rebuild_prologue_mmu) was vestigial
+** post the ThreadScan rewrite (the arena survivor scan it protected was
+** deleted): no remaining rebuild phase re-links mmudata members, and
+** gc_mark_mmudata re-marks + gc_finalize whitens at the next atomic. Keeping
+** mmudata members' marks SET through rebuild is also required by T1, which
+** sets the MARK on finalized cdata so a HugeScan restart skips it -- clearing
+** it here would undo that fix. */
 
 static void rebuild_prologue(global_State *g)
 {
   lj_assertG(g->gc.state == GCSsweep, "rebuild prologue outside GCSsweep");
   if (!g->gc.rebuild_mmu_started) {
-    /* The CdataV-arena scan runs before the mmudata clear starts
-    ** (rebuild_mmu_started is the cross-slice phase marker). */
+    /* CdataV-arena dead sweep runs first (rebuild_mmu_started is the
+    ** cross-slice phase marker: 0 = CdataV scan in progress). */
 #if LJ_HASFFI
     if (rebuild_prologue_cdatav(g))
       return;  /* CdataV scan not finished: yield. */
 #endif
+    g->gc.rebuild_mmu_started = 1;  /* CdataV done; no mmudata walk (T2). */
   }
-  if (rebuild_prologue_mmu(g))
-    return;  /* mmudata walk not finished: yield. */
 
   /* Prologue done. Arm the ThreadScan cursor. */
   g->gc.sweepa = 0;
