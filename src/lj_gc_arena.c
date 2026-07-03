@@ -1350,19 +1350,23 @@ static void rebuild_hugescan(global_State *g)
   ** was rehashed between slices, slot positions changed and the cursor
   ** restarts from 0 with the new generation.
   **
-  ** Restart idempotency: processed survivors get the HUGESET_SWEPT slot bit
-  ** (bit 3, value 8) — NOT a header color bit. The slot is the entire GC
-  ** state of a huge object (color lives in the slot), so the restart tag is
-  ** slot-resident by construction. On restart, SWEPT-tagged slots are skipped
-  ** BEFORE the dead/alive test (a cleared slot MARK would otherwise look dead
-  ** → use-after-free). Freed dead objects tombstone their slots → skipped.
-  ** SWEPT persists past rebuild Done and is cleared at the next
-  ** lj_arena_gc_markinit (alongside HUGESET_MARK) — nothing reads SWEPT
-  ** between rebuild Done and the next mark cycle start, so the deferred clear
-  ** is safe (Oracle F1).
+  ** T3: marks are AUTHORITATIVE through every mutator yield. Survivors
+  ** (mark=1) keep their slot MARK set; the dead-free branch frees only
+  ** mark=0 slots. On a restart, a survivor slot still has MARK set → the
+  ** dead-free branch skips it (no re-free). Dead objects tombstone their
+  ** slots via lj_hugeblock_free → skipped by !hugeset_slot_live on restart.
+  ** Thread openupval fullsweep is idempotent across restarts (dead upvalues
+  ** freed on first pass). This makes the HUGESET_SWEPT restart-skip tag
+  ** redundant — it was removed (def, set, check, markinit clear).
   **
-  ** Huge STRINGS are not freed here (owned by gc_sweepstr); their slot mark
-  ** is cleared for the per-cycle reset. Upvalues are never huge. */
+  ** The slot MARK clear is deferred to rebuild_clearmarks (one-shot,
+  ** non-yielding, runs after HugeScan) and the next cycle's markinit, both
+  ** of which clear all live huge slot marks. This preserves the post-fullgc
+  ** mark0 invariant checked by gc_arena_verify.
+  **
+  ** Huge STRINGS are not freed here (owned by gc_sweepstr); they keep MARK
+  ** set through the yield (cleared by rebuild_clearmarks/markinit). Upvalues
+  ** are never huge. */
   GCRef *slots;
   MSize hmask;
   MSize budget = GCSWEEPMAX;
@@ -1384,41 +1388,29 @@ static void rebuild_hugescan(global_State *g)
     budget--;
     if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
     hugeset_slot_assert(g, u);
-    { /* base = slot address (mark authority); o = GCobj (cd for CDATAV slots). */
-      GCobj *base = hugeset_slot_addr(u);
+    { /* o = GCobj (cd for CDATAV slots); mark authority is the slot itself. */
       o = hugeset_slot_obj(u);
-      if (o->gch.gct == ~LJ_TSTR) {
-	if (u & HUGESET_MARK)
-	  huge_obj_clearmark(g, base);
-	continue;
-      }
+      if (o->gch.gct == ~LJ_TSTR)
+	continue;  /* Huge strings: owned by gc_sweepstr. Keep MARK (T3). */
       lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
-      if (u & HUGESET_SWEPT)
-	continue;  /* Already processed (restart safety). */
       if (!(u & HUGESET_MARK)) {
-	/* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot. */
+	/* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot.
+	** A restart skips it by !hugeset_slot_live (TOMB). */
 	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
       } else {
-	/* Survivor: clear the slot mark (per-cycle white reset), set the
-	** slot SWEPT tag (restart safety). The slot index is
-	** rebuild_hugehi-1 (rebuild_hugehi was incremented above). The header
-	** GRAY frontier bit is left stale — survivor liveness is the MARK
-	** bit/slot, not the header; stale GRAY is tolerated across cycles
-	** (Oracle-verified). SWEPT lives in the slot, not the header. */
-	setgcrefp(slots[g->gc.rebuild_hugehi-1],
-		  (void *)((u & ~(uintptr_t)HUGESET_MARK) | (uintptr_t)HUGESET_SWEPT));
-	if (o->gch.gct == ~LJ_TTHREAD) {
+	/* Survivor: keep MARK SET through the yield (T3). A restart sees
+	** MARK set and skips the dead-free branch (no re-free, no re-link).
+	** MARK clearing is deferred to rebuild_clearmarks + next markinit.
+	** Thread openupval fullsweep is idempotent across restarts. */
+	if (o->gch.gct == ~LJ_TTHREAD)
 	  gc_fullsweep(g, &gco2th(o)->openupval);
-	}
       }
     }
   }
   if (g->gc.rebuild_hugehi > hmask) {
-    /* Main walk done. SWEPT slot bits (set on survivors above) persist past
-    ** rebuild Done and are cleared at the next lj_arena_gc_markinit
-    ** (alongside HUGESET_MARK). The old SWEPT-clear sub-phase that used to
-    ** run here was eliminated — Oracle F1 proved nothing reads SWEPT
-    ** between rebuild Done and the next mark cycle start. */
+    /* Main walk done. Survivor slot MARKs persist past this point and are
+    ** cleared by rebuild_clearmarks (one-shot, non-yielding, runs next in
+    ** the dispatcher) and the next cycle's lj_arena_gc_markinit. */
     g->gc.rebuildphase = Rebuild_Epilogue;
   }
 }
@@ -1476,6 +1468,23 @@ static void rebuild_clearmarks(global_State *g)
     if (a->flags & ArenaFlag_PODOnly) continue;
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
+  }
+  /* T3: also clear all live huge slot MARKs. HugeScan no longer clears
+  ** survivor/string marks mid-yield (marks are authoritative during rebuild),
+  ** so the per-cycle mark0 reset for huge objects lands here — one-shot,
+  ** non-yielding, symmetric with the arena mark clear above. This preserves
+  ** the post-fullgc mark0 invariant checked by gc_arena_verify (huge color
+  ** cross-check). The next cycle's markinit also clears (redundant, harmless). */
+  {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	if (hugeset_slot_live(u))
+	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
+      }
+    }
   }
   lj_assertG(g->gc.total == total_before,
 	     "ClearMarks freed memory (total %lu -> %lu); no gc_freefunc expected",
@@ -2172,15 +2181,10 @@ static void gc_arena_verify(global_State *g)
   }
   /* Huge color cross-check, mirroring gc_arena_verify_color: at GCSpause after
   ** rebuild, every live huge object (string and non-string) must be slot-white
-  ** (MARK clear). Non-strings have MARK cleared by the rebuild hugescan
-  ** survivor path; huge strings by the ~LJ_TSTR slot-clear in that same walk.
-  ** A stuck slot mark means the per-cycle reset regressed.
-  **
-  ** HUGESET_SWEPT is NOT asserted here: it is intentionally allowed to
-  ** persist at GCSpause after rebuild, because the old SWEPT-clear sub-phase
-  ** was folded into lj_arena_gc_markinit (Oracle F1). SWEPT is cleared at the
-  ** next mark cycle start alongside HUGESET_MARK — nothing reads it between
-  ** rebuild Done and that markinit, so a stale SWEPT here is harmless. */
+  ** (MARK clear). T3 moved the huge MARK clear out of HugeScan (marks stay
+  ** authoritative through the rebuild yield) into rebuild_clearmarks (one-shot,
+  ** non-yielding, runs before this verify). A stuck slot mark means the
+  ** per-cycle reset regressed. HUGESET_SWEPT no longer exists (T3 removed it). */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {

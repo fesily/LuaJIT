@@ -857,14 +857,15 @@ void lj_arena_gc_markinit(global_State *g)
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
-  /* Clear huge-set slot marks and the rebuild SWEPT tag: stale MARKALLOC
-  ** marks from the previous sweep window must not persist into this mark
-  ** cycle (gc_mark dedup at lj_gc_arena.c would skip tracing references of
-  ** objects with a stale slot mark). The HUGESET_SWEPT restart-skip tag is
-  ** cleared here too — the Rebuild_HugeClear sub-phase was folded into this
-  ** pass (Oracle F1): nothing reads SWEPT between rebuild Done and the next
-  ** markinit, so deferring the clear to here is safe and removes a resumable
-  ** sub-phase. Symmetric counterpart to the arena mark clearing above. */
+  /* Clear huge-set slot marks: stale MARKALLOC marks from the previous sweep
+  ** window must not persist into this mark cycle (gc_mark dedup at
+  ** lj_gc_arena.c would skip tracing references of objects with a stale slot
+  ** mark). T3 removed the HUGESET_SWEPT restart-skip tag (marks are now
+  ** authoritative through rebuild, making SWEPT redundant), so only
+  ** HUGESET_MARK is cleared here. Symmetric counterpart to the arena mark
+  ** clearing above. (rebuild_clearmarks also clears huge marks at the end of
+  ** the rebuild for the post-fullgc mark0 invariant; this is the cycle-start
+  ** reset for the normal path.) */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -872,7 +873,7 @@ void lj_arena_gc_markinit(global_State *g)
       for (hi = 0; hi <= hmask; hi++) {
 	uintptr_t u = gcrefu(slots[hi]);
 	if (hugeset_slot_live(u))
-	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)(HUGESET_MARK|HUGESET_SWEPT)));
+	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
       }
     }
   }
@@ -1039,30 +1040,6 @@ void huge_obj_clearmark(global_State *g, void *p)
 ** re-scan skips them (a cleared slot MARK would otherwise look dead). Keyed on
 ** the base address. The inline slots[hi] writes in rebuild_hugescan are O(1)
 ** and preferred there; these helpers exist for any base-keyed caller. */
-void huge_obj_set_swept(global_State *g, void *p)
-{
-  GCRef *slots = mref(g->gc.hugeset, GCRef);
-  MSize i = hugeset_find(slots, g->gc.hugesetmask, p);
-  lj_assertG_(g, i <= g->gc.hugesetmask, "huge set_swept: address not found");
-  setgcrefp(slots[i], (void *)(gcrefu(slots[i]) | HUGESET_SWEPT));
-}
-
-int huge_obj_is_swept(global_State *g, void *p)
-{
-  GCRef *slots = mref(g->gc.hugeset, GCRef);
-  MSize i = hugeset_find(slots, g->gc.hugesetmask, p);
-  lj_assertG_(g, i <= g->gc.hugesetmask, "huge is_swept: address not found");
-  return (gcrefu(slots[i]) & HUGESET_SWEPT) != 0;
-}
-
-void huge_obj_clear_swept(global_State *g, void *p)
-{
-  GCRef *slots = mref(g->gc.hugeset, GCRef);
-  MSize i = hugeset_find(slots, g->gc.hugesetmask, p);
-  lj_assertG_(g, i <= g->gc.hugesetmask, "huge clear_swept: address not found");
-  setgcrefp(slots[i], (void *)(gcrefu(slots[i]) & ~HUGESET_SWEPT));
-}
-
 /* Set the CDATAV flag on a registered huge block base: the block holds a VLA
 ** cdata whose GCobj is at base + GCcdataVar.offset, not at base. The flag
 ** survives rehash (hugeset_put carries the raw slot value) and is stripped by

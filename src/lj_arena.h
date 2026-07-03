@@ -370,23 +370,21 @@ LJ_FUNC void *lj_hugeblock_alloc(global_State *g, size_t size);
 LJ_FUNC void lj_hugeblock_free(global_State *g, void *p, size_t size);
 LJ_FUNC void lj_hugeset_free(global_State *g);
 /* Hugeset slot encoding. A slot is EMPTY (0), TOMB (1), or a live arena-aligned
-** address with up to three flag bits OR'd into the low bits: MARK (bit 1),
-** CDATAV (bit 2), SWEPT (bit 3). The address bits survive PTRMASK; EMPTY/TOMB
+** address with up to two flag bits OR'd into the low bits: MARK (bit 1),
+** CDATAV (bit 2). The address bits survive PTRMASK; EMPTY/TOMB
 ** have no address bits. Huge blocks are ArenaSize (1MB = 2^20)-aligned, so
-** their low 20 bits are zero -- bits 0-3 are free for the TOMB/MARK/CDATAV/
-** SWEPT flags; bits 4-19 remain free for future slot tags. */
+** their low 20 bits are zero -- bits 0-2 are free for the TOMB/MARK/CDATAV
+** flags; bits 3-19 remain free for future slot tags. */
 #define HUGESET_MARK	((uintptr_t)2)	/* Bit 1: reachable this GC cycle. */
 /* Bit 2: slot base is a GCcdataVar prefix; the GCobj is at
 ** base + GCcdataVar.offset (a VLA cdata whose block went huge). The GC must
 ** translate base->cd at every consumer; mark/color authority stays keyed on
 ** the base address (the slot). */
 #define HUGESET_CDATAV	((uintptr_t)4)
-/* Bit 3: survivor already processed by rebuild_hugescan (restart-skip tag).
-** Replaces the old header LJ_GC_BLACK tag -- the restart-safety decision now
-** reads the slot bit, so rebuild_hugescan never writes a header color bit on
-** huge survivors. */
-#define HUGESET_SWEPT	((uintptr_t)8)
-#define HUGESET_PTRMASK	(~(uintptr_t)15)	/* Strip TOMB|MARK|CDATAV|SWEPT to recover addr. */
+/* T3 removed HUGESET_SWEPT (bit 3): marks are now authoritative through the
+** rebuild window, so a restart sees survivor MARK set and skips the dead-free
+** branch without a separate processed-skip tag. Bit 3 is free. */
+#define HUGESET_PTRMASK	(~(uintptr_t)15)	/* Strip TOMB|MARK|CDATAV to recover addr. */
 #define hugeset_slot_addr(u)	((GCobj *)((u) & HUGESET_PTRMASK))
 #define hugeset_slot_live(u)	(((u) & HUGESET_PTRMASK) != 0)
 /* Return the GCobj carried by a hugeset slot. For a CDATAV slot the stored
@@ -409,13 +407,6 @@ static LJ_AINLINE GCobj *hugeset_slot_obj(uintptr_t u)
 LJ_FUNC void huge_obj_setmark(global_State *g, void *p);
 LJ_FUNC int huge_obj_ismarked(global_State *g, void *p);
 LJ_FUNC void huge_obj_clearmark(global_State *g, void *p);
-/* Huge-object rebuild-swept tag, stored in the hugeset slot (bit 3). Set on
-** survivors by rebuild_hugescan; read as the restart-skip tag; cleared at the
-** next lj_arena_gc_markinit (alongside HUGESET_MARK). Keyed on the base
-** address (same as the mark trio). */
-LJ_FUNC void huge_obj_set_swept(global_State *g, void *p);
-LJ_FUNC int huge_obj_is_swept(global_State *g, void *p);
-LJ_FUNC void huge_obj_clear_swept(global_State *g, void *p);
 /* Mark a registered huge block base as carrying a VLA cdata prefix (CDATAV).
 ** Called by lj_cdata_newv after a huge allocation so the GC can recover the
 ** GCobj (cd = base + GCcdataVar.offset) when scanning the hugeset. */
