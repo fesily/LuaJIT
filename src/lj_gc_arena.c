@@ -1107,8 +1107,6 @@ static size_t gc_bitmap_sweep(global_State *g)
   uint32_t w = g->gc.sweepw;
   uint32_t freed = 0;
 
-  lj_assertG(g->gc.gcmarkflags & GCF_DEADAUTH,
-	     "GCF_DEADAUTH must be set during bitmap sweep");
   while (ai < g->gc.arenastop && freed < GCSWEEPMAX) {
     GCArena *a = arenas[ai];
     uint32_t wtop;
@@ -1183,10 +1181,11 @@ static size_t gc_bitmap_sweep(global_State *g)
   g->gc.sweepa = ai;
   g->gc.sweepw = (uint16_t)w;
   if (ai >= g->gc.arenastop) {
-    /* Last bitmap free is done. Drop death-authority before any rebuild slice
-    ** tears down a survivor mark, so mutator barriers can't read a half-cleared
-    ** mark as dead. Link-suppression (GCF_BITMAPSWEEP) stays set until Done. */
-    g->gc.gcmarkflags &= ~GCF_DEADAUTH;
+    /* Last bitmap free is done. Transition to the rebuild phase. T4 removed
+    ** the GCF_DEADAUTH drop that used to live here: DEADAUTH no longer exists,
+    ** and T3 made marks authoritative through the rebuild window (no mid-yield
+    ** teardown), so there is no half-cleared mark for mutator barriers to
+    ** observe. Link-suppression (GCF_BITMAPSWEEP) stays set until Done. */
     g->gc.sweepphase = SweepPhase_Rebuild;
     g->gc.rebuildphase = Rebuild_Prologue;
     /* Arm the CdataV-arena scan cursor (sweepa, sweepw) for the prologue's
@@ -1323,8 +1322,6 @@ static void rebuild_threadscan(global_State *g)
   GCobj **thr = mref(g->gc.sweepthreads, GCobj *);
   MSize i, n = g->gc.sweepthreadstop;
   lj_assertG(g->gc.state == GCSsweep, "thread scan outside GCSsweep");
-  lj_assertG(!(g->gc.gcmarkflags & GCF_DEADAUTH),
-             "thread scan with death-authority still held");
   for (i = 0; i < n; i++) {
     GCobj *o = thr[i];
     lj_assertG(o->gch.gct == ~LJ_TTHREAD, "sweepthreads non-thread");
@@ -1442,18 +1439,17 @@ static void rebuild_clearmarks(global_State *g)
 	     "ClearMarks entered with rebuildphase=%d (expected Rebuild_ClearMarks)",
 	     g->gc.rebuildphase);
   lj_assertG(g->gc.state == GCSsweep, "ClearMarks outside GCSsweep");
-  /* GCF_DEADAUTH was dropped at the Bitmap->Rebuild transition (T3): a back-
-  ** barrier reading an unmarked survivor during this pass is benign (this
-  ** cycle's gray already drained at atomic; next cycle re-marks from roots
-  ** with a reset bitmap). That makes a YIELDING ClearMarks safe -- pass-2 is
-  ** word-parallel O(arenas*words). Measured ~2.5-3ms at 16M objects (see
-  ** .omo/evidence/task-8-*), which EXCEEDS the plan's <1ms estimate but is
-  ** still far below the 5ms inc_pause_assert threshold and the pre-fix 109ms
-  ** spike. Plan task T8 explicitly authorized this: "if >1ms, note it but
-  ** don't chunk." The one-shot form is the simplest correct change; T3 made
-  ** chunking the escape hatch should a future pathological heap push pass-2
-  ** over budget -- not needed today. This is NOT the incremental-GC spike
-  ** (that was pass-1 ThreadScan, fixed by T5). */
+  /* T4 removed GCF_DEADAUTH entirely. Marks were authoritative right up to this
+  ** one-shot clear (T3 stopped mid-yield teardown). A back-barrier reading an
+  ** unmarked survivor after this pass is benign (this cycle's gray already
+  ** drained at atomic; next cycle re-marks from roots with a reset bitmap).
+  ** That makes a YIELDING ClearMarks safe -- pass-2 is word-parallel
+  ** O(arenas*words). Measured ~2.5-3ms at 16M objects (see .omo/evidence/
+  ** task-8-*), still far below the 5ms inc_pause_assert threshold. The one-shot
+  ** form is the simplest correct change; T3 made chunking the escape hatch
+  ** should a future pathological heap push pass-2 over budget -- not needed
+  ** today. This is NOT the incremental-GC spike (that was pass-1 ThreadScan,
+  ** fixed by T5). */
   /* No-free assert (G7): ClearMarks only clears bitmap words, never frees. The
   ** total memory counter must be unchanged across this call -- any decrease
   ** would indicate a gc_freefunc was invoked, which this pass must never do. */
@@ -1497,8 +1493,9 @@ static void rebuild_clearmarks(global_State *g)
 
 static void gc_rebuild_rootchain(global_State *g)
 {
-  lj_assertG(!(g->gc.gcmarkflags & GCF_DEADAUTH),
-	     "GCF_DEADAUTH must be clear during rebuild");
+  /* T4: GCF_DEADAUTH no longer exists -- marks are authoritative through the
+  ** rebuild window (T3), so the rebuild entry asserts only BITMAPSWEEP +
+  ** MARKALLOC invariants. */
   lj_assertG(g->gc.gcmarkflags & GCF_BITMAPSWEEP,
 	     "GCF_BITMAPSWEEP must be set during rebuild");
   lj_assertG(g->gc.gcmarkflags & GCF_MARKALLOC,
@@ -1928,7 +1925,7 @@ static void atomic(global_State *g, lua_State *L)
   g->strempty.marked = LJ_GC_FIXED | LJ_GC_SFIXED;
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
-  g->gc.gcmarkflags |= GCF_BITMAPSWEEP | GCF_DEADAUTH | GCF_MARKALLOC;
+  g->gc.gcmarkflags |= GCF_BITMAPSWEEP | GCF_MARKALLOC;
   g->gc.sweepa = 0;
   g->gc.sweepw = UnusedBlockWords;
   g->gc.sweepphase = SweepPhase_Bitmap;
@@ -2637,14 +2634,13 @@ void lj_gc_fullgc(lua_State *L)
 ** white→light-gray just sets gray (no push needed). */
 void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
+  /* T4: removed the rebuild-window skip (GCF_BITMAPSWEEP && !GCF_DEADAUTH).
+  ** Marks are now authoritative through the rebuild window (T3), so an
+  ** ismarked read here is trustworthy. A barrier on a marked (black) survivor
+  ** during rebuild pushes to SSB/hugegray -- extra work, NOT a liveness error:
+  ** this cycle's gray already drained at atomic, and next cycle re-marks from
+  ** roots (gc_mark dedups already-marked objects). */
   o->gch.marked |= LJ_GC_GRAY;
-  /* Rebuild window (GCF_BITMAPSWEEP set, GCF_DEADAUTH clear): survivor marks are
-  ** being torn down, so an ismarked read here is stale. Skip the queue push --
-  ** benign: this cycle's gray drained at atomic; next cycle re-marks from roots
-  ** (lj_arena_gc_markinit). Just leaving the gray bit set is enough. */
-  if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
-      !(g->gc.gcmarkflags & GCF_DEADAUTH))
-    return;
   if (lj_arena_ishuge(o)) {
     /* Every huge object carries black in its hugeset slot; gc_sweepstr still
     ** unlinks dead huge strings from the intern table, but the slot owns

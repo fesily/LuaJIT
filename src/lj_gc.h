@@ -34,10 +34,10 @@ enum {
 /* gcmarkflags bits in GCState. */
 #define GCF_BITMAPSWEEP	0x01	/* Bitmap sweep active for this GC cycle. */
 #define GCF_MARKALLOC	0x02	/* Allocate-black: mark new arena objects. */
-#define GCF_DEADAUTH	0x04	/* Death-authority: arena/huge mark bits are the
-				** authoritative dead/alive test. Cleared at
-				** Bitmap->Rebuild so mutator barriers can't
-				** observe half-cleared marks. */
+/* T4 removed GCF_DEADAUTH (0x04): marks are now authoritative through the
+** ENTIRE sweep+rebuild window (T3 stopped mid-yield MARK teardown, T1 keeps
+** finalized-cdata MARK set), so the gc_obj_is* readers read raw marks under
+** GCF_BITMAPSWEEP directly -- no separate death-authority gate needed. */
 #endif
 
 #if LJ_HASGCMARK
@@ -165,18 +165,10 @@ static LJ_AINLINE int gc_obj_inhugeset(global_State *g, GCobj *o)
 static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
 {
   void *k = gc_obj_key(o);
-  if (gc_obj_inarena(g, o)) {
-    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
-	!(g->gc.gcmarkflags & GCF_DEADAUTH))
-      return 0;  /* Rebuild window: survivor marks torn down, not collectible. */
+  if (gc_obj_inarena(g, o))
     return !arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
-  }
-  if (gc_obj_inhugeset(g, o)) {
-    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
-	!(g->gc.gcmarkflags & GCF_DEADAUTH))
-      return 0;
+  if (gc_obj_inhugeset(g, o))
     return !huge_obj_ismarked(g, k);
-  }
   /* Reached only by the two dlmalloc FIXED|SFIXED roots (mainthread, strempty):
   ** they have no bitmap/slot and no header white bit under bitmap GC. Roots are
   ** never collectible, hence never white. */
@@ -188,18 +180,10 @@ static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
 static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
 {
   void *k = gc_obj_key(o);
-  if (gc_obj_inarena(g, o)) {
-    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
-	!(g->gc.gcmarkflags & GCF_DEADAUTH))
-      return 0;  /* Rebuild window: marks not trustworthy, treat as not black. */
+  if (gc_obj_inarena(g, o))
     return arena_obj_ismarked(ptr2arena(k), ptr2cell(k)) && !isgray(o);
-  }
-  if (gc_obj_inhugeset(g, o)) {
-    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
-	!(g->gc.gcmarkflags & GCF_DEADAUTH))
-      return 0;
+  if (gc_obj_inhugeset(g, o))
     return huge_obj_ismarked(g, k) && !isgray(o);
-  }
   /* The two dlmalloc FIXED|SFIXED roots are permanently reachable: report black
   ** so barriers treat them as already-marked (never re-greyed via the header). */
   lj_assertG(o == obj2gco(mainthread(g)) || o == obj2gco(&g->strempty),
@@ -243,18 +227,21 @@ __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
 #endif
 #endif
 
-/* Mark-authoritative death test for ALL GC phases. An arena/huge object is dead
-** only when (a) it is unmarked AND (b) the collector has reached the sweep
-** window for it (GCF_BITMAPSWEEP). OUTSIDE that window -- in mark/pause, or
-** outside any collection -- an arena/huge object is NEVER dead: returning 0
-** makes the answer depend on the mark authority alone, not the header white
-** bits. Non-arena/non-huge objects are only the FIXED/SFIXED roots (mainthread,
-** strempty), never collected, so the isdead fallback is the constant 0 too. */
+/* Mark-authoritative death test for ALL GC phases. An arena/huge object is
+** dead only when (a) it is unmarked AND (b) the collector has reached the
+** sweep window for it (GCF_BITMAPSWEEP). T4: the old GCF_DEADAUTH gate was
+** removed -- marks are now authoritative through the ENTIRE sweep+rebuild
+** window (T3 stopped mid-yield MARK teardown, T1 keeps finalized-cdata MARK
+** set), so reading raw marks under GCF_BITMAPSWEEP is correct for both the
+** bitmap-sweep and rebuild phases. Outside the sweep window -- in mark/pause,
+** or outside any collection -- an arena/huge object is NEVER dead. Non-arena/
+** non-huge objects are only the FIXED/SFIXED roots (mainthread, strempty),
+** never collected, so the isdead fallback is the constant 0 too. */
 static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
 {
   void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
-    if (g->gc.gcmarkflags & GCF_DEADAUTH)
+    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
       return !arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
 #ifdef LUA_USE_ASSERT
     lj_gc_obj_isdead_nonsweep_counter++;
@@ -262,7 +249,7 @@ static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
     return 0;  /* Outside the sweep window an arena object is never dead. */
   }
   if (gc_obj_inhugeset(g, o)) {
-    if (g->gc.gcmarkflags & GCF_DEADAUTH)
+    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
       return !huge_obj_ismarked(g, k);
 #ifdef LUA_USE_ASSERT
     lj_gc_obj_isdead_nonsweep_counter++;
@@ -270,20 +257,6 @@ static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
     return 0;  /* Outside the sweep window a huge object is never dead. */
   }
   return isdead(g, o) != 0;
-}
-
-/* GC-internal raw mark-dead test. Reads the arena/huge mark DIRECTLY,
-** NOT gated on GCF_DEADAUTH. For rebuild-internal dead-checks that need
-** mark-truth during the rebuild window (after GCF_DEADAUTH is cleared).
-** Caller must be GC-internal (no mutator interleave). */
-static LJ_AINLINE int gc_mark_isdead_raw(global_State *g, GCobj *o)
-{
-  void *k = gc_obj_key(o);
-  if (gc_obj_inarena(g, o))
-    return !arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
-  if (gc_obj_inhugeset(g, o))
-    return !huge_obj_ismarked(g, k);
-  return 0;  /* Non-arena/huge (FIXED roots): never dead here. */
 }
 
 static LJ_AINLINE void gc_obj_makewhite(global_State *g, GCobj *o)
