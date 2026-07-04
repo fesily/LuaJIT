@@ -2554,6 +2554,32 @@ static void gc_arena_verify(global_State *g)
 	arena_obj_shadowmark(o);
   }
 #endif
+  /* P3 (§3.4): under LUAJIT_STRTAB_OPENADDR, strings are allocated unlinked
+  ** from g->gc.root (lj_str_alloc -> lj_mem_newagco link=0) and resurrection
+  ** only sets the mark bit (gc_obj_resurrect never touches nextgc). So no
+  ** ~LJ_TSTR may ever be reachable via the g->gc.root nextgc chain. This
+  ** bounded walk locks that invariant; a fire is a genuine design-premise
+  ** regression -- report it, do not paper over. Cheap: at verify time
+  ** (after rebuild_epilogue) the root chain is mainthread alone. */
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+  {
+    GCobj *ro = gcref(g->gc.root);
+    uint32_t rn = 0;
+    while (ro != NULL) {
+      if (rn >= GC_ROOT_CHAIN_MAX) {
+	lj_assertG(0, "gc_arena_verify: root chain hit safety cap %u (corrupted?)",
+		   GC_ROOT_CHAIN_MAX);
+	break;
+      }
+      rn++;
+      lj_assertG(ro->gch.gct != ~LJ_TSTR,
+		 "string on g->gc.root chain under OPENADDR (design §3.4 violation): "
+		 "ptr=%p gct=%d marked=0x%02x",
+		 (void *)ro, ro->gch.gct, ro->gch.marked);
+      ro = gcref(ro->gch.nextgc);
+    }
+  }
+#endif
   /* After a full GC nothing dead remains, so no allocated arena object may
   ** be left unmarked. */
   for (i = 0; i < g->gc.arenastop; i++)
