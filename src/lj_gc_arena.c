@@ -33,6 +33,10 @@
 #include "lj_vmevent.h"
 #include "lj_arena.h"
 
+#ifdef LUAJIT_ENABLE_GCSTATS_TIMING
+#include <time.h>
+#endif
+
 #define GCSTEPSIZE	1024u
 #define GCSWEEPMAX	40
 #define GCSWEEPCOST	10
@@ -656,6 +660,7 @@ static size_t propagatemark(global_State *g
 )
 {
   int gct = o->gch.gct;
+  gcstat_inc(g, mark_calls);
   lj_assertG(isgray(o), "propagation of non-gray object");
   lj_assertG(o->gch.marked & LJ_GC_GRAY,
     "gray object missing gray bit: gct=%d marked=0x%02x ptr=%p state=%d",
@@ -747,8 +752,10 @@ static GCArena *gc_grayarena_pop(global_State *g)
   while (g->gc.grayastop > 0) {
     MSize idx = heap[0];
     GCArena *a = arenas[idx];
-    if ((a->flags & ArenaFlag_TravObjs) && !arena_gray_empty(a))
+    if ((a->flags & ArenaFlag_TravObjs) && !arena_gray_empty(a)) {
+      gcstat_inc(g, grayarena_pops);
       return a;
+    }
     /* Stale entry — remove from heap and drop its membership flag. */
     a->flags &= (uint16_t)~ArenaFlag_InGrayHeap;
     g->gc.grayastop--;
@@ -767,7 +774,11 @@ static size_t gc_propagate_arena(global_State *g, GCArena *a)
   GCobj *o = (GCobj *)arena_cellptr(a, cellid);
   lj_assertG(isgray(o), "arena gray stack: non-gray object cellid=%u gct=%d marked=0x%02x",
     (unsigned)cellid, o->gch.gct, o->gch.marked);
-  return propagatemark(g, o);
+  {
+    size_t c = propagatemark(g, o);
+    gcstat_add(g, mark_cost, c);
+    return c;
+  }
 }
 
 /* -- Non-arena gray worklists (huge objects + threads) ------------------- */
@@ -819,6 +830,7 @@ static LJ_AINLINE int gc_hugegray_empty(global_State *g)
 }
 static LJ_AINLINE GCobj *gc_hugegray_pop(global_State *g)
 {
+  gcstat_inc(g, hugegray_pops);
   return mref(g->gc.hugegray, GCobj *)[--g->gc.hugegraytop];
 }
 static LJ_AINLINE void gc_hugegray_reset(global_State *g)
@@ -940,8 +952,11 @@ static size_t gc_propagate_gray(global_State *g)
 {
   size_t m = 0;
   /* Drain huge gray objects (non-arena worklist). */
-  while (!gc_hugegray_empty(g))
-    m += propagatemark(g, gc_hugegray_pop(g));
+  while (!gc_hugegray_empty(g)) {
+    size_t c = propagatemark(g, gc_hugegray_pop(g));
+    gcstat_add(g, mark_cost, c);
+    m += c;
+  }
   /* Drain all arena gray stacks. */
   {
     GCArena *a;
@@ -949,8 +964,11 @@ static size_t gc_propagate_gray(global_State *g)
       while (!arena_gray_empty(a))
 	m += gc_propagate_arena(g, a);
       /* Also drain any huge objects pushed during arena traversal. */
-      while (!gc_hugegray_empty(g))
-	m += propagatemark(g, gc_hugegray_pop(g));
+      while (!gc_hugegray_empty(g)) {
+	size_t c = propagatemark(g, gc_hugegray_pop(g));
+	gcstat_add(g, mark_cost, c);
+	m += c;
+      }
     }
   }
   return m;
@@ -1023,8 +1041,10 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 }
 
 /* Sweep one string interning table chain. Preserves hashalg bit. */
+#if !(LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR))
 static void gc_sweepstr(global_State *g, GCRef *chain)
 {
+  gcstat_inc(g, strings_chains_swept);
   /* Mask with other white and LJ_GC_FIXED. Or LJ_GC_SFIXED on shutdown. */
   uintptr_t u = gcrefu(*chain);
   GCRef q;
@@ -1044,8 +1064,10 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
 	** recolor needed; the mark is reset per cycle by gc_rebuild_rootchain
 	** (arena second pass mark[w] &= ~block[w] for cells, the ~LJ_TSTR slot
 	** clear for huge strings). */
+	gcstat_inc(g, strings_live_walked);
 	p = &o->gch.nextgc;
       } else {
+	gcstat_inc(g, strings_dead_freed);
 	setgcrefr(*p, o->gch.nextgc);
 	lj_str_free(g, gco2str(o));
       }
@@ -1067,6 +1089,32 @@ static void gc_sweepstr(global_State *g, GCRef *chain)
   }
   setgcrefp(*chain, (gcrefu(q) | (u & 1)));
 }
+#endif
+
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+/* Open-addressing string sweep: free every interned string. Called only from
+** the shutdown/freeall path (P2 folds incremental string reclaim into the
+** GCSsweep bitmap pass; the GCSsweepstring case is a defensive no-op under
+** the flag). No table maintenance here -- the table is being torn down, so
+** backward-shift deletion is unnecessary; just free each non-empty slot. */
+static MSize gc_sweepstr_oa(global_State *g, MSize start, MSize count)
+{
+  MSize mask = g->str.mask;
+  MSize i;
+  gcstat_inc(g, strings_chains_swept);
+  for (i = 0; i < count && start <= mask; i++, start++) {
+    uintptr_t v = gcrefu(g->str.tab[start]);
+    GCobj *o;
+    if (v == 0 || v == STRTAB_OA_TOMB) continue;
+    o = (GCobj *)(void *)v;
+    if (o == obj2gco(&g->strempty) || (o->gch.marked & LJ_GC_FIXED))
+      continue;
+    gcstat_inc(g, strings_dead_freed);
+    lj_str_free(g, gco2str(o));
+  }
+  return i;
+}
+#endif
 
 /*
 ** Bitmap-driven sweep: scan arena mark bitmaps to locate dead objects.
@@ -1110,6 +1158,51 @@ static size_t gc_bitmap_sweep(global_State *g)
   while (ai < g->gc.arenastop && freed < GCSWEEPMAX) {
     GCArena *a = arenas[ai];
     uint32_t wtop;
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+    /* P2: NonTrav string-arena reclaim, reached BEFORE the TravObjs skip below.
+    ** Under the flag, ArenaClass_NonTrav arenas are de-facto strings-only
+    ** (verified by gc_arena_verify); they lack ArenaFlag_TravObjs and would
+    ** otherwise be skipped at the `!(TravObjs)` continue, leaking every dead
+    ** arena string. Word-parallel scan: dead = block & ~mark. For each dead
+    ** ~LJ_TSTR cell (not FIXED, not strempty): lj_strtab_remove STRICTLY before
+    ** lj_str_free (the freed cell head may be overwritten by freelist metadata
+    ** or unmapped). Probe count is billed against GCSWEEPMAX so a large die-off
+    ** cannot blow the incremental step. Survivors (mark=1) are untouched here;
+    ** their marks clear in rebuild_clearmarks. */
+    if (!(a->flags & (ArenaFlag_TravObjs | ArenaFlag_PODOnly |
+		      ArenaFlag_UdataOnly | ArenaFlag_CdataVOnly))) {
+      lj_arena_flushbins(a);
+      wtop = arena_blockidx((GCCellID)a->celltop - 1);
+      while (w <= wtop && freed < GCSWEEPMAX) {
+	GCBlockword dead = a->block[w] & ~a->mark[w];
+	while (dead) {
+	  uint32_t bitidx = lj_ffs(dead);
+	  GCCellID c = (w << 5) + bitidx;
+	  GCobj *o = (GCobj *)arena_cellptr(a, c);
+	  GCstr *s;
+	  MSize probes;
+	  dead &= dead - 1;
+	  lj_assertG(o->gch.gct == ~LJ_TSTR,
+		     "non-string in NonTrav arena (OPENADDR): gct=%d cell=%d flags=0x%x",
+		     (int)o->gch.gct, (int)c, a->flags);
+	  if (o->gch.gct != ~LJ_TSTR) continue;  /* defensive: not a string */
+	  if (o == obj2gco(&g->strempty) || (o->gch.marked & LJ_GC_FIXED))
+	    continue;
+	  s = gco2str(o);
+	  probes = lj_strtab_remove(g, s);  /* backward-shift; num-- by lj_str_free */
+	  gcstat_inc(g, strings_dead_freed);
+	  lj_str_free(g, s);  /* free cell (may overwrite head / unmap) */
+	  freed += 1 + (probes >> 2);  /* bill object + probe/shift cost */
+	}
+	w++;
+      }
+      if (w > wtop) {
+	ai++;
+	w = UnusedBlockWords;
+      }
+      continue;
+    }
+#endif
     if (!(a->flags & ArenaFlag_TravObjs)) {
       ai++;
       w = UnusedBlockWords;
@@ -1180,6 +1273,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 
   g->gc.sweepa = ai;
   g->gc.sweepw = (uint16_t)w;
+  gcstat_add(g, sweep_cells, freed);
   if (ai >= g->gc.arenastop) {
     /* Last bitmap free is done. Transition to the rebuild phase. T4 removed
     ** the GCF_DEADAUTH drop that used to live here: DEADAUTH no longer exists,
@@ -1387,8 +1481,23 @@ static void rebuild_hugescan(global_State *g)
     hugeset_slot_assert(g, u);
     { /* o = GCobj (cd for CDATAV slots); mark authority is the slot itself. */
       o = hugeset_slot_obj(u);
-      if (o->gch.gct == ~LJ_TSTR)
-	continue;  /* Huge strings: owned by gc_sweepstr. Keep MARK (T3). */
+      if (o->gch.gct == ~LJ_TSTR) {
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+	/* P2: huge strings reclaimed here, symmetric to the arena bitmap sweep.
+	** strtab_remove BEFORE lj_str_free (huge unmap invalidates the cell).
+	** lj_str_free -> lj_hugeblock_free tombstones this hugeset slot, so a
+	** restart skips it via !hugeset_slot_live. Survivors (MARK set) keep
+	** their slot MARK through the yield (cleared by rebuild_clearmarks).
+	** strtab_remove touches the intern table, not hugeset slot order, so
+	** the hugesetgen/restart machinery is unaffected. */
+	if (!(u & HUGESET_MARK)) {
+	  lj_strtab_remove(g, gco2str(o));
+	  gcstat_inc(g, strings_dead_freed);
+	  lj_str_free(g, gco2str(o));
+	}
+#endif
+	continue;  /* Huge strings: not freed by the generic gc_freefunc path. */
+      }
       lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
       if (!(u & HUGESET_MARK)) {
 	/* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot.
@@ -1503,11 +1612,11 @@ static void gc_rebuild_rootchain(global_State *g)
   for (;;) {
     uint8_t phase = g->gc.rebuildphase;
     switch (phase) {
-    case Rebuild_Prologue:   rebuild_prologue(g);   break;
-    case Rebuild_ThreadScan:  rebuild_threadscan(g);  break;
-    case Rebuild_HugeScan:   rebuild_hugescan(g);   break;
-    case Rebuild_Epilogue:   rebuild_epilogue(g);   break;
-    case Rebuild_ClearMarks: rebuild_clearmarks(g); break;
+    case Rebuild_Prologue:   gcstat_inc(g, rebuild_prologue);   rebuild_prologue(g);   break;
+    case Rebuild_ThreadScan:  gcstat_inc(g, rebuild_threadscan);  rebuild_threadscan(g);  break;
+    case Rebuild_HugeScan:   gcstat_inc(g, rebuild_hugescan);   rebuild_hugescan(g);   break;
+    case Rebuild_Epilogue:   gcstat_inc(g, rebuild_epilogue);   rebuild_epilogue(g);   break;
+    case Rebuild_ClearMarks: gcstat_inc(g, rebuild_clearmarks); rebuild_clearmarks(g); break;
     default:
       lj_assertG(0, "bad rebuild phase %d", g->gc.rebuildphase);
       return;
@@ -1630,6 +1739,7 @@ static void gc_call_finalizer(global_State *g, lua_State *L,
 static void gc_finalize(lua_State *L)
 {
   global_State *g = G(L);
+  gcstat_inc(g, finalizers);
   GCobj *o = gcnext(gcref(g->gc.mmudata));
   cTValue *mo;
   lj_assertG(tvref(g->jit_base) == NULL, "finalizer called on trace");
@@ -1803,8 +1913,12 @@ void lj_gc_freeall(global_State *g)
     setgcref(g->gc.root, obj2gco(mainthread(g)));
     gc_assert_root_anchor_only(g);
   }
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+  gc_sweepstr_oa(g, 0, g->str.mask + 1);  /* Free all string slots. */
+#else
   for (i = g->str.mask; i != ~(MSize)0; i--)  /* Free all string hash chains. */
     gc_sweepstr(g, &g->str.tab[i]);
+#endif
 }
 
 /* -- Collector ----------------------------------------------------------- */
@@ -1940,12 +2054,18 @@ static size_t gc_onestep_raw(lua_State *L)
     gc_mark_start(g);  /* Start a new GC cycle by marking all GC roots. */
     return 0;
   case GCSpropagate:
-    if (!gc_hugegray_empty(g))
-      return propagatemark(g, gc_hugegray_pop(g));
+    if (!gc_hugegray_empty(g)) {
+      size_t c = propagatemark(g, gc_hugegray_pop(g));
+      gcstat_add(g, mark_cost, c);
+      return c;
+    }
     {
       GCArena *a = gc_grayarena_pop(g);
-      if (a != NULL)
-	return gc_propagate_arena(g, a);
+      if (a != NULL) {
+	size_t c = gc_propagate_arena(g, a);
+	gcstat_add(g, mark_cost, c);
+	return c;
+      }
     }
     g->gc.state = GCSatomic;  /* End of mark phase. */
     return 0;
@@ -1953,14 +2073,31 @@ static size_t gc_onestep_raw(lua_State *L)
     if (tvref(g->jit_base))  /* Don't run atomic phase on trace. */
       return LJ_MAX_MEM;
     atomic(g, L);
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+    /* P2: string reclaim is folded into the GCSsweep bitmap pass (NonTrav
+    ** arena branch + huge-string reclaim in rebuild_hugescan). Skip
+    ** GCSsweepstring entirely: atomic() already armed GCF_BITMAPSWEEP, the
+    ** sweep cursors, and SweepPhase_Bitmap, so GCSsweep starts immediately.
+    ** The estimate accounting for string frees now happens in GCSsweep
+    ** (old - g->gc.total), not a separate GCSsweepstring step. */
+    g->gc.state = GCSsweep;
+#else
     g->gc.state = GCSsweepstring;  /* Start of sweep phase. */
     g->gc.sweepstr = 0;
+#endif
     return 0;
   case GCSsweepstring: {
     GCSize old = g->gc.total;
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+    /* P2: unreachable under the flag (atomic transitions straight to GCSsweep).
+    ** Defensive: if ever re-entered, do no reclaim here (reclaim lives in the
+    ** bitmap sweep) and advance immediately. */
+    g->gc.state = GCSsweep;
+#else
     gc_sweepstr(g, &g->str.tab[g->gc.sweepstr++]);  /* Sweep one chain. */
     if (g->gc.sweepstr > g->str.mask)
       g->gc.state = GCSsweep;  /* All string hash chains sweeped. */
+#endif
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
     return GCSWEEPCOST;
@@ -1987,6 +2124,10 @@ static size_t gc_onestep_raw(lua_State *L)
 	if (gcref(g->gc.mmudata)) {
 	  g->gc.state = GCSfinalize;
 	} else {
+	  gcstat_inc(g, cycles);
+	  g->gc.stats.last_arenastop = g->gc.arenastop;
+	  g->gc.stats.last_hugenum = g->gc.hugenum;
+	  g->gc.stats.last_hugemem = g->gc.hugemem;
 	  g->gc.state = GCSpause;
 	  g->gc.debt = 0;
 	}
@@ -2004,6 +2145,10 @@ static size_t gc_onestep_raw(lua_State *L)
       if (gcref(g->gc.mmudata)) {  /* Need any finalizations? */
 	g->gc.state = GCSfinalize;
       } else {  /* Otherwise skip this phase to help the JIT. */
+	gcstat_inc(g, cycles);
+	g->gc.stats.last_arenastop = g->gc.arenastop;
+	g->gc.stats.last_hugenum = g->gc.hugenum;
+	g->gc.stats.last_hugemem = g->gc.hugemem;
 	g->gc.state = GCSpause;  /* End of GC cycle. */
 	g->gc.debt = 0;
       }
@@ -2022,6 +2167,10 @@ static size_t gc_onestep_raw(lua_State *L)
 	g->gc.estimate -= GCFINALIZECOST;
       return GCFINALIZECOST;
     }
+    gcstat_inc(g, cycles);
+    g->gc.stats.last_arenastop = g->gc.arenastop;
+    g->gc.stats.last_hugenum = g->gc.hugenum;
+    g->gc.stats.last_hugemem = g->gc.hugemem;
     g->gc.state = GCSpause;  /* End of GC cycle. */
     g->gc.debt = 0;
     return 0;
@@ -2031,15 +2180,67 @@ static size_t gc_onestep_raw(lua_State *L)
   }
 }
 
+#ifdef LUAJIT_ENABLE_GCSTATS_TIMING
+static void gcstat_timing_record(global_State *g, uint8_t state,
+				 uint8_t sweepphase, uint64_t dt)
+{
+  uint64_t *t, *m;
+  if (state == GCSsweep) {
+    if (sweepphase == 1) {  /* SweepPhase_Rebuild */
+      t = &g->gc.stats.time_sweep_rebuild_ns;
+      m = &g->gc.stats.maxpause_sweep_rebuild_ns;
+    } else {  /* SweepPhase_Bitmap (0) or Done (2, shouldn't happen) */
+      t = &g->gc.stats.time_sweep_bitmap_ns;
+      m = &g->gc.stats.maxpause_sweep_bitmap_ns;
+    }
+  } else {
+    switch (state) {
+    case GCSpause:	t = &g->gc.stats.time_pause_ns;	m = &g->gc.stats.maxpause_pause_ns;	break;
+    case GCSpropagate:	t = &g->gc.stats.time_propagate_ns;	m = &g->gc.stats.maxpause_propagate_ns;	break;
+    case GCSatomic:	t = &g->gc.stats.time_atomic_ns;	m = &g->gc.stats.maxpause_atomic_ns;	break;
+    case GCSsweepstring: t = &g->gc.stats.time_sweepstring_ns; m = &g->gc.stats.maxpause_sweepstring_ns; break;
+    case GCSfinalize:	t = &g->gc.stats.time_finalize_ns;	m = &g->gc.stats.maxpause_finalize_ns;	break;
+    default:	return;
+    }
+  }
+  *t += dt;
+  if (dt > *m) *m = dt;
+}
+#endif
+
 static size_t gc_onestep(lua_State *L)
 {
-  size_t cost = gc_onestep_raw(L);
+  global_State *g = G(L);
+  uint8_t pre_state = g->gc.state;
+  uint8_t pre_sweepphase = g->gc.sweepphase;
+  size_t cost;
+#ifdef LUAJIT_ENABLE_GCSTATS_TIMING
+  struct timespec ts0, ts1;
+  clock_gettime(CLOCK_MONOTONIC, &ts0);
+  cost = gc_onestep_raw(L);
+  clock_gettime(CLOCK_MONOTONIC, &ts1);
+  {
+    uint64_t dt = (uint64_t)(ts1.tv_sec - ts0.tv_sec) * 1000000000u +
+		  (uint64_t)ts1.tv_nsec - (uint64_t)ts0.tv_nsec;
+    gcstat_timing_record(g, pre_state, pre_sweepphase, dt);
+  }
+#else
+  cost = gc_onestep_raw(L);
+#endif
+  if (pre_state == GCSsweep) {
+    if (pre_sweepphase == 1)  /* SweepPhase_Rebuild */
+      gcstat_inc(g, sweep_rebuild_steps);
+    else
+      gcstat_inc(g, sweep_bitmap_steps);
+  } else {
+    g->gc.stats.nsteps[pre_state]++;
+  }
 #if defined(LUA_USE_ASSERT) && !defined(LJ_GC_NOSTEPVERIFY)
   /* Read-only free-list consistency check after every incremental step, in
   ** every GC phase. Catches arena double-free / bin corruption / accounting
   ** drift the instant a step produces it, instead of at the next dereference.
   ** Compiled out of release builds; the check itself mutates nothing. */
-  lj_gc_checkheap(G(L));
+  lj_gc_checkheap(g);
 #endif
   return cost;
 }
@@ -2268,6 +2469,15 @@ static void gc_arena_verify(global_State *g)
 	  lj_assertG(o2->gch.gct != ~LJ_TUDATA,
 		     "udata in NonTrav arena: gct=%d marked=0x%02x cell=%d flags=0x%x",
 		     (int)o2->gch.gct, o2->gch.marked, (int)c, a->flags);
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+	  /* P2 §9 item 10: under the flag, NonTrav arenas are the string reclaim
+	  ** target, so every allocated cell MUST be ~LJ_TSTR. A non-string here
+	  ** would either leak (the bitmap-sweep string branch skips it) or mis-free
+	  ** (strtab_remove would fail the slot-found assert). */
+	  lj_assertG(o2->gch.gct == ~LJ_TSTR,
+		     "non-string in NonTrav arena (OPENADDR): gct=%d marked=0x%02x cell=%d flags=0x%x",
+		     (int)o2->gch.gct, o2->gch.marked, (int)c, a->flags);
+#endif
 	}
       }
     }
@@ -2327,6 +2537,15 @@ static void gc_arena_verify(global_State *g)
     }
   }
 #endif
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+  for (i = 0; i <= g->str.mask; i++) {
+    uintptr_t v = gcrefu(g->str.tab[i]);
+    if (v == 0 || v == STRTAB_OA_TOMB) continue;
+    o = (GCobj *)(void *)v;
+    if (!lj_arena_ishuge(o))
+      arena_obj_shadowmark(o);
+  }
+#else
   for (i = 0; i <= g->str.mask; i++) {
     GCRef r = g->str.tab[i];
     /* Chain head low bit is the hashalg flag; mask it off. */
@@ -2334,6 +2553,7 @@ static void gc_arena_verify(global_State *g)
       if (!lj_arena_ishuge(o))
 	arena_obj_shadowmark(o);
   }
+#endif
   /* After a full GC nothing dead remains, so no allocated arena object may
   ** be left unmarked. */
   for (i = 0; i < g->gc.arenastop; i++)
@@ -2552,13 +2772,24 @@ void lj_gc_fullgc(lua_State *L)
       }
       /* mainthread is not in any arena (dlmalloc). Stale GRAY tolerated
       ** across cycles (Oracle-verified). */
-      /* Reset MARK bits on huge strings via the intern table walk. The chain
-      ** HEAD stores the per-bucket hashalg marker in bit 0 (lj_str.c), so mask
-      ** it off before dereferencing; subsequent nextgc links carry no marker.
+      /* Reset MARK bits on huge strings via the intern table walk.
       ** The per-string makewhite is dropped — stale GRAY is tolerated across
       ** cycles (Oracle-verified). */
       {
         MSize i;
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+        for (i = 0; i <= g->str.mask; i++) {
+          uintptr_t v = gcrefu(g->str.tab[i]);
+          GCobj *o2;
+          if (v == 0 || v == STRTAB_OA_TOMB) continue;
+          o2 = (GCobj *)(void *)v;
+          if (lj_arena_ishuge(o2))
+            huge_obj_clearmark(g, o2);
+        }
+#else
+        /* Chain HEAD stores the per-bucket hashalg marker in bit 0 (lj_str.c),
+        ** so mask it off before dereferencing; subsequent nextgc links carry
+        ** no marker. */
         for (i = 0; i <= g->str.mask; i++) {
           GCobj *o2 = (GCobj *)(gcrefu(g->str.tab[i]) & ~(uintptr_t)1);
           while (o2 != NULL) {
@@ -2567,6 +2798,7 @@ void lj_gc_fullgc(lua_State *L)
             o2 = gcref(o2->gch.nextgc);
           }
         }
+#endif
       }
 #if LJ_HASFFI
       /* Reset state for VLA cdata in CdataV arenas (small VLA). Huge VLA
@@ -2634,6 +2866,7 @@ void lj_gc_fullgc(lua_State *L)
 ** white→light-gray just sets gray (no push needed). */
 void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
+  gcstat_inc(g, barrierback);
   /* T4: removed the rebuild-window skip (GCF_BITMAPSWEEP && !GCF_DEADAUTH).
   ** Marks are now authoritative through the rebuild window (T3), so an
   ** ismarked read here is trustworthy. A barrier on a marked (black) survivor
@@ -2653,8 +2886,10 @@ void lj_gc_barrierback_arena(global_State *g, GCobj *o)
     GCobj **top = mref(g->gc.ssbtop, GCobj *);
     *top++ = o;
     setmref(g->gc.ssbtop, top);
-    if (LJ_UNLIKELY(top >= mref(g->gc.ssblim, GCobj *)))
+    if (LJ_UNLIKELY(top >= mref(g->gc.ssblim, GCobj *))) {
+      gcstat_inc(g, ssb_overflow);
       lj_gc_ssb_flush(g);
+    }
   }
 }
 
@@ -2662,6 +2897,7 @@ void lj_gc_barrierback_arena(global_State *g, GCobj *o)
 void lj_gc_grayarena_notify(global_State *g, MSize idx)
 {
   MSize *heap;
+  gcstat_inc(g, gray_notify);
   GCArena *a = mref(g->gc.arenas, GCArena *)[idx];
   if (a->flags & ArenaFlag_InGrayHeap)
     return;  /* Already queued: skip duplicate insert (dedup guard). */
@@ -2830,6 +3066,90 @@ void *lj_mem_grow(lua_State *L, void *p, MSize *szp, MSize lim, MSize esz)
   p = lj_mem_realloc(L, p, (*szp)*esz, sz*esz);
   *szp = sz;
   return p;
+}
+
+/* -- GC stats instrumentation -------------------------------------------- */
+
+void lj_gc_stats_reset(global_State *g)
+{
+  memset(&g->gc.stats, 0, sizeof(GCstats));
+}
+
+void lj_gc_stats_push(lua_State *L)
+{
+  global_State *g = G(L);
+  GCtab *t = lj_tab_new(L, 0, 6);
+  GCstats *s = &g->gc.stats;
+#define SETNUM(name, val) do { \
+  TValue _k; \
+  setstrV(L, &_k, lj_str_newlit(L, name)); \
+  setnumV(lj_tab_set(L, t, &_k), (lua_Number)(val)); \
+} while (0)
+#define SETBOOL(name, val) do { \
+  TValue _k; \
+  setstrV(L, &_k, lj_str_newlit(L, name)); \
+  setboolV(lj_tab_set(L, t, &_k), (val)); \
+} while (0)
+  SETNUM("steps_propagate", s->nsteps[GCSpropagate]);
+  SETNUM("steps_atomic", s->nsteps[GCSatomic]);
+  SETNUM("steps_sweepstring", s->nsteps[GCSsweepstring]);
+  SETNUM("steps_sweep_bitmap", s->sweep_bitmap_steps);
+  SETNUM("steps_sweep_rebuild", s->sweep_rebuild_steps);
+  SETNUM("steps_finalize", s->nsteps[GCSfinalize]);
+  SETNUM("cycles", s->cycles);
+  SETNUM("mark_calls", s->mark_calls);
+  SETNUM("mark_cost", s->mark_cost);
+  SETNUM("hugegray_pops", s->hugegray_pops);
+  SETNUM("grayarena_pops", s->grayarena_pops);
+  SETNUM("sweep_cells", s->sweep_cells);
+  SETNUM("pod_sweeps", s->pod_sweeps);
+  SETNUM("rebuild_prologue", s->rebuild_prologue);
+  SETNUM("rebuild_threadscan", s->rebuild_threadscan);
+  SETNUM("rebuild_hugescan", s->rebuild_hugescan);
+  SETNUM("rebuild_epilogue", s->rebuild_epilogue);
+  SETNUM("rebuild_clearmarks", s->rebuild_clearmarks);
+  SETNUM("barrierback", s->barrierback);
+  SETNUM("gray_notify", s->gray_notify);
+  SETNUM("ssb_overflow", s->ssb_overflow);
+  SETNUM("arenas_created", s->arenas_created);
+  SETNUM("arenas_destroyed", s->arenas_destroyed);
+  SETNUM("findspace_calls", s->findspace_calls);
+  SETNUM("arenas_shrunk", s->arenas_shrunk);
+  SETNUM("huge_allocs", s->huge_allocs);
+  SETNUM("huge_frees", s->huge_frees);
+  SETNUM("strings_chains_swept", s->strings_chains_swept);
+  SETNUM("strings_live_walked", s->strings_live_walked);
+  SETNUM("strings_dead_freed", s->strings_dead_freed);
+  SETNUM("finalizers", s->finalizers);
+  SETNUM("hugeset_rehashes", g->gc.hugesetgen);
+  SETNUM("arenastop", g->gc.arenastop);
+  SETNUM("hugenum", g->gc.hugenum);
+  SETNUM("hugemem", g->gc.hugemem);
+  SETNUM("last_cycle_arenastop", s->last_arenastop);
+  SETNUM("last_cycle_hugenum", s->last_hugenum);
+  SETNUM("last_cycle_hugemem", s->last_hugemem);
+#ifdef LUAJIT_ENABLE_GCSTATS_TIMING
+  SETNUM("time_pause_ns", s->time_pause_ns);
+  SETNUM("time_propagate_ns", s->time_propagate_ns);
+  SETNUM("time_atomic_ns", s->time_atomic_ns);
+  SETNUM("time_sweepstring_ns", s->time_sweepstring_ns);
+  SETNUM("time_sweep_bitmap_ns", s->time_sweep_bitmap_ns);
+  SETNUM("time_sweep_rebuild_ns", s->time_sweep_rebuild_ns);
+  SETNUM("time_finalize_ns", s->time_finalize_ns);
+  SETNUM("maxpause_pause_ns", s->maxpause_pause_ns);
+  SETNUM("maxpause_propagate_ns", s->maxpause_propagate_ns);
+  SETNUM("maxpause_atomic_ns", s->maxpause_atomic_ns);
+  SETNUM("maxpause_sweepstring_ns", s->maxpause_sweepstring_ns);
+  SETNUM("maxpause_sweep_bitmap_ns", s->maxpause_sweep_bitmap_ns);
+  SETNUM("maxpause_sweep_rebuild_ns", s->maxpause_sweep_rebuild_ns);
+  SETNUM("maxpause_finalize_ns", s->maxpause_finalize_ns);
+  SETBOOL("timing", 1);
+#else
+  SETBOOL("timing", 0);
+#endif
+#undef SETNUM
+#undef SETBOOL
+  settabV(L, L->top++, t);
 }
 
 #endif

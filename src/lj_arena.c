@@ -305,6 +305,7 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
   uint32_t w, wtop;
   GCCellID free_pre, free_post, freed;
+  gcstat_inc(g, pod_sweeps);
   UNUSED(g);
   lj_assertX((a->flags & ArenaFlag_PODOnly) == ArenaFlag_PODOnly,
 	     "podsweep of non-POD arena");
@@ -538,6 +539,7 @@ static GCArena *arena_create(global_State *g, int cls)
   ArenaChunk *c;
   GCArena *a;
   uint32_t slot;
+  gcstat_inc(g, arenas_created);
   for (c = mref(g->gc.chunks, ArenaChunk); c; c = c->next)
     if (c->freemap) break;
   if (c == NULL) {
@@ -578,6 +580,7 @@ static void arena_destroy(global_State *g, GCArena *a)
   GCArena **vec = mref(g->gc.arenas, GCArena *);
   ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
   MSize i = a->id;
+  gcstat_inc(g, arenas_destroyed);
   if (fl != NULL)
     g->allocf(g->allocd, fl, sizeof(ArenaFreeList), 0);
 #if LJ_HASGCMARK
@@ -614,6 +617,7 @@ void *lj_arena_findspace(global_State *g, size_t size, int cls)
   uint32_t want = arena_classflags(cls);
   void *p;
   MSize i;
+  gcstat_inc(g, findspace_calls);
   if (cur != NULL && (p = lj_arena_allocslow(g, cur, size)) != NULL)
     return p;
   for (i = 0; i < g->gc.arenastop; i++) {
@@ -680,6 +684,7 @@ void lj_arena_shrink(global_State *g)
     if (a != cura && a != curt && a != curp && a != curu && a != curcv && arena_isempty(a)) {
       if (keepempty == 0) {
 	arena_destroy(g, a);
+	gcstat_inc(g, arenas_shrunk);
 	continue;  /* Do not advance: the slot was swap-filled. */
       }
       arena_reinit(a, a->flags);
@@ -1069,6 +1074,7 @@ void *lj_hugeblock_alloc(global_State *g, size_t size)
 {
   size_t rsz = (size + ArenaCellMask) & ~(size_t)ArenaCellMask;
   void *p;
+  gcstat_inc(g, huge_allocs);
   if (LJ_UNLIKELY(rsz < size))  /* Overflow of the size rounding. */
     return NULL;
   p = arena_os_reserve(rsz);
@@ -1091,6 +1097,7 @@ void *lj_hugeblock_alloc(global_State *g, size_t size)
 void lj_hugeblock_free(global_State *g, void *p, size_t size)
 {
   size_t rsz = (size + ArenaCellMask) & ~(size_t)ArenaCellMask;
+  gcstat_inc(g, huge_frees);
   lj_assertG_(g, g->gc.hugenum > 0, "huge block underflow");
   huge_unregister(g, p);
   arena_os_release(p, rsz);

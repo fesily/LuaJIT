@@ -51,6 +51,9 @@ end
 
 io.write("=== Focused GC Benchmark ===\n\n")
 
+-- Reset GC stats counters so the report reflects only benchmark work.
+pcall(collectgarbage, "statsreset")
+
 -- 1. Mark: 200 full GC over 50K live tables
 bench("B1: 200 fullgc, 50K live tables", function()
   local live = {}
@@ -193,3 +196,18 @@ bench("B11: fullgc on 10 tables × 10K keys", function()
 end)
 
 io.write("\nDone.\n")
+
+-- Print a compact GC stats diff report (arena builds only; pcall guards
+-- non-arena builds where the verb is unrecognized).
+do
+  local ok, stats = pcall(collectgarbage, "stats")
+  if ok and type(stats) == "table" then
+    io.write("\n=== GC Stats (benchmark totals) ===\n")
+    local keys = {}
+    for k in pairs(stats) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _, k in ipairs(keys) do
+      io.write(string.format("  %-30s %s\n", k, tostring(stats[k])))
+    end
+  end
+end

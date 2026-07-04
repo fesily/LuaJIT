@@ -310,6 +310,8 @@ LJ_FUNC int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps);
 LJ_FUNC void lj_gc_fullgc(lua_State *L);
 #if LJ_HASGCARENA
 LJ_FUNC int lj_gc_checkheap(global_State *g);
+LJ_FUNC void lj_gc_stats_push(lua_State *L);
+LJ_FUNC void lj_gc_stats_reset(global_State *g);
 #endif
 
 /* GC check: drive collector forward if the GC threshold has been reached. */

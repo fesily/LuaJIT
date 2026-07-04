@@ -472,6 +472,8 @@ LJLIB_CF(collectgarbage)
     "\4stop\7restart\7collect\5count\1\377\4step\10setpause\12setstepmul\1\377\11isrunning"
 #if LJ_HASGCARENA
     "\11checkheap"  /* opt 10: read-only arena heap consistency check. */
+    "\5stats"      /* opt 11: push GC stats table. */
+    "\12statsreset"  /* opt 12: zero GC stats counters. */
 #endif
     );
   int32_t data = lj_lib_optint(L, 2, 0);
@@ -480,6 +482,14 @@ LJLIB_CF(collectgarbage)
     setintV(L->top, lj_gc_checkheap(G(L)));
     L->top++;
     return 1;
+  }
+  if (opt == 11) {  /* stats: push instrumentation table. */
+    lj_gc_stats_push(L);
+    return 1;
+  }
+  if (opt == 12) {  /* statsreset: zero counters, no return value. */
+    lj_gc_stats_reset(G(L));
+    return 0;
   }
 #endif
   if (opt == LUA_GCCOUNT) {
