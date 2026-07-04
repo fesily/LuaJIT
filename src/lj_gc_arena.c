@@ -1107,7 +1107,14 @@ static MSize gc_sweepstr_oa(global_State *g, MSize start, MSize count)
     GCobj *o;
     if (v == 0 || v == STRTAB_OA_TOMB) continue;
     o = (GCobj *)(void *)v;
-    if (o == obj2gco(&g->strempty) || (o->gch.marked & LJ_GC_FIXED))
+    /* Shutdown skip: keep only super-fixed roots (strempty + mainthread are
+    ** SFIXED). FIXED-but-not-SFIXED strings (reserved words, fixed error
+    ** messages) MUST be freed here so g->str.num is driven to 0 -- matching
+    ** the chain-path shutdown sweep (gc_sweepstr above) which keeps only
+    ** SFIXED. Skipping on LJ_GC_FIXED instead leaves those strings alive and
+    ** trips close_state's `leaked N strings` assert. strempty is FIXED|SFIXED
+    ** so the explicit pointer check is redundant but kept defensively. */
+    if (o == obj2gco(&g->strempty) || (o->gch.marked & LJ_GC_SFIXED))
       continue;
     gcstat_inc(g, strings_dead_freed);
     lj_str_free(g, gco2str(o));
