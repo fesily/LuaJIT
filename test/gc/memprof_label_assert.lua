@@ -79,9 +79,9 @@ assert(#data > 5, "stream too short: " .. #data)
 local parsed = parse.parse(data)
 local agg = aggregate.aggregate(parsed)
 
--- (d) stream version is 6 and labeldict has "A" and "B".
-check(parsed.version == 6,
-  "(d) stream version == 6 (got " .. tostring(parsed.version) .. ")")
+-- (d) stream version is >= 6 and labeldict has "A" and "B".
+check(parsed.version >= 6,
+  "(d) stream version >= 6 (got " .. tostring(parsed.version) .. ")")
 local has_a, has_b = false, false
 for id, s in pairs(parsed.labeldict) do
   if s == "A" then has_a = true end

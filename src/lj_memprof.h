@@ -80,6 +80,16 @@ LJ_FUNC void lj_memprof_stop(lua_State *L);
 ** GCstr may be collected before stop). */
 LJ_FUNC void lj_memprof_setlabel(lua_State *L, const char *str, size_t len);
 
+/* v7: emit a named timestamped MARK record into the event stream at the
+** current position (inline, interleaved with ALLOC/FREE). Called on the
+** Lua-call path only (memprof.mark()) — zero per-allocation hot-path cost.
+** The record carries a CLOCK_MONOTONIC timestamp (ns), the current live-heap
+** total (g->gc.total), and the mark name. The offline `timeline` subcommand
+** segments the stream into windows between consecutive marks. When the
+** profiler is inactive this is a no-op. name==NULL is treated as the empty
+** string. */
+LJ_FUNC void lj_memprof_mark(lua_State *L, const char *name, size_t len);
+
 #endif /* LJ_HASGCMARK && LUAJIT_ENABLE_MEMPROF */
 
 #endif /* _LJ_MEMPROF_H */

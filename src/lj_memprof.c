@@ -40,6 +40,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 /* -- Type classification -------------------------------------------------- */
 
@@ -1602,7 +1603,8 @@ enum {
   MP_OP_SYMTAB_CFUNC = 7,
   /* 8 is reserved as the epilogue nibble (0x80). */
   MP_OP_LABELDICT = 9,	/* v6: label-id -> string dictionary (dumped at stop). */
-  MP_OP__END = 10
+  MP_OP_MARK = 10,	/* v7: named timestamped marker (emitted inline by mark()). */
+  MP_OP__END = 11
 };
 /* The epilogue byte: top nibble 8, bottom nibble 0. */
 #define MP_EPILOGUE_BYTE	0x80
@@ -1614,7 +1616,7 @@ enum {
   MP_SRC_TRACE = 3
 };
 
-#define MP_STREAM_VERSION	6
+#define MP_STREAM_VERSION	7
 #define MP_PROLOGUE_MAGIC	"ljm"
 #define MP_MAX_DEPTH		32	/* Cap on per-event stack walk depth. */
 
@@ -2250,6 +2252,22 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
       memprof_read_uleb128(&p, e);	/* cellcount */
       memprof_read_uleb128(&p, e);	/* bytes */
       break;
+    case MP_OP_MARK:
+      /* v7: MARK records are emitted inline in the event body (interleaved
+      ** with ALLOC/FREE) by memprof.mark(). They carry no proto/trace/label
+      ** refs, so skip the fields and continue scanning. Without this case
+      ** the scanner would hit `default: goto done` and stop prematurely,
+      ** missing subsequent ALLOC/FREE proto ids (the recurring desync
+      ** lesson). The opcode is self-identifying — v1–v6 streams never
+      ** contain MARK records, so this case never fires for them. */
+      memprof_read_uleb128(&p, e);	/* ts_ns */
+      memprof_read_uleb128(&p, e);	/* gc_total */
+      {
+        uint64_t namelen = memprof_read_uleb128(&p, e);
+        if (namelen > (uint64_t)(e - p)) goto done;  /* truncated: defensive */
+        p += namelen;				/* skip name bytes */
+      }
+      break;
     default:
       goto done;	/* unknown opcode: stop scanning */
     }
@@ -2388,6 +2406,42 @@ LJ_FUNC void lj_memprof_setlabel(lua_State *L, const char *str, size_t len)
     return;
   }
   mps->current_label_id = label_intern(mps, g, str, len);
+}
+
+/* v7: emit a named timestamped MARK record into the event stream. Called on
+** the Lua-call path (memprof.mark()) — NOT in the alloc hot path, so it adds
+** zero per-allocation overhead. The record carries a monotonic timestamp
+** (CLOCK_MONOTONIC ns, same source as lj_gc_arena.c's GCSTATS_TIMING), the
+** current live-heap total (g->gc.total), and the mark name. The offline tool
+** segments the stream into windows between consecutive marks and reports
+** per-window allocation/live-heap delta (Go-style timeline). When the
+** profiler is inactive (mps->g == NULL) this is a documented no-op.
+** Record layout: header (MP_OP_MARK<<4 | 0 = 0xA0), uleb(ts_ns),
+** uleb(gc_total), uleb(name_len), name_len bytes. The header high nibble is
+** 0xA (0xA0), which cannot collide with the 0x80 epilogue byte (the scanner
+** checks hdr==0x80 first); LABELDICT (0x90) is the precedent. */
+LJ_FUNC void lj_memprof_mark(lua_State *L, const char *name, size_t len)
+{
+  MemprofState *mps = &memprof_state;
+  global_State *g;
+  SBuf *sb;
+  struct timespec ts;
+  uint64_t ts_ns;
+  if (mps->g == NULL) return;	/* inactive: no-op (documented). */
+  if (mps->g != G(L)) return;	/* not the owning VM. */
+  if (mps->in_emit) return;	/* re-entrancy guard. */
+  g = mps->g;
+  if (name == NULL) { name = ""; len = 0; }
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  ts_ns = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+  mps->in_emit = 1;
+  sb = &mps->sb;
+  lj_buf_putb(sb, (uint8_t)((MP_OP_MARK << 4) | 0));
+  memprof_put_uleb128(sb, ts_ns);
+  memprof_put_uleb128(sb, (uint64_t)g->gc.total);
+  memprof_put_uleb128(sb, (uint64_t)len);
+  if (len > 0) lj_buf_putmem(sb, name, (MSize)len);
+  mps->in_emit = 0;
 }
 
 #endif /* LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF) */

@@ -233,6 +233,30 @@ LJLIB_CF(memprof_setlabel)
 #endif
 }
 
+/* memprof.mark(name) -> true
+** Emits a named timestamped MARK record into the event stream at the current
+** position (inline, interleaved with ALLOC/FREE). The offline `timeline`
+** subcommand segments the stream into windows between consecutive marks and
+** reports per-window allocation/live-heap delta (Go-style timeline). When the
+** profiler is inactive, mark is a no-op. name is a string (empty string is
+** allowed; nil defaults to the empty string). */
+LJLIB_CF(memprof_mark)
+{
+#if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
+  if (L->base < L->top && tvisstr(L->base)) {
+    GCstr *s = strV(L->base);
+    lj_memprof_mark(L, strdata(s), s->len);
+  } else {
+    /* nil or no argument: emit a mark with the empty name. */
+    lj_memprof_mark(L, NULL, 0);
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+#else
+  return luaL_error(L, "memprof not enabled (build with -DLUAJIT_ENABLE_MEMPROF)");
+#endif
+}
+
 #include "lj_libdef.h"
 
 #if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)

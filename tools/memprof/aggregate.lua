@@ -552,11 +552,11 @@ function M.top_labels(agg)
   local rows = {}
   for label, st in pairs(agg.labels or {}) do
     rows[#rows+1] = { label = label, alloc_space = st.alloc_space,
-                     alloc_objects = st.alloc_objects,
-                     freed_space = st.freed_space,
-                     freed_objects = st.freed_objects,
-                     inuse_space = st.inuse_space,
-                     inuse_objects = st.inuse_objects }
+                      alloc_objects = st.alloc_objects,
+                      freed_space = st.freed_space,
+                      freed_objects = st.freed_objects,
+                      inuse_space = st.inuse_space,
+                      inuse_objects = st.inuse_objects }
   end
   table.sort(rows, function(a, b)
     if a.alloc_space ~= b.alloc_space then
@@ -565,6 +565,148 @@ function M.top_labels(agg)
     return a.label < b.label
   end)
   return rows
+end
+
+-- Build the Go-style timeline: segment the event stream into windows bounded
+-- by consecutive MARK records (plus an implicit [start] window before the
+-- first mark and [end] window after the last). Each window reports alloc/freed
+-- bytes+objects, net live delta, live_bytes (gc_total at the closing mark),
+-- duration (ts delta between bounding marks), and alloc rate (bytes/sec).
+-- Returns:
+--   marks:   list of {name=, ts=, gc_total=} in stream order
+--   windows: list of window tables (see below) in stream order
+--   hottest: index (1-based) of the window with the most alloc_bytes
+--   leak_suspects: list of indices (1-based) of windows with net-positive
+--                  live growth (alloc_bytes - freed_bytes > 0)
+-- Each window: { name=, from=, to=, from_ts=, to_ts=, duration_ns=,
+--   alloc_bytes=, alloc_objects=, freed_bytes=, freed_objects=,
+--   net_live=, live_bytes=, alloc_rate_bps= }
+-- For v1–v6 streams (no MARK records) there is a single [start]/[end] window
+-- covering the whole stream with duration 0 and live_bytes 0 (no marks → no
+-- timestamps → no windows to segment). Existing subcommands are unaffected.
+function M.timeline_windows(parsed)
+  local events = parsed.events
+  local marks = {}
+  for i = 1, #events do
+    local ev = events[i]
+    if ev.op == "MARK" then
+      marks[#marks+1] = { name = ev.name, ts = ev.ts, gc_total = ev.gc_total }
+    end
+  end
+
+  local windows = {}
+  local nmarks = #marks
+  -- Compute window boundaries. Window i covers events between boundary i-1
+  -- and boundary i. Boundaries are: stream-start, mark[1], ..., mark[n],
+  -- stream-end. So there are nmarks+1 windows.
+  -- Window 1: [start] -> mark[1]   (name "[start")
+  -- Window k (2..nmarks): mark[k-1] -> mark[k]  (name = mark[k].name)
+  -- Window nmarks+1: mark[nmarks] -> [end]  (name "[end]")
+  local function make_window(name, from_name, to_name,
+                              from_ts, to_ts, from_gc, to_gc,
+                              ev_start, ev_end)
+    local w = {
+      name = name, from = from_name, to = to_name,
+      from_ts = from_ts or 0, to_ts = to_ts or 0,
+      duration_ns = 0,
+      alloc_bytes = 0, alloc_objects = 0,
+      freed_bytes = 0, freed_objects = 0,
+      net_live = 0, live_bytes = to_gc or 0,
+      alloc_rate_bps = 0,
+    }
+    if from_ts and to_ts and to_ts > from_ts then
+      w.duration_ns = to_ts - from_ts
+    end
+    for i = ev_start, ev_end do
+      local ev = events[i]
+      if ev.op == "ALLOC" then
+        local wt = ev.weight or ev.size
+        w.alloc_bytes = w.alloc_bytes + wt
+        w.alloc_objects = w.alloc_objects + 1
+      elseif ev.op == "REALLOC" then
+        local prev_osize = ev.osize
+        local prev_nsize = ev.nsize
+        w.freed_bytes = w.freed_bytes + prev_osize
+        w.freed_objects = w.freed_objects + 1
+        w.alloc_bytes = w.alloc_bytes + prev_nsize
+        w.alloc_objects = w.alloc_objects + 1
+      elseif ev.op == "FREE" then
+        w.freed_bytes = w.freed_bytes + ev.osize
+        w.freed_objects = w.freed_objects + 1
+      elseif ev.op == "PODFREE" then
+        w.freed_bytes = w.freed_bytes + ev.bytes
+        w.freed_objects = w.freed_objects + 1
+      end
+    end
+    w.net_live = w.alloc_bytes - w.freed_bytes
+    if w.duration_ns > 0 then
+      w.alloc_rate_bps = w.alloc_bytes / (w.duration_ns / 1e9)
+    end
+    return w
+  end
+
+  -- Find the event index of each MARK record so we can compute the event
+  -- range of each window (non-MARK events between consecutive marks).
+  local mark_event_idx = {}
+  for i = 1, #events do
+    if events[i].op == "MARK" then
+      mark_event_idx[#mark_event_idx+1] = i
+    end
+  end
+
+  -- Build windows: nmarks+1 windows total.
+  if nmarks == 0 then
+    -- No marks: a single [start]/[end] window covering all events.
+    windows[1] = make_window("[start]", "[start]", "[end]",
+                              nil, nil, nil, nil, 1, #events)
+    windows[1].name = "[start]"
+  else
+    -- Window 1: [start] -> mark[1]
+    local ev_end = mark_event_idx[1] - 1
+    if ev_end < 1 then ev_end = 0 end
+    windows[1] = make_window("[start]", "[start]", marks[1].name,
+                              nil, marks[1].ts, nil, marks[1].gc_total,
+                              1, ev_end)
+    -- Windows 2..nmarks: mark[k-1] -> mark[k]
+    for k = 2, nmarks do
+      local ev_s = mark_event_idx[k-1] + 1
+      local ev_e = mark_event_idx[k] - 1
+      windows[k] = make_window(marks[k].name, marks[k-1].name, marks[k].name,
+                                marks[k-1].ts, marks[k].ts,
+                                marks[k-1].gc_total, marks[k].gc_total,
+                                ev_s, ev_e)
+    end
+    -- Window nmarks+1: mark[nmarks] -> [end]
+    local ev_s = mark_event_idx[nmarks] + 1
+    windows[nmarks+1] = make_window("[end]", marks[nmarks].name, "[end]",
+                                     marks[nmarks].ts, nil,
+                                     marks[nmarks].gc_total, nil,
+                                     ev_s, #events)
+  end
+
+  -- Find the hottest window (max alloc_bytes). Skip [start] and [end] if
+  -- they have zero alloc (common); include them if they have allocs.
+  local hottest = 1
+  for i = 1, #windows do
+    if windows[i].alloc_bytes > windows[hottest].alloc_bytes then
+      hottest = i
+    end
+  end
+
+  -- Leak suspects: windows with net-positive live growth.
+  local leak_suspects = {}
+  for i = 1, #windows do
+    if windows[i].net_live > 0 then
+      leak_suspects[#leak_suspects+1] = i
+    end
+  end
+
+  return {
+    marks = marks,
+    windows = windows,
+    hottest = hottest,
+    leak_suspects = leak_suspects,
+  }
 end
 
 return M

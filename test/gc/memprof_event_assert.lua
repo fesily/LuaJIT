@@ -57,8 +57,8 @@ local function parse_stream(data)
   check(magic == "ljm", "prologue magic 'ljm' (got '" .. magic .. "')")
   local version = data:byte(pos); pos = pos + 1
   check(version == 1 or version == 2 or version == 3 or version == 4
-        or version == 5 or version == 6,
-        "stream version 1, 2, 3, 4, 5 or 6 (got " .. tostring(version) .. ")")
+        or version == 5 or version == 6 or version == 7,
+        "stream version 1, 2, 3, 4, 5, 6 or 7 (got " .. tostring(version) .. ")")
   local has_cycle = (version >= 2)
   local has_frames = (version >= 3)
   local has_line = (version >= 4)

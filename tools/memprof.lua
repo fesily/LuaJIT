@@ -27,6 +27,15 @@
 --                 showing how allocation is distributed across the labels set
 --                 via memprof.setlabel. Unlabeled allocations appear as
 --                 <none>. v1–v5 streams show a single <none> row.
+--   timeline     Go-style lightweight timeline: segments the event stream
+--                 into windows between consecutive memprof.mark(name) markers
+--                 (plus [start] before the first mark and [end] after the
+--                 last). Per window: alloc/freed bytes+objects, net live
+--                 delta, live_bytes (gc_total at the closing mark), duration,
+--                 and alloc rate (bytes/sec). Highlights the HOTTEST window
+--                 (max alloc bytes) and leak-suspect windows (net positive
+--                 live growth). v1–v6 streams (no marks) show a single
+--                 [start] window with no segmentation.
 --   pprof         Serialize the aggregated per-site stats into an UNCOMPRESSED
 --                 google/pprof `Profile` protobuf (raw bytes, no gzip) so the
 --                 whole `go tool pprof` ecosystem (top/graph/web/flamegraph)
@@ -233,13 +242,71 @@ local function cmd_labels(agg)
   end
 end
 
+local function fmt_duration(ns)
+  if not ns or ns == 0 then return "0ms" end
+  local ms = ns / 1e6
+  if ms < 1 then return ("%.1fus"):format(ns / 1e3) end
+  if ms < 1000 then return ("%.1fms"):format(ms) end
+  return ("%.2fs"):format(ms / 1000)
+end
+
+local function fmt_rate(bps)
+  if not bps or bps == 0 then return "-" end
+  if bps >= 1024 * 1024 then return ("%.1fMiB/s"):format(bps / (1024 * 1024))
+  elseif bps >= 1024 then return ("%.1fKiB/s"):format(bps / 1024)
+  else return ("%dB/s"):format(bps) end
+end
+
+local function cmd_timeline(parsed)
+  local tl = aggregate.timeline_windows(parsed)
+  local marks = tl.marks
+  local windows = tl.windows
+  if #marks == 0 then
+    io.write("(no marks in stream — use memprof.mark(name) to create timeline windows)\n")
+    return
+  end
+  io.write(("marks: %d  windows: %d  version: %d\n\n"):format(
+    #marks, #windows, parsed.version))
+  io.write(("  %-8s  %-10s  %-10s  %-12s  %-8s  %-12s  %-12s  %-12s  %-10s\n"):format(
+    "window", "duration", "live_bytes", "alloc_bytes", "objs",
+    "freed_bytes", "net_live", "alloc_rate", "flag"))
+  for i = 1, #windows do
+    local w = windows[i]
+    local flag = ""
+    if i == tl.hottest and w.alloc_bytes > 0 then flag = "HOTTEST" end
+    if w.net_live > 0 then
+      flag = flag == "" and "LEAK?" or flag .. "+LEAK?"
+    end
+    io.write(("  %-8s  %-10s  %-10s  %-12s  %-8d  %-12s  %-12s  %-10s  %s\n"):format(
+      w.name, fmt_duration(w.duration_ns), fmt_bytes(w.live_bytes),
+      fmt_bytes(w.alloc_bytes), w.alloc_objects,
+      fmt_bytes(w.freed_bytes), fmt_bytes(w.net_live),
+      fmt_rate(w.alloc_rate_bps), flag))
+  end
+  io.write(("\n"))
+  if tl.hottest and tl.hottest >= 1 and windows[tl.hottest].alloc_bytes > 0 then
+    local hw = windows[tl.hottest]
+    io.write(("hottest window: %s  alloc=%s  rate=%s  duration=%s\n"):format(
+      hw.name, fmt_bytes(hw.alloc_bytes), fmt_rate(hw.alloc_rate_bps),
+      fmt_duration(hw.duration_ns)))
+  end
+  if #tl.leak_suspects > 0 then
+    local names = {}
+    for _, idx in ipairs(tl.leak_suspects) do
+      names[#names+1] = windows[idx].name
+    end
+    io.write(("leak-suspect windows (net positive live growth): %s\n"):format(
+      table.concat(names, ", ")))
+  end
+end
+
 -- -- arg parsing / dispatch -------------------------------------------------
 
 local function usage()
   io.stderr:write([[
 usage: luajit tools/memprof.lua <subcmd> <stream.bin> [limit|out] [--label=<str>]
 subcommands: top | top-leaf | collapsed | summary | leak | survival |
-             survival-leaf | labels | pprof
+              survival-leaf | labels | timeline | pprof
   pprof <stream.bin> [out.pb]   write pprof protobuf to out.pb (or stdout)
   --label=<str>                 filter: show only allocations under <str>
                                 (<none> for unlabeled); applies to top,
@@ -269,7 +336,8 @@ local function main(arg)
 
   local subcmds = { top = true, ["top-leaf"] = true, collapsed = true,
                     summary = true, leak = true, survival = true,
-                    ["survival-leaf"] = true, labels = true, pprof = true }
+                    ["survival-leaf"] = true, labels = true, pprof = true,
+                    timeline = true }
   if not subcmds[subcmd] then
     io.stderr:write(("unknown subcommand: %s\n"):format(subcmd))
     usage()
@@ -307,6 +375,8 @@ local function main(arg)
     cmd_survival(agg, limit, { leaf = true })
   elseif subcmd == "labels" then
     cmd_labels(agg)
+  elseif subcmd == "timeline" then
+    cmd_timeline(parsed)
   elseif subcmd == "pprof" then
     cmd_pprof(agg, out_path)
   end

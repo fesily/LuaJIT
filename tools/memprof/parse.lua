@@ -11,9 +11,11 @@
 --              4 = +per-frame actual source line (line-precise attribution);
 --              5 = +trailing uleb(weight) on ALLOC (sampling mode);
 --              6 = +trailing uleb(label_id) on ALLOC + LABELDICT section
+--              7 = +MP_OP_MARK records (named timestamped markers, inline)
 --   * Event header: 1 byte  (opcode << 4) | (src_kind & 0xf)
 --     opcodes: EPILOGUE=0 ALLOC=1 REALLOC=2 FREE=3 PODFREE=4
 --              SYMTAB_LFUNC=5 SYMTAB_TRACE=6 SYMTAB_CFUNC=7 LABELDICT=9
+--              MARK=10 (v7; inline named timestamped marker)
 --     src_kind: INT=0 LFUNC=1 CFUNC=2 TRACE=3
 --   * Epilogue byte: 0x80  (top nibble 8)
 --   * ULEB128: little-endian base-128, high bit = continuation
@@ -32,6 +34,14 @@
 --   * LABELDICT:     uleb(id) uleb(len) <len bytes>  (v6; id 1-based; dumped at
 --              stop after the symtab section, before the epilogue; resolves
 --              per-ALLOC label_id fields to their label strings)
+--   * MARK:    uleb(ts_ns) uleb(gc_total) uleb(name_len) <name_len bytes>
+--              (v7; emitted INLINE in the event body by memprof.mark(name),
+--              interleaved with ALLOC/FREE. ts_ns is a CLOCK_MONOTONIC
+--              nanosecond timestamp; gc_total is g->gc.total (live bytes at
+--              the mark); name is the mark's label. The offline `timeline`
+--              subcommand segments the stream into windows between consecutive
+--              marks. Header high nibble is 0xA (0xA0) — cannot collide with
+--              the 0x80 epilogue byte.)
 --   * gc_cycle = g->gc.stats.cycles (monotonic completed-GC-cycle counter,
 --     lj_obj.h GCstats). Appended at the END of ALLOC/REALLOC/FREE so v1
 --     readers halt cleanly on the new version byte. For v1 streams gc_cycle
@@ -66,6 +76,7 @@ local OP = {
   EPILOGUE = 0, ALLOC = 1, REALLOC = 2, FREE = 3, PODFREE = 4,
   SYMTAB_LFUNC = 5, SYMTAB_TRACE = 6, SYMTAB_CFUNC = 7,
   LABELDICT = 9,	-- v6: label-id -> string dictionary (dumped at stop).
+  MARK = 10,	-- v7: named timestamped marker (emitted inline by mark()).
 }
 local SRC = { INT = 0, LFUNC = 1, CFUNC = 2, TRACE = 3 }
 local EPILOGUE_BYTE = 0x80
@@ -86,7 +97,8 @@ local STREAM_VERSION_V3 = 3
 local STREAM_VERSION_V4 = 4
 local STREAM_VERSION_V5 = 5
 local STREAM_VERSION_V6 = 6
-local STREAM_VERSION_MAX = STREAM_VERSION_V6
+local STREAM_VERSION_V7 = 7
+local STREAM_VERSION_MAX = STREAM_VERSION_V7
 
 local SRC_NAME = { [0] = "INT", "LFUNC", "CFUNC", "TRACE" }
 
@@ -102,9 +114,14 @@ end
 -- Read a ULEB128 value from string `s` starting at byte position `pos`
 -- (1-based). Returns value, new position. Raises on truncation / overlong
 -- encodings / overflow, matching the defensive-reader contract.
+-- Uses arithmetic multiplication (not bit.lshift) for accumulation so values
+-- larger than 2^32 (e.g. CLOCK_MONOTONIC ns timestamps in v7 MARK records)
+-- are parsed correctly — bit.lshift wraps at 32 bits and would silently drop
+-- high bytes. Doubles can represent integers up to 2^53, which covers
+-- 128^7 = 2^49 (the 8th byte), so all practical 64-bit ULEB128 values fit.
 local function read_uleb128(s, pos, e)
   local v = 0
-  local shift = 0
+  local mult = 1
   local n = 0
   local b, lo
   while true do
@@ -114,13 +131,10 @@ local function read_uleb128(s, pos, e)
     n = n + 1
     if n > ULEB128_MAXBYTES then err("over-long ULEB128", pos) end
     lo = band(b, 0x7f)
-    v = v + lshift(lo, shift)
+    v = v + lo * mult
     if band(b, 0x80) == 0 then break end
-    shift = shift + 7
+    mult = mult * 128
   end
-  -- The only non-canonical ULEB128 shape the C writer cannot produce is a
-  -- trailing zero byte after a non-empty continuation (e.g. 0x01 0x00 for the
-  -- value 1). Reject it so a corrupt stream cannot hide data in padding.
   if n > 1 and lo == 0 then err("non-canonical ULEB128 (trailing zero)", pos) end
   return v, pos
 end
@@ -212,6 +226,7 @@ function M.parse(data)
     elseif op == OP.SYMTAB_TRACE then opname = "SYMTAB_TRACE"
     elseif op == OP.SYMTAB_CFUNC then opname = "SYMTAB_CFUNC"
     elseif op == OP.LABELDICT then opname = "LABELDICT"
+    elseif op == OP.MARK then opname = "MARK"
     else
       -- Unknown opcode: stop parsing the event body. The C reader does the
       -- same (memprof_dump_symtab `goto done`). Any bytes we did not consume
@@ -353,6 +368,21 @@ function M.parse(data)
       if pos + labellen - 1 > e then err("truncated LABELDICT label", pos) end
       labeldict[id] = data:sub(pos, pos + labellen - 1)
       pos = pos + labellen
+
+    elseif opname == "MARK" then
+      -- v7: named timestamped marker emitted inline by memprof.mark(name).
+      -- uleb(ts_ns) uleb(gc_total) uleb(name_len) <name_len bytes>.
+      local ts, gc_total, namelen
+      ts, pos = read_uleb128(data, pos, e)
+      gc_total, pos = read_uleb128(data, pos, e)
+      namelen, pos = read_uleb128(data, pos, e)
+      if pos + namelen - 1 > e then err("truncated MARK name", pos) end
+      local name = data:sub(pos, pos + namelen - 1)
+      pos = pos + namelen
+      events[#events+1] = {
+        op = opname, src = srcname, ofs = hdrOfs,
+        kind = "mark", ts = ts, gc_total = gc_total, name = name,
+      }
     end
   end
 
@@ -529,6 +559,7 @@ M.STREAM_VERSION_V3 = STREAM_VERSION_V3
 M.STREAM_VERSION_V4 = STREAM_VERSION_V4
 M.STREAM_VERSION_V5 = STREAM_VERSION_V5
 M.STREAM_VERSION_V6 = STREAM_VERSION_V6
+M.STREAM_VERSION_V7 = STREAM_VERSION_V7
 M.STREAM_VERSION_MAX = STREAM_VERSION_MAX
 
 return M

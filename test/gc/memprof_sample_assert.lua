@@ -151,7 +151,7 @@ if e_agg and s_agg then
         ("%.1f"):format(s_agg.totals.inuse_space) .. ")")
 
   -- Sanity: the sampled stream version is 5 and weights are present on ALLOCs.
-  check(s_parsed.version == 5 or s_parsed.version == 6, "sampled stream version 5 or 6 (got " ..
+  check(s_parsed.version == 5 or s_parsed.version == 6 or s_parsed.version == 7, "sampled stream version 5, 6 or 7 (got " ..
         tostring(s_parsed.version) .. ")")
   local n_weighted = 0
   for _, ev in ipairs(s_parsed.events) do
