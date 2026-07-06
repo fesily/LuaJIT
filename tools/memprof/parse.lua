@@ -17,6 +17,7 @@
 --   * ALLOC:    uleb(addr) uleb(size) byte(gct) byte(cls) byte(gcstate)
 --              uleb(src_id) [v2: uleb(gc_cycle)] [v3: uleb(nframes)
 --              nframes × (byte kind, uleb id) [v4: uleb(line) per frame]]
+--              [v5: uleb(weight)]   (trailing; bytes this sample represents)
 --   * REALLOC:  uleb(addr) uleb(osize) uleb(nsize) uleb(src_id)
 --              [v2: uleb(gc_cycle)] [v3: frame stack]
 --   * FREE:     uleb(addr) uleb(osize) byte(gct) uleb(src_id)
@@ -65,14 +66,18 @@ local PROLOGUE_MAGIC = "ljm"
 -- Stream versions we can read. v1 = original event stream; v2 = +gc_cycle
 -- field appended to ALLOC/REALLOC/FREE (survival-rate analysis); v3 =
 -- +per-record frame stack (multi-frame attribution); v4 = +per-frame actual
--- source line (line-precise attribution). Older streams parse with gc_cycle
--- defaulting to 0, a synthesized 1-element leaf stack, and line=0 (falling
--- back to the symtab's firstline for display).
+-- source line (line-precise attribution); v5 = +trailing uleb(weight) on
+-- ALLOC (sampling mode: bytes this sample represents; exact mode writes
+-- weight=size so the aggregator applies no scaling). Older streams parse with
+-- gc_cycle defaulting to 0, a synthesized 1-element leaf stack, line=0
+-- (falling back to the symtab's firstline for display), and weight defaulting
+-- to size (weight-per-object = 1, no scaling — preserving exact-mode totals).
 local STREAM_VERSION_V1 = 1
 local STREAM_VERSION_V2 = 2
 local STREAM_VERSION_V3 = 3
 local STREAM_VERSION_V4 = 4
-local STREAM_VERSION_MAX = STREAM_VERSION_V4
+local STREAM_VERSION_V5 = 5
+local STREAM_VERSION_MAX = STREAM_VERSION_V5
 
 local SRC_NAME = { [0] = "INT", "LFUNC", "CFUNC", "TRACE" }
 
@@ -160,6 +165,7 @@ function M.parse(data)
   local has_cycle = (version >= STREAM_VERSION_V2)
   local has_frames = (version >= STREAM_VERSION_V3)
   local has_line = (version >= STREAM_VERSION_V4)
+  local has_weight = (version >= STREAM_VERSION_V5)
   -- data:byte(5) is the reserved byte; we read but do not validate it.
 
   local events = {}
@@ -221,11 +227,16 @@ function M.parse(data)
       else
         stack = { { kind = srcname, kind_n = sk, id = src_id, line = 0 } }
       end
+      -- v5: trailing uleb(weight) — bytes this sample represents. Exact mode
+      -- writes weight=size (no scaling); sampling writes the accumulator
+      -- delta. v1–v4 streams default weight=size (weight-per-object = 1).
+      local weight = size
+      if has_weight then weight, pos = read_uleb128(data, pos, e) end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, size = size, gct = gct, cls = cls,
         gcstate = gcstate, src_id = src_id, gc_cycle = gc_cycle,
-        stack = stack,
+        weight = weight, stack = stack,
       }
       if sk == SRC.CFUNC then
 	-- Record CFUNC ffids seen (diagnostics). The src_id is now the
@@ -475,6 +486,7 @@ M.STREAM_VERSION_V1 = STREAM_VERSION_V1
 M.STREAM_VERSION_V2 = STREAM_VERSION_V2
 M.STREAM_VERSION_V3 = STREAM_VERSION_V3
 M.STREAM_VERSION_V4 = STREAM_VERSION_V4
+M.STREAM_VERSION_V5 = STREAM_VERSION_V5
 M.STREAM_VERSION_MAX = STREAM_VERSION_MAX
 
 return M

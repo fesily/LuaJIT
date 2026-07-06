@@ -95,8 +95,12 @@ LJLIB_CF(memprof_diff)
 #endif
 }
 
-/* memprof.start{mode="event", depth=1, out="path"} -> true | nil, err
-** Starts the event-stream profiler. Only one VM may profile at a time. */
+/* memprof.start{mode="exact"|"sample", depth=1, out="path", interval=N}
+** -> true | nil, err
+** Starts the event-stream profiler. mode="exact" (default) emits every
+** alloc; mode="sample" enables the v5 byte-accumulator sampling gate with
+** interval=N bytes (emit ~1 event per N bytes allocated, low overhead for
+** production). Only one VM may profile at a time. */
 LJLIB_CF(memprof_start)
 {
 #if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
@@ -104,7 +108,9 @@ LJLIB_CF(memprof_start)
   TValue k;
   const TValue *v;
   const char *outpath = NULL;
+  const char *mode = "exact";
   int depth = 1;
+  uint64_t interval = 0;
   int rc;
   if (!(L->base < L->top && tvistab(L->base)))
     return luaL_error(L, "memprof.start: table argument required");
@@ -115,9 +121,20 @@ LJLIB_CF(memprof_start)
   setstrV(L, &k, lj_str_newlit(L, "depth"));
   v = lj_tab_get(L, arg, &k);
   if (tvisnum(v)) depth = (int)numV(v);
+  setstrV(L, &k, lj_str_newlit(L, "mode"));
+  v = lj_tab_get(L, arg, &k);
+  if (tvisstr(v)) mode = strdata(strV(v));
+  setstrV(L, &k, lj_str_newlit(L, "interval"));
+  v = lj_tab_get(L, arg, &k);
+  if (tvisnum(v)) interval = (uint64_t)numV(v);
   if (outpath == NULL)
     return luaL_error(L, "memprof.start: out= path required");
-  rc = lj_memprof_start(L, outpath, depth);
+  /* mode="sample" requires interval > 0; mode="exact" ignores interval. */
+  if (mode[0] == 's' && interval == 0)
+    return luaL_error(L, "memprof.start: mode=\"sample\" requires interval > 0");
+  if (mode[0] == 'e')
+    interval = 0;	/* exact mode: force interval=0 (the default). */
+  rc = lj_memprof_start(L, outpath, depth, interval);
   if (rc == 1)
     return luaL_error(L, "memprof.start: profiler already active on a VM");
   if (rc == 2)

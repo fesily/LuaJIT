@@ -632,6 +632,40 @@ LJ_FUNC int lj_memprof_diff(lua_State *L)
 **   carry line=0 (no bytecode line). The offline tool renders
 **   chunkname:ACTUAL_line for v4 streams and falls back to the symtab's
 **   firstline for v1/v2/v3 streams. v1/v2/v3 stream parsing is unchanged.
+**
+** v5 (sampling mode): a byte-accumulator gate in lj_memprof_emit_alloc
+**   keeps a running `accum += size`; the ALLOC is emitted ONLY when
+**   accum >= interval (the sample period, set via memprof.start{interval=N}).
+**   `interval == 0` is EXACT mode = emit every alloc (the DEFAULT), which is
+**   byte-for-byte semantically identical to v4 (the weight field is present
+**   but carries weight = size, so weight/size = 1 and the aggregator applies
+**   no scaling). When interval > 0, each emitted ALLOC appends a trailing
+**     uleb(weight)
+**   at the END of the ALLOC record (after the v3/v4 frame stack). `weight`
+**   is the number of bytes this sample REPRESENTS (= accum at the crossing,
+**   then accum resets to 0), so sum(weights) over all sampled ALLOCs equals
+**   the true total GC-object allocation bytes. The offline tool scales
+**   alloc_objects by weight/size and alloc_space by weight to produce
+**   POPULATION ESTIMATES (the Go pprof / V8 allocation-sampling model).
+**
+**   THE CORRECTNESS TRAP: the profiler matches FREE by address. If only some
+**   ALLOCs are emitted, a naive FREE would emit FREE for objects whose ALLOC
+**   was never recorded -> phantom frees, negative inuse, broken survival.
+**   FIX: a sampled-address hash set (MemprofState.sampled, C-managed via
+**   g->allocf — NOT a Lua table; the FREE hook runs in the sweep path with no
+**   lua_State) records every emitted (sampled) ALLOC address. emit_free and
+**   emit_realloc CONSULT the set and emit ONLY when the address is present;
+**   emit_free also REMOVES it. Un-sampled allocations produce no ALLOC, no
+**   FREE, no REALLOC — fully invisible — so all downstream math stays
+**   consistent. Raw allocf buffers (emit_realloc, cls=0xff) are never
+**   inserted into the set (only GC objects via emit_alloc are), so in sampling
+**   mode all raw-buffer events are suppressed — they are pure overhead noise.
+**
+**   REALLOC/FREE/PODFREE records carry NO weight field (they reference an
+**   already-weighted sampled object, or are aggregate). The v5 addition is
+**   purely the trailing uleb(weight) on ALLOC. v1–v4 streams default weight =
+**   size in the parser (weight-per-object = 1, no scaling), so all existing
+**   subcommands keep working unchanged for old streams.
 ** ======================================================================== **/
 
 /* -- Wire format constants ------------------------------------------------ */
@@ -658,11 +692,26 @@ enum {
   MP_SRC_TRACE = 3
 };
 
-#define MP_STREAM_VERSION	4
+#define MP_STREAM_VERSION	5
 #define MP_PROLOGUE_MAGIC	"ljm"
 #define MP_MAX_DEPTH		32	/* Cap on per-event stack walk depth. */
 
 /* -- Profiler state (single-VM owner, mirrors lj_profile.c ProfileState) -- */
+
+/* Sampled-address hash set (v5 sampling mode). Open-addressing uintptr_t set
+** with backward-shift deletion (no tombstones), power-of-two capacity, resized
+** at ~70% load. Slot value 0 (NULL) denotes an empty slot — NULL is never a
+** valid GCobj address, so it is a safe empty sentinel. Allocated/resized/freed
+** via g->allocf (NOT a Lua table): the FREE hook runs in the GC sweep path
+** with no lua_State and must not allocate GC objects. The set ops run inside
+** mps->in_emit=1; the set's own allocf calls are raw memory and do not recur
+** into the profiler (allocf is not a GC-object alloc hook), and the in_emit
+** guard covers any lj_mem_realloc-based SBuf growth regardless. */
+typedef struct {
+  uintptr_t *slots;	/* Power-of-two array, 0 = empty. NULL when inactive. */
+  uint32_t mask;	/* capacity - 1 (0 when slots == NULL). */
+  uint32_t count;	/* Live entries (== used; backward-shift has no tombstones). */
+} SampleSet;
 
 typedef struct MemprofState {
   global_State *g;	/* Owning VM, or NULL when inactive. */
@@ -670,9 +719,135 @@ typedef struct MemprofState {
   FILE *fp;		/* Output file handle. */
   int in_emit;		/* Re-entrancy guard (SBuf growth triggers realloc). */
   int depth;		/* Stack walk depth cap (1..MP_MAX_DEPTH). */
+  uint64_t interval;	/* Sampling period in bytes; 0 = EXACT mode (default). */
+  uint64_t accum;	/* Byte accumulator (sampling mode only). */
+  SampleSet sampled;	/* Sampled-address set (sampling mode only). */
 } MemprofState;
 
 static MemprofState memprof_state;
+
+/* -- Sampled-address set (raw allocf, open-addressing, backward-shift) ----- */
+
+/* Fibonacci-multiply the cell-aligned address bits. GCobj addresses are at
+** least 16-byte aligned (CellSize = 16), so shift away the low zero bits
+** before mixing to spread sequential arena addresses across the table. */
+static uint32_t sampleset_hash(uintptr_t a)
+{
+  uintptr_t x = a >> 4;
+  x ^= x >> 16;
+  return (uint32_t)((x * (uintptr_t)2654435761u) & 0xffffffffu);
+}
+
+/* Allocate / resize / free the slot array via the VM's raw allocator. */
+static uintptr_t *sampleset_allocf(global_State *g, uintptr_t *old,
+				   size_t oldsz, size_t newsz)
+{
+  return (uintptr_t *)g->allocf(g->allocd, old, oldsz, newsz);
+}
+
+/* Insert `addr` into the set, growing (doubling) if load factor > 70%.
+** No-op (returns) if already present. */
+static void sampleset_add(SampleSet *s, global_State *g, uintptr_t addr)
+{
+  uint32_t cap, mask, i;
+  uintptr_t *slots;
+  if (addr == 0) return;	/* NULL is the empty sentinel — never stored. */
+  cap = s->mask ? s->mask + 1 : 0;
+  /* Grow at 70% load (or on first insert: start at 256). */
+  if (cap == 0 || (uint64_t)s->count * 10 >= (uint64_t)cap * 7) {
+    uint32_t newcap = cap ? cap << 1 : 256;
+    uintptr_t *newslots;
+    uint32_t newmask = newcap - 1, j;
+    newslots = sampleset_allocf(g, s->slots, (size_t)cap * sizeof(uintptr_t),
+				(size_t)newcap * sizeof(uintptr_t));
+    if (newslots == NULL) return;	/* OOM: skip insert (rare; no crash). */
+    /* Rehash all live entries into the new table. */
+    memset(newslots, 0, (size_t)newcap * sizeof(uintptr_t));
+    for (j = 0; j < cap; j++) {
+      uintptr_t v = s->slots[j];
+      uint32_t k;
+      if (v == 0) continue;
+      k = sampleset_hash(v) & newmask;
+      while (newslots[k] != 0) k = (k + 1) & newmask;
+      newslots[k] = v;
+    }
+    s->slots = newslots;
+    s->mask = newmask;
+    cap = newcap;
+  }
+  slots = s->slots;
+  mask = s->mask;
+  i = sampleset_hash(addr) & mask;
+  while (slots[i] != 0) {
+    if (slots[i] == addr) return;	/* already present */
+    i = (i + 1) & mask;
+  }
+  slots[i] = addr;
+  s->count++;
+}
+
+/* Return 1 if `addr` is in the set, 0 otherwise. */
+static int sampleset_has(SampleSet *s, uintptr_t addr)
+{
+  uintptr_t *slots;
+  uint32_t mask, i;
+  if (s->slots == NULL || addr == 0) return 0;
+  slots = s->slots;
+  mask = s->mask;
+  i = sampleset_hash(addr) & mask;
+  while (slots[i] != 0) {
+    if (slots[i] == addr) return 1;
+    i = (i + 1) & mask;
+  }
+  return 0;
+}
+
+/* Remove `addr` from the set using backward-shift deletion (maintains probe
+** sequences without tombstones). Returns 1 if removed, 0 if not found. */
+static int sampleset_remove(SampleSet *s, global_State *g, uintptr_t addr)
+{
+  uintptr_t *slots;
+  uint32_t mask, i, j, k, dgap, dcur;
+  if (s->slots == NULL || addr == 0) return 0;
+  slots = s->slots;
+  mask = s->mask;
+  i = sampleset_hash(addr) & mask;
+  while (slots[i] != 0) {
+    if (slots[i] == addr) goto found;
+    i = (i + 1) & mask;
+  }
+  return 0;
+found:
+  /* Backward-shift: for each subsequent occupied slot j, if its natural home
+  ** k is at or before the gap i in probe order (the gap lies within the run
+  ** the entry probed from home), move it back to fill the gap. */
+  j = i;
+  while (1) {
+    j = (j + 1) & mask;
+    if (slots[j] == 0) break;
+    k = sampleset_hash(slots[j]) & mask;
+    dgap = (i - k) & mask;	/* distance from home to the gap */
+    dcur = (j - k) & mask;	/* distance from home to current slot */
+    if (dgap <= dcur) {		/* gap is within the entry's probe run */
+      slots[i] = slots[j];
+      i = j;
+    }
+  }
+  slots[i] = 0;
+  s->count--;
+  return 1;
+}
+
+/* Free the slot array (called at stop). */
+static void sampleset_free(SampleSet *s, global_State *g)
+{
+  if (s->slots != NULL) {
+    sampleset_allocf(g, s->slots, (size_t)(s->mask + 1) * sizeof(uintptr_t), 0);
+    s->slots = NULL;
+    s->mask = 0;
+    s->count = 0;
+  }
+}
 
 /* -- ULEB128 writer ------------------------------------------------------- */
 
@@ -793,10 +968,22 @@ LJ_FUNC void lj_memprof_emit_alloc(lua_State *L, void *o, GCSize size,
   SBuf *sb;
   MemprofFrame frames[MP_MAX_DEPTH];
   int nframes;
+  uint64_t weight;	/* v5: bytes this sample represents (== size in exact). */
   UNUSED(link);
   if (mps->in_emit) return;
   g = mps->g;
   if (g == NULL) return;
+  /* v5 sampling gate: accumulate bytes; emit only on threshold crossing.
+  ** interval == 0 is EXACT mode — no accumulator math, no set ops. */
+  if (mps->interval) {
+    mps->accum += (uint64_t)size;
+    if (mps->accum < mps->interval)
+      return;	/* not sampled — fully invisible (no event, no set entry) */
+    weight = mps->accum;	/* bytes accumulated since the last sample */
+    mps->accum = 0;
+  } else {
+    weight = (uint64_t)size;	/* exact mode: weight == size (no scaling) */
+  }
   mps->in_emit = 1;
   sb = &mps->sb;
   nframes = memprof_attribution(g, L, frames, mps->depth);
@@ -809,6 +996,9 @@ LJ_FUNC void lj_memprof_emit_alloc(lua_State *L, void *o, GCSize size,
   memprof_put_uleb128(sb, frames[0].id);  /* leaf src_id (v1/v2 shape) */
   memprof_put_uleb128(sb, (uint64_t)g->gc.stats.cycles);  /* v2: cycle */
   memprof_emit_frames(sb, frames, nframes);  /* v3: leaf..root stack */
+  memprof_put_uleb128(sb, weight);  /* v5: trailing weight (end-of-record) */
+  if (mps->interval)
+    sampleset_add(&mps->sampled, g, (uintptr_t)o);  /* record sampled addr */
   mps->in_emit = 0;
 }
 
@@ -824,6 +1014,16 @@ LJ_FUNC void lj_memprof_emit_realloc(lua_State *L, void *p,
   if (mps->in_emit) return;
   g = mps->g;
   if (g == NULL) return;
+  /* v5 sampling mode: raw allocf buffers (cls=0xff) are never inserted into
+  ** the sampled-address set (only GC objects via emit_alloc are), so this
+  ** consultation never matches for raw buffers and all raw-buffer events are
+  ** suppressed — they are pure overhead noise. If the address happens to be
+  ** in the set (defensive; cannot occur for raw buffers vs GC objects), emit
+  ** so a sampled object is not lost. */
+  if (mps->interval) {
+    if (!sampleset_has(&mps->sampled, (uintptr_t)p))
+      return;
+  }
   mps->in_emit = 1;
   sb = &mps->sb;
   nframes = memprof_attribution(g, L, frames, mps->depth);
@@ -845,6 +1045,14 @@ LJ_FUNC void lj_memprof_emit_realloc(lua_State *L, void *p,
   memprof_put_uleb128(sb, frames[0].id);  /* leaf src_id */
   memprof_put_uleb128(sb, (uint64_t)g->gc.stats.cycles);  /* v2: cycle */
   memprof_emit_frames(sb, frames, nframes);  /* v3: leaf..root stack */
+  if (op == MP_OP_ALLOC) {
+    /* v5: ALLOC records (including raw-buffer ALLOC) carry a trailing
+    ** weight. Exact mode: weight == nsize (no scaling). Sampling mode only
+    ** reaches here for set members (see the gate above). */
+    memprof_put_uleb128(sb, (uint64_t)nsize);
+  }
+  if (mps->interval && op == MP_OP_FREE)
+    sampleset_remove(&mps->sampled, g, (uintptr_t)p);
   mps->in_emit = 0;
 }
 
@@ -853,9 +1061,15 @@ LJ_FUNC void lj_memprof_emit_free(global_State *g, void *o,
 {
   MemprofState *mps = &memprof_state;
   SBuf *sb;
-  UNUSED(g);
   if (mps->in_emit) return;
   if (mps->g == NULL) return;
+  /* v5 sampling mode: emit FREE only for previously-sampled objects, so a
+  ** FREE is never emitted for an object whose ALLOC was not recorded (the
+  ** phantom-free trap). Remove the address so a second FREE is a no-op. */
+  if (mps->interval) {
+    if (!sampleset_has(&mps->sampled, (uintptr_t)o))
+      return;
+  }
   mps->in_emit = 1;
   sb = &mps->sb;
   lj_buf_putb(sb, (uint8_t)((MP_OP_FREE << 4) | MP_SRC_INT));
@@ -869,6 +1083,8 @@ LJ_FUNC void lj_memprof_emit_free(global_State *g, void *o,
     MemprofFrame fint = { MP_SRC_INT, 0, 0 };
     memprof_emit_frames(sb, &fint, 1);
   }
+  if (mps->interval)
+    sampleset_remove(&mps->sampled, g, (uintptr_t)o);
   mps->in_emit = 0;
 }
 
@@ -965,12 +1181,13 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
   memset(traces, 0, sizeof(traces));
 
   /* Walk the event stream (skip the 5-byte prologue). */
-  int has_cycle = 0, has_frames = 0, has_line = 0;
+  int has_cycle = 0, has_frames = 0, has_line = 0, has_weight = 0;
   if (p + 5 <= e) {
     uint8_t ver = (uint8_t)p[3];
     has_cycle = (ver >= 2);   /* v2+ appends a gc_cycle uleb128 */
     has_frames = (ver >= 3); /* v3+ appends a frame stack */
     has_line = (ver >= 4);   /* v4+ appends a per-frame uleb line */
+    has_weight = (ver >= 5); /* v5+ appends a trailing uleb weight on ALLOC */
     p += 5;
   }
   while (p < e) {
@@ -995,6 +1212,7 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
       if (has_cycle) memprof_read_uleb128(&p, e);  /* v2: gc_cycle */
       if (has_frames)
 	symtab_read_frames(&p, e, has_line, protos, &nprotos, traces, &ntraces);
+      if (has_weight) memprof_read_uleb128(&p, e);  /* v5: trailing weight */
       break;
     case MP_OP_REALLOC:
       memprof_read_uleb128(&p, e);	/* addr */
@@ -1066,7 +1284,8 @@ done:
 
 /* -- Start / Stop --------------------------------------------------------- */
 
-LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth)
+LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth,
+			     uint64_t interval)
 {
   MemprofState *mps = &memprof_state;
   global_State *g = G(L);
@@ -1080,6 +1299,11 @@ LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth)
   mps->g = g;
   mps->in_emit = 0;
   mps->depth = depth > 0 ? depth : 1;
+  mps->interval = interval;	/* 0 = EXACT mode (default). */
+  mps->accum = 0;
+  mps->sampled.slots = NULL;
+  mps->sampled.mask = 0;
+  mps->sampled.count = 0;
   lj_buf_init(L, &mps->sb);
   lj_buf_need(&mps->sb, 4096);
   lj_buf_reset(&mps->sb);
@@ -1108,6 +1332,9 @@ LJ_FUNC void lj_memprof_stop(lua_State *L)
     mps->fp = NULL;
   }
   lj_buf_free(g, sb);
+  sampleset_free(&mps->sampled, g);  /* v5: release the sampled-address set. */
+  mps->interval = 0;
+  mps->accum = 0;
   mps->g = NULL;
 }
 

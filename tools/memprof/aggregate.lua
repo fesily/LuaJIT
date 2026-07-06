@@ -141,11 +141,14 @@ function M.aggregate(parsed)
     if ls then ls[addr] = nil end
   end
   -- Bump a per-cycle counter in both the full-stack and leaf survival maps.
-  local function surv_bump(skey, lkey, cyc, map_full, map_leaf)
+  -- `n` is the population-object count this event represents (weight/size);
+  -- it defaults to 1 for exact-mode streams where weight == size.
+  local function surv_bump(skey, lkey, cyc, map_full, map_leaf, n)
+    n = n or 1
     local function bump(map, key)
       local m = map[key]
       if not m then m = {}; map[key] = m end
-      m[cyc] = (m[cyc] or 0) + 1
+      m[cyc] = (m[cyc] or 0) + n
     end
     bump(map_full, skey)
     bump(map_leaf, lkey)
@@ -167,61 +170,76 @@ function M.aggregate(parsed)
     if op == "ALLOC" then
       local skey = site_key(ev, symtab)
       local lkey = leaf_key(ev, symtab)
-      bill(skey, lkey, ev.size, 1, 0, 0, ev.size, 1)
-      totals.alloc_space = totals.alloc_space + ev.size
-      totals.alloc_objects = totals.alloc_objects + 1
-      totals.inuse_space = totals.inuse_space + ev.size
-      totals.inuse_objects = totals.inuse_objects + 1
+      -- v5 sampling: weight = bytes this sample represents; obj = weight/size
+      -- = the population-object count. Exact mode: weight == size, obj == 1.
+      local w = ev.weight or ev.size
+      local obj = w / ev.size
+      bill(skey, lkey, w, obj, 0, 0, w, obj)
+      totals.alloc_space = totals.alloc_space + w
+      totals.alloc_objects = totals.alloc_objects + obj
+      totals.inuse_space = totals.inuse_space + w
+      totals.inuse_objects = totals.inuse_objects + obj
       -- Type axis: ALLOC carries cls (arena-class). gct is 0 at inline time.
       local tag = parse.cls_name(ev.cls)
       local tt = type_tab(tag)
-      tt.alloc_space = tt.alloc_space + ev.size
-      tt.alloc_objects = tt.alloc_objects + 1
-      -- Track live addr for leak view and FREE matching.
+      tt.alloc_space = tt.alloc_space + w
+      tt.alloc_objects = tt.alloc_objects + obj
+      -- Track live addr for leak view and FREE matching. Store weight so the
+      -- matching FREE bills the same population (keeps inuse non-negative).
       local cyc = ev.gc_cycle or 0
-      live[ev.addr] = { site = skey, leaf = lkey, size = ev.size, cycle = cyc }
-      surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf)
-      leak_add(leaks, skey, ev.addr, ev.size)
-      leak_add(leaks_leaf, lkey, ev.addr, ev.size)
+      live[ev.addr] = { site = skey, leaf = lkey, size = ev.size,
+			weight = w, cycle = cyc }
+      surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf, obj)
+      leak_add(leaks, skey, ev.addr, w)
+      leak_add(leaks_leaf, lkey, ev.addr, w)
 
     elseif op == "REALLOC" then
-      -- True resize (osz!=0, nsize!=0). Bill osize as freed, nsize as alloc
-      -- at the event's site. Update live[addr] size.
+      -- True resize (osz!=0, nsize!=0). Bill the old object's weight as freed
+      -- and the new object (weight=nsize, 1 object) as alloc at the event's
+      -- site. REALLOC carries no weight field; the freed side uses the
+      -- original ALLOC's weight from live[addr] (exact mode: == osize).
       totals.realloc_count = totals.realloc_count + 1
       local skey = site_key(ev, symtab)
       local lkey = leaf_key(ev, symtab)
-      bill(skey, lkey, ev.nsize, 1, ev.osize, 1,
-           ev.nsize - ev.osize, 0)
-      totals.freed_space = totals.freed_space + ev.osize
-      totals.freed_objects = totals.freed_objects + 1
-      totals.inuse_space = totals.inuse_space - ev.osize
-      totals.inuse_objects = totals.inuse_objects - 1
-      totals.alloc_space = totals.alloc_space + ev.nsize
-      totals.alloc_objects = totals.alloc_objects + 1
-      totals.inuse_space = totals.inuse_space + ev.nsize
-      totals.inuse_objects = totals.inuse_objects + 1
+      local prev = live[ev.addr]
+      local cyc = ev.gc_cycle or 0
+      local fw, fobj
+      if prev then
+        fw = prev.weight
+        fobj = prev.weight / prev.size
+        leak_del(leaks, prev.site, ev.addr)
+        leak_del(leaks_leaf, prev.leaf, ev.addr)
+        surv_bump(prev.site, prev.leaf, prev.cycle, surv_freed, surv_freed_leaf, fobj)
+      else
+        fw = ev.osize
+        fobj = 1
+      end
+      local nw = ev.nsize
+      local nobj = 1
+      bill(skey, lkey, nw, nobj, fw, fobj, nw - fw, nobj - fobj)
+      totals.freed_space = totals.freed_space + fw
+      totals.freed_objects = totals.freed_objects + fobj
+      totals.inuse_space = totals.inuse_space - fw
+      totals.inuse_objects = totals.inuse_objects - fobj
+      if totals.inuse_objects < 0 then totals.inuse_objects = 0 end
+      totals.alloc_space = totals.alloc_space + nw
+      totals.alloc_objects = totals.alloc_objects + nobj
+      totals.inuse_space = totals.inuse_space + nw
+      totals.inuse_objects = totals.inuse_objects + nobj
       -- REALLOC type axis: synthetic "realloc" tag (C emitter attaches no
       -- cls/gct to REALLOC records). Counted under both alloc and freed so
       -- per-type churn is visible.
       local tt = type_tab("realloc")
-      tt.alloc_space = tt.alloc_space + ev.nsize
-      tt.alloc_objects = tt.alloc_objects + 1
-      tt.freed_space = tt.freed_space + ev.osize
-      tt.freed_objects = tt.freed_objects + 1
+      tt.alloc_space = tt.alloc_space + nw
+      tt.alloc_objects = tt.alloc_objects + nobj
+      tt.freed_space = tt.freed_space + fw
+      tt.freed_objects = tt.freed_objects + fobj
       -- Update live/leak tracking for this addr.
-      local prev = live[ev.addr]
-      local cyc = ev.gc_cycle or 0
-      if prev then
-        leak_del(leaks, prev.site, ev.addr)
-        leak_del(leaks_leaf, prev.leaf, ev.addr)
-        -- The old object (osz) is "freed" for survival accounting at its
-        -- birth site/cycle; the REALLOC re-bills nsize as a fresh alloc.
-        surv_bump(prev.site, prev.leaf, prev.cycle, surv_freed, surv_freed_leaf)
-      end
-      live[ev.addr] = { site = skey, leaf = lkey, size = ev.nsize, cycle = cyc }
-      surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf)
-      leak_add(leaks, skey, ev.addr, ev.nsize)
-      leak_add(leaks_leaf, lkey, ev.addr, ev.nsize)
+      live[ev.addr] = { site = skey, leaf = lkey, size = ev.nsize,
+			weight = nw, cycle = cyc }
+      surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf, nobj)
+      leak_add(leaks, skey, ev.addr, nw)
+      leak_add(leaks_leaf, lkey, ev.addr, nw)
 
     elseif op == "FREE" then
       totals.free_count = totals.free_count + 1
@@ -231,34 +249,45 @@ function M.aggregate(parsed)
       -- accounting we want to credit the FREE back to the ORIGINAL alloc
       -- site (which we know from live[addr]). This gives accurate per-site
       -- inuse deltas and a correct leak view.
+      -- v5 sampling: bill the original ALLOC's weight/size so the FREE
+      -- represents the same population as the ALLOC (inuse stays non-negative
+      -- and consistent). The sampled-address set in the C emitter guarantees a
+      -- FREE only arrives for a previously-sampled (recorded) addr.
       local prev = live[ev.addr]
-      local skey, lkey
+      local skey, lkey, fw, fobj
       if prev then
         skey = prev.site
         lkey = prev.leaf
+        fw = prev.weight
+        fobj = prev.weight / prev.size
         leak_del(leaks, skey, ev.addr)
         leak_del(leaks_leaf, lkey, ev.addr)
         live[ev.addr] = nil
-        surv_bump(skey, lkey, prev.cycle, surv_freed, surv_freed_leaf)
+        surv_bump(skey, lkey, prev.cycle, surv_freed, surv_freed_leaf, fobj)
       else
         -- FREE without a preceding ALLOC in the stream (alloc happened before
-        -- memprof.start). Bill to INTERNAL so it is not lost.
+        -- memprof.start, or an un-sampled object in a corrupted stream). Bill
+        -- to INTERNAL with osize/1 so it is not lost. In sampling mode this
+        -- branch is unreachable (the C set-gate suppresses un-sampled FREEs).
         skey = "INTERNAL"
         lkey = "INTERNAL"
+        fw = osize
+        fobj = 1
       end
-      local st = apply_stat(sites, skey, 0, 0, osize, 1, -osize, -1)
+      local st = apply_stat(sites, skey, 0, 0, fw, fobj, -fw, -fobj)
       if st.inuse_objects < 0 then st.inuse_objects = 0 end
-      local stl = apply_stat(sites_leaf, lkey, 0, 0, osize, 1, -osize, -1)
+      local stl = apply_stat(sites_leaf, lkey, 0, 0, fw, fobj, -fw, -fobj)
       if stl.inuse_objects < 0 then stl.inuse_objects = 0 end
-      totals.freed_space = totals.freed_space + osize
-      totals.freed_objects = totals.freed_objects + 1
-      totals.inuse_space = totals.inuse_space - osize
-      if totals.inuse_objects > 0 then totals.inuse_objects = totals.inuse_objects - 1 end
+      totals.freed_space = totals.freed_space + fw
+      totals.freed_objects = totals.freed_objects + fobj
+      totals.inuse_space = totals.inuse_space - fw
+      totals.inuse_objects = totals.inuse_objects - fobj
+      if totals.inuse_objects < 0 then totals.inuse_objects = 0 end
       -- Type axis: FREE carries the precise gct. Use gct_name.
       local tag = parse.gct_name(ev.gct)
       local tt = type_tab(tag)
-      tt.freed_space = tt.freed_space + osize
-      tt.freed_objects = tt.freed_objects + 1
+      tt.freed_space = tt.freed_space + fw
+      tt.freed_objects = tt.freed_objects + fobj
 
     elseif op == "PODFREE" then
       totals.podfree_count = totals.podfree_count + 1
@@ -348,6 +377,8 @@ function M.aggregate(parsed)
       end
     end
     -- Count survivors from `live` (addrs still allocated at end of stream).
+    -- v5 sampling: each surviving sampled object represents weight/size
+    -- population objects, so survivors/allocated stay on the same scale.
     for addr, info in pairs(live) do
       local label = info[key_field]
       local st = surv_sites[label]
@@ -356,15 +387,16 @@ function M.aggregate(parsed)
                by_cycle = {} }
         surv_sites[label] = st
       end
-      st.survivors = st.survivors + 1
+      local sobj = info.weight / info.size
+      st.survivors = st.survivors + sobj
       local bc = st.by_cycle[info.cycle]
       if not bc then bc = { allocated = 0, freed = 0, survivors = 0 }
                      st.by_cycle[info.cycle] = bc end
-      bc.survivors = bc.survivors + 1
+      bc.survivors = bc.survivors + sobj
       local cm = surv_cycles[info.cycle]
       if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
                  surv_cycles[info.cycle] = cm end
-      cm.survivors = cm.survivors + 1
+      cm.survivors = cm.survivors + sobj
     end
     -- Finalize survival_rate per site (guard against divide-by-zero).
     for _, st in pairs(surv_sites) do

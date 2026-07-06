@@ -42,9 +42,15 @@ LJ_FUNC int lj_memprof_diff(lua_State *L);
 /* -- v1: event-stream mode (Capability B) ------------------------------- */
 
 /* Start emitting ALLOC/REALLOC/FREE events to `outpath`. depth is the stack
-** read depth (currently fixed at 1; proto/trace-id attribution). Returns 0
-** on success, nonzero if a profiler is already active on another VM. */
-LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth);
+** read depth (currently fixed at 1; proto/trace-id attribution). interval is
+** the sampling period in bytes for v5 sampling mode: 0 = EXACT mode (emit
+** every alloc, the default — byte-for-byte semantically identical to v4);
+** >0 = SAMPLE mode (byte-accumulator gate: emit ~1 event per `interval` bytes
+** allocated, with a per-sample weight + sampled-address set so FREE/REALLOC
+** stay consistent). Returns 0 on success, nonzero if a profiler is already
+** active on another VM. */
+LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth,
+			     uint64_t interval);
 
 /* Stop the event stream: flush symtab + epilogue, close the output file.
 ** Only the VM that started the profiler may stop it. */

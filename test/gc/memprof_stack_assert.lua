@@ -113,8 +113,8 @@ os.remove(STREAM)
 check(#data > 5, "stream non-empty (" .. #data .. " bytes)")
 
 local parsed = parse.parse(data)
-check(parsed.version == 3 or parsed.version == 4,
-      "stream version 3 or 4 (got " .. tostring(parsed.version) .. ")")
+check(parsed.version == 3 or parsed.version == 4 or parsed.version == 5,
+      "stream version 3, 4 or 5 (got " .. tostring(parsed.version) .. ")")
 
 -- (a) at least one event has a multi-frame stack.
 local n_multiframe = 0
