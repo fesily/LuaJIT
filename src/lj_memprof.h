@@ -39,6 +39,17 @@ LJ_FUNC int lj_memprof_snapshot(lua_State *L, const MemprofOpts *opts);
 ** Pushes a {leak_suspects=, grown=, shrunk=} table. Returns 1. */
 LJ_FUNC int lj_memprof_diff(lua_State *L);
 
+/* -- v1: event-stream mode (Capability B) ------------------------------- */
+
+/* Start emitting ALLOC/REALLOC/FREE events to `outpath`. depth is the stack
+** read depth (currently fixed at 1; proto/trace-id attribution). Returns 0
+** on success, nonzero if a profiler is already active on another VM. */
+LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth);
+
+/* Stop the event stream: flush symtab + epilogue, close the output file.
+** Only the VM that started the profiler may stop it. */
+LJ_FUNC void lj_memprof_stop(lua_State *L);
+
 #endif /* LJ_HASGCMARK && LUAJIT_ENABLE_MEMPROF */
 
 #endif /* _LJ_MEMPROF_H */

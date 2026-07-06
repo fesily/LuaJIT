@@ -38,6 +38,27 @@ enum {
 ** ENTIRE sweep+rebuild window (T3 stopped mid-yield MARK teardown, T1 keeps
 ** finalized-cdata MARK set), so the gc_obj_is* readers read raw marks under
 ** GCF_BITMAPSWEEP directly -- no separate death-authority gate needed. */
+/* v1 memprof: set while the event-stream profiler is active. The hot alloc/
+** free inlines test this (one predictable-not-taken branch, same shape as
+** GCF_MARKALLOC) and call an out-of-line LJ_NOINLINE emitter. The whole hook
+** is gated behind LUAJIT_ENABLE_MEMPROF, so flag-OFF builds are byte-identical. */
+#if defined(LUAJIT_ENABLE_MEMPROF)
+#define GCF_MEMPROF	0x08	/* Memory profiler event stream active. */
+#endif
+#endif
+
+/* v1 memprof event-stream emit functions (out-of-line, LJ_NOINLINE).
+** Forward-declared here so the hot alloc/free inlines in lj_gc.h can call them
+** with a single guarded flag test. Defined in lj_memprof.c. */
+#if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
+LJ_FUNC void lj_memprof_emit_alloc(lua_State *L, void *o, GCSize size,
+				   int cls, int link);
+LJ_FUNC void lj_memprof_emit_realloc(lua_State *L, void *p,
+				     GCSize osz, GCSize nsize);
+LJ_FUNC void lj_memprof_emit_free(global_State *g, void *o,
+				  size_t osize, uint32_t gct);
+LJ_FUNC void lj_memprof_emit_podfree(global_State *g, uint32_t cellcount,
+				     size_t bytes);
 #endif
 
 #if LJ_HASGCMARK
@@ -454,6 +475,10 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
       if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC))
 	arena_obj_setmark(a, ptr2cell(o));
 #endif
+#if defined(LUAJIT_ENABLE_MEMPROF)
+      if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
+	lj_memprof_emit_alloc(L, o, size, cls, link);
+#endif
       if (link)
 	newwhite(g, o);
       return o;
@@ -465,6 +490,10 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
 /* Free a GC object allocated by lj_mem_newgco_arena(). */
 static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 {
+#if defined(LUAJIT_ENABLE_MEMPROF)
+  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
+    lj_memprof_emit_free(g, p, osize, ((GCobj *)p)->gch.gct);
+#endif
   if (LJ_LIKELY(!lj_arena_ishuge(p))) {
     GCArena *a = ptr2arena(p);
     GCCellID c = ptr2cell(p);

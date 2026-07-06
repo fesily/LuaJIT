@@ -30,9 +30,16 @@
 #include "lj_tab.h"
 #include "lj_lib.h"
 #include "lauxlib.h"
+#include "lj_frame.h"
+#include "lj_debug.h"
+#if LJ_HASJIT
+#include "lj_jit.h"
+#include "lj_trace.h"
+#endif
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* -- Type classification -------------------------------------------------- */
 
@@ -558,6 +565,364 @@ LJ_FUNC int lj_memprof_diff(lua_State *L)
     lua_setfield(L, base, "leak_suspects");
   }
   return 1;
+}
+
+/* ======================================================================== **
+** v1: Event-stream mode (Capability B, design doc 2.2/3/9).
+**
+** While active (GCF_MEMPROF set in g->gc.gcmarkflags), every GC-object
+** ALLOC/REALLOC/FREE emits a compact ULEB128 record into an in-memory SBuf.
+** At stop the symtab sideband (proto/trace -> file:line) is appended, then the
+** epilogue, and the whole buffer is flushed to the output file.
+**
+** Attribution (design 3.2, option B — proto/trace-id + offline symtab):
+**   vmstate >= 0          -> TRACE, src_id = trace number
+**   vmstate ~INTERP/~C    -> read level-0 frame: LFUNC(proto*) or CFUNC(fn*)
+**   else (GC/EXIT/...)    -> INT, src_id = 0
+** ALLOC records carry the arena-class (cls) as the type axis and gct=0
+** (pending: the caller sets gct after the inline returns). FREE records carry
+** the precise gct (valid at free time). POD sweep is aggregate (PODFREE).
+** ======================================================================== **/
+
+/* -- Wire format constants ------------------------------------------------ */
+
+enum {
+  MP_OP_EPILOGUE = 0,
+  MP_OP_ALLOC = 1,
+  MP_OP_REALLOC = 2,
+  MP_OP_FREE = 3,
+  MP_OP_PODFREE = 4,
+  MP_OP_SYMTAB_LFUNC = 5,
+  MP_OP_SYMTAB_TRACE = 6,
+  MP_OP_SYMTAB_CFUNC = 7,
+  /* 8 is reserved as the epilogue nibble (0x80). */
+  MP_OP__END = 9
+};
+/* The epilogue byte: top nibble 8, bottom nibble 0. */
+#define MP_EPILOGUE_BYTE	0x80
+
+enum {
+  MP_SRC_INT = 0,
+  MP_SRC_LFUNC = 1,
+  MP_SRC_CFUNC = 2,
+  MP_SRC_TRACE = 3
+};
+
+#define MP_STREAM_VERSION	1
+#define MP_PROLOGUE_MAGIC	"ljm"
+
+/* -- Profiler state (single-VM owner, mirrors lj_profile.c ProfileState) -- */
+
+typedef struct MemprofState {
+  global_State *g;	/* Owning VM, or NULL when inactive. */
+  SBuf sb;		/* In-memory event stream. */
+  FILE *fp;		/* Output file handle. */
+  int in_emit;		/* Re-entrancy guard (SBuf growth triggers realloc). */
+  int depth;		/* Stack read depth (reserved, currently 1). */
+} MemprofState;
+
+static MemprofState memprof_state;
+
+/* -- ULEB128 writer ------------------------------------------------------- */
+
+static void memprof_put_uleb128(SBuf *sb, uint64_t v)
+{
+  do {
+    uint8_t b = (uint8_t)(v & 0x7f);
+    v >>= 7;
+    if (v) b |= 0x80;
+    lj_buf_putb(sb, b);
+  } while (v);
+}
+
+/* -- Attribution ---------------------------------------------------------- */
+
+static void memprof_attribution(global_State *g, lua_State *L,
+				uint8_t *src_kind, uint64_t *src_id)
+{
+  int32_t vmstate = g->vmstate;
+  if (vmstate >= 0) {
+    *src_kind = MP_SRC_TRACE;
+    *src_id = (uint64_t)vmstate;
+    return;
+  }
+  *src_kind = MP_SRC_INT;
+  *src_id = 0;
+  {
+    int vs = ~vmstate;
+    if (vs == LJ_VMST_INTERP || vs == LJ_VMST_C) {
+      int size;
+      cTValue *frame = lj_debug_frame(L, 0, &size);
+      if (frame) {
+	GCfunc *fn = frame_func(frame);
+	if (isluafunc(fn)) {
+	  *src_kind = MP_SRC_LFUNC;
+	  *src_id = (uint64_t)(uintptr_t)funcproto(fn);
+	} else if (iscfunc(fn) || isffunc(fn)) {
+	  *src_kind = MP_SRC_CFUNC;
+	  *src_id = (uint64_t)(uintptr_t)fn;
+	}
+      }
+    }
+  }
+}
+
+/* -- Emit functions (out-of-line, called from the hot inlines) ------------- */
+
+LJ_FUNC void lj_memprof_emit_alloc(lua_State *L, void *o, GCSize size,
+				   int cls, int link)
+{
+  MemprofState *mps = &memprof_state;
+  global_State *g;
+  SBuf *sb;
+  uint8_t src_kind = 0;
+  uint64_t src_id = 0;
+  UNUSED(link);
+  if (mps->in_emit) return;
+  g = mps->g;
+  if (g == NULL) return;
+  mps->in_emit = 1;
+  sb = &mps->sb;
+  memprof_attribution(g, L, &src_kind, &src_id);
+  lj_buf_putb(sb, (uint8_t)((MP_OP_ALLOC << 4) | (src_kind & 0xf)));
+  memprof_put_uleb128(sb, (uint64_t)(uintptr_t)o);
+  memprof_put_uleb128(sb, (uint64_t)size);
+  lj_buf_putb(sb, 0);		/* gct pending (caller sets after return) */
+  lj_buf_putb(sb, (uint8_t)cls);	/* arena-class type axis */
+  lj_buf_putb(sb, (uint8_t)g->gc.state);
+  memprof_put_uleb128(sb, src_id);
+  mps->in_emit = 0;
+}
+
+LJ_FUNC void lj_memprof_emit_realloc(lua_State *L, void *p,
+				     GCSize osz, GCSize nsize)
+{
+  MemprofState *mps = &memprof_state;
+  global_State *g;
+  SBuf *sb;
+  uint8_t src_kind = 0, op;
+  uint64_t src_id = 0;
+  if (mps->in_emit) return;
+  g = mps->g;
+  if (g == NULL) return;
+  mps->in_emit = 1;
+  sb = &mps->sb;
+  memprof_attribution(g, L, &src_kind, &src_id);
+  op = (osz == 0) ? MP_OP_ALLOC : (nsize == 0) ? MP_OP_FREE : MP_OP_REALLOC;
+  lj_buf_putb(sb, (uint8_t)((op << 4) | (src_kind & 0xf)));
+  memprof_put_uleb128(sb, (uint64_t)(uintptr_t)p);
+  if (op == MP_OP_ALLOC) {
+    memprof_put_uleb128(sb, (uint64_t)nsize);
+    lj_buf_putb(sb, 0);	/* no gct for raw buffers */
+    lj_buf_putb(sb, 0xff);	/* cls sentinel: raw allocf memory */
+    lj_buf_putb(sb, (uint8_t)g->gc.state);
+  } else if (op == MP_OP_FREE) {
+    memprof_put_uleb128(sb, (uint64_t)osz);
+    lj_buf_putb(sb, 0);
+  } else {
+    memprof_put_uleb128(sb, (uint64_t)osz);
+    memprof_put_uleb128(sb, (uint64_t)nsize);
+  }
+  memprof_put_uleb128(sb, src_id);
+  mps->in_emit = 0;
+}
+
+LJ_FUNC void lj_memprof_emit_free(global_State *g, void *o,
+				  size_t osize, uint32_t gct)
+{
+  MemprofState *mps = &memprof_state;
+  SBuf *sb;
+  UNUSED(g);
+  if (mps->in_emit) return;
+  if (mps->g == NULL) return;
+  mps->in_emit = 1;
+  sb = &mps->sb;
+  lj_buf_putb(sb, (uint8_t)((MP_OP_FREE << 4) | MP_SRC_INT));
+  memprof_put_uleb128(sb, (uint64_t)(uintptr_t)o);
+  memprof_put_uleb128(sb, (uint64_t)osize);
+  lj_buf_putb(sb, (uint8_t)gct);
+  memprof_put_uleb128(sb, 0);	/* INT: no source id */
+  mps->in_emit = 0;
+}
+
+LJ_FUNC void lj_memprof_emit_podfree(global_State *g, uint32_t cellcount,
+				     size_t bytes)
+{
+  MemprofState *mps = &memprof_state;
+  SBuf *sb;
+  UNUSED(g);
+  if (mps->in_emit) return;
+  if (mps->g == NULL) return;
+  mps->in_emit = 1;
+  sb = &mps->sb;
+  lj_buf_putb(sb, (uint8_t)((MP_OP_PODFREE << 4) | MP_SRC_INT));
+  memprof_put_uleb128(sb, (uint64_t)cellcount);
+  memprof_put_uleb128(sb, (uint64_t)bytes);
+  mps->in_emit = 0;
+}
+
+/* -- Symtab scan-and-dump (at stop, zero hot-path cost) ------------------- */
+
+static uint64_t memprof_read_uleb128(const char **pp, const char *e)
+{
+  const char *p = *pp;
+  uint64_t v = 0;
+  int s = 0;
+  while (p < e) {
+    uint8_t b = (uint8_t)*p++;
+    v |= (uint64_t)(b & 0x7f) << s;
+    s += 7;
+    if (!(b & 0x80)) break;
+  }
+  *pp = p;
+  return v;
+}
+
+/* Collect unique LFUNC proto pointers and TRACE ids from the event stream,
+** then append SYMTAB_* records. Dedup via a file-local array (unique protos
+** are typically O(hundreds) in a session; cap 4096, overflow skips). */
+#define MP_SYMTAB_CAP	4096
+
+static void memprof_dump_symtab(global_State *g, SBuf *sb)
+{
+  const char *p = sb->b;
+  const char *e = sb->w;
+  static uintptr_t protos[MP_SYMTAB_CAP];
+  static uintptr_t traces[MP_SYMTAB_CAP];
+  int nprotos = 0, ntraces = 0;
+  int i;
+  memset(protos, 0, sizeof(protos));
+  memset(traces, 0, sizeof(traces));
+
+  /* Walk the event stream (skip the 5-byte prologue). */
+  if (p + 5 <= e) p += 5;
+  while (p < e) {
+    uint8_t hdr = (uint8_t)*p++;
+    uint8_t op = hdr >> 4;
+    uint8_t sk = hdr & 0xf;
+    if (hdr == MP_EPILOGUE_BYTE) break;
+    switch (op) {
+    case MP_OP_ALLOC:
+      memprof_read_uleb128(&p, e);	/* addr */
+      memprof_read_uleb128(&p, e);	/* size */
+      p++;					/* gct */
+      p++;					/* cls */
+      p++;					/* gcstate */
+      if (sk == MP_SRC_LFUNC) {
+	uint64_t id = memprof_read_uleb128(&p, e);
+	uintptr_t pp = (uintptr_t)id;
+	for (i = 0; i < nprotos; i++) if (protos[i] == pp) break;
+	if (i == nprotos && nprotos < MP_SYMTAB_CAP) protos[nprotos++] = pp;
+      } else if (sk == MP_SRC_TRACE) {
+	uint64_t id = memprof_read_uleb128(&p, e);
+	uintptr_t pp = (uintptr_t)id;
+	for (i = 0; i < ntraces; i++) if (traces[i] == pp) break;
+	if (i == ntraces && ntraces < MP_SYMTAB_CAP) traces[ntraces++] = pp;
+      } else {
+	memprof_read_uleb128(&p, e);
+      }
+      break;
+    case MP_OP_REALLOC:
+      memprof_read_uleb128(&p, e);	/* addr */
+      memprof_read_uleb128(&p, e);	/* osize */
+      memprof_read_uleb128(&p, e);	/* nsize */
+      memprof_read_uleb128(&p, e);	/* src_id */
+      break;
+    case MP_OP_FREE:
+      memprof_read_uleb128(&p, e);	/* addr */
+      memprof_read_uleb128(&p, e);	/* osize */
+      p++;					/* gct */
+      memprof_read_uleb128(&p, e);	/* src_id */
+      break;
+    case MP_OP_PODFREE:
+      memprof_read_uleb128(&p, e);	/* cellcount */
+      memprof_read_uleb128(&p, e);	/* bytes */
+      break;
+    default:
+      goto done;	/* unknown opcode: stop scanning */
+    }
+  }
+done:
+  /* Emit SYMTAB_LFUNC records. */
+  for (i = 0; i < nprotos; i++) {
+    GCproto *pt = (GCproto *)(void *)protos[i];
+    GCstr *cn;
+    const char *name;
+    MSize len;
+    if (pt == NULL) continue;
+    cn = proto_chunkname(pt);
+    name = strdata(cn);
+    len = cn->len;
+    lj_buf_putb(sb, (uint8_t)((MP_OP_SYMTAB_LFUNC << 4) | 0));
+    memprof_put_uleb128(sb, (uint64_t)protos[i]);
+    memprof_put_uleb128(sb, (uint64_t)len);
+    lj_buf_putmem(sb, name, len);
+    memprof_put_uleb128(sb, (uint64_t)pt->firstline);
+  }
+  /* Emit SYMTAB_TRACE records (also pick up live traces not seen in events). */
+#if LJ_HASJIT
+  {
+    jit_State *J = G2J(g);
+    MSize tn;
+    for (tn = 1; tn < J->sizetrace; tn++) {
+      GCtrace *tr = (GCtrace *)gcref(J->trace[tn]);
+      if (tr == NULL) continue;
+      GCproto *tpt = (GCproto *)gcrefp(tr->startpt, GCproto);
+      lj_buf_putb(sb, (uint8_t)((MP_OP_SYMTAB_TRACE << 4) | 0));
+      memprof_put_uleb128(sb, (uint64_t)tn);
+      memprof_put_uleb128(sb, (uint64_t)(uintptr_t)tpt);
+      memprof_put_uleb128(sb, (uint64_t)(tpt ? tpt->firstline : 0));
+    }
+  }
+#endif
+  UNUSED(g);
+}
+
+/* -- Start / Stop --------------------------------------------------------- */
+
+LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth)
+{
+  MemprofState *mps = &memprof_state;
+  global_State *g = G(L);
+  if (mps->g != NULL)
+    return 1;	/* Already active (possibly on another VM). */
+  if (outpath == NULL)
+    return 2;
+  mps->fp = fopen(outpath, "wb");
+  if (mps->fp == NULL)
+    return 2;
+  mps->g = g;
+  mps->in_emit = 0;
+  mps->depth = depth > 0 ? depth : 1;
+  lj_buf_init(L, &mps->sb);
+  lj_buf_need(&mps->sb, 4096);
+  lj_buf_reset(&mps->sb);
+  lj_buf_putmem(&mps->sb, MP_PROLOGUE_MAGIC, 3);
+  lj_buf_putb(&mps->sb, MP_STREAM_VERSION);
+  lj_buf_putb(&mps->sb, 0);	/* reserved */
+  g->gc.gcmarkflags |= GCF_MEMPROF;
+  return 0;
+}
+
+LJ_FUNC void lj_memprof_stop(lua_State *L)
+{
+  MemprofState *mps = &memprof_state;
+  global_State *g;
+  SBuf *sb;
+  if (mps->g != G(L))
+    return;	/* Not the owning VM. */
+  g = mps->g;
+  g->gc.gcmarkflags &= ~GCF_MEMPROF;
+  sb = &mps->sb;
+  memprof_dump_symtab(g, sb);
+  lj_buf_putb(sb, MP_EPILOGUE_BYTE);
+  if (mps->fp != NULL) {
+    fwrite(sb->b, 1, sbuflen(sb), mps->fp);
+    fclose(mps->fp);
+    mps->fp = NULL;
+  }
+  lj_buf_free(g, sb);
+  mps->g = NULL;
 }
 
 #endif /* LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF) */

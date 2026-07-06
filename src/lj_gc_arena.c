@@ -1225,6 +1225,10 @@ static size_t gc_bitmap_sweep(global_State *g)
     if (a->flags & ArenaFlag_PODOnly) {
       GCCellID fcells = lj_arena_podsweep(g, a);
       g->gc.total -= (GCSize)fcells << CellSizeLog2;
+#if defined(LUAJIT_ENABLE_MEMPROF)
+      if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
+	lj_memprof_emit_podfree(g, (uint32_t)fcells, (size_t)fcells << CellSizeLog2);
+#endif
       freed += GCSWEEPMAX/2;  /* Bill ~half a step's worth per POD arena. */
       ai++;
       w = UnusedBlockWords;
@@ -2124,7 +2128,11 @@ static size_t gc_onestep_raw(lua_State *L)
       lj_assertG(old >= g->gc.total, "sweep increased memory");
       g->gc.estimate -= old - g->gc.total;
       if (g->gc.sweepphase == SweepPhase_Done) {
+#if defined(LUAJIT_ENABLE_MEMPROF)
+	g->gc.gcmarkflags &= GCF_MEMPROF;
+#else
 	g->gc.gcmarkflags = 0;
+#endif
 	if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	  lj_str_resize(L, g->str.mask >> 1);
 	lj_arena_shrink(g);
@@ -2145,7 +2153,11 @@ static size_t gc_onestep_raw(lua_State *L)
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
+#if defined(LUAJIT_ENABLE_MEMPROF)
+      g->gc.gcmarkflags &= GCF_MEMPROF;
+#else
       g->gc.gcmarkflags = 0;
+#endif
       if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	lj_str_resize(L, g->str.mask >> 1);  /* Shrink string table. */
       lj_arena_shrink(g);  /* Coalesce free space, release empty arenas. */
@@ -2865,7 +2877,11 @@ void lj_gc_fullgc(lua_State *L)
       }
 #endif
     }
+#if defined(LUAJIT_ENABLE_MEMPROF)
+    g->gc.gcmarkflags &= GCF_MEMPROF;
+#else
     g->gc.gcmarkflags = 0;
+#endif
     g->gc.grayastop = 0;
     {
       MSize ii;
@@ -3037,6 +3053,10 @@ void *lj_mem_realloc(lua_State *L, void *p, GCSize osz, GCSize nsz)
   lj_assertG(checkptrGC(p),
 	     "allocated memory address %p outside required range", p);
   g->gc.total = (g->gc.total - osz) + nsz;
+#if defined(LUAJIT_ENABLE_MEMPROF)
+  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
+    lj_memprof_emit_realloc(L, p, osz, nsz);
+#endif
   return p;
 }
 
@@ -3082,6 +3102,10 @@ void *lj_mem_newgco_slow(lua_State *L, GCSize size, int cls, int link)
     else
       arena_obj_setmark(ptr2arena(o), ptr2cell(o));
   }
+#if defined(LUAJIT_ENABLE_MEMPROF)
+  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
+    lj_memprof_emit_alloc(L, o, size, cls, link);
+#endif
   if (link)
     newwhite(g, o);
   return o;
