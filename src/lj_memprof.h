@@ -56,6 +56,13 @@ LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth,
 ** Only the VM that started the profiler may stop it. */
 LJ_FUNC void lj_memprof_stop(lua_State *L);
 
+/* v6: set the current allocation label. str==NULL or len==0 clears the label
+** (current_label_id = 0). When the profiler is inactive this is a no-op.
+** Interning happens here (on the Lua-call path); the emit hook just writes
+** the current id. The string bytes are COPIED into the store (the caller's
+** GCstr may be collected before stop). */
+LJ_FUNC void lj_memprof_setlabel(lua_State *L, const char *str, size_t len);
+
 #endif /* LJ_HASGCMARK && LUAJIT_ENABLE_MEMPROF */
 
 #endif /* _LJ_MEMPROF_H */

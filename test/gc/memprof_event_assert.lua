@@ -57,12 +57,13 @@ local function parse_stream(data)
   check(magic == "ljm", "prologue magic 'ljm' (got '" .. magic .. "')")
   local version = data:byte(pos); pos = pos + 1
   check(version == 1 or version == 2 or version == 3 or version == 4
-        or version == 5,
-        "stream version 1, 2, 3, 4 or 5 (got " .. tostring(version) .. ")")
+        or version == 5 or version == 6,
+        "stream version 1, 2, 3, 4, 5 or 6 (got " .. tostring(version) .. ")")
   local has_cycle = (version >= 2)
   local has_frames = (version >= 3)
   local has_line = (version >= 4)
   local has_weight = (version >= 5)
+  local has_label = (version >= 6)
   pos = pos + 1  -- reserved
 
   local events = {}
@@ -96,6 +97,9 @@ local function parse_stream(data)
       end
       if has_weight then  -- v5: trailing uleb(weight) on ALLOC
         ev.weight, pos = read_uleb128(data, pos)
+      end
+      if has_label then  -- v6: trailing uleb(label_id) on ALLOC
+        ev.label_id, pos = read_uleb128(data, pos)
       end
     elseif op == 2 then -- REALLOC
       ev.addr, pos = read_uleb128(data, pos)

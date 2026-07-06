@@ -7,17 +7,21 @@
 -- Wire format (authoritative source: src/lj_memprof.c):
 --   * Prologue: 5 bytes  "ljm" <version> 0x00(reserved)
 --     version: 1 = original event stream; 2 = +gc_cycle field (survival-rate);
---              3 = +per-record frame stack (multi-frame attribution)
+--              3 = +per-record frame stack (multi-frame attribution);
+--              4 = +per-frame actual source line (line-precise attribution);
+--              5 = +trailing uleb(weight) on ALLOC (sampling mode);
+--              6 = +trailing uleb(label_id) on ALLOC + LABELDICT section
 --   * Event header: 1 byte  (opcode << 4) | (src_kind & 0xf)
 --     opcodes: EPILOGUE=0 ALLOC=1 REALLOC=2 FREE=3 PODFREE=4
---              SYMTAB_LFUNC=5 SYMTAB_TRACE=6 SYMTAB_CFUNC=7
+--              SYMTAB_LFUNC=5 SYMTAB_TRACE=6 SYMTAB_CFUNC=7 LABELDICT=9
 --     src_kind: INT=0 LFUNC=1 CFUNC=2 TRACE=3
 --   * Epilogue byte: 0x80  (top nibble 8)
 --   * ULEB128: little-endian base-128, high bit = continuation
 --   * ALLOC:    uleb(addr) uleb(size) byte(gct) byte(cls) byte(gcstate)
 --              uleb(src_id) [v2: uleb(gc_cycle)] [v3: uleb(nframes)
 --              nframes × (byte kind, uleb id) [v4: uleb(line) per frame]]
---              [v5: uleb(weight)]   (trailing; bytes this sample represents)
+--              [v5: uleb(weight)] [v6: uleb(label_id)]  (trailing; weight =
+--              bytes this sample represents; label_id = active label, 0=none)
 --   * REALLOC:  uleb(addr) uleb(osize) uleb(nsize) uleb(src_id)
 --              [v2: uleb(gc_cycle)] [v3: frame stack]
 --   * FREE:     uleb(addr) uleb(osize) byte(gct) uleb(src_id)
@@ -25,6 +29,9 @@
 --   * PODFREE:  uleb(cellcount) uleb(bytes)   (no cycle, no stack — aggregate)
 --   * SYMTAB_LFUNC:  uleb(proto_ptr) uleb(namelen) <namelen bytes> uleb(firstline)
 --   * SYMTAB_TRACE:  uleb(traceno) uleb(proto_ptr) uleb(firstline)
+--   * LABELDICT:     uleb(id) uleb(len) <len bytes>  (v6; id 1-based; dumped at
+--              stop after the symtab section, before the epilogue; resolves
+--              per-ALLOC label_id fields to their label strings)
 --   * gc_cycle = g->gc.stats.cycles (monotonic completed-GC-cycle counter,
 --     lj_obj.h GCstats). Appended at the END of ALLOC/REALLOC/FREE so v1
 --     readers halt cleanly on the new version byte. For v1 streams gc_cycle
@@ -58,6 +65,7 @@ local band, bor, lshift, rshift = bit.band, bit.bor, bit.lshift, bit.rshift
 local OP = {
   EPILOGUE = 0, ALLOC = 1, REALLOC = 2, FREE = 3, PODFREE = 4,
   SYMTAB_LFUNC = 5, SYMTAB_TRACE = 6, SYMTAB_CFUNC = 7,
+  LABELDICT = 9,	-- v6: label-id -> string dictionary (dumped at stop).
 }
 local SRC = { INT = 0, LFUNC = 1, CFUNC = 2, TRACE = 3 }
 local EPILOGUE_BYTE = 0x80
@@ -77,7 +85,8 @@ local STREAM_VERSION_V2 = 2
 local STREAM_VERSION_V3 = 3
 local STREAM_VERSION_V4 = 4
 local STREAM_VERSION_V5 = 5
-local STREAM_VERSION_MAX = STREAM_VERSION_V5
+local STREAM_VERSION_V6 = 6
+local STREAM_VERSION_MAX = STREAM_VERSION_V6
 
 local SRC_NAME = { [0] = "INT", "LFUNC", "CFUNC", "TRACE" }
 
@@ -166,6 +175,7 @@ function M.parse(data)
   local has_frames = (version >= STREAM_VERSION_V3)
   local has_line = (version >= STREAM_VERSION_V4)
   local has_weight = (version >= STREAM_VERSION_V5)
+  local has_label = (version >= STREAM_VERSION_V6)
   -- data:byte(5) is the reserved byte; we read but do not validate it.
 
   local events = {}
@@ -174,6 +184,7 @@ function M.parse(data)
     trace = {},  -- traceno   -> {proto_ptr=, firstline=}
   }
   local cfunc_ids = {}  -- set of CFUNC ffids seen (for diagnostics/debug)
+  local labeldict = {}  -- v6: id (1-based) -> label string; id 0 = unlabeled.
 
   local pos = PROLOGUE_LEN + 1
   while pos <= e do
@@ -200,6 +211,7 @@ function M.parse(data)
     elseif op == OP.SYMTAB_LFUNC then opname = "SYMTAB_LFUNC"
     elseif op == OP.SYMTAB_TRACE then opname = "SYMTAB_TRACE"
     elseif op == OP.SYMTAB_CFUNC then opname = "SYMTAB_CFUNC"
+    elseif op == OP.LABELDICT then opname = "LABELDICT"
     else
       -- Unknown opcode: stop parsing the event body. The C reader does the
       -- same (memprof_dump_symtab `goto done`). Any bytes we did not consume
@@ -232,11 +244,16 @@ function M.parse(data)
       -- delta. v1–v4 streams default weight=size (weight-per-object = 1).
       local weight = size
       if has_weight then weight, pos = read_uleb128(data, pos, e) end
+      -- v6: trailing uleb(label_id) — the active label at alloc time. id 0
+      -- = unlabeled (the default). Resolved to a string via labeldict at
+      -- end-of-parse; v1–v5 streams carry label_id = 0 (no field on wire).
+      local label_id = 0
+      if has_label then label_id, pos = read_uleb128(data, pos, e) end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, size = size, gct = gct, cls = cls,
         gcstate = gcstate, src_id = src_id, gc_cycle = gc_cycle,
-        weight = weight, stack = stack,
+        weight = weight, label_id = label_id, stack = stack,
       }
       if sk == SRC.CFUNC then
 	-- Record CFUNC ffids seen (diagnostics). The src_id is now the
@@ -324,6 +341,29 @@ function M.parse(data)
       pos = pos + namelen
       symtab.cfunc = symtab.cfunc or {}
       symtab.cfunc[fn_ptr] = { name = name }
+
+    elseif opname == "LABELDICT" then
+      -- v6: label-id -> string dictionary (dumped at stop, after symtab).
+      -- uleb(id) uleb(len) <len bytes>. id is 1-based; 0 is the "no label"
+      -- sentinel and never appears. Populate labeldict so events can be
+      -- resolved to their label string in the second pass below.
+      local id, labellen
+      id, pos = read_uleb128(data, pos, e)
+      labellen, pos = read_uleb128(data, pos, e)
+      if pos + labellen - 1 > e then err("truncated LABELDICT label", pos) end
+      labeldict[id] = data:sub(pos, pos + labellen - 1)
+      pos = pos + labellen
+    end
+  end
+
+  -- v6 second pass: resolve each ALLOC event's label_id to a string (or nil
+  -- for id 0 / missing dict entry). v1–v5 streams have label_id = 0 for every
+  -- event, so `label` is uniformly nil (back-compat — no field is added that
+  -- would change downstream behavior).
+  for i = 1, #events do
+    local ev = events[i]
+    if ev.label_id and ev.label_id ~= 0 then
+      ev.label = labeldict[ev.label_id]
     end
   end
 
@@ -332,6 +372,7 @@ function M.parse(data)
     events = events,
     symtab = symtab,
     cfunc_ids = cfunc_ids,
+    labeldict = labeldict,
   }
 end
 
@@ -487,6 +528,7 @@ M.STREAM_VERSION_V2 = STREAM_VERSION_V2
 M.STREAM_VERSION_V3 = STREAM_VERSION_V3
 M.STREAM_VERSION_V4 = STREAM_VERSION_V4
 M.STREAM_VERSION_V5 = STREAM_VERSION_V5
+M.STREAM_VERSION_V6 = STREAM_VERSION_V6
 M.STREAM_VERSION_MAX = STREAM_VERSION_MAX
 
 return M

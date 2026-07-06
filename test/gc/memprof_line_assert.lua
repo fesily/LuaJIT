@@ -57,8 +57,8 @@ os.remove(STREAM)
 check(#data > 5, "stream non-empty (" .. #data .. " bytes)")
 
 local parsed = parse.parse(data)
-check(parsed.version == 4 or parsed.version == 5,
-      "stream version 4 or 5 (got " .. tostring(parsed.version) .. ")")
+  check(parsed.version == 4 or parsed.version == 5 or parsed.version == 6,
+        "stream version 4, 5 or 6 (got " .. tostring(parsed.version) .. ")")
 
 local agg = aggregate.aggregate(parsed)
 

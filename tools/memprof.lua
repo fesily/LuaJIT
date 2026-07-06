@@ -23,6 +23,10 @@
 --                 temporaries), RETAINED (>0.9, long-lived / potential leak),
 --                 or MIXED. Sorted by alloc volume desc.
 --   survival-leaf Same as `survival` but keyed by the LEAF frame only.
+--   labels        Per-label allocation summary (bytes/objects per label),
+--                 showing how allocation is distributed across the labels set
+--                 via memprof.setlabel. Unlabeled allocations appear as
+--                 <none>. v1–v5 streams show a single <none> row.
 --   pprof         Serialize the aggregated per-site stats into an UNCOMPRESSED
 --                 google/pprof `Profile` protobuf (raw bytes, no gzip) so the
 --                 whole `go tool pprof` ecosystem (top/graph/web/flamegraph)
@@ -213,14 +217,34 @@ local function cmd_survival(agg, limit, opts)
   end
 end
 
+local function cmd_labels(agg)
+  local rows = aggregate.top_labels(agg)
+  if #rows == 0 then
+    io.write("(no labels recorded)\n")
+    return
+  end
+  io.write(("label        alloc_space   objects   freed_space  freed_objs  inuse_space  inuse_objs\n"))
+  for i = 1, #rows do
+    local r = rows[i]
+    io.write(("%-11s  %-11s  %-8d  %-11s  %-10d  %-11s  %-10d\n"):format(
+      r.label, fmt_bytes(r.alloc_space), r.alloc_objects,
+      fmt_bytes(r.freed_space), r.freed_objects,
+      fmt_bytes(r.inuse_space), r.inuse_objects))
+  end
+end
+
 -- -- arg parsing / dispatch -------------------------------------------------
 
 local function usage()
   io.stderr:write([[
-usage: luajit tools/memprof.lua <subcmd> <stream.bin> [limit|out]
+usage: luajit tools/memprof.lua <subcmd> <stream.bin> [limit|out] [--label=<str>]
 subcommands: top | top-leaf | collapsed | summary | leak | survival |
-             survival-leaf | pprof
+             survival-leaf | labels | pprof
   pprof <stream.bin> [out.pb]   write pprof protobuf to out.pb (or stdout)
+  --label=<str>                 filter: show only allocations under <str>
+                                (<none> for unlabeled); applies to top,
+                                top-leaf, collapsed, summary, leak, survival,
+                                survival-leaf
 ]])
 end
 
@@ -233,10 +257,19 @@ local function main(arg)
   local path = arg[2]
   local limit = tonumber(arg[3])
   local out_path = arg[3]  -- for pprof subcommand (may be "-" or a path)
+  -- Parse --label=<str> from the remaining args (positional args still work
+  -- for back-compat: `top <stream> 10 --label=A` and `top <stream> --label=A`).
+  local label_filter
+  for i = 3, #arg do
+    local a = arg[i]
+    if type(a) == "string" and a:sub(1, 8) == "--label=" then
+      label_filter = a:sub(9)
+    end
+  end
 
   local subcmds = { top = true, ["top-leaf"] = true, collapsed = true,
                     summary = true, leak = true, survival = true,
-                    ["survival-leaf"] = true, pprof = true }
+                    ["survival-leaf"] = true, labels = true, pprof = true }
   if not subcmds[subcmd] then
     io.stderr:write(("unknown subcommand: %s\n"):format(subcmd))
     usage()
@@ -256,7 +289,7 @@ local function main(arg)
   end
 
   local parsed = parse.parse(data)
-  local agg = aggregate.aggregate(parsed)
+  local agg = aggregate.aggregate(parsed, { label = label_filter })
 
   if subcmd == "top" then
     cmd_top(agg, limit, {})
@@ -272,6 +305,8 @@ local function main(arg)
     cmd_survival(agg, limit, {})
   elseif subcmd == "survival-leaf" then
     cmd_survival(agg, limit, { leaf = true })
+  elseif subcmd == "labels" then
+    cmd_labels(agg)
   elseif subcmd == "pprof" then
     cmd_pprof(agg, out_path)
   end

@@ -680,7 +680,8 @@ enum {
   MP_OP_SYMTAB_TRACE = 6,
   MP_OP_SYMTAB_CFUNC = 7,
   /* 8 is reserved as the epilogue nibble (0x80). */
-  MP_OP__END = 9
+  MP_OP_LABELDICT = 9,	/* v6: label-id -> string dictionary (dumped at stop). */
+  MP_OP__END = 10
 };
 /* The epilogue byte: top nibble 8, bottom nibble 0. */
 #define MP_EPILOGUE_BYTE	0x80
@@ -692,7 +693,7 @@ enum {
   MP_SRC_TRACE = 3
 };
 
-#define MP_STREAM_VERSION	5
+#define MP_STREAM_VERSION	6
 #define MP_PROLOGUE_MAGIC	"ljm"
 #define MP_MAX_DEPTH		32	/* Cap on per-event stack walk depth. */
 
@@ -713,6 +714,24 @@ typedef struct {
   uint32_t count;	/* Live entries (== used; backward-shift has no tombstones). */
 } SampleSet;
 
+/* v6 label dictionary: a string-interning store mapping small 1-based ids to
+** copied label bytes. Managed via g->allocf (raw memory, NOT Lua tables —
+** consistent with the sampled-address set above), because the store must not
+** hold GCstr pointers (a label string may be collected before stop) and must
+** be safe to touch from the stop path. Interndedded on the setlabel
+** (Lua-call) path only; the emit hook just writes the current id.
+** current_label_id == 0 means "no label" (the default for unlabeled allocs). */
+typedef struct {
+  char *bytes;		/* Copied label bytes (allocf-managed; NOT NUL-terminated). */
+  uint32_t len;		/* Number of bytes in `bytes`. */
+} LabelEntry;
+
+typedef struct {
+  LabelEntry *entries;	/* Array of length `cap`; ids are 1-based (entries[id-1]). */
+  uint32_t count;	/* Number of live labels (ids 1..count). */
+  uint32_t cap;		/* Array capacity (doubled on grow). */
+} LabelDict;
+
 typedef struct MemprofState {
   global_State *g;	/* Owning VM, or NULL when inactive. */
   SBuf sb;		/* In-memory event stream. */
@@ -722,6 +741,8 @@ typedef struct MemprofState {
   uint64_t interval;	/* Sampling period in bytes; 0 = EXACT mode (default). */
   uint64_t accum;	/* Byte accumulator (sampling mode only). */
   SampleSet sampled;	/* Sampled-address set (sampling mode only). */
+  LabelDict labels;	/* v6: interned label strings (ids 1..count). */
+  uint32_t current_label_id;	/* v6: active label (0 = none). Set by setlabel. */
 } MemprofState;
 
 static MemprofState memprof_state;
@@ -846,6 +867,68 @@ static void sampleset_free(SampleSet *s, global_State *g)
     s->slots = NULL;
     s->mask = 0;
     s->count = 0;
+  }
+}
+
+/* -- Label dictionary (raw allocf, linear-scan dedup) -------------------- */
+
+/* v6 label interning: dedup `str` (len bytes) against the live label dict,
+** returning the existing 1-based id if seen, or a new id (copying the bytes
+** via g->allocf) on first sight. `str == NULL` or `len == 0` returns 0
+** (the "no label" sentinel). Called ONLY on the setlabel Lua-call path
+** (has L, safe to allocate); the emit hook just reads current_label_id.
+** Label counts are expected to be small (tens), so a linear scan is fine. */
+static uint32_t label_intern(MemprofState *mps, global_State *g,
+			     const char *str, size_t len)
+{
+  uint32_t i, newid;
+  LabelEntry *e;
+  char *copy;
+  if (str == NULL || len == 0 || len > 0xffffffffu)
+    return 0;
+  /* Dedup: linear scan for an identical (bytes,len) entry. */
+  for (i = 0; i < mps->labels.count; i++) {
+    LabelEntry *p = &mps->labels.entries[i];
+    if (p->len == (uint32_t)len && memcmp(p->bytes, str, len) == 0)
+      return i + 1;	/* 1-based id. */
+  }
+  /* Grow the entries array (doubling) if full. Start at 8 on first insert. */
+  if (mps->labels.count >= mps->labels.cap) {
+    uint32_t newcap = mps->labels.cap ? mps->labels.cap << 1 : 8;
+    LabelEntry *newe = (LabelEntry *)g->allocf(g->allocd,
+			mps->labels.entries,
+			(size_t)mps->labels.cap * sizeof(LabelEntry),
+			(size_t)newcap * sizeof(LabelEntry));
+    if (newe == NULL) return 0;	/* OOM: leave current_label_id unchanged. */
+    mps->labels.entries = newe;
+    mps->labels.cap = newcap;
+  }
+  /* Copy the label bytes via allocf (do NOT hold the GCstr pointer — the
+  ** string may be collected before stop). */
+  copy = (char *)g->allocf(g->allocd, NULL, 0, len);
+  if (copy == NULL) return 0;	/* OOM: leave label unset. */
+  memcpy(copy, str, len);
+  newid = ++mps->labels.count;
+  e = &mps->labels.entries[newid - 1];
+  e->bytes = copy;
+  e->len = (uint32_t)len;
+  return newid;
+}
+
+/* Free every copied label string + the entries array (called at stop). */
+static void labeldict_free(LabelDict *ld, global_State *g)
+{
+  if (ld->entries != NULL) {
+    uint32_t i;
+    for (i = 0; i < ld->count; i++) {
+      if (ld->entries[i].bytes != NULL)
+	g->allocf(g->allocd, ld->entries[i].bytes, ld->entries[i].len, 0);
+    }
+    g->allocf(g->allocd, ld->entries,
+	      (size_t)ld->cap * sizeof(LabelEntry), 0);
+    ld->entries = NULL;
+    ld->count = 0;
+    ld->cap = 0;
   }
 }
 
@@ -997,6 +1080,7 @@ LJ_FUNC void lj_memprof_emit_alloc(lua_State *L, void *o, GCSize size,
   memprof_put_uleb128(sb, (uint64_t)g->gc.stats.cycles);  /* v2: cycle */
   memprof_emit_frames(sb, frames, nframes);  /* v3: leaf..root stack */
   memprof_put_uleb128(sb, weight);  /* v5: trailing weight (end-of-record) */
+  memprof_put_uleb128(sb, mps->current_label_id);  /* v6: label id (0=none) */
   if (mps->interval)
     sampleset_add(&mps->sampled, g, (uintptr_t)o);  /* record sampled addr */
   mps->in_emit = 0;
@@ -1050,6 +1134,7 @@ LJ_FUNC void lj_memprof_emit_realloc(lua_State *L, void *p,
     ** weight. Exact mode: weight == nsize (no scaling). Sampling mode only
     ** reaches here for set members (see the gate above). */
     memprof_put_uleb128(sb, (uint64_t)nsize);
+    memprof_put_uleb128(sb, mps->current_label_id);  /* v6: label id (0=none) */
   }
   if (mps->interval && op == MP_OP_FREE)
     sampleset_remove(&mps->sampled, g, (uintptr_t)p);
@@ -1181,13 +1266,14 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
   memset(traces, 0, sizeof(traces));
 
   /* Walk the event stream (skip the 5-byte prologue). */
-  int has_cycle = 0, has_frames = 0, has_line = 0, has_weight = 0;
+  int has_cycle = 0, has_frames = 0, has_line = 0, has_weight = 0, has_label = 0;
   if (p + 5 <= e) {
     uint8_t ver = (uint8_t)p[3];
     has_cycle = (ver >= 2);   /* v2+ appends a gc_cycle uleb128 */
     has_frames = (ver >= 3); /* v3+ appends a frame stack */
     has_line = (ver >= 4);   /* v4+ appends a per-frame uleb line */
     has_weight = (ver >= 5); /* v5+ appends a trailing uleb weight on ALLOC */
+    has_label = (ver >= 6);  /* v6+ appends a trailing uleb label_id on ALLOC */
     p += 5;
   }
   while (p < e) {
@@ -1213,6 +1299,7 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
       if (has_frames)
 	symtab_read_frames(&p, e, has_line, protos, &nprotos, traces, &ntraces);
       if (has_weight) memprof_read_uleb128(&p, e);  /* v5: trailing weight */
+      if (has_label) memprof_read_uleb128(&p, e);  /* v6: trailing label_id */
       break;
     case MP_OP_REALLOC:
       memprof_read_uleb128(&p, e);	/* addr */
@@ -1282,6 +1369,25 @@ done:
   UNUSED(g);
 }
 
+/* v6: dump the LABELDICT section — one record per interned label id, so the
+** offline tool can resolve per-ALLOC label ids back to their strings. Each
+** record: header byte (MP_OP_LABELDICT<<4 | 0), uleb(id), uleb(len), len bytes.
+** Emitted at stop AFTER the symtab section and BEFORE the epilogue. The
+** header high nibble is 9 (0x90), which cannot collide with the 0x80 epilogue
+** byte (the scanner checks `hdr == 0x80` first). ids are 1-based; id 0 is the
+** "no label" sentinel and is never emitted. */
+static void memprof_dump_labeldict(MemprofState *mps, SBuf *sb)
+{
+  uint32_t i;
+  for (i = 0; i < mps->labels.count; i++) {
+    lj_buf_putb(sb, (uint8_t)((MP_OP_LABELDICT << 4) | 0));
+    memprof_put_uleb128(sb, (uint64_t)(i + 1));		/* 1-based id */
+    memprof_put_uleb128(sb, (uint64_t)mps->labels.entries[i].len);
+    lj_buf_putmem(sb, mps->labels.entries[i].bytes,
+		  (MSize)mps->labels.entries[i].len);
+  }
+}
+
 /* -- Start / Stop --------------------------------------------------------- */
 
 LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth,
@@ -1304,6 +1410,10 @@ LJ_FUNC int lj_memprof_start(lua_State *L, const char *outpath, int depth,
   mps->sampled.slots = NULL;
   mps->sampled.mask = 0;
   mps->sampled.count = 0;
+  mps->labels.entries = NULL;
+  mps->labels.count = 0;
+  mps->labels.cap = 0;
+  mps->current_label_id = 0;
   lj_buf_init(L, &mps->sb);
   lj_buf_need(&mps->sb, 4096);
   lj_buf_reset(&mps->sb);
@@ -1325,6 +1435,7 @@ LJ_FUNC void lj_memprof_stop(lua_State *L)
   g->gc.gcmarkflags &= ~GCF_MEMPROF;
   sb = &mps->sb;
   memprof_dump_symtab(g, sb);
+  memprof_dump_labeldict(mps, sb);  /* v6: label-id -> string dictionary. */
   lj_buf_putb(sb, MP_EPILOGUE_BYTE);
   if (mps->fp != NULL) {
     fwrite(sb->b, 1, sbuflen(sb), mps->fp);
@@ -1333,9 +1444,29 @@ LJ_FUNC void lj_memprof_stop(lua_State *L)
   }
   lj_buf_free(g, sb);
   sampleset_free(&mps->sampled, g);  /* v5: release the sampled-address set. */
+  labeldict_free(&mps->labels, g);  /* v6: release the label dictionary. */
+  mps->current_label_id = 0;
   mps->interval = 0;
   mps->accum = 0;
   mps->g = NULL;
+}
+
+/* v6: set the current allocation label. Called from the memprof.setlabel
+** Lua function (the Lua-call path — has L, safe to intern via g->allocf).
+** str==NULL or len==0 clears the label (current_label_id = 0). When the
+** profiler is inactive (mps->g == NULL) this is a documented no-op. */
+LJ_FUNC void lj_memprof_setlabel(lua_State *L, const char *str, size_t len)
+{
+  MemprofState *mps = &memprof_state;
+  global_State *g;
+  if (mps->g == NULL) return;	/* inactive: no-op (documented). */
+  if (mps->g != G(L)) return;	/* not the owning VM. */
+  g = mps->g;
+  if (str == NULL || len == 0) {
+    mps->current_label_id = 0;
+    return;
+  }
+  mps->current_label_id = label_intern(mps, g, str, len);
 }
 
 #endif /* LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF) */

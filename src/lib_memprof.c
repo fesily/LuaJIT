@@ -159,6 +159,29 @@ LJLIB_CF(memprof_stop)
 #endif
 }
 
+/* memprof.setlabel(str|nil) -> true
+** Tags subsequent ALLOC events with the given label string so the offline
+** tool can filter/group allocations by context (route, worker, tenant, ...).
+** setlabel(nil) clears the label (back to unlabeled). When the profiler is
+** inactive, setlabel is a no-op. The string bytes are copied internally,
+** so the caller's string may be collected before memprof.stop. */
+LJLIB_CF(memprof_setlabel)
+{
+#if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
+  if (L->base < L->top && tvisstr(L->base)) {
+    GCstr *s = strV(L->base);
+    lj_memprof_setlabel(L, strdata(s), s->len);
+  } else {
+    /* nil or no argument: clear the current label. */
+    lj_memprof_setlabel(L, NULL, 0);
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+#else
+  return luaL_error(L, "memprof not enabled (build with -DLUAJIT_ENABLE_MEMPROF)");
+#endif
+}
+
 #include "lj_libdef.h"
 
 #if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)

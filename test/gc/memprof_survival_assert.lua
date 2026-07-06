@@ -116,8 +116,8 @@ check(#data > 5, "stream non-empty (" .. #data .. " bytes)")
 
   local parsed = parse.parse(data)
   check(parsed.version == 2 or parsed.version == 3 or parsed.version == 4
-        or parsed.version == 5,
-        "stream version 2, 3, 4 or 5 (got " .. tostring(parsed.version) .. ")")
+        or parsed.version == 5 or parsed.version == 6,
+        "stream version 2, 3, 4, 5 or 6 (got " .. tostring(parsed.version) .. ")")
   local agg = aggregate.aggregate(parsed)
   local surv = agg.survival
   check(surv ~= nil, "aggregate produced survival table")

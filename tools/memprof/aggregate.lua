@@ -68,7 +68,16 @@ local function leaf_key(ev, symtab)
   return parse.site_label(ev.src, ev.src_id, symtab)
 end
 
+-- Sentinel label string for unlabeled allocations in the `labels` summary and
+-- the --label filter. Using a human-readable tag keeps the CLI output obvious
+-- and avoids nil-key issues in Lua tables.
+local LABEL_NONE = "<none>"
+
 -- Main entry point. `parsed` is the table returned by parse.parse().
+-- `opts` (optional): { label = "<str>" } — when set, only allocations carrying
+-- that label (or LABEL_NONE for unlabeled) are billed; FREE/REALLOC are billed
+-- only if their original ALLOC carried the matching label. This filters the
+-- ENTIRE view (sites, types, leaks, survival, totals) to one label's slice.
 -- Returns:
 --   sites:       full-stack keyed { [stack_label] = {alloc_space=, ...} }
 --   sites_leaf:  leaf-only keyed { [leaf_label]  = {alloc_space=, ...} }
@@ -83,16 +92,19 @@ end
 --                  cycles = per-cycle }
 -- For depth=1 streams the full-stack and leaf labels coincide, so the two
 -- views are identical (back-compat with the v1/v2 single-frame aggregator).
-function M.aggregate(parsed)
+function M.aggregate(parsed, opts)
+  opts = opts or {}
+  local label_filter = opts.label
   local events = parsed.events
   local symtab = parsed.symtab
 
   local sites = {}
   local sites_leaf = {}
   local types = {}
+  local labels = {}            -- [label_str] = {alloc_space, alloc_objects, ...}
   local leaks = {}             -- full-stack -> { addr -> lastsize }
   local leaks_leaf = {}        -- leaf-only  -> { addr -> lastsize }
-  local live = {}              -- addr -> { site=, leaf=, size=, cycle= }
+  local live = {}              -- addr -> { site=, leaf=, size=, weight=, cycle=, label= }
   -- survival tracking: per-site alloc counts by birth cycle; survivors counted
   -- post-loop from `live`. freed-by-addr removes the live entry, so whatever
   -- remains live at end-of-stream is a survivor of its birth cycle.
@@ -162,6 +174,26 @@ function M.aggregate(parsed)
     end
     return t
   end
+  -- Accumulate (alloc,freed,inuse) deltas into the per-label summary. The
+  -- label key is the resolved string or LABEL_NONE for unlabeled (id 0).
+  local function label_key(ev)
+    return ev.label or LABEL_NONE
+  end
+  local function label_bill(lkey, da_s, da_o, df_s, df_o, di_s, di_o)
+    local t = labels[lkey]
+    if not t then
+      t = { alloc_space = 0, alloc_objects = 0,
+            freed_space = 0, freed_objects = 0,
+            inuse_space = 0, inuse_objects = 0 }
+      labels[lkey] = t
+    end
+    t.alloc_space = t.alloc_space + da_s
+    t.alloc_objects = t.alloc_objects + da_o
+    t.freed_space = t.freed_space + df_s
+    t.freed_objects = t.freed_objects + df_o
+    t.inuse_space = t.inuse_space + di_s
+    t.inuse_objects = t.inuse_objects + di_o
+  end
 
   for i = 1, #events do
     local ev = events[i]
@@ -170,28 +202,37 @@ function M.aggregate(parsed)
     if op == "ALLOC" then
       local skey = site_key(ev, symtab)
       local lkey = leaf_key(ev, symtab)
+      local ev_label = label_key(ev)
       -- v5 sampling: weight = bytes this sample represents; obj = weight/size
       -- = the population-object count. Exact mode: weight == size, obj == 1.
       local w = ev.weight or ev.size
       local obj = w / ev.size
-      bill(skey, lkey, w, obj, 0, 0, w, obj)
-      totals.alloc_space = totals.alloc_space + w
-      totals.alloc_objects = totals.alloc_objects + obj
-      totals.inuse_space = totals.inuse_space + w
-      totals.inuse_objects = totals.inuse_objects + obj
-      -- Type axis: ALLOC carries cls (arena-class). gct is 0 at inline time.
-      local tag = parse.cls_name(ev.cls)
-      local tt = type_tab(tag)
-      tt.alloc_space = tt.alloc_space + w
-      tt.alloc_objects = tt.alloc_objects + obj
-      -- Track live addr for leak view and FREE matching. Store weight so the
-      -- matching FREE bills the same population (keeps inuse non-negative).
-      local cyc = ev.gc_cycle or 0
-      live[ev.addr] = { site = skey, leaf = lkey, size = ev.size,
-			weight = w, cycle = cyc }
-      surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf, obj)
-      leak_add(leaks, skey, ev.addr, w)
-      leak_add(leaks_leaf, lkey, ev.addr, w)
+      -- Label filter: skip this ALLOC entirely if its label does not match.
+      if label_filter and ev_label ~= label_filter then
+        -- Still track the addr in `live` so a later FREE under a different
+        -- label can find it (but do NOT bill it to this filtered view).
+        live[ev.addr] = { site = skey, leaf = lkey, size = ev.size,
+			  weight = w, cycle = ev.gc_cycle or 0,
+			  label = ev_label, filtered = true }
+      else
+	bill(skey, lkey, w, obj, 0, 0, w, obj)
+	label_bill(ev_label, w, obj, 0, 0, w, obj)
+	totals.alloc_space = totals.alloc_space + w
+	totals.alloc_objects = totals.alloc_objects + obj
+	totals.inuse_space = totals.inuse_space + w
+	totals.inuse_objects = totals.inuse_objects + obj
+	-- Type axis: ALLOC carries cls (arena-class). gct is 0 at inline time.
+	local tag = parse.cls_name(ev.cls)
+	local tt = type_tab(tag)
+	tt.alloc_space = tt.alloc_space + w
+	tt.alloc_objects = tt.alloc_objects + obj
+	local cyc = ev.gc_cycle or 0
+	live[ev.addr] = { site = skey, leaf = lkey, size = ev.size,
+			  weight = w, cycle = cyc, label = ev_label }
+	surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf, obj)
+	leak_add(leaks, skey, ev.addr, w)
+	leak_add(leaks_leaf, lkey, ev.addr, w)
+      end
 
     elseif op == "REALLOC" then
       -- True resize (osz!=0, nsize!=0). Bill the old object's weight as freed
@@ -203,6 +244,18 @@ function M.aggregate(parsed)
       local lkey = leaf_key(ev, symtab)
       local prev = live[ev.addr]
       local cyc = ev.gc_cycle or 0
+      local prev_label = (prev and prev.label) or LABEL_NONE
+      -- Label filter: skip REALLOCs whose original ALLOC was under a different
+      -- label, keeping the filtered view consistent with the ALLOC filter.
+      if label_filter and prev_label ~= label_filter then
+	-- Preserve the live entry (resized) but skip billing; keep filtered
+        -- so a later FREE is also skipped.
+	if prev then
+	  live[ev.addr] = { site = skey, leaf = lkey, size = ev.nsize,
+			    weight = ev.nsize, cycle = cyc,
+			    label = prev_label, filtered = true }
+	end
+      else
       local fw, fobj
       if prev then
         fw = prev.weight
@@ -217,6 +270,7 @@ function M.aggregate(parsed)
       local nw = ev.nsize
       local nobj = 1
       bill(skey, lkey, nw, nobj, fw, fobj, nw - fw, nobj - fobj)
+      label_bill(prev_label, nw, nobj, fw, fobj, nw - fw, nobj - fobj)
       totals.freed_space = totals.freed_space + fw
       totals.freed_objects = totals.freed_objects + fobj
       totals.inuse_space = totals.inuse_space - fw
@@ -236,24 +290,22 @@ function M.aggregate(parsed)
       tt.freed_objects = tt.freed_objects + fobj
       -- Update live/leak tracking for this addr.
       live[ev.addr] = { site = skey, leaf = lkey, size = ev.nsize,
-			weight = nw, cycle = cyc }
+			weight = nw, cycle = cyc, label = prev_label }
       surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf, nobj)
       leak_add(leaks, skey, ev.addr, nw)
       leak_add(leaks_leaf, lkey, ev.addr, nw)
+      end
 
     elseif op == "FREE" then
       totals.free_count = totals.free_count + 1
       local osize = ev.osize
-      -- FREE records always carry src_kind=INT (the GC frees, not the user),
-      -- so the site is INTERNAL from the event's perspective. But for leak
-      -- accounting we want to credit the FREE back to the ORIGINAL alloc
-      -- site (which we know from live[addr]). This gives accurate per-site
-      -- inuse deltas and a correct leak view.
-      -- v5 sampling: bill the original ALLOC's weight/size so the FREE
-      -- represents the same population as the ALLOC (inuse stays non-negative
-      -- and consistent). The sampled-address set in the C emitter guarantees a
-      -- FREE only arrives for a previously-sampled (recorded) addr.
       local prev = live[ev.addr]
+      local prev_label = (prev and prev.label) or LABEL_NONE
+      -- Label filter: skip FREEs whose original ALLOC was under a different
+      -- label (or was filtered out at ALLOC time).
+      if label_filter and prev_label ~= label_filter then
+	if prev then live[ev.addr] = nil end
+      else
       local skey, lkey, fw, fobj
       if prev then
         skey = prev.site
@@ -278,6 +330,7 @@ function M.aggregate(parsed)
       if st.inuse_objects < 0 then st.inuse_objects = 0 end
       local stl = apply_stat(sites_leaf, lkey, 0, 0, fw, fobj, -fw, -fobj)
       if stl.inuse_objects < 0 then stl.inuse_objects = 0 end
+      label_bill(prev_label, 0, 0, fw, fobj, -fw, -fobj)
       totals.freed_space = totals.freed_space + fw
       totals.freed_objects = totals.freed_objects + fobj
       totals.inuse_space = totals.inuse_space - fw
@@ -288,6 +341,7 @@ function M.aggregate(parsed)
       local tt = type_tab(tag)
       tt.freed_space = tt.freed_space + fw
       tt.freed_objects = tt.freed_objects + fobj
+      end
 
     elseif op == "PODFREE" then
       totals.podfree_count = totals.podfree_count + 1
@@ -415,6 +469,7 @@ function M.aggregate(parsed)
     sites = sites,
     sites_leaf = sites_leaf,
     types = types,
+    labels = labels,
     leaks = pruned_leaks,
     leaks_leaf = pruned_leaks_leaf,
     totals = totals,
@@ -483,6 +538,32 @@ function M.survival_sites(agg, limit, opts)
   if limit and #rows > limit then
     for i = #rows, limit + 1, -1 do rows[i] = nil end
   end
+  return rows
+end
+
+M.LABEL_NONE = LABEL_NONE
+
+-- Return per-label rows sorted descending by alloc_space (the `labels` view).
+-- Each row: { label=, alloc_space=, alloc_objects=, freed_space=,
+-- freed_objects=, inuse_space=, inuse_objects= }. `agg.labels` is populated by
+-- M.aggregate; for v1–v5 streams (no label_id field) every ALLOC falls under
+-- LABEL_NONE, so the view shows a single row (back-compat).
+function M.top_labels(agg)
+  local rows = {}
+  for label, st in pairs(agg.labels or {}) do
+    rows[#rows+1] = { label = label, alloc_space = st.alloc_space,
+                     alloc_objects = st.alloc_objects,
+                     freed_space = st.freed_space,
+                     freed_objects = st.freed_objects,
+                     inuse_space = st.inuse_space,
+                     inuse_objects = st.inuse_objects }
+  end
+  table.sort(rows, function(a, b)
+    if a.alloc_space ~= b.alloc_space then
+      return a.alloc_space > b.alloc_space
+    end
+    return a.label < b.label
+  end)
   return rows
 end
 
