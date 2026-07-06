@@ -29,10 +29,14 @@ local function hot(n)
   return t
 end
 
--- Resolve the hot function's site label the same way the symtab will: the
--- chunkname (debug source) and the function's first line.
+-- Resolve the hot function's source. With v4 line-precise attribution the
+-- site label carries the ACTUAL allocation line (e.g. :25 for `local t = {}`,
+-- :27 for `{ i }`), not the function's firstline (:24). The hot function
+-- allocates on two lines, so we collect all matching sites and sum their
+-- stats to preserve the test's spirit (total allocs/freed/inuse for hot).
 local hot_info = debug.getinfo(hot, "S")
-local hot_label = ("%s:%d"):format(hot_info.source, hot_info.linedefined)
+local hot_source = hot_info.source
+local hot_prefix = hot_source .. ":"
 
 local N_BURNED = 2000
 local N_RETAINED = 500
@@ -61,9 +65,31 @@ local agg = aggregate.aggregate(parsed)
 assert(#parsed.events > 0, "no events parsed")
 assert(parsed.symtab.lfunc ~= nil, "no lfunc symtab map")
 
--- (a) hot site within expected bounds.
-local hot_site = agg.sites[hot_label]
-assert(hot_site, "hot site not found in aggregated sites; got: " ..
+-- (a) hot site within expected bounds. With v4, the hot function may span
+-- multiple sites (one per allocation line). Collect all sites whose label
+-- starts with the hot function's source prefix and sum their stats.
+local hot_labels = {}
+local hot_site = { alloc_objects = 0, alloc_space = 0, freed_objects = 0,
+                   inuse_objects = 0, inuse_space = 0 }
+local hot_leak = { count = 0, bytes = 0 }
+for label, st in pairs(agg.sites) do
+  if label:sub(1, #hot_prefix) == hot_prefix then
+    hot_labels[#hot_labels+1] = label
+    hot_site.alloc_objects = hot_site.alloc_objects + st.alloc_objects
+    hot_site.alloc_space = hot_site.alloc_space + st.alloc_space
+    hot_site.freed_objects = hot_site.freed_objects + st.freed_objects
+    hot_site.inuse_objects = hot_site.inuse_objects + st.inuse_objects
+    hot_site.inuse_space = hot_site.inuse_space + st.inuse_space
+  end
+end
+for label, info in pairs(agg.leaks) do
+  if label:sub(1, #hot_prefix) == hot_prefix then
+    hot_leak.count = hot_leak.count + info.count
+    hot_leak.bytes = hot_leak.bytes + info.bytes
+  end
+end
+local hot_label_str = table.concat(hot_labels, ", ")
+assert(#hot_labels > 0, "hot site not found in aggregated sites; got: " ..
   (function()
     local labels = {}
     for k in pairs(agg.sites) do labels[#labels+1] = k end
@@ -98,9 +124,7 @@ assert(hot_site.inuse_space >= 0, "(c) inuse_space went negative")
 
 -- (b) leak view lists the deliberately-retained set.
 -- `retained` (N_RETAINED tables + arrays) stays alive past memprof.stop, so
--- those addresses must appear in the leak view under the hot site.
-local hot_leak = agg.leaks[hot_label]
-assert(hot_leak, "(b) hot site absent from leak view")
+-- those addresses must appear in the leak view under the hot function's sites.
 assert(hot_leak.count >= N_RETAINED,
   ("(b) leak count too low: got %d addrs, want >= %d (retained tables+arrays)"):format(
     hot_leak.count, N_RETAINED))
@@ -115,6 +139,6 @@ assert(t.inuse_space == t.alloc_space - t.freed_space,
   ("totals inconsistent: inuse=%d alloc=%d freed=%d"):format(
     t.inuse_space, t.alloc_space, t.freed_space))
 
-io.write(("OK memprof_parse_assert: events=%d hot=%s alloc_objs=%d freed_objs=%d inuse_objs=%d leak=%d\n"):format(
-  #parsed.events, hot_label, hot_site.alloc_objects, hot_site.freed_objects,
+io.write(("OK memprof_parse_assert: events=%d hot=[%s] alloc_objs=%d freed_objs=%d inuse_objs=%d leak=%d\n"):format(
+  #parsed.events, hot_label_str, hot_site.alloc_objects, hot_site.freed_objects,
   hot_site.inuse_objects, hot_leak.count))

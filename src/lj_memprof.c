@@ -621,6 +621,17 @@ LJ_FUNC int lj_memprof_diff(lua_State *L)
 **   the v3 record shape is uniform across ALLOC/REALLOC/FREE. PODFREE is
 **   unchanged (aggregate, no per-object stack). v1/v2 streams synthesize a
 **   1-element leaf stack in the parser for back-compat.
+**
+** v4 (line-precise attribution): every frame in the v3 suffix gains a
+**   trailing uleb128 `line` field, so the frame suffix becomes
+**     nframes × (byte kind, uleb id, uleb line)
+**   For LFUNC frames `line` is the ACTUAL source line of the currently
+**   executing bytecode instruction (via lj_debug_frameline, which derives
+**   the live PC and maps it through the proto's line info), NOT the
+**   function's definition line (pt->firstline). CFUNC/TRACE/INT frames
+**   carry line=0 (no bytecode line). The offline tool renders
+**   chunkname:ACTUAL_line for v4 streams and falls back to the symtab's
+**   firstline for v1/v2/v3 streams. v1/v2/v3 stream parsing is unchanged.
 ** ======================================================================== **/
 
 /* -- Wire format constants ------------------------------------------------ */
@@ -647,7 +658,7 @@ enum {
   MP_SRC_TRACE = 3
 };
 
-#define MP_STREAM_VERSION	3
+#define MP_STREAM_VERSION	4
 #define MP_PROLOGUE_MAGIC	"ljm"
 #define MP_MAX_DEPTH		32	/* Cap on per-event stack walk depth. */
 
@@ -679,10 +690,15 @@ static void memprof_put_uleb128(SBuf *sb, uint64_t v)
 
 /* A single resolved frame in the per-allocation call stack (leaf..root).
 ** kind is one of MP_SRC_{INT,LFUNC,CFUNC,TRACE}; id is the per-kind
-** identifier (LFUNC: proto pointer, CFUNC: ffid, TRACE: traceno, INT: 0). */
+** identifier (LFUNC: proto pointer, CFUNC: ffid, TRACE: traceno, INT: 0).
+** line is the ACTUAL source line for LFUNC frames (v4 line-precise
+** attribution via lj_debug_frameline), or 0 for CFUNC/TRACE/INT frames
+** (no bytecode line). For v1/v2/v3 streams the parser sets line=0 and
+** falls back to the symtab's firstline for display. */
 typedef struct MemprofFrame {
   uint8_t kind;
   uint64_t id;
+  BCLine line;
 } MemprofFrame;
 
 /* Fill `frames` (leaf at index 0) by walking the Lua call stack, returning
@@ -700,6 +716,7 @@ static int memprof_attribution(global_State *g, lua_State *L,
   if (vmstate >= 0) {
     frames[0].kind = MP_SRC_TRACE;
     frames[0].id = (uint64_t)vmstate;
+    frames[0].line = 0;
     return 1;
   }
   {
@@ -707,6 +724,7 @@ static int memprof_attribution(global_State *g, lua_State *L,
     if (vs != LJ_VMST_INTERP && vs != LJ_VMST_C) {
       frames[0].kind = MP_SRC_INT;
       frames[0].id = 0;
+      frames[0].line = 0;
       return 1;
     }
   }
@@ -715,18 +733,28 @@ static int memprof_attribution(global_State *g, lua_State *L,
     for (level = 0; level < cap; level++) {
       int size;
       cTValue *frame = lj_debug_frame(L, level, &size);
+      cTValue *nextframe;
       GCfunc *fn;
       if (frame == NULL) break;  /* past the outermost frame */
+      nextframe = size ? frame+size : NULL;
       fn = frame_func(frame);
       if (isluafunc(fn)) {
-	frames[n].kind = MP_SRC_LFUNC;
-	frames[n].id = (uint64_t)(uintptr_t)funcproto(fn);
+        frames[n].kind = MP_SRC_LFUNC;
+        frames[n].id = (uint64_t)(uintptr_t)funcproto(fn);
+        {
+          BCLine ln = lj_debug_frameline(L, fn, nextframe);
+          if (ln == (BCLine)-1)
+            ln = funcproto(fn)->firstline;
+          frames[n].line = ln;
+        }
       } else if (iscfunc(fn) || isffunc(fn)) {
-	frames[n].kind = MP_SRC_CFUNC;
-	frames[n].id = (uint64_t)fn->c.ffid;
+        frames[n].kind = MP_SRC_CFUNC;
+        frames[n].id = (uint64_t)fn->c.ffid;
+        frames[n].line = 0;
       } else {
-	frames[n].kind = MP_SRC_INT;
-	frames[n].id = 0;
+        frames[n].kind = MP_SRC_INT;
+        frames[n].id = 0;
+        frames[n].line = 0;
       }
       n++;
     }
@@ -734,12 +762,16 @@ static int memprof_attribution(global_State *g, lua_State *L,
   if (n == 0) {
     frames[0].kind = MP_SRC_INT;
     frames[0].id = 0;
+    frames[0].line = 0;
     n = 1;
   }
   return n;
 }
 
-/* Emit the v3 frame-stack suffix: uleb(nframes) then nframes × (byte,uleb). */
+/* Emit the v4 frame-stack suffix: uleb(nframes) then
+** nframes × (byte kind, uleb id, uleb line). The per-frame `line` field
+** (v4) carries the actual source line for LFUNC frames; v1/v2/v3 streams
+** do not have this field (the parser defaults line=0 / firstline). */
 static void memprof_emit_frames(SBuf *sb, const MemprofFrame *frames, int n)
 {
   int i;
@@ -747,6 +779,7 @@ static void memprof_emit_frames(SBuf *sb, const MemprofFrame *frames, int n)
   for (i = 0; i < n; i++) {
     lj_buf_putb(sb, frames[i].kind);
     memprof_put_uleb128(sb, frames[i].id);
+    memprof_put_uleb128(sb, (uint64_t)frames[i].line);
   }
 }
 
@@ -833,7 +866,7 @@ LJ_FUNC void lj_memprof_emit_free(global_State *g, void *o,
   memprof_put_uleb128(sb, (uint64_t)mps->g->gc.stats.cycles);  /* v2: cycle */
   /* v3: FREE has no walkable Lua stack (emitted from sweep); single INT frame. */
   {
-    MemprofFrame fint = { MP_SRC_INT, 0 };
+    MemprofFrame fint = { MP_SRC_INT, 0, 0 };
     memprof_emit_frames(sb, &fint, 1);
   }
   mps->in_emit = 0;
@@ -894,8 +927,11 @@ static void symtab_note_trace(uintptr_t tt, uintptr_t *traces, int *ntraces)
   if (*ntraces < MP_SYMTAB_CAP) traces[(*ntraces)++] = tt;
 }
 
-/* Read and discard a v3 frame stack, collecting unique LFUNC/TRACE ids. */
-static void symtab_read_frames(const char **pp, const char *e,
+/* Read and discard a v3/v4 frame stack, collecting unique LFUNC/TRACE ids.
+** v4+ streams carry an extra uleb128 `line` field per frame (the actual
+** source line for LFUNC frames); v3 streams stop after `id`. The `has_line`
+** flag selects which shape to read so the scanner does not desync. */
+static void symtab_read_frames(const char **pp, const char *e, int has_line,
 			       uintptr_t *protos, int *nprotos,
 			       uintptr_t *traces, int *ntraces)
 {
@@ -908,6 +944,7 @@ static void symtab_read_frames(const char **pp, const char *e,
     if (p >= e) break;
     kind = (uint8_t)*p++;
     id = memprof_read_uleb128(&p, e);
+    if (has_line) (void)memprof_read_uleb128(&p, e);
     if (kind == MP_SRC_LFUNC)
       symtab_note_proto((uintptr_t)id, protos, nprotos);
     else if (kind == MP_SRC_TRACE)
@@ -928,11 +965,12 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
   memset(traces, 0, sizeof(traces));
 
   /* Walk the event stream (skip the 5-byte prologue). */
-  int has_cycle = 0, has_frames = 0;
+  int has_cycle = 0, has_frames = 0, has_line = 0;
   if (p + 5 <= e) {
     uint8_t ver = (uint8_t)p[3];
     has_cycle = (ver >= 2);   /* v2+ appends a gc_cycle uleb128 */
     has_frames = (ver >= 3); /* v3+ appends a frame stack */
+    has_line = (ver >= 4);   /* v4+ appends a per-frame uleb line */
     p += 5;
   }
   while (p < e) {
@@ -956,7 +994,7 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
       }
       if (has_cycle) memprof_read_uleb128(&p, e);  /* v2: gc_cycle */
       if (has_frames)
-	symtab_read_frames(&p, e, protos, &nprotos, traces, &ntraces);
+	symtab_read_frames(&p, e, has_line, protos, &nprotos, traces, &ntraces);
       break;
     case MP_OP_REALLOC:
       memprof_read_uleb128(&p, e);	/* addr */
@@ -971,7 +1009,7 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
       }
       if (has_cycle) memprof_read_uleb128(&p, e);  /* v2: gc_cycle */
       if (has_frames)
-	symtab_read_frames(&p, e, protos, &nprotos, traces, &ntraces);
+	symtab_read_frames(&p, e, has_line, protos, &nprotos, traces, &ntraces);
       break;
     case MP_OP_FREE:
       memprof_read_uleb128(&p, e);	/* addr */
@@ -980,7 +1018,7 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
       memprof_read_uleb128(&p, e);	/* src_id (always INT/0) */
       if (has_cycle) memprof_read_uleb128(&p, e);  /* v2: gc_cycle */
       if (has_frames)
-	symtab_read_frames(&p, e, protos, &nprotos, traces, &ntraces);
+	symtab_read_frames(&p, e, has_line, protos, &nprotos, traces, &ntraces);
       break;
     case MP_OP_PODFREE:
       memprof_read_uleb128(&p, e);	/* cellcount */

@@ -52,15 +52,33 @@ local function caller_b()
   return r
 end
 
--- Resolve each function's site label the same way the symtab will: the
--- chunkname (debug source, leading '@') and the function's first line.
-local function label_of(fn)
+-- Resolve each function's source and line range. With v4 line-precise
+-- attribution, frames carry the ACTUAL bytecode/call line, not the function's
+-- firstline. We match sites by checking if any frame in the label falls within
+-- the function's [linedefined, lastlinedefined] range, so the test is robust
+-- to which specific line inside the function allocated or called.
+local function info_of(fn)
   local info = debug.getinfo(fn, "S")
-  return ("%s:%d"):format(info.source, info.linedefined)
+  return info.source, info.linedefined, info.lastlinedefined
 end
-local helper_label = label_of(alloc_n)
-local caller_a_label = label_of(caller_a)
-local caller_b_label = label_of(caller_b)
+local helper_src, helper_first, helper_last = info_of(alloc_n)
+local caller_a_src, caller_a_first, caller_a_last = info_of(caller_a)
+local caller_b_src, caller_b_first, caller_b_last = info_of(caller_b)
+
+-- Check if a site label contains a frame from the given function (source +
+-- line range). Frames are @source:NN or builtin names, joined by ";".
+local function label_has_frame(label, source, firstline, lastline)
+  local prefix = source .. ":"
+  for frame in label:gmatch("[^;]+") do
+    if frame:sub(1, #prefix) == prefix then
+      local ln = tonumber(frame:sub(#prefix + 1))
+      if ln and ln >= firstline and ln <= lastline then
+        return true
+      end
+    end
+  end
+  return false
+end
 
 local checks = 0
 local failures = 0
@@ -95,8 +113,8 @@ os.remove(STREAM)
 check(#data > 5, "stream non-empty (" .. #data .. " bytes)")
 
 local parsed = parse.parse(data)
-check(parsed.version == 3,
-      "stream version 3 (got " .. tostring(parsed.version) .. ")")
+check(parsed.version == 3 or parsed.version == 4,
+      "stream version 3 or 4 (got " .. tostring(parsed.version) .. ")")
 
 -- (a) at least one event has a multi-frame stack.
 local n_multiframe = 0
@@ -110,48 +128,55 @@ local agg = aggregate.aggregate(parsed)
 
 -- (b) Full-stack view: a site containing caller_a AND one containing
 -- caller_b, both also containing the shared helper. The site keys are the
--- full leaf..root stack joined by ";".
+-- full leaf..root stack joined by ";". With v4 line-precise attribution,
+-- frames carry the actual call/allocation line, so we match by line range
+-- rather than exact label.
 local has_a_path = false
 local has_b_path = false
 local has_a_with_helper = false
 local has_b_with_helper = false
 for label in pairs(agg.sites) do
-  if label:find(caller_a_label, 1, true) then
+  if label_has_frame(label, caller_a_src, caller_a_first, caller_a_last) then
     has_a_path = true
-    if label:find(helper_label, 1, true) then
+    if label_has_frame(label, helper_src, helper_first, helper_last) then
       has_a_with_helper = true
     end
   end
-  if label:find(caller_b_label, 1, true) then
+  if label_has_frame(label, caller_b_src, caller_b_first, caller_b_last) then
     has_b_path = true
-    if label:find(helper_label, 1, true) then
+    if label_has_frame(label, helper_src, helper_first, helper_last) then
       has_b_with_helper = true
     end
   end
 end
 check(has_a_path, "full-stack view has a site routing through caller_a (" ..
-      caller_a_label .. ")")
+      caller_a_src .. ":" .. caller_a_first .. ")")
 check(has_b_path, "full-stack view has a site routing through caller_b ("..
-      caller_b_label .. ")")
+      caller_b_src .. ":" .. caller_b_first .. ")")
 check(has_a_with_helper,
-      "a caller_a site also contains the shared helper (" .. helper_label ..
-      ") — both paths route through it")
+      "a caller_a site also contains the shared helper (" .. helper_src ..
+      ":" .. helper_first .. ") — both paths route through it")
 check(has_b_with_helper,
-      "a caller_b site also contains the shared helper (" .. helper_label ..
-      ") — both paths route through it")
+      "a caller_b site also contains the shared helper (" .. helper_src ..
+      ":" .. helper_first .. ") — both paths route through it")
 
--- (c) Leaf-only view: the helper's allocations collapse to a single leaf
--- site (helper_label), whereas the full-stack view distinguishes the two
--- call paths. This is the v1/v2 site-granularity ceiling the multi-frame
--- attribution fixes. caller_a/caller_b may still appear as leaves for THEIR
--- OWN direct allocs (e.g. the tag string), but the shared helper's allocs
--- are not split by caller in the leaf view.
-check(agg.sites_leaf[helper_label] ~= nil,
+-- (c) Leaf-only view: the helper's allocations collapse to leaf site(s)
+-- keyed by the actual allocation line (v4). caller_a/caller_b may still
+-- appear as leaves for THEIR OWN direct allocs (e.g. the tag string), but
+-- the shared helper's allocs are not split by caller in the leaf view.
+local has_helper_leaf = false
+for label in pairs(agg.sites_leaf) do
+  if label_has_frame(label, helper_src, helper_first, helper_last) then
+    has_helper_leaf = true
+    break
+  end
+end
+check(has_helper_leaf,
       "leaf-only view has the shared helper as a leaf site (" ..
-      helper_label .. ")")
+      helper_src .. ":" .. helper_first .. ")")
 local n_full_helper_sites = 0
 for label in pairs(agg.sites) do
-  if label:find(helper_label, 1, true) then
+  if label_has_frame(label, helper_src, helper_first, helper_last) then
     n_full_helper_sites = n_full_helper_sites + 1
   end
 end
@@ -160,26 +185,37 @@ check(n_full_helper_sites >= 2,
       n_full_helper_sites ..
       ") — the two call paths are distinguished; leaf-only collapses to 1")
 
--- (d) collapsed-style: the joined stack labels contain both caller labels.
+-- (d) collapsed-style: the joined stack labels contain both caller labels
+-- (matched by line range for v4 robustness).
 local collapsed = {}
 for label, st in pairs(agg.sites) do
   collapsed[#collapsed + 1] = label .. " " .. tostring(st.alloc_objects)
 end
 local joined = table.concat(collapsed, "\n")
-check(joined:find(caller_a_label, 1, true) ~= nil,
-      "collapsed output contains caller_a label")
-check(joined:find(caller_b_label, 1, true) ~= nil,
-      "collapsed output contains caller_b label")
+local has_a_collapsed = false
+local has_b_collapsed = false
+for line in joined:gmatch("[^\n]+") do
+  if label_has_frame(line, caller_a_src, caller_a_first, caller_a_last) then
+    has_a_collapsed = true
+  end
+  if label_has_frame(line, caller_b_src, caller_b_first, caller_b_last) then
+    has_b_collapsed = true
+  end
+end
+check(has_a_collapsed, "collapsed output contains caller_a label")
+check(has_b_collapsed, "collapsed output contains caller_b label")
 
 io.write(("OK memprof_stack_assert: version=%d events=%d multiframe=%d " ..
-          "sites=%d helper=%s caller_a=%s caller_b=%s\n"):format(
+           "sites=%d helper=%s:%d-%d caller_a=%s:%d-%d caller_b=%s:%d-%d\n"):format(
   parsed.version, #parsed.events, n_multiframe,
   (function()
     local n = 0
     for _ in pairs(agg.sites) do n = n + 1 end
     return n
   end)(),
-  helper_label, caller_a_label, caller_b_label))
+  helper_src, helper_first, helper_last,
+  caller_a_src, caller_a_first, caller_a_last,
+  caller_b_src, caller_b_first, caller_b_last))
 
 io.write(("memprof_stack_assert: %d checks, %d failures\n"):format(
   checks, failures))

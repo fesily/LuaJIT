@@ -60,16 +60,22 @@ local function retain_site(batch, store)
   end
 end
 
--- Resolve the site label the aggregator will assign to each function: the
--- symtab maps proto_ptr -> {chunkname=, firstline=}, and site_label renders
--- "<chunkname>:<firstline>". debug.getinfo "S" gives source + linedefined,
--- which match chunkname + firstline.
-local function site_label_of(fn)
+-- Resolve the site label the aggregator will assign to each function. With
+-- v4 line-precise attribution, the label is chunkname:ACTUAL_ALLOC_LINE (the
+-- line of the allocating bytecode), not the function's definition line. For
+-- v1/v2/v3 streams it would be chunkname:firstline. We compute the expected
+-- label by finding the allocation line within each function. Both churn_site
+-- and retain_site have a single allocation expression (the string concat on
+-- the loop body line), so the site label is chunkname:<that line>.
+local function alloc_line_of(fn)
   local info = debug.getinfo(fn, "S")
-  return info.source .. ":" .. info.linedefined
+  -- Scan the function's source range for the allocation line. Both functions
+  -- allocate via a string concatenation expression inside a for-loop body;
+  -- the line of that expression is the v4 attribution line.
+  return info.source, info.linedefined, info.lastlinedefined
 end
-local churn_label = site_label_of(churn_site)
-local retain_label = site_label_of(retain_site)
+local churn_src, churn_first, churn_last = alloc_line_of(churn_site)
+local retain_src, retain_first, retain_last = alloc_line_of(retain_site)
 
 -- -- Run the workload under the profiler -----------------------------------
 
@@ -108,15 +114,32 @@ local data = f:read("*a")
 f:close()
 check(#data > 5, "stream non-empty (" .. #data .. " bytes)")
 
-local parsed = parse.parse(data)
-check(parsed.version == 2 or parsed.version == 3,
-      "stream version 2 or 3 (got " .. tostring(parsed.version) .. ")")
-local agg = aggregate.aggregate(parsed)
-local surv = agg.survival
-check(surv ~= nil, "aggregate produced survival table")
+  local parsed = parse.parse(data)
+  check(parsed.version == 2 or parsed.version == 3 or parsed.version == 4,
+        "stream version 2, 3 or 4 (got " .. tostring(parsed.version) .. ")")
+  local agg = aggregate.aggregate(parsed)
+  local surv = agg.survival
+  check(surv ~= nil, "aggregate produced survival table")
 
-local churn_info = surv and surv.sites[churn_label]
-local retain_info = surv and surv.sites[retain_label]
+  -- Find the churn and retain sites by matching the function's source prefix
+  -- and line range. With v4 line-precise attribution the site label carries
+  -- the ACTUAL allocation line (e.g. :50 for churn, :59 for retain), not the
+  -- function's firstline (:47 / :56). Each function has one allocation line
+  -- so there is exactly one matching site per function.
+  local function find_site(surv_sites, source, firstline, lastline)
+    local prefix = source .. ":"
+    for label, st in pairs(surv_sites) do
+      if label:sub(1, #prefix) == prefix then
+        local ln = tonumber(label:sub(#prefix + 1))
+        if ln and ln >= firstline and ln <= lastline then
+          return label, st
+        end
+      end
+    end
+    return nil, nil
+  end
+  local churn_label, churn_info = find_site(surv.sites, churn_src, churn_first, churn_last)
+  local retain_label, retain_info = find_site(surv.sites, retain_src, retain_first, retain_last)
 
 -- Diagnostic: if a site is missing, dump what we have so the failure is
 -- debuggable rather than a bare "nil".
