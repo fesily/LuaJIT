@@ -21,12 +21,21 @@
 -- src. Billed to an `INTERNAL:POD` bucket on freed_space/freed_objects and a
 -- dedicated podfree_bytes counter.
 --
--- leak view: addresses allocated (ALLOC or ALLOC-via-REALLOC) and never freed
+--   leak view: addresses allocated (ALLOC or ALLOC-via-REALLOC) and never freed
 -- (by FREE or FREE-via-REALLOC of the same addr) within the stream, grouped
 -- by their allocation site. retained size = the last known ALLOC size for
 -- that addr. This is the event-stream notion of "retained" — it is NOT the
 -- pprof live-heap notion (that is P2 snapshot territory) — it only reflects
 -- what the stream observed.
+--
+-- survival view: buckets ALLOC events by their gc_cycle (the completed-GC-cycle
+-- counter stamped into each record at emit time). An object is a "survivor"
+-- of its birth cycle if it is still live (not freed by FREE or FREE-via-REALLOC
+-- of the same addr) at end of stream. per-site survival_rate =
+-- survivors / allocated. Churn sites (temporaries that die every iteration)
+-- approach 0; retained/leaked sites approach 1. PODFREE has no addr and does
+-- not participate. For v1 streams gc_cycle is always 0, so survival collapses
+-- to a single-cycle whole-stream view (still meaningful, just not per-cycle).
 --
 -- Copyright (C) 2005-2026 Mike Pall. See Copyright Notice in luajit.h.
 ------------------------------------------------------------------------------
@@ -61,7 +70,12 @@ function M.aggregate(parsed)
   local sites = {}
   local types = {}
   local leaks = {}            -- site -> { addr -> lastsize }
-  local live = {}             -- addr -> { site=, size= }  (currently allocated)
+  local live = {}             -- addr -> { site=, size=, cycle= }  (currently allocated)
+  -- survival tracking: per-site alloc counts by birth cycle; survivors counted
+  -- post-loop from `live`. freed-by-addr removes the live entry, so whatever
+  -- remains live at end-of-stream is a survivor of its birth cycle.
+  local surv_alloc = {}       -- site -> { [cycle] = alloc_count }
+  local surv_freed = {}       -- site -> { [cycle] = freed_count } (matched by addr)
   local totals = {
     alloc_space = 0, alloc_objects = 0,
     freed_space = 0, freed_objects = 0,
@@ -112,7 +126,11 @@ function M.aggregate(parsed)
       tt.alloc_space = tt.alloc_space + ev.size
       tt.alloc_objects = tt.alloc_objects + 1
       -- Track live addr for leak view and FREE matching.
-      live[ev.addr] = { site = label, size = ev.size }
+      live[ev.addr] = { site = label, size = ev.size, cycle = ev.gc_cycle or 0 }
+      local cyc = ev.gc_cycle or 0
+      local sa = surv_alloc[label]
+      if not sa then sa = {}; surv_alloc[label] = sa end
+      sa[cyc] = (sa[cyc] or 0) + 1
       local ls = leaks[label]
       if not ls then ls = {}; leaks[label] = ls end
       ls[ev.addr] = ev.size
@@ -155,8 +173,17 @@ function M.aggregate(parsed)
         -- Remove prior leak entry, then re-add with new size.
         local ls = leaks[prev.site]
         if ls then ls[ev.addr] = nil end
+        -- The old object (osz) is "freed" for survival accounting at its
+        -- birth site/cycle; the REALLOC re-bills nsize as a fresh alloc.
+        local sf = surv_freed[prev.site]
+        if not sf then sf = {}; surv_freed[prev.site] = sf end
+        sf[prev.cycle] = (sf[prev.cycle] or 0) + 1
       end
-      live[ev.addr] = { site = label, size = ev.nsize }
+      live[ev.addr] = { site = label, size = ev.nsize, cycle = ev.gc_cycle or 0 }
+      local cyc = ev.gc_cycle or 0
+      local sa = surv_alloc[label]
+      if not sa then sa = {}; surv_alloc[label] = sa end
+      sa[cyc] = (sa[cyc] or 0) + 1
       local ls = leaks[label]
       if not ls then ls = {}; leaks[label] = ls end
       ls[ev.addr] = ev.nsize
@@ -177,6 +204,10 @@ function M.aggregate(parsed)
         local ls = leaks[label]
         if ls then ls[ev.addr] = nil end
         live[ev.addr] = nil
+        -- Record the freed object against its birth cycle for survival.
+        local sf = surv_freed[label]
+        if not sf then sf = {}; surv_freed[label] = sf end
+        sf[prev.cycle] = (sf[prev.cycle] or 0) + 1
       else
         -- FREE without a preceding ALLOC in the stream (alloc happened before
         -- memprof.start). Bill to INTERNAL so it is not lost.
@@ -236,12 +267,87 @@ function M.aggregate(parsed)
     end
   end
 
+  -- Survival-rate computation. Whatever remains in `live` at end-of-stream is
+  -- a survivor of its birth cycle. Aggregate per-site and per-cycle.
+  local surv_sites = {}   -- label -> { allocated=, freed=, survivors=, survival_rate=, by_cycle={...} }
+  local surv_cycles = {}  -- cycle -> { allocated=, freed=, survivors= }
+  -- Seed per-site and per-cycle alloc/freed from the counters built in-loop.
+  for label, cycmap in pairs(surv_alloc) do
+    local st = { allocated = 0, freed = 0, survivors = 0,
+                 survival_rate = 0, by_cycle = {} }
+    for cyc, n in pairs(cycmap) do
+      st.allocated = st.allocated + n
+      st.by_cycle[cyc] = { allocated = n, freed = 0, survivors = 0 }
+      local cm = surv_cycles[cyc]
+      if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
+                 surv_cycles[cyc] = cm end
+      cm.allocated = cm.allocated + n
+    end
+    local sf = surv_freed[label]
+    if sf then
+      for cyc, n in pairs(sf) do
+        st.freed = st.freed + n
+        local bc = st.by_cycle[cyc]
+        if bc then bc.freed = n else st.by_cycle[cyc] = { allocated = 0, freed = n, survivors = 0 } end
+        local cm = surv_cycles[cyc]
+        if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
+                   surv_cycles[cyc] = cm end
+        cm.freed = cm.freed + n
+      end
+    end
+    surv_sites[label] = st
+  end
+  -- Also seed freed-only sites (FREE without preceding ALLOC in-stream: the
+  -- object was allocated before memprof.start). Bill to INTERNAL cycle 0.
+  for label, sf in pairs(surv_freed) do
+    if not surv_sites[label] then
+      local st = { allocated = 0, freed = 0, survivors = 0,
+                   survival_rate = 0, by_cycle = {} }
+      for cyc, n in pairs(sf) do
+        st.freed = st.freed + n
+        st.by_cycle[cyc] = { allocated = 0, freed = n, survivors = 0 }
+        local cm = surv_cycles[cyc]
+        if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
+                   surv_cycles[cyc] = cm end
+        cm.freed = cm.freed + n
+      end
+      surv_sites[label] = st
+    end
+  end
+  -- Count survivors from `live` (addrs still allocated at end of stream).
+  for addr, info in pairs(live) do
+    local st = surv_sites[info.site]
+    if not st then
+      st = { allocated = 0, freed = 0, survivors = 0, survival_rate = 0,
+             by_cycle = {} }
+      surv_sites[info.site] = st
+    end
+    st.survivors = st.survivors + 1
+    local bc = st.by_cycle[info.cycle]
+    if not bc then bc = { allocated = 0, freed = 0, survivors = 0 }
+                   st.by_cycle[info.cycle] = bc end
+    bc.survivors = bc.survivors + 1
+    local cm = surv_cycles[info.cycle]
+    if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
+               surv_cycles[info.cycle] = cm end
+    cm.survivors = cm.survivors + 1
+  end
+  -- Finalize survival_rate per site (guard against divide-by-zero).
+  for label, st in pairs(surv_sites) do
+    if st.allocated > 0 then
+      st.survival_rate = st.survivors / st.allocated
+    else
+      st.survival_rate = 0
+    end
+  end
+
   return {
     sites = sites,
     types = types,
     leaks = pruned_leaks,
     totals = totals,
     symtab = symtab,
+    survival = { sites = surv_sites, cycles = surv_cycles },
   }
 end
 
@@ -256,6 +362,42 @@ function M.top_sites(agg, limit)
     if a.stat.alloc_space ~= b.stat.alloc_space then
       return a.stat.alloc_space > b.stat.alloc_space
     end
+    return a.label < b.label
+  end)
+  if limit and #rows > limit then
+    for i = #rows, limit + 1, -1 do rows[i] = nil end
+  end
+  return rows
+end
+
+-- Classify a survival_rate into a churn/retained band.
+--   < 0.10 -> CHURN   (short-lived allocation churn)
+--   > 0.90 -> RETAINED (long-lived / potential leak)
+--   else   -> MIXED
+function M.survival_class(rate)
+  if rate < 0.10 then return "CHURN"
+  elseif rate > 0.90 then return "RETAINED"
+  else return "MIXED" end
+end
+
+-- Return per-site survival rows sorted by alloc volume desc (the `survival`
+-- view). Each row: { label=, allocated=, freed=, survivors=, survival_rate=,
+-- class= }. `limit` caps rows; nil = all. Sites with 0 allocated (freed-only,
+-- from pre-stream allocations) are included so orphans are visible.
+function M.survival_sites(agg, limit)
+  local rows = {}
+  local surv = agg.survival
+  if not surv then return rows end
+  for label, st in pairs(surv.sites) do
+    rows[#rows+1] = {
+      label = label,
+      allocated = st.allocated, freed = st.freed, survivors = st.survivors,
+      survival_rate = st.survival_rate,
+      class = M.survival_class(st.survival_rate),
+    }
+  end
+  table.sort(rows, function(a, b)
+    if a.allocated ~= b.allocated then return a.allocated > b.allocated end
     return a.label < b.label
   end)
   if limit and #rows > limit then

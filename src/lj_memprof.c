@@ -577,11 +577,24 @@ LJ_FUNC int lj_memprof_diff(lua_State *L)
 **
 ** Attribution (design 3.2, option B — proto/trace-id + offline symtab):
 **   vmstate >= 0          -> TRACE, src_id = trace number
-**   vmstate ~INTERP/~C    -> read level-0 frame: LFUNC(proto*) or CFUNC(fn*)
+**   vmstate ~INTERP/~C    -> read level-0 frame: LFUNC(proto*) or CFUNC(ffid)
 **   else (GC/EXIT/...)    -> INT, src_id = 0
 ** ALLOC records carry the arena-class (cls) as the type axis and gct=0
 ** (pending: the caller sets gct after the inline returns). FREE records carry
 ** the precise gct (valid at free time). POD sweep is aggregate (PODFREE).
+**
+** v2 (survival-rate): every ALLOC / REALLOC / FREE record appends ONE uleb128
+**   = g->gc.stats.cycles
+** the monotonic completed-GC-cycle counter (uint64, GCstats, lj_obj.h;
+** incremented at the 3 GCSpause cycle-end sites in lj_gc_arena.c). This lets
+** the offline tool bucket allocations by the cycle they were born in and
+** compute survival = (objects still live at end of stream) / (allocated in
+** that cycle) — separating churn (survival ~0) from retained/leaked
+** (survival ~1). The field is APPENDED at the end of each record (after
+** src_id) so v1 readers halt cleanly on the new version byte and v2 readers
+** default cycle=0 for v1 streams. PODFREE carries no cycle (it is an
+** aggregate bulk-sweep event with no per-object addr; survival analysis
+** matches FREEs by addr and does not consume PODFREE).
 ** ======================================================================== **/
 
 /* -- Wire format constants ------------------------------------------------ */
@@ -608,7 +621,7 @@ enum {
   MP_SRC_TRACE = 3
 };
 
-#define MP_STREAM_VERSION	1
+#define MP_STREAM_VERSION	2
 #define MP_PROLOGUE_MAGIC	"ljm"
 
 /* -- Profiler state (single-VM owner, mirrors lj_profile.c ProfileState) -- */
@@ -660,7 +673,7 @@ static void memprof_attribution(global_State *g, lua_State *L,
 	  *src_id = (uint64_t)(uintptr_t)funcproto(fn);
 	} else if (iscfunc(fn) || isffunc(fn)) {
 	  *src_kind = MP_SRC_CFUNC;
-	  *src_id = (uint64_t)(uintptr_t)fn;
+	  *src_id = (uint64_t)fn->c.ffid;  /* FF_C=1 generic; >1 is a fast-function id. */
 	}
       }
     }
@@ -691,6 +704,7 @@ LJ_FUNC void lj_memprof_emit_alloc(lua_State *L, void *o, GCSize size,
   lj_buf_putb(sb, (uint8_t)cls);	/* arena-class type axis */
   lj_buf_putb(sb, (uint8_t)g->gc.state);
   memprof_put_uleb128(sb, src_id);
+  memprof_put_uleb128(sb, (uint64_t)g->gc.stats.cycles);  /* v2: cycle */
   mps->in_emit = 0;
 }
 
@@ -724,6 +738,7 @@ LJ_FUNC void lj_memprof_emit_realloc(lua_State *L, void *p,
     memprof_put_uleb128(sb, (uint64_t)nsize);
   }
   memprof_put_uleb128(sb, src_id);
+  memprof_put_uleb128(sb, (uint64_t)g->gc.stats.cycles);  /* v2: cycle */
   mps->in_emit = 0;
 }
 
@@ -742,6 +757,7 @@ LJ_FUNC void lj_memprof_emit_free(global_State *g, void *o,
   memprof_put_uleb128(sb, (uint64_t)osize);
   lj_buf_putb(sb, (uint8_t)gct);
   memprof_put_uleb128(sb, 0);	/* INT: no source id */
+  memprof_put_uleb128(sb, (uint64_t)mps->g->gc.stats.cycles);  /* v2: cycle */
   mps->in_emit = 0;
 }
 
@@ -795,7 +811,11 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
   memset(traces, 0, sizeof(traces));
 
   /* Walk the event stream (skip the 5-byte prologue). */
-  if (p + 5 <= e) p += 5;
+  int has_cycle = 0;
+  if (p + 5 <= e) {
+    has_cycle = ((uint8_t)p[3] >= 2);  /* v2+ appends a gc_cycle uleb128 */
+    p += 5;
+  }
   while (p < e) {
     uint8_t hdr = (uint8_t)*p++;
     uint8_t op = hdr >> 4;
@@ -821,18 +841,21 @@ static void memprof_dump_symtab(global_State *g, SBuf *sb)
       } else {
 	memprof_read_uleb128(&p, e);
       }
+      if (has_cycle) memprof_read_uleb128(&p, e);  /* v2: gc_cycle */
       break;
     case MP_OP_REALLOC:
       memprof_read_uleb128(&p, e);	/* addr */
       memprof_read_uleb128(&p, e);	/* osize */
       memprof_read_uleb128(&p, e);	/* nsize */
       memprof_read_uleb128(&p, e);	/* src_id */
+      if (has_cycle) memprof_read_uleb128(&p, e);  /* v2: gc_cycle */
       break;
     case MP_OP_FREE:
       memprof_read_uleb128(&p, e);	/* addr */
       memprof_read_uleb128(&p, e);	/* osize */
       p++;					/* gct */
       memprof_read_uleb128(&p, e);	/* src_id */
+      if (has_cycle) memprof_read_uleb128(&p, e);  /* v2: gc_cycle */
       break;
     case MP_OP_PODFREE:
       memprof_read_uleb128(&p, e);	/* cellcount */

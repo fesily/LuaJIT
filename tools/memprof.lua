@@ -12,6 +12,12 @@
 --   summary    Total alloc / freed / inuse bytes + objects, per-type breakdown.
 --   leak       Addresses allocated and never freed in the stream, grouped by
 --              their allocation site.
+--   survival   Per-site survival rate: of the objects each site allocated,
+--              the fraction still live at end of stream. Classifies each site
+--              as CHURN (survival<0.1, short-lived temporaries), RETAINED
+--              (>0.9, long-lived / potential leak), or MIXED. Sorted by
+--              alloc volume desc. The metric that distinguishes churn from
+--              real leaks in a GC'd VM.
 --   pprof      Serialize the aggregated per-site stats into an UNCOMPRESSED
 --              google/pprof `Profile` protobuf (raw bytes, no gzip) so the
 --              whole `go tool pprof` ecosystem (top/graph/web/flamegraph)
@@ -174,12 +180,42 @@ local function cmd_leak(agg)
   end
 end
 
+local function cmd_survival(agg, limit)
+  local rows = aggregate.survival_sites(agg, limit)
+  if #rows == 0 then
+    io.write("(no allocation sites recorded)\n")
+    return
+  end
+  io.write(("allocated  freed  survivors  survival  class     site\n"))
+  for i = 1, #rows do
+    local r = rows[i]
+    io.write(("%-9d  %-5d  %-9d  %-8s  %-8s  %s\n"):format(
+      r.allocated, r.freed, r.survivors,
+      ("%.3f"):format(r.survival_rate), r.class, r.label))
+  end
+  -- Per-cycle summary (alloc/freed/survivor counts by birth cycle).
+  local surv = agg.survival
+  if surv and surv.cycles then
+    local cycs = {}
+    for c in pairs(surv.cycles) do cycs[#cycs+1] = c end
+    if #cycs > 0 then
+      table.sort(cycs)
+      io.write(("\nby GC cycle (birth cycle -> alloc/freed/survivors):\n"))
+      for _, c in ipairs(cycs) do
+        local cm = surv.cycles[c]
+        io.write(("  cycle %-6d  alloc=%-8d freed=%-8d survivors=%-8d\n"):format(
+          c, cm.allocated, cm.freed, cm.survivors))
+      end
+    end
+  end
+end
+
 -- -- arg parsing / dispatch -------------------------------------------------
 
 local function usage()
   io.stderr:write([[
 usage: luajit tools/memprof.lua <subcmd> <stream.bin> [limit|out]
-subcommands: top | collapsed | summary | leak | pprof
+subcommands: top | collapsed | summary | leak | survival | pprof
   pprof <stream.bin> [out.pb]   write pprof protobuf to out.pb (or stdout)
 ]])
 end
@@ -195,7 +231,7 @@ local function main(arg)
   local out_path = arg[3]  -- for pprof subcommand (may be "-" or a path)
 
   local subcmds = { top = true, collapsed = true, summary = true,
-                    leak = true, pprof = true }
+                    leak = true, survival = true, pprof = true }
   if not subcmds[subcmd] then
     io.stderr:write(("unknown subcommand: %s\n"):format(subcmd))
     usage()
@@ -225,6 +261,8 @@ local function main(arg)
     cmd_summary(agg)
   elseif subcmd == "leak" then
     cmd_leak(agg)
+  elseif subcmd == "survival" then
+    cmd_survival(agg, limit)
   elseif subcmd == "pprof" then
     cmd_pprof(agg, out_path)
   end

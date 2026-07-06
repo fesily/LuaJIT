@@ -5,19 +5,27 @@
 -- out=...} and turns it into a list of typed event tables plus a symtab map.
 --
 -- Wire format (authoritative source: src/lj_memprof.c):
---   * Prologue: 5 bytes  "ljm" 0x01 0x00(reserved)
+--   * Prologue: 5 bytes  "ljm" <version> 0x00(reserved)
+--     version: 1 = original event stream; 2 = +gc_cycle field (survival-rate)
 --   * Event header: 1 byte  (opcode << 4) | (src_kind & 0xf)
 --     opcodes: EPILOGUE=0 ALLOC=1 REALLOC=2 FREE=3 PODFREE=4
 --              SYMTAB_LFUNC=5 SYMTAB_TRACE=6 SYMTAB_CFUNC=7
 --     src_kind: INT=0 LFUNC=1 CFUNC=2 TRACE=3
 --   * Epilogue byte: 0x80  (top nibble 8)
 --   * ULEB128: little-endian base-128, high bit = continuation
---   * ALLOC:    uleb(addr) uleb(size) byte(gct) byte(cls) byte(gcstate) uleb(src_id)
+--   * ALLOC:    uleb(addr) uleb(size) byte(gct) byte(cls) byte(gcstate)
+--              uleb(src_id) [v2: uleb(gc_cycle)]
 --   * REALLOC:  uleb(addr) uleb(osize) uleb(nsize) uleb(src_id)
+--              [v2: uleb(gc_cycle)]
 --   * FREE:     uleb(addr) uleb(osize) byte(gct) uleb(src_id)
---   * PODFREE:  uleb(cellcount) uleb(bytes)
+--              [v2: uleb(gc_cycle)]
+--   * PODFREE:  uleb(cellcount) uleb(bytes)   (no cycle — aggregate bulk sweep)
 --   * SYMTAB_LFUNC:  uleb(proto_ptr) uleb(namelen) <namelen bytes> uleb(firstline)
 --   * SYMTAB_TRACE:  uleb(traceno) uleb(proto_ptr) uleb(firstline)
+--   * gc_cycle = g->gc.stats.cycles (monotonic completed-GC-cycle counter,
+--     lj_obj.h GCstats). Appended at the END of ALLOC/REALLOC/FREE so v1
+--     readers halt cleanly on the new version byte. For v1 streams gc_cycle
+--     defaults to 0 (the parser never reads a cycle byte for v1).
 --   * Ordering: prologue, event body, SYMTAB_* records (appended at stop),
 --     then 0x80 epilogue. Site names arrive AFTER the events that reference
 --     them, so callers must buffer events and resolve src_ids in a second pass.
@@ -40,7 +48,12 @@ local SRC = { INT = 0, LFUNC = 1, CFUNC = 2, TRACE = 3 }
 local EPILOGUE_BYTE = 0x80
 local PROLOGUE_LEN = 5
 local PROLOGUE_MAGIC = "ljm"
-local STREAM_VERSION = 1
+-- Stream versions we can read. v1 = original event stream; v2 = +gc_cycle
+-- field appended to ALLOC/REALLOC/FREE (survival-rate analysis). Older
+-- streams parse with gc_cycle defaulting to 0.
+local STREAM_VERSION_V1 = 1
+local STREAM_VERSION_V2 = 2
+local STREAM_VERSION_MAX = STREAM_VERSION_V2
 
 local SRC_NAME = { [0] = "INT", "LFUNC", "CFUNC", "TRACE" }
 
@@ -93,9 +106,10 @@ function M.parse(data)
   -- Prologue.
   if data:sub(1, 3) ~= PROLOGUE_MAGIC then err("bad prologue magic") end
   local version = data:byte(4)
-  if version ~= STREAM_VERSION then
+  if version < 1 or version > STREAM_VERSION_MAX then
     err(("unsupported stream version %d"):format(version))
   end
+  local has_cycle = (version >= STREAM_VERSION_V2)
   -- data:byte(5) is the reserved byte; we read but do not validate it.
 
   local events = {}
@@ -103,7 +117,7 @@ function M.parse(data)
     lfunc = {},  -- proto_ptr -> {chunkname=, firstline=}
     trace = {},  -- traceno   -> {proto_ptr=, firstline=}
   }
-  local cfunc_ids = {}  -- ordered list of CFUNC src_ids seen (for C:<addr> render)
+  local cfunc_ids = {}  -- set of CFUNC ffids seen (for diagnostics/debug)
 
   local pos = PROLOGUE_LEN + 1
   while pos <= e do
@@ -149,19 +163,18 @@ function M.parse(data)
       local gcstate = data:byte(pos); pos = pos + 1
       local src_id
       src_id, pos = read_uleb128(data, pos, e)
+      local gc_cycle = 0
+      if has_cycle then gc_cycle, pos = read_uleb128(data, pos, e) end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, size = size, gct = gct, cls = cls,
-        gcstate = gcstate, src_id = src_id,
+        gcstate = gcstate, src_id = src_id, gc_cycle = gc_cycle,
       }
       if sk == SRC.CFUNC then
-        -- Record CFUNC src_ids for `C:0x<addr>` rendering. Dedup is the
-        -- aggregator's job; here we just note every distinct pointer.
-        if not cfunc_ids[addr] and not cfunc_ids[src_id] then
-          -- Use src_id (the function pointer) as the CFUNC identity, per
-          -- lj_memprof.c memprof_attribution: src_id = (uintptr_t)fn.
-          cfunc_ids[src_id] = true
-        end
+	-- Record CFUNC ffids seen (diagnostics). The src_id is now the
+	-- fast-function id (fn->c.ffid), not a pointer; site_label resolves
+	-- it through jit.vmdef.ffnames.
+	cfunc_ids[src_id] = true
       end
 
     elseif opname == "REALLOC" then
@@ -170,9 +183,12 @@ function M.parse(data)
       osize, pos = read_uleb128(data, pos, e)
       nsize, pos = read_uleb128(data, pos, e)
       src_id, pos = read_uleb128(data, pos, e)
+      local gc_cycle = 0
+      if has_cycle then gc_cycle, pos = read_uleb128(data, pos, e) end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, osize = osize, nsize = nsize, src_id = src_id,
+        gc_cycle = gc_cycle,
       }
 
     elseif opname == "FREE" then
@@ -182,9 +198,12 @@ function M.parse(data)
       if pos > e then err("truncated FREE gct", pos) end
       gct = data:byte(pos); pos = pos + 1
       src_id, pos = read_uleb128(data, pos, e)
+      local gc_cycle = 0
+      if has_cycle then gc_cycle, pos = read_uleb128(data, pos, e) end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, osize = osize, gct = gct, src_id = src_id,
+        gc_cycle = gc_cycle,
       }
 
     elseif opname == "PODFREE" then
@@ -240,10 +259,64 @@ end
 -- as both a display label and a hash key.
 --   LFUNC  -> chunkname:firstline   (chunkname keeps its leading '@')
 --   TRACE  -> TRACE[n]              (n = traceno)
---   CFUNC  -> C:0x<hex>             (v1 has no CFUNC symtab)
+--   CFUNC  -> builtin name from jit.vmdef.ffnames[ffid];
+--             ffid==1 (FF_C) -> "C"; unknown/missing -> "C:ff<ffid>"
 --   INT    -> INTERNAL
 -- If a LFUNC src_id has no matching symtab record (e.g. symtab overflow at
 -- 4096 protos), fall back to L:0x<hex> so the site is still distinguishable.
+-- Resolve the fast-function name table (jit.vmdef). ffnames is 0-indexed:
+-- [0]="Lua", [1]="C" (FF_C), [2]="assert", ... matching fn->c.ffid. Used to
+-- turn a CFUNC src_id (the ffid) into a readable builtin name like
+-- "string.format".
+--
+-- jit.vmdef is NOT on the default package.path when running from the source
+-- tree (it lives at src/jit/vmdef.lua). We locate it by probing candidate
+-- paths derived from this module's own location, falling back to a plain
+-- require (which works under a normal install). If nothing resolves,
+-- ffnames stays false and CFUNC sites degrade to "C:ff<ffid>".
+local ffnames
+local function load_ffnames()
+  if ffnames ~= nil then return end
+  -- Candidate search roots, each probed as <root>/?.lua for jit.vmdef.
+  local roots = {}
+  -- 1. Relative to this file: tools/memprof/parse.lua -> ../..  (repo root,
+  --    where src/jit/vmdef.lua lives when running from the source tree).
+  local here = debug.getinfo(1, "S").source
+  if here and here:sub(1, 1) == "@" then here = here:sub(2) end
+  if here and #here > 0 then
+    local parent = here:match("^(.*)[/\\]tools[/\\]memprof[/\\]parse%.lua$")
+    if parent then roots[#roots+1] = parent .. "/src" end
+    roots[#roots+1] = here:match("^(.*)[/\\][^/\\]*$") or "."
+  end
+  -- 2. The install path (standard require handles this).
+  for _, root in ipairs(roots) do
+    local path = root .. "/jit/vmdef.lua"
+    local f = io.open(path, "r")
+    if f then
+      f:close()
+      local ok, v = pcall(require, "jit.vmdef")
+      if ok then ffnames = v.ffnames; return end
+      -- File exists but require still failed (path not in package.path):
+      -- load it directly via dofile and pull ffnames out.
+      local ok2, chunk = pcall(loadfile, path)
+      if ok2 and chunk then
+        local ok3, mod = pcall(chunk)
+        if ok3 and type(mod) == "table" and mod.ffnames then
+          ffnames = mod.ffnames; return
+        end
+      end
+    end
+  end
+  -- 3. Last resort: standard require (works under a normal install where
+  --    jit/vmdef.lua is on the Lua path).
+  local ok, v = pcall(require, "jit.vmdef")
+  ffnames = (ok and v and v.ffnames) or false
+end
+local function ffname(ffid)
+  load_ffnames()
+  if ffnames then return ffnames[ffid] end
+  return nil
+end
 function M.site_label(src, src_id, symtab)
   if src == "LFUNC" then
     local info = symtab.lfunc[src_id]
@@ -262,7 +335,10 @@ function M.site_label(src, src_id, symtab)
     end
     return ("TRACE[%d]"):format(src_id)
   elseif src == "CFUNC" then
-    return ("C:0x%x"):format(src_id)
+    if src_id == 1 then return "C" end
+    local name = ffname(src_id)
+    if name then return name end
+    return ("C:ff%d"):format(src_id)
   elseif src == "INT" then
     return "INTERNAL"
   end
@@ -295,6 +371,8 @@ end
 M.OP = OP
 M.SRC = SRC
 M.PROLOGUE_LEN = PROLOGUE_LEN
-M.STREAM_VERSION = STREAM_VERSION
+M.STREAM_VERSION_V1 = STREAM_VERSION_V1
+M.STREAM_VERSION_V2 = STREAM_VERSION_V2
+M.STREAM_VERSION_MAX = STREAM_VERSION_MAX
 
 return M
