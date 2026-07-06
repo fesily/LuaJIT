@@ -515,6 +515,9 @@ LJVM_MODE= elfasm
 LJLIB_O= lib_base.o lib_math.o lib_bit.o lib_string.o lib_table.o \
 	 lib_io.o lib_os.o lib_package.o lib_debug.o lib_jit.o lib_ffi.o \
 	 lib_buffer.o
+ifneq (,$(findstring DLUAJIT_ENABLE_MEMPROF,$(XCFLAGS)))
+  LJLIB_O += lib_memprof.o
+endif
 LJLIB_C= $(LJLIB_O:.o=.c)
 
 LJCORE_O= lj_assert.o lj_gc_arena.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
@@ -531,6 +534,9 @@ LJCORE_O= lj_assert.o lj_gc_arena.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o 
 	  lj_carith.o lj_clib.o lj_cparse.o \
 	  lj_lib.o lj_alloc.o lj_arena.o lib_aux.o \
 	  $(LJLIB_O) lib_init.o
+ifneq (,$(findstring DLUAJIT_ENABLE_MEMPROF,$(XCFLAGS)))
+  LJCORE_O += lj_memprof.o
+endif
 
 LJVMCORE_O= $(LJVM_O) $(LJCORE_O)
 LJVMCORE_DYNO= $(LJVMCORE_O:.o=_dyn.o)
