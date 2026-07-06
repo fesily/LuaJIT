@@ -124,16 +124,23 @@ end
 
 -- Encode a Sample message:
 --   1 location_id [uint64 packed]  2 value [int64 packed]
--- location_id is leaf-first; depth-1 today so a single frame.
-local function encode_sample(location_id, values)
+-- location_id is leaf-first; for v3 multi-frame stacks it carries the FULL
+-- stack (one Location id per frame, leaf..root). For depth=1 streams this
+-- collapses to a single location_id (the legacy v1/v2 shape).
+local function encode_sample(location_ids, values)
   local b = Buffer.new()
-  b:packed_varint_field(1, { location_id })
+  b:packed_varint_field(1, location_ids)
   b:packed_varint_field(2, values)
   return b:result()
 end
 
 -- Build a complete Profile protobuf from an aggregate result.
--- `agg` is the table returned by aggregate.aggregate().
+-- `agg` is the table returned by aggregate.aggregate(). The site key is the
+-- full leaf..root stack joined by ";" (v3 multi-frame attribution); each
+-- frame is split out and assigned its own Function + Location so `go tool
+-- pprof` graph/tree/peek views resolve the full call path. For depth=1
+-- streams each site is a single frame and the output is identical to the
+-- legacy v1/v2 shape (one Function + one Location per site).
 -- Returns: string (UNCOMPRESSED serialized Profile protobuf bytes)
 function M.build(agg)
   local sites = agg.sites
@@ -158,37 +165,61 @@ function M.build(agg)
   end
   local inuse_space_idx = intern("inuse_space")
 
-  -- Per-site Function / Location / Sample. IDs start at 1 (0 is reserved).
+  -- Intern Function by (name, filename) and Location by (function_id, line).
+  -- IDs start at 1 (0 is reserved). A shared counter keeps Function and
+  -- Location ids trivially unique across both tables.
   local function_msgs = {}
   local location_msgs = {}
   local sample_msgs = {}
-
+  local func_id = {}      -- (name|filename) -> function id
+  local loc_id = {}       -- (function_id|line) -> location id
   local next_id = 1
+
+  local function intern_function(name, filename)
+    local k = name .. "\0" .. filename
+    local id = func_id[k]
+    if id then return id end
+    id = next_id
+    next_id = next_id + 1
+    func_id[k] = id
+    local name_idx = intern(name)
+    local filename_idx = intern(filename)
+    function_msgs[#function_msgs + 1] =
+      encode_function(id, name_idx, name_idx, filename_idx, 0)
+    return id
+  end
+
+  local function intern_location(fid, line)
+    local k = fid .. "\0" .. line
+    local id = loc_id[k]
+    if id then return id end
+    id = next_id
+    next_id = next_id + 1
+    loc_id[k] = id
+    local line_msg = encode_line(fid, line)
+    location_msgs[#location_msgs + 1] = encode_location(id, line_msg)
+    return id
+  end
+
   for i = 1, #labels do
     local label = labels[i]
     local stat = sites[label]
-    -- A "non-empty" site: present in the sites map (aggregate only creates a
-    -- site entry when at least one event is attributed to it). Emit a sample
-    -- for every such site.
-    local name, filename, line = parse_site(label)
-    local name_idx = intern(name)
-    local sysname_idx = name_idx  -- system_name may equal name
-    local filename_idx = intern(filename)
+    -- Split the full-stack key into individual frame labels (leaf..root).
+    -- Frame labels are chunkname:line / builtin names / TRACE[n]@... /
+    -- INTERNAL / INTERNAL:POD — none contain ";", so the split is unambiguous.
+    -- For depth=1 streams there is no ";" and this yields a single frame.
+    local frames = {}
+    for piece in label:gmatch("[^;]+") do frames[#frames + 1] = piece end
+    if #frames == 0 then frames = { label } end
 
-    local fid = next_id
-    local lid = next_id  -- one Function + one Location per site, same id space
-    next_id = next_id + 1
-    -- (IDs are unique across both Function and Location tables; pprof only
-    -- requires id != 0 within each table, and using a shared counter keeps
-    -- them trivially unique.)
-
-    local fn_msg = encode_function(fid, name_idx, sysname_idx,
-                                   filename_idx, line)
-    function_msgs[#function_msgs + 1] = fn_msg
-
-    local line_msg = encode_line(fid, line)
-    local loc_msg = encode_location(lid, line_msg)
-    location_msgs[#location_msgs + 1] = loc_msg
+    -- Build the leaf-first location_id list for this sample.
+    local location_ids = {}
+    for fi = 1, #frames do
+      local name, filename, line = parse_site(frames[fi])
+      local fid = intern_function(name, filename)
+      local lid = intern_location(fid, line)
+      location_ids[fi] = lid
+    end
 
     -- value order MUST match sample_type order:
     --   alloc_objects, alloc_space, inuse_objects, inuse_space
@@ -204,8 +235,7 @@ function M.build(agg)
     -- displays. alloc_* are always >= 0 by construction.)
     if values[3] < 0 then values[3] = 0 end
     if values[4] < 0 then values[4] = 0 end
-    local sm_msg = encode_sample(lid, values)
-    sample_msgs[#sample_msgs + 1] = sm_msg
+    sample_msgs[#sample_msgs + 1] = encode_sample(location_ids, values)
   end
 
   -- Assemble the Profile.

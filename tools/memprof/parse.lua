@@ -6,7 +6,8 @@
 --
 -- Wire format (authoritative source: src/lj_memprof.c):
 --   * Prologue: 5 bytes  "ljm" <version> 0x00(reserved)
---     version: 1 = original event stream; 2 = +gc_cycle field (survival-rate)
+--     version: 1 = original event stream; 2 = +gc_cycle field (survival-rate);
+--              3 = +per-record frame stack (multi-frame attribution)
 --   * Event header: 1 byte  (opcode << 4) | (src_kind & 0xf)
 --     opcodes: EPILOGUE=0 ALLOC=1 REALLOC=2 FREE=3 PODFREE=4
 --              SYMTAB_LFUNC=5 SYMTAB_TRACE=6 SYMTAB_CFUNC=7
@@ -14,18 +15,26 @@
 --   * Epilogue byte: 0x80  (top nibble 8)
 --   * ULEB128: little-endian base-128, high bit = continuation
 --   * ALLOC:    uleb(addr) uleb(size) byte(gct) byte(cls) byte(gcstate)
---              uleb(src_id) [v2: uleb(gc_cycle)]
+--              uleb(src_id) [v2: uleb(gc_cycle)] [v3: uleb(nframes)
+--              nframes × (byte kind, uleb id)]
 --   * REALLOC:  uleb(addr) uleb(osize) uleb(nsize) uleb(src_id)
---              [v2: uleb(gc_cycle)]
+--              [v2: uleb(gc_cycle)] [v3: frame stack]
 --   * FREE:     uleb(addr) uleb(osize) byte(gct) uleb(src_id)
---              [v2: uleb(gc_cycle)]
---   * PODFREE:  uleb(cellcount) uleb(bytes)   (no cycle — aggregate bulk sweep)
+--              [v2: uleb(gc_cycle)] [v3: frame stack]
+--   * PODFREE:  uleb(cellcount) uleb(bytes)   (no cycle, no stack — aggregate)
 --   * SYMTAB_LFUNC:  uleb(proto_ptr) uleb(namelen) <namelen bytes> uleb(firstline)
 --   * SYMTAB_TRACE:  uleb(traceno) uleb(proto_ptr) uleb(firstline)
 --   * gc_cycle = g->gc.stats.cycles (monotonic completed-GC-cycle counter,
 --     lj_obj.h GCstats). Appended at the END of ALLOC/REALLOC/FREE so v1
 --     readers halt cleanly on the new version byte. For v1 streams gc_cycle
 --     defaults to 0 (the parser never reads a cycle byte for v1).
+--   * v3 frame stack: leaf..root sequence of {kind,id} where kind is one of
+--     MP_SRC_{INT,LFUNC,CFUNC,TRACE} and id is the per-kind identifier
+--     (LFUNC: proto pointer, CFUNC: ffid, TRACE: traceno, INT: 0). The
+--     header's src_kind nibble and the leading uleb(src_id) always carry the
+--     LEAF frame; the v3 suffix repeats it as frames[0] and adds callers.
+--     For v1/v2 streams the parser synthesizes a 1-element stack from the
+--     leaf src_kind/src_id so downstream tooling always sees ev.stack.
 --   * Ordering: prologue, event body, SYMTAB_* records (appended at stop),
 --     then 0x80 epilogue. Site names arrive AFTER the events that reference
 --     them, so callers must buffer events and resolve src_ids in a second pass.
@@ -49,11 +58,13 @@ local EPILOGUE_BYTE = 0x80
 local PROLOGUE_LEN = 5
 local PROLOGUE_MAGIC = "ljm"
 -- Stream versions we can read. v1 = original event stream; v2 = +gc_cycle
--- field appended to ALLOC/REALLOC/FREE (survival-rate analysis). Older
--- streams parse with gc_cycle defaulting to 0.
+-- field appended to ALLOC/REALLOC/FREE (survival-rate analysis); v3 =
+-- +per-record frame stack (multi-frame attribution). Older streams parse
+-- with gc_cycle defaulting to 0 and a synthesized 1-element leaf stack.
 local STREAM_VERSION_V1 = 1
 local STREAM_VERSION_V2 = 2
-local STREAM_VERSION_MAX = STREAM_VERSION_V2
+local STREAM_VERSION_V3 = 3
+local STREAM_VERSION_MAX = STREAM_VERSION_V3
 
 local SRC_NAME = { [0] = "INT", "LFUNC", "CFUNC", "TRACE" }
 
@@ -93,6 +104,27 @@ local function read_uleb128(s, pos, e)
 end
 M.read_uleb128 = read_uleb128
 
+-- Map a numeric src_kind (MP_SRC_*) to the SRC name string used in events.
+local function src_kind_name(k)
+  return SRC_NAME[k] or ("SRC?"..tostring(k))
+end
+
+-- Read a v3 frame stack: uleb(nframes) then nframes × (byte kind, uleb id).
+-- Returns a 1-based Lua array of {kind=NAME, kind_n=NUM, id=...} leaf..root.
+local function read_frame_stack(s, pos, e)
+  local n, i
+  n, pos = read_uleb128(s, pos, e)
+  local stack = {}
+  for i = 1, n do
+    if pos > e then err("truncated frame kind", pos) end
+    local kind_n = s:byte(pos); pos = pos + 1
+    local id
+    id, pos = read_uleb128(s, pos, e)
+    stack[i] = { kind = src_kind_name(kind_n), kind_n = kind_n, id = id }
+  end
+  return stack, pos
+end
+
 -- Parse the full stream. Returns a table:
 --   { version=, events={...}, symtab={lfunc={...}, trace={...}}, cfunc_ids={...} }
 -- Each event is a table with .op (string), .src (string), and opcode-specific
@@ -110,6 +142,7 @@ function M.parse(data)
     err(("unsupported stream version %d"):format(version))
   end
   local has_cycle = (version >= STREAM_VERSION_V2)
+  local has_frames = (version >= STREAM_VERSION_V3)
   -- data:byte(5) is the reserved byte; we read but do not validate it.
 
   local events = {}
@@ -165,10 +198,17 @@ function M.parse(data)
       src_id, pos = read_uleb128(data, pos, e)
       local gc_cycle = 0
       if has_cycle then gc_cycle, pos = read_uleb128(data, pos, e) end
+      local stack
+      if has_frames then
+        stack, pos = read_frame_stack(data, pos, e)
+      else
+        stack = { { kind = srcname, kind_n = sk, id = src_id } }
+      end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, size = size, gct = gct, cls = cls,
         gcstate = gcstate, src_id = src_id, gc_cycle = gc_cycle,
+        stack = stack,
       }
       if sk == SRC.CFUNC then
 	-- Record CFUNC ffids seen (diagnostics). The src_id is now the
@@ -185,10 +225,16 @@ function M.parse(data)
       src_id, pos = read_uleb128(data, pos, e)
       local gc_cycle = 0
       if has_cycle then gc_cycle, pos = read_uleb128(data, pos, e) end
+      local stack
+      if has_frames then
+        stack, pos = read_frame_stack(data, pos, e)
+      else
+        stack = { { kind = srcname, kind_n = sk, id = src_id } }
+      end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, osize = osize, nsize = nsize, src_id = src_id,
-        gc_cycle = gc_cycle,
+        gc_cycle = gc_cycle, stack = stack,
       }
 
     elseif opname == "FREE" then
@@ -200,10 +246,16 @@ function M.parse(data)
       src_id, pos = read_uleb128(data, pos, e)
       local gc_cycle = 0
       if has_cycle then gc_cycle, pos = read_uleb128(data, pos, e) end
+      local stack
+      if has_frames then
+        stack, pos = read_frame_stack(data, pos, e)
+      else
+        stack = { { kind = srcname, kind_n = sk, id = src_id } }
+      end
       events[#events+1] = {
         op = opname, src = srcname, ofs = hdrOfs,
         addr = addr, osize = osize, gct = gct, src_id = src_id,
-        gc_cycle = gc_cycle,
+        gc_cycle = gc_cycle, stack = stack,
       }
 
     elseif opname == "PODFREE" then
@@ -345,6 +397,28 @@ function M.site_label(src, src_id, symtab)
   return ("?%s"):format(src)
 end
 
+-- Resolve a single frame {kind=, id=} (as produced by read_frame_stack) to
+-- the same label site_label would produce for the equivalent (src, src_id).
+-- `kind` may be the SRC name string ("LFUNC", ...) or the numeric kind.
+function M.frame_label(frame, symtab)
+  local src = frame.kind
+  if type(src) == "number" then src = src_kind_name(src) end
+  return M.site_label(src, frame.id, symtab)
+end
+
+-- Render the full stack of an event as a leaf..root joined label string.
+-- `sep` defaults to ";" (the flamegraph collapsed-lines convention).
+-- For v1/v2 streams the synthesized 1-element stack yields just the leaf
+-- label, identical to the legacy single-frame site_label.
+function M.stack_label(ev, symtab, sep)
+  sep = sep or ";"
+  local parts = {}
+  for i = 1, #ev.stack do
+    parts[i] = M.frame_label(ev.stack[i], symtab)
+  end
+  return table.concat(parts, sep)
+end
+
 -- Map the ALLOC `cls` byte (arena-class axis, 0xff = raw allocf buffer) to a
 -- short human-readable type tag. The C emitter uses the ArenaClass enum or
 -- 0xff for raw allocf memory (see lj_memprof_emit_realloc ALLOC branch).
@@ -373,6 +447,7 @@ M.SRC = SRC
 M.PROLOGUE_LEN = PROLOGUE_LEN
 M.STREAM_VERSION_V1 = STREAM_VERSION_V1
 M.STREAM_VERSION_V2 = STREAM_VERSION_V2
+M.STREAM_VERSION_V3 = STREAM_VERSION_V3
 M.STREAM_VERSION_MAX = STREAM_VERSION_MAX
 
 return M

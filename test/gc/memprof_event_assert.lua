@@ -56,9 +56,10 @@ local function parse_stream(data)
   pos = pos + 3
   check(magic == "ljm", "prologue magic 'ljm' (got '" .. magic .. "')")
   local version = data:byte(pos); pos = pos + 1
-  check(version == 1 or version == 2,
-        "stream version 1 or 2 (got " .. tostring(version) .. ")")
+  check(version == 1 or version == 2 or version == 3,
+        "stream version 1, 2 or 3 (got " .. tostring(version) .. ")")
   local has_cycle = (version >= 2)
+  local has_frames = (version >= 3)
   pos = pos + 1  -- reserved
 
   local events = {}
@@ -82,18 +83,39 @@ local function parse_stream(data)
       ev.gcstate = data:byte(pos); pos = pos + 1
       ev.src_id, pos = read_uleb128(data, pos)
       if has_cycle then ev.gc_cycle, pos = read_uleb128(data, pos) end
+      if has_frames then  -- skip v3 frame stack
+        local nf; nf, pos = read_uleb128(data, pos)
+        for _ = 1, nf do
+          pos = pos + 1  -- kind byte
+          local id; id, pos = read_uleb128(data, pos)
+        end
+      end
     elseif op == 2 then -- REALLOC
       ev.addr, pos = read_uleb128(data, pos)
       ev.osize, pos = read_uleb128(data, pos)
       ev.nsize, pos = read_uleb128(data, pos)
       ev.src_id, pos = read_uleb128(data, pos)
       if has_cycle then ev.gc_cycle, pos = read_uleb128(data, pos) end
+      if has_frames then
+        local nf; nf, pos = read_uleb128(data, pos)
+        for _ = 1, nf do
+          pos = pos + 1
+          local id; id, pos = read_uleb128(data, pos)
+        end
+      end
     elseif op == 3 then -- FREE
       ev.addr, pos = read_uleb128(data, pos)
       ev.osize, pos = read_uleb128(data, pos)
       ev.gct = data:byte(pos); pos = pos + 1
       ev.src_id, pos = read_uleb128(data, pos)
       if has_cycle then ev.gc_cycle, pos = read_uleb128(data, pos) end
+      if has_frames then
+        local nf; nf, pos = read_uleb128(data, pos)
+        for _ = 1, nf do
+          pos = pos + 1
+          local id; id, pos = read_uleb128(data, pos)
+        end
+      end
     elseif op == 4 then -- PODFREE
       ev.cellcount, pos = read_uleb128(data, pos)
       ev.bytes, pos = read_uleb128(data, pos)

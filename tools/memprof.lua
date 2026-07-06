@@ -5,26 +5,32 @@
 --   ./src/luajit tools/memprof.lua <subcmd> <stream.bin> [limit]
 --
 -- Subcommands:
---   top        Per-site flat allocation stats, sorted by alloc_space desc.
---              Columns: flat_space  objects  site   (Go-pprof flat style)
---   collapsed  Brendan-Gregg flamegraph-input lines:  site1;site2  count
---              (depth-1 today, so single-frame stacks — see note below)
---   summary    Total alloc / freed / inuse bytes + objects, per-type breakdown.
---   leak       Addresses allocated and never freed in the stream, grouped by
---              their allocation site.
---   survival   Per-site survival rate: of the objects each site allocated,
---              the fraction still live at end of stream. Classifies each site
---              as CHURN (survival<0.1, short-lived temporaries), RETAINED
---              (>0.9, long-lived / potential leak), or MIXED. Sorted by
---              alloc volume desc. The metric that distinguishes churn from
---              real leaks in a GC'd VM.
---   pprof      Serialize the aggregated per-site stats into an UNCOMPRESSED
---              google/pprof `Profile` protobuf (raw bytes, no gzip) so the
---              whole `go tool pprof` ecosystem (top/graph/web/flamegraph)
---              works on our data. Writes to the `out` path given after the
---              stream, or stdout if `out` is `-` / omitted.
---              Usage: luajit tools/memprof.lua pprof <stream.bin> [out.pb]
---              View with: go tool pprof [-http] <out.pb>
+--   top           Per-site flat allocation stats (FULL stack key), sorted by
+--                 alloc_space desc. Columns: flat_space objects inuse_space
+--                 inuse_objs site   (Go-pprof flat style). The site label is
+--                 the leaf..root stack joined by ";" (v3 multi-frame).
+--   top-leaf      Same as `top` but keyed by the LEAF frame only (the v1/v2
+--                 single-frame view) — collapses distinct call paths that
+--                 share a leaf into one row.
+--   collapsed     Brendan-Gregg flamegraph-input lines:  leaf;caller;...;root
+--                 count  (semicolon-separated multi-frame stacks, leaf-first).
+--   summary       Total alloc / freed / inuse bytes + objects, per-type breakdown.
+--   leak          Addresses allocated and never freed in the stream, grouped by
+--                 their allocation (full-stack) site.
+--   survival      Per-site survival rate (FULL stack key): of the objects each
+--                 site allocated, the fraction still live at end of stream.
+--                 Classifies each site as CHURN (survival<0.1, short-lived
+--                 temporaries), RETAINED (>0.9, long-lived / potential leak),
+--                 or MIXED. Sorted by alloc volume desc.
+--   survival-leaf Same as `survival` but keyed by the LEAF frame only.
+--   pprof         Serialize the aggregated per-site stats into an UNCOMPRESSED
+--                 google/pprof `Profile` protobuf (raw bytes, no gzip) so the
+--                 whole `go tool pprof` ecosystem (top/graph/web/flamegraph)
+--                 works on our data. Sample.location_id carries the full
+--                 leaf..root stack. Writes to the `out` path given after the
+--                 stream, or stdout if `out` is `-` / omitted.
+--                 Usage: luajit tools/memprof.lua pprof <stream.bin> [out.pb]
+--                 View with: go tool pprof [-http] <out.pb>
 --
 -- The stream is produced by:
 --   memprof.start{mode="event", depth=1, out="stream.bin"}
@@ -78,8 +84,8 @@ local function cmd_pprof(agg, out_path)
   return n
 end
 
-local function cmd_top(agg, limit)
-  local rows = aggregate.top_sites(agg, limit)
+local function cmd_top(agg, limit, opts)
+  local rows = aggregate.top_sites(agg, limit, opts)
   if #rows == 0 then
     io.write("(no allocation sites recorded)\n")
     return
@@ -96,15 +102,12 @@ local function cmd_top(agg, limit)
 end
 
 local function cmd_collapsed(agg)
-  -- Flamegraph input: `frame;frame;... count`. depth=1 today, so each line is
-  -- a single frame (the allocation site) plus its alloc_objects count. Use
-  -- alloc_objects (call count) as the sample value, which is the conventional
-  -- flamegraph metric for allocation profilers. Sorted by site for stable
-  -- output; the flamegraph tool re-sorts anyway.
-  --
-  -- NOTE: real stack depth requires the v1 emitter to walk N frames; today it
-  -- reads only the level-0 frame (memprof_attribution), so every stack is a
-  -- single frame. This is the documented v1 limitation.
+  -- Flamegraph input: `frame;frame;... count`. The aggregate site key is the
+  -- full leaf..root stack joined by ";" (v3 multi-frame attribution), so each
+  -- line is a real multi-frame stack with alloc_objects as the sample value
+  -- (the conventional flamegraph metric for allocation profilers). For depth=1
+  -- streams each stack is a single frame, matching the legacy v1/v2 output.
+  -- Sorted by site for stable output; the flamegraph tool re-sorts anyway.
   local rows = aggregate.top_sites(agg, nil)
   for i = 1, #rows do
     local r = rows[i]
@@ -180,8 +183,8 @@ local function cmd_leak(agg)
   end
 end
 
-local function cmd_survival(agg, limit)
-  local rows = aggregate.survival_sites(agg, limit)
+local function cmd_survival(agg, limit, opts)
+  local rows = aggregate.survival_sites(agg, limit, opts)
   if #rows == 0 then
     io.write("(no allocation sites recorded)\n")
     return
@@ -215,7 +218,8 @@ end
 local function usage()
   io.stderr:write([[
 usage: luajit tools/memprof.lua <subcmd> <stream.bin> [limit|out]
-subcommands: top | collapsed | summary | leak | survival | pprof
+subcommands: top | top-leaf | collapsed | summary | leak | survival |
+             survival-leaf | pprof
   pprof <stream.bin> [out.pb]   write pprof protobuf to out.pb (or stdout)
 ]])
 end
@@ -230,8 +234,9 @@ local function main(arg)
   local limit = tonumber(arg[3])
   local out_path = arg[3]  -- for pprof subcommand (may be "-" or a path)
 
-  local subcmds = { top = true, collapsed = true, summary = true,
-                    leak = true, survival = true, pprof = true }
+  local subcmds = { top = true, ["top-leaf"] = true, collapsed = true,
+                    summary = true, leak = true, survival = true,
+                    ["survival-leaf"] = true, pprof = true }
   if not subcmds[subcmd] then
     io.stderr:write(("unknown subcommand: %s\n"):format(subcmd))
     usage()
@@ -254,7 +259,9 @@ local function main(arg)
   local agg = aggregate.aggregate(parsed)
 
   if subcmd == "top" then
-    cmd_top(agg, limit)
+    cmd_top(agg, limit, {})
+  elseif subcmd == "top-leaf" then
+    cmd_top(agg, limit, { leaf = true })
   elseif subcmd == "collapsed" then
     cmd_collapsed(agg)
   elseif subcmd == "summary" then
@@ -262,7 +269,9 @@ local function main(arg)
   elseif subcmd == "leak" then
     cmd_leak(agg)
   elseif subcmd == "survival" then
-    cmd_survival(agg, limit)
+    cmd_survival(agg, limit, {})
+  elseif subcmd == "survival-leaf" then
+    cmd_survival(agg, limit, { leaf = true })
   elseif subcmd == "pprof" then
     cmd_pprof(agg, out_path)
   end

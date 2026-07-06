@@ -109,7 +109,8 @@ f:close()
 check(#data > 5, "stream non-empty (" .. #data .. " bytes)")
 
 local parsed = parse.parse(data)
-check(parsed.version == 2, "stream version 2 (got " .. tostring(parsed.version) .. ")")
+check(parsed.version == 2 or parsed.version == 3,
+      "stream version 2 or 3 (got " .. tostring(parsed.version) .. ")")
 local agg = aggregate.aggregate(parsed)
 local surv = agg.survival
 check(surv ~= nil, "aggregate produced survival table")

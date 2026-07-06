@@ -44,38 +44,62 @@ local parse = require("tools.memprof.parse")
 
 local M = {}
 
--- Render a stable site key from an event using the symtab. Wraps parse's
--- site_label so callers do not need to import parse directly.
+-- Render a stable FULL-STACK site key from an event using the symtab: the
+-- resolved leaf..root frame labels joined by ";" (the flamegraph collapsed
+-- convention). For depth=1 streams this collapses to the leaf label, so
+-- legacy single-frame streams keep their original site identity.
 local function site_key(ev, symtab)
   if ev.op == "PODFREE" then
     return "INTERNAL:POD"
+  end
+  return parse.stack_label(ev, symtab, ";")
+end
+
+-- Leaf-only label (the v1/v2 single-frame identity). Used for the per-leaf
+-- view exposed alongside the full-stack view so top/survival/leak can be
+-- sliced either way.
+local function leaf_key(ev, symtab)
+  if ev.op == "PODFREE" then
+    return "INTERNAL:POD"
+  end
+  if ev.stack and ev.stack[1] then
+    return parse.frame_label(ev.stack[1], symtab)
   end
   return parse.site_label(ev.src, ev.src_id, symtab)
 end
 
 -- Main entry point. `parsed` is the table returned by parse.parse().
 -- Returns:
---   sites:   { [site_label] = {alloc_space=, alloc_objects=, freed_space=,
---                              freed_objects=, inuse_space=, inuse_objects=} }
---   types:   { [type_tag]   = {alloc_space=, alloc_objects=, freed_space=,
---                              freed_objects=} }
---   leaks:   { [site_label] = { [addr] = size, ... } }
---   totals:  { alloc_space, alloc_objects, freed_space, freed_objects,
---              inuse_space, inuse_objects, podfree_bytes, podfree_objects,
---              realloc_count, free_count, podfree_count, event_count }
+--   sites:       full-stack keyed { [stack_label] = {alloc_space=, ...} }
+--   sites_leaf:  leaf-only keyed { [leaf_label]  = {alloc_space=, ...} }
+--   types:       { [type_tag]   = {alloc_space=, alloc_objects=, freed_space=,
+--                                  freed_objects=} }
+--   leaks:       full-stack keyed { [stack_label] = { addrs=, count=, bytes= } }
+--   leaks_leaf:  leaf-only keyed { [leaf_label]  = { addrs=, count=, bytes= } }
+--   totals:      { alloc_space, alloc_objects, freed_space, freed_objects,
+--                  inuse_space, inuse_objects, podfree_bytes, podfree_objects,
+--                  realloc_count, free_count, podfree_count, event_count }
+--   survival:    { sites = full-stack keyed, sites_leaf = leaf keyed,
+--                  cycles = per-cycle }
+-- For depth=1 streams the full-stack and leaf labels coincide, so the two
+-- views are identical (back-compat with the v1/v2 single-frame aggregator).
 function M.aggregate(parsed)
   local events = parsed.events
   local symtab = parsed.symtab
 
   local sites = {}
+  local sites_leaf = {}
   local types = {}
-  local leaks = {}            -- site -> { addr -> lastsize }
-  local live = {}             -- addr -> { site=, size=, cycle= }  (currently allocated)
+  local leaks = {}             -- full-stack -> { addr -> lastsize }
+  local leaks_leaf = {}        -- leaf-only  -> { addr -> lastsize }
+  local live = {}              -- addr -> { site=, leaf=, size=, cycle= }
   -- survival tracking: per-site alloc counts by birth cycle; survivors counted
   -- post-loop from `live`. freed-by-addr removes the live entry, so whatever
   -- remains live at end-of-stream is a survivor of its birth cycle.
-  local surv_alloc = {}       -- site -> { [cycle] = alloc_count }
-  local surv_freed = {}       -- site -> { [cycle] = freed_count } (matched by addr)
+  local surv_alloc = {}        -- full-stack -> { [cycle] = alloc_count }
+  local surv_freed = {}        -- full-stack -> { [cycle] = freed_count }
+  local surv_alloc_leaf = {}   -- leaf-only  -> { [cycle] = alloc_count }
+  local surv_freed_leaf = {}   -- leaf-only  -> { [cycle] = freed_count }
   local totals = {
     alloc_space = 0, alloc_objects = 0,
     freed_space = 0, freed_objects = 0,
@@ -85,15 +109,46 @@ function M.aggregate(parsed)
     event_count = #events,
   }
 
-  local function site_tab(label)
-    local t = sites[label]
+  -- Apply a (alloc,freed,inuse) delta tuple to one site map.
+  local function apply_stat(map, key, da_s, da_o, df_s, df_o, di_s, di_o)
+    local t = map[key]
     if not t then
       t = { alloc_space = 0, alloc_objects = 0,
             freed_space = 0, freed_objects = 0,
             inuse_space = 0, inuse_objects = 0 }
-      sites[label] = t
+      map[key] = t
     end
+    t.alloc_space = t.alloc_space + da_s
+    t.alloc_objects = t.alloc_objects + da_o
+    t.freed_space = t.freed_space + df_s
+    t.freed_objects = t.freed_objects + df_o
+    t.inuse_space = t.inuse_space + di_s
+    t.inuse_objects = t.inuse_objects + di_o
     return t
+  end
+  -- Bill the same delta to BOTH the full-stack and leaf-only site maps.
+  local function bill(skey, lkey, da_s, da_o, df_s, df_o, di_s, di_o)
+    apply_stat(sites, skey, da_s, da_o, df_s, df_o, di_s, di_o)
+    apply_stat(sites_leaf, lkey, da_s, da_o, df_s, df_o, di_s, di_o)
+  end
+  local function leak_add(map, key, addr, size)
+    local ls = map[key]
+    if not ls then ls = {}; map[key] = ls end
+    ls[addr] = size
+  end
+  local function leak_del(map, key, addr)
+    local ls = map[key]
+    if ls then ls[addr] = nil end
+  end
+  -- Bump a per-cycle counter in both the full-stack and leaf survival maps.
+  local function surv_bump(skey, lkey, cyc, map_full, map_leaf)
+    local function bump(map, key)
+      local m = map[key]
+      if not m then m = {}; map[key] = m end
+      m[cyc] = (m[cyc] or 0) + 1
+    end
+    bump(map_full, skey)
+    bump(map_leaf, lkey)
   end
   local function type_tab(tag)
     local t = types[tag]
@@ -110,12 +165,9 @@ function M.aggregate(parsed)
     local op = ev.op
 
     if op == "ALLOC" then
-      local label = site_key(ev, symtab)
-      local st = site_tab(label)
-      st.alloc_space = st.alloc_space + ev.size
-      st.alloc_objects = st.alloc_objects + 1
-      st.inuse_space = st.inuse_space + ev.size
-      st.inuse_objects = st.inuse_objects + 1
+      local skey = site_key(ev, symtab)
+      local lkey = leaf_key(ev, symtab)
+      bill(skey, lkey, ev.size, 1, 0, 0, ev.size, 1)
       totals.alloc_space = totals.alloc_space + ev.size
       totals.alloc_objects = totals.alloc_objects + 1
       totals.inuse_space = totals.inuse_space + ev.size
@@ -126,42 +178,31 @@ function M.aggregate(parsed)
       tt.alloc_space = tt.alloc_space + ev.size
       tt.alloc_objects = tt.alloc_objects + 1
       -- Track live addr for leak view and FREE matching.
-      live[ev.addr] = { site = label, size = ev.size, cycle = ev.gc_cycle or 0 }
       local cyc = ev.gc_cycle or 0
-      local sa = surv_alloc[label]
-      if not sa then sa = {}; surv_alloc[label] = sa end
-      sa[cyc] = (sa[cyc] or 0) + 1
-      local ls = leaks[label]
-      if not ls then ls = {}; leaks[label] = ls end
-      ls[ev.addr] = ev.size
+      live[ev.addr] = { site = skey, leaf = lkey, size = ev.size, cycle = cyc }
+      surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf)
+      leak_add(leaks, skey, ev.addr, ev.size)
+      leak_add(leaks_leaf, lkey, ev.addr, ev.size)
 
     elseif op == "REALLOC" then
       -- True resize (osz!=0, nsize!=0). Bill osize as freed, nsize as alloc
       -- at the event's site. Update live[addr] size.
       totals.realloc_count = totals.realloc_count + 1
-      local label = site_key(ev, symtab)
-      local st = site_tab(label)
-      -- freed side
-      st.freed_space = st.freed_space + ev.osize
-      st.freed_objects = st.freed_objects + 1
-      st.inuse_space = st.inuse_space - ev.osize
-      st.inuse_objects = st.inuse_objects - 1
+      local skey = site_key(ev, symtab)
+      local lkey = leaf_key(ev, symtab)
+      bill(skey, lkey, ev.nsize, 1, ev.osize, 1,
+           ev.nsize - ev.osize, 0)
       totals.freed_space = totals.freed_space + ev.osize
       totals.freed_objects = totals.freed_objects + 1
       totals.inuse_space = totals.inuse_space - ev.osize
       totals.inuse_objects = totals.inuse_objects - 1
-      -- alloc side
-      st.alloc_space = st.alloc_space + ev.nsize
-      st.alloc_objects = st.alloc_objects + 1
-      st.inuse_space = st.inuse_space + ev.nsize
-      st.inuse_objects = st.inuse_objects + 1
       totals.alloc_space = totals.alloc_space + ev.nsize
       totals.alloc_objects = totals.alloc_objects + 1
       totals.inuse_space = totals.inuse_space + ev.nsize
       totals.inuse_objects = totals.inuse_objects + 1
-      -- REALLOC type axis: use a synthetic "realloc" tag (the C emitter does
-      -- not attach cls/gct to REALLOC records). Counted under both alloc and
-      -- freed so per-type churn is visible.
+      -- REALLOC type axis: synthetic "realloc" tag (C emitter attaches no
+      -- cls/gct to REALLOC records). Counted under both alloc and freed so
+      -- per-type churn is visible.
       local tt = type_tab("realloc")
       tt.alloc_space = tt.alloc_space + ev.nsize
       tt.alloc_objects = tt.alloc_objects + 1
@@ -169,24 +210,18 @@ function M.aggregate(parsed)
       tt.freed_objects = tt.freed_objects + 1
       -- Update live/leak tracking for this addr.
       local prev = live[ev.addr]
+      local cyc = ev.gc_cycle or 0
       if prev then
-        -- Remove prior leak entry, then re-add with new size.
-        local ls = leaks[prev.site]
-        if ls then ls[ev.addr] = nil end
+        leak_del(leaks, prev.site, ev.addr)
+        leak_del(leaks_leaf, prev.leaf, ev.addr)
         -- The old object (osz) is "freed" for survival accounting at its
         -- birth site/cycle; the REALLOC re-bills nsize as a fresh alloc.
-        local sf = surv_freed[prev.site]
-        if not sf then sf = {}; surv_freed[prev.site] = sf end
-        sf[prev.cycle] = (sf[prev.cycle] or 0) + 1
+        surv_bump(prev.site, prev.leaf, prev.cycle, surv_freed, surv_freed_leaf)
       end
-      live[ev.addr] = { site = label, size = ev.nsize, cycle = ev.gc_cycle or 0 }
-      local cyc = ev.gc_cycle or 0
-      local sa = surv_alloc[label]
-      if not sa then sa = {}; surv_alloc[label] = sa end
-      sa[cyc] = (sa[cyc] or 0) + 1
-      local ls = leaks[label]
-      if not ls then ls = {}; leaks[label] = ls end
-      ls[ev.addr] = ev.nsize
+      live[ev.addr] = { site = skey, leaf = lkey, size = ev.nsize, cycle = cyc }
+      surv_bump(skey, lkey, cyc, surv_alloc, surv_alloc_leaf)
+      leak_add(leaks, skey, ev.addr, ev.nsize)
+      leak_add(leaks_leaf, lkey, ev.addr, ev.nsize)
 
     elseif op == "FREE" then
       totals.free_count = totals.free_count + 1
@@ -197,27 +232,24 @@ function M.aggregate(parsed)
       -- site (which we know from live[addr]). This gives accurate per-site
       -- inuse deltas and a correct leak view.
       local prev = live[ev.addr]
-      local label
+      local skey, lkey
       if prev then
-        label = prev.site
-        -- Remove from leak set for that site.
-        local ls = leaks[label]
-        if ls then ls[ev.addr] = nil end
+        skey = prev.site
+        lkey = prev.leaf
+        leak_del(leaks, skey, ev.addr)
+        leak_del(leaks_leaf, lkey, ev.addr)
         live[ev.addr] = nil
-        -- Record the freed object against its birth cycle for survival.
-        local sf = surv_freed[label]
-        if not sf then sf = {}; surv_freed[label] = sf end
-        sf[prev.cycle] = (sf[prev.cycle] or 0) + 1
+        surv_bump(skey, lkey, prev.cycle, surv_freed, surv_freed_leaf)
       else
         -- FREE without a preceding ALLOC in the stream (alloc happened before
         -- memprof.start). Bill to INTERNAL so it is not lost.
-        label = "INTERNAL"
+        skey = "INTERNAL"
+        lkey = "INTERNAL"
       end
-      local st = site_tab(label)
-      st.freed_space = st.freed_space + osize
-      st.freed_objects = st.freed_objects + 1
-      st.inuse_space = st.inuse_space - osize
-      if st.inuse_objects > 0 then st.inuse_objects = st.inuse_objects - 1 end
+      local st = apply_stat(sites, skey, 0, 0, osize, 1, -osize, -1)
+      if st.inuse_objects < 0 then st.inuse_objects = 0 end
+      local stl = apply_stat(sites_leaf, lkey, 0, 0, osize, 1, -osize, -1)
+      if stl.inuse_objects < 0 then stl.inuse_objects = 0 end
       totals.freed_space = totals.freed_space + osize
       totals.freed_objects = totals.freed_objects + 1
       totals.inuse_space = totals.inuse_space - osize
@@ -233,10 +265,7 @@ function M.aggregate(parsed)
       totals.podfree_bytes = totals.podfree_bytes + ev.bytes
       totals.podfree_objects = totals.podfree_objects + ev.cellcount
       local label = "INTERNAL:POD"
-      local st = site_tab(label)
-      st.freed_space = st.freed_space + ev.bytes
-      st.freed_objects = st.freed_objects + 1
-      st.inuse_space = st.inuse_space - ev.bytes
+      bill(label, label, 0, 0, ev.bytes, 1, -ev.bytes, 0)
       totals.freed_space = totals.freed_space + ev.bytes
       totals.freed_objects = totals.freed_objects + 1
       totals.inuse_space = totals.inuse_space - ev.bytes
@@ -246,116 +275,132 @@ function M.aggregate(parsed)
     end
   end
 
-  -- Prune empty leak buckets (sites where every alloc was freed).
-  local pruned_leaks = {}
-  for label, addrs in pairs(leaks) do
-    local n = 0
-    for _ in pairs(addrs) do n = n + 1 end
-    if n > 0 then
-      -- Materialize as a list of {addr=, size=} for stable output.
-      local list = {}
-      for addr, size in pairs(addrs) do
-        list[#list+1] = { addr = addr, size = size }
+  -- Materialize a pruned leak view (drop empty buckets; sorted addr list).
+  local function prune_leaks(map)
+    local out = {}
+    for label, addrs in pairs(map) do
+      local n = 0
+      for _ in pairs(addrs) do n = n + 1 end
+      if n > 0 then
+        local list = {}
+        for addr, size in pairs(addrs) do
+          list[#list+1] = { addr = addr, size = size }
+        end
+        table.sort(list, function(a, b) return a.addr < b.addr end)
+        local bytes = 0
+        for _, e in ipairs(list) do bytes = bytes + e.size end
+        out[label] = { addrs = list, count = n, bytes = bytes }
       end
-      table.sort(list, function(a, b) return a.addr < b.addr end)
-      pruned_leaks[label] = { addrs = list, count = n,
-                              bytes = (function()
-                                local s = 0
-                                for _, e in ipairs(list) do s = s + e.size end
-                                return s
-                              end)() }
     end
+    return out
   end
+  local pruned_leaks = prune_leaks(leaks)
+  local pruned_leaks_leaf = prune_leaks(leaks_leaf)
 
   -- Survival-rate computation. Whatever remains in `live` at end-of-stream is
-  -- a survivor of its birth cycle. Aggregate per-site and per-cycle.
-  local surv_sites = {}   -- label -> { allocated=, freed=, survivors=, survival_rate=, by_cycle={...} }
-  local surv_cycles = {}  -- cycle -> { allocated=, freed=, survivors= }
-  -- Seed per-site and per-cycle alloc/freed from the counters built in-loop.
-  for label, cycmap in pairs(surv_alloc) do
-    local st = { allocated = 0, freed = 0, survivors = 0,
-                 survival_rate = 0, by_cycle = {} }
-    for cyc, n in pairs(cycmap) do
-      st.allocated = st.allocated + n
-      st.by_cycle[cyc] = { allocated = n, freed = 0, survivors = 0 }
-      local cm = surv_cycles[cyc]
-      if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
-                 surv_cycles[cyc] = cm end
-      cm.allocated = cm.allocated + n
-    end
-    local sf = surv_freed[label]
-    if sf then
-      for cyc, n in pairs(sf) do
-        st.freed = st.freed + n
-        local bc = st.by_cycle[cyc]
-        if bc then bc.freed = n else st.by_cycle[cyc] = { allocated = 0, freed = n, survivors = 0 } end
-        local cm = surv_cycles[cyc]
-        if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
-                   surv_cycles[cyc] = cm end
-        cm.freed = cm.freed + n
-      end
-    end
-    surv_sites[label] = st
-  end
-  -- Also seed freed-only sites (FREE without preceding ALLOC in-stream: the
-  -- object was allocated before memprof.start). Bill to INTERNAL cycle 0.
-  for label, sf in pairs(surv_freed) do
-    if not surv_sites[label] then
+  -- a survivor of its birth cycle. Build the per-site/per-cycle tables for a
+  -- given (surv_alloc, surv_freed, live-key) axis, returning {sites=,cycles=}.
+  -- `key_field` is "site" (full-stack) or "leaf" (leaf-only).
+  local function build_survival(sa_map, sf_map, key_field)
+    local surv_sites = {}
+    local surv_cycles = {}
+    for label, cycmap in pairs(sa_map) do
       local st = { allocated = 0, freed = 0, survivors = 0,
                    survival_rate = 0, by_cycle = {} }
-      for cyc, n in pairs(sf) do
-        st.freed = st.freed + n
-        st.by_cycle[cyc] = { allocated = 0, freed = n, survivors = 0 }
+      for cyc, n in pairs(cycmap) do
+        st.allocated = st.allocated + n
+        st.by_cycle[cyc] = { allocated = n, freed = 0, survivors = 0 }
         local cm = surv_cycles[cyc]
         if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
                    surv_cycles[cyc] = cm end
-        cm.freed = cm.freed + n
+        cm.allocated = cm.allocated + n
+      end
+      local sf = sf_map[label]
+      if sf then
+        for cyc, n in pairs(sf) do
+          st.freed = st.freed + n
+          local bc = st.by_cycle[cyc]
+          if bc then bc.freed = n
+          else st.by_cycle[cyc] = { allocated = 0, freed = n, survivors = 0 } end
+          local cm = surv_cycles[cyc]
+          if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
+                     surv_cycles[cyc] = cm end
+          cm.freed = cm.freed + n
+        end
       end
       surv_sites[label] = st
     end
-  end
-  -- Count survivors from `live` (addrs still allocated at end of stream).
-  for addr, info in pairs(live) do
-    local st = surv_sites[info.site]
-    if not st then
-      st = { allocated = 0, freed = 0, survivors = 0, survival_rate = 0,
-             by_cycle = {} }
-      surv_sites[info.site] = st
+    -- Also seed freed-only sites (FREE without preceding ALLOC in-stream: the
+    -- object was allocated before memprof.start). Bill to INTERNAL cycle 0.
+    for label, sf in pairs(sf_map) do
+      if not surv_sites[label] then
+        local st = { allocated = 0, freed = 0, survivors = 0,
+                     survival_rate = 0, by_cycle = {} }
+        for cyc, n in pairs(sf) do
+          st.freed = st.freed + n
+          st.by_cycle[cyc] = { allocated = 0, freed = n, survivors = 0 }
+          local cm = surv_cycles[cyc]
+          if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
+                     surv_cycles[cyc] = cm end
+          cm.freed = cm.freed + n
+        end
+        surv_sites[label] = st
+      end
     end
-    st.survivors = st.survivors + 1
-    local bc = st.by_cycle[info.cycle]
-    if not bc then bc = { allocated = 0, freed = 0, survivors = 0 }
-                   st.by_cycle[info.cycle] = bc end
-    bc.survivors = bc.survivors + 1
-    local cm = surv_cycles[info.cycle]
-    if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
-               surv_cycles[info.cycle] = cm end
-    cm.survivors = cm.survivors + 1
-  end
-  -- Finalize survival_rate per site (guard against divide-by-zero).
-  for label, st in pairs(surv_sites) do
-    if st.allocated > 0 then
-      st.survival_rate = st.survivors / st.allocated
-    else
-      st.survival_rate = 0
+    -- Count survivors from `live` (addrs still allocated at end of stream).
+    for addr, info in pairs(live) do
+      local label = info[key_field]
+      local st = surv_sites[label]
+      if not st then
+        st = { allocated = 0, freed = 0, survivors = 0, survival_rate = 0,
+               by_cycle = {} }
+        surv_sites[label] = st
+      end
+      st.survivors = st.survivors + 1
+      local bc = st.by_cycle[info.cycle]
+      if not bc then bc = { allocated = 0, freed = 0, survivors = 0 }
+                     st.by_cycle[info.cycle] = bc end
+      bc.survivors = bc.survivors + 1
+      local cm = surv_cycles[info.cycle]
+      if not cm then cm = { allocated = 0, freed = 0, survivors = 0 }
+                 surv_cycles[info.cycle] = cm end
+      cm.survivors = cm.survivors + 1
     end
+    -- Finalize survival_rate per site (guard against divide-by-zero).
+    for _, st in pairs(surv_sites) do
+      if st.allocated > 0 then
+        st.survival_rate = st.survivors / st.allocated
+      else
+        st.survival_rate = 0
+      end
+    end
+    return { sites = surv_sites, cycles = surv_cycles }
   end
+  local surv_full = build_survival(surv_alloc, surv_freed, "site")
+  local surv_leaf = build_survival(surv_alloc_leaf, surv_freed_leaf, "leaf")
 
   return {
     sites = sites,
+    sites_leaf = sites_leaf,
     types = types,
     leaks = pruned_leaks,
+    leaks_leaf = pruned_leaks_leaf,
     totals = totals,
     symtab = symtab,
-    survival = { sites = surv_sites, cycles = surv_cycles },
+    survival = { sites = surv_full.sites, sites_leaf = surv_leaf.sites,
+                 cycles = surv_full.cycles },
   }
 end
 
 -- Return a list of {label=, stat=} sorted descending by alloc_space (the
 -- `top` view). `limit` caps the number of rows; nil = all.
-function M.top_sites(agg, limit)
+-- `opts.leaf == true` selects the leaf-only view (agg.sites_leaf); the
+-- default is the full-stack view (agg.sites).
+function M.top_sites(agg, limit, opts)
+  opts = opts or {}
+  local map = opts.leaf and agg.sites_leaf or agg.sites
   local rows = {}
-  for label, st in pairs(agg.sites) do
+  for label, st in pairs(map) do
     rows[#rows+1] = { label = label, stat = st }
   end
   table.sort(rows, function(a, b)
@@ -384,11 +429,14 @@ end
 -- view). Each row: { label=, allocated=, freed=, survivors=, survival_rate=,
 -- class= }. `limit` caps rows; nil = all. Sites with 0 allocated (freed-only,
 -- from pre-stream allocations) are included so orphans are visible.
-function M.survival_sites(agg, limit)
+-- `opts.leaf == true` selects the leaf-only survival view; default is full-stack.
+function M.survival_sites(agg, limit, opts)
+  opts = opts or {}
   local rows = {}
   local surv = agg.survival
   if not surv then return rows end
-  for label, st in pairs(surv.sites) do
+  local map = opts.leaf and surv.sites_leaf or surv.sites
+  for label, st in pairs(map) do
     rows[#rows+1] = {
       label = label,
       allocated = st.allocated, freed = st.freed, survivors = st.survivors,
