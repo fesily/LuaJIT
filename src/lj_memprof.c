@@ -568,6 +568,927 @@ LJ_FUNC int lj_memprof_diff(lua_State *L)
 }
 
 /* ======================================================================== **
+** v0.5: Retained-size + retaining-path analysis (read-only dominator tree).
+**
+** Builds a read-only object reference graph over the live set, computes a
+** dominator tree (Cooper-Harvey-Kennedy "A Simple, Fast Dominance Algorithm"),
+** and derives retained sizes and retaining paths.
+**
+** It mirrors the GC's per-type traverse logic (gc_traverse_tab/_func/_proto/
+** _thread in lj_gc_arena.c and the udata/upval cases in gc_mark) but ONLY
+** READS the reference fields — it never calls gc_mark/gc_marktv/gray/mark,
+** never flips a color bit, never touches a gray list, never mutates the arena
+** mark bitmap. The GC state is left byte-for-byte unperturbed.
+**
+** All scratch (node table, CSR adjacency, dom arrays) is allocated via
+** g->allocf and freed before the API returns; no Lua tables are used for the
+** graph. Exposed as memprof.retained{top=N} and memprof.retainers(addr).
+**
+** Node set = every allocated arena cell (block bit set, valid gct) + every
+** live huge slot + the SFIXED roots (mainthread, vmthread), plus a synthetic
+** super-root (node 0) whose out-edges mirror gc_mark_start's root set
+** (mainthread, mainthread->env, vmthread, registrytv, g->gcroot[]). After a
+** full GC (the default for these APIs) every allocated object is reachable
+** from the roots, so the dominator tree is well-defined over the whole set.
+** ======================================================================== */
+
+/* Graph node. Node 0 is the synthetic super-root. */
+typedef struct MpGNode {
+  uintptr_t	addr;	/* GCobj address; 0 for the super-root. */
+  uint32_t	gct;	/* ~LJ_Txxx tag; 0 for the super-root. */
+  uint32_t	shallow;/* Shallow size in bytes (type-based, matches propagatemark). */
+} MpGNode;
+
+/* Edge callback: called for each outgoing reference target. The callback
+** decides whether to record (target must be a live in-graph object). */
+typedef void (*MpRefCb)(void *ctx, GCobj *target);
+
+typedef struct MpGraph {
+  global_State	*g;
+  uint32_t	nnodes;	/* including super-root (node 0). */
+  MpGNode	*nodes;	/* nnodes entries, sorted by addr; nodes[0] = super-root. */
+  uint32_t	*head;	/* CSR: out-edges of node i are dst[head[i]..head[i+1]). */
+  uint32_t	*dst;	/* head[nnodes] entries. */
+} MpGraph;
+
+/* -- allocf helpers ------------------------------------------------------- */
+
+static void *mp_alloc(global_State *g, size_t sz)
+{
+  void *p = g->allocf(g->allocd, NULL, 0, sz);
+  if (p != NULL && sz) memset(p, 0, sz);
+  return p;
+}
+
+static void mp_free(global_State *g, void *p, size_t sz)
+{
+  if (p != NULL) g->allocf(g->allocd, p, sz, 0);
+}
+
+/* -- shallow size (mirrors propagatemark's per-type accounting) ----------- */
+
+static uint32_t mp_shallow_size(GCobj *o)
+{
+  uint32_t gct = o->gch.gct;
+  if (gct == (uint32_t)~LJ_TSTR) {
+    GCstr *s = gco2str(o);
+    return (uint32_t)(sizeof(GCstr) + s->len + 1);
+  } else if (gct == (uint32_t)~LJ_TTAB) {
+    GCtab *t = gco2tab(o);
+    return (uint32_t)(sizeof(GCtab) + sizeof(TValue) * (size_t)t->asize +
+		      (t->hmask ? sizeof(Node) * (size_t)(t->hmask + 1) : 0));
+  } else if (gct == (uint32_t)~LJ_TFUNC) {
+    GCfunc *fn = gco2func(o);
+    return isluafunc(fn) ?
+      (uint32_t)sizeLfunc((MSize)fn->l.nupvalues) :
+      (uint32_t)sizeCfunc((MSize)fn->c.nupvalues);
+  } else if (gct == (uint32_t)~LJ_TPROTO) {
+    GCproto *pt = gco2pt(o);
+    return (uint32_t)pt->sizept;
+  } else if (gct == (uint32_t)~LJ_TTHREAD) {
+    lua_State *th = gco2th(o);
+    return (uint32_t)(sizeof(lua_State) + sizeof(TValue) * (size_t)th->stacksize);
+  } else if (gct == (uint32_t)~LJ_TUDATA) {
+    return (uint32_t)sizeudata(gco2ud(o));
+  } else if (gct == (uint32_t)~LJ_TUPVAL) {
+    return (uint32_t)sizeof(GCupval);
+  } else if (gct == (uint32_t)~LJ_TCDATA) {
+    GCcdata *cd = gco2cd(o);
+    if (cdataisv(cd))
+      return (uint32_t)(sizeof(GCcdata) + sizeof(GCcdataVar) + cdatavlen(cd));
+    return (uint32_t)sizeof(GCcdata);
+  } else if (gct == (uint32_t)~LJ_TTRACE) {
+#if LJ_HASJIT
+    GCtrace *T = (GCtrace *)gco2trace(o);
+    return (uint32_t)(((sizeof(GCtrace) + 7) & ~(size_t)7) +
+		      (size_t)(T->nins - T->nk) * sizeof(IRIns) +
+		      (size_t)T->nsnap * sizeof(SnapShot) +
+		      (size_t)T->nsnapmap * sizeof(SnapEntry));
+#else
+    return 0;
+#endif
+  }
+  return 0;
+}
+
+/* -- read-only reference enumeration (mirrors the GC traverse fns) --------
+**
+** For each object type, reads exactly the same reference fields the GC's
+** traverse functions read, but instead of gc_markobj/gc_marktv it invokes
+** the callback with the target GCobj pointer. The callback performs the
+** in-graph membership check. Strings and cdata have no outgoing refs (the GC
+** treats them as leaves in gc_mark), so they are not enumerated here. */
+
+static void mp_enum_refs(global_State *g, GCobj *o, void *ctx, MpRefCb cb)
+{
+  uint32_t gct = o->gch.gct;
+  if (gct == (uint32_t)~LJ_TTAB) {
+    GCtab *t = gco2tab(o);
+    MSize i, asize = t->asize;
+    /* metatable (gc_traverse_tab: tabref(t->metatable)). */
+    if (gcrefu(t->metatable) != 0)
+      cb(ctx, obj2gco(tabref(t->metatable)));
+    /* array part (gc_traverse_tab: arrayslot(t,i) for i in [0,asize)). */
+    if (asize > 0) {
+      for (i = 0; i < asize; i++) {
+	cTValue *tv = arrayslot(t, i);
+	if (tvisgcv(tv)) cb(ctx, gcV(tv));
+      }
+    }
+    /* hash part (gc_traverse_tab: noderef(t->node) for i in [0,hmask]). */
+    if (t->hmask > 0) {
+      Node *node = noderef(t->node);
+      MSize hmask = t->hmask;
+      for (i = 0; i <= hmask; i++) {
+	Node *n = &node[i];
+	if (!tvisnil(&n->val)) {
+	  if (tvisgcv(&n->key)) cb(ctx, gcV(&n->key));
+	  if (tvisgcv(&n->val)) cb(ctx, gcV(&n->val));
+	}
+      }
+    }
+  } else if (gct == (uint32_t)~LJ_TFUNC) {
+    GCfunc *fn = gco2func(o);
+    /* env (gc_traverse_func: tabref(fn->c.env)). */
+    if (gcrefu(fn->c.env) != 0)
+      cb(ctx, obj2gco(tabref(fn->c.env)));
+    if (isluafunc(fn)) {
+      uint32_t i;
+      GCproto *pt = funcproto(fn);
+      cb(ctx, obj2gco(pt));
+      for (i = 0; i < fn->l.nupvalues; i++) {  /* Lua upvalues. */
+	GCobj *uv = gcref(fn->l.uvptr[i]);
+	if (uv != NULL) cb(ctx, uv);
+      }
+    } else {
+      uint32_t i;
+      for (i = 0; i < fn->c.nupvalues; i++) {  /* C upvalues (TValue each). */
+	cTValue *tv = &fn->c.upvalue[i];
+	if (tvisgcv(tv)) cb(ctx, gcV(tv));
+      }
+    }
+  } else if (gct == (uint32_t)~LJ_TPROTO) {
+    GCproto *pt = gco2pt(o);
+    ptrdiff_t i;
+    /* chunkname (gc_traverse_proto: proto_chunkname). */
+    if (gcrefu(pt->chunkname) != 0)
+      cb(ctx, obj2gco(strref(pt->chunkname)));
+    /* collectable constants (proto_kgc for i in [-sizekgc,0)). */
+    for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++) {
+      GCobj *k = proto_kgc(pt, (size_t)i);
+      if (k != NULL) cb(ctx, k);
+    }
+#if LJ_HASJIT
+    if (pt->trace) {
+      GCtrace *T = traceref(G2J(g), pt->trace);
+      if (T != NULL) cb(ctx, obj2gco(T));
+    }
+#endif
+  } else if (gct == (uint32_t)~LJ_TTHREAD) {
+    lua_State *th = gco2th(o);
+    TValue *bot = tvref(th->stack);
+    TValue *top = th->top;
+    TValue *stend = bot + th->stacksize;
+    TValue *p;
+    /* stack slots (gc_traverse_thread: tvref(th->stack)+1+LJ_FR2 .. th->top). */
+    if (top > stend) top = stend;  /* defensive */
+    if (bot != NULL) {
+      for (p = bot + 1 + LJ_FR2; p < top; p++) {
+	if (tvisgcv(p)) cb(ctx, gcV(p));
+      }
+      /* env (gc_traverse_thread: tabref(th->env)). */
+      if (gcrefu(th->env) != 0)
+	cb(ctx, obj2gco(tabref(th->env)));
+      /* frame functions (gc_traverse_frames: frame_func for each frame).
+      ** Mirrors the GC walk; read-only (no lj_state_shrinkstack call). The
+      ** stack-slot scan above already covers most frame-func slots, but we
+      ** replicate the frame walk to match the GC's edge set exactly. */
+      {
+	TValue *frame, *base = th->base;
+	uint32_t guard = 0;
+	if (base != NULL && base >= bot + 1 + LJ_FR2 && base <= stend) {
+	  for (frame = base - 1; frame > bot + LJ_FR2; frame = frame_prev(frame)) {
+	    GCfunc *fn;
+	    if (frame < bot + 1 + LJ_FR2 || frame >= stend) break;  /* defensive */
+	    fn = frame_func(frame);
+	    if (fn != NULL) cb(ctx, obj2gco(fn));
+	    if (++guard > th->stacksize + 8) break;  /* anti-loop */
+	  }
+	}
+      }
+    }
+  } else if (gct == (uint32_t)~LJ_TUDATA) {
+    GCudata *u = gco2ud(o);
+    /* metatable + env (gc_mark UDATA case). */
+    if (gcrefu(u->metatable) != 0)
+      cb(ctx, obj2gco(tabref(u->metatable)));
+    if (gcrefu(u->env) != 0)
+      cb(ctx, obj2gco(tabref(u->env)));
+#if LJ_HASBUFFER
+    if (u->udtype == UDTYPE_BUFFER) {
+      SBufExt *sbx = (SBufExt *)uddata(u);
+      if (sbufiscow(sbx) && gcrefu(sbx->cowref) != 0)
+	cb(ctx, gcref(sbx->cowref));
+      if (gcrefu(sbx->dict_str) != 0)
+	cb(ctx, gcref(sbx->dict_str));
+      if (gcrefu(sbx->dict_mt) != 0)
+	cb(ctx, gcref(sbx->dict_mt));
+    }
+#endif
+  } else if (gct == (uint32_t)~LJ_TUPVAL) {
+    GCupval *uv = gco2uv(o);
+    /* closed upvalue value (gc_mark UPVAL case: gc_marktv(uvval(uv))). */
+    cTValue *v = uvval(uv);
+    if (v != NULL && tvisgcv(v)) cb(ctx, gcV(v));
+  } else if (gct == (uint32_t)~LJ_TTRACE) {
+#if LJ_HASJIT
+    GCtrace *T = (GCtrace *)gco2trace(o);
+    IRRef ref;
+    if (T->traceno == 0) return;
+    for (ref = T->nk; ref < REF_TRUE; ref++) {
+      IRIns *ir = &T->ir[ref];
+      if (ir->o == IR_KGC) {
+	GCobj *k = ir_kgc(ir);
+	if (k != NULL) cb(ctx, k);
+      }
+      if (irt_is64(ir->t) && ir->o != IR_KNULL) ref++;
+    }
+    if (T->link) { GCtrace *L2 = traceref(G2J(g), T->link); if (L2) cb(ctx, obj2gco(L2)); }
+    if (T->nextroot) { GCtrace *R = traceref(G2J(g), T->nextroot); if (R) cb(ctx, obj2gco(R)); }
+    if (T->nextside) { GCtrace *S = traceref(G2J(g), T->nextside); if (S) cb(ctx, obj2gco(S)); }
+    if (gcrefu(T->startpt) != 0) cb(ctx, gcref(T->startpt));
+#endif
+  }
+  /* STR, CDATA: no outgoing refs (GC treats them as leaves). */
+  UNUSED(g);
+}
+
+/* Super-root out-edges: mirror gc_mark_start's root set. */
+static void mp_enum_root_refs(global_State *g, void *ctx, MpRefCb cb)
+{
+  lua_State *mt = mainthread(g);
+  cb(ctx, obj2gco(mt));
+  if (gcrefu(mt->env) != 0)
+    cb(ctx, obj2gco(tabref(mt->env)));
+  if (gcrefu(g->vmthref) != 0)
+    cb(ctx, obj2gco(vmthread(g)));
+  if (tvisgcv(&g->registrytv))
+    cb(ctx, gcV(&g->registrytv));
+  {
+    ptrdiff_t i;
+    for (i = 0; i < (ptrdiff_t)GCROOT_MAX; i++) {
+      if (gcrefu(g->gcroot[i]) != 0)
+	cb(ctx, gcref(g->gcroot[i]));
+    }
+  }
+}
+
+/* -- node enumeration (reuses the v0 arena-bitmap + huge-set walk) -------- */
+
+/* Count allocated arena cells with a valid gct. */
+static uint32_t mp_count_arena(global_State *g)
+{
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  MSize n = g->gc.arenastop, i;
+  uint32_t count = 0;
+  if (arenas == NULL) return 0;
+  for (i = 0; i < n; i++) {
+    GCArena *a = arenas[i];
+    GCCellID cell;
+    if (a == NULL) continue;
+    for (cell = MinCellId; cell < (GCCellID)a->celltop; ) {
+      GCBlockword bw = a->block[arena_blockidx(cell)];
+      if (!(bw & arena_blockbit(cell))) { cell++; continue; }
+      {
+	GCobj *o = (GCobj *)arena_cellptr(a, cell);
+	uint32_t gct = o->gch.gct;
+	GCCellID extent = 1;
+	int tidx = gct_to_idx(gct);
+	while (cell + extent < (GCCellID)a->celltop) {
+	  if (arena_cellstate(a, (GCCellID)(cell + extent)) != CellState_Extent)
+	    break;
+	  extent++;
+	}
+	if (tidx >= 0) count++;
+	cell = (GCCellID)(cell + extent);
+      }
+    }
+  }
+  return count;
+}
+
+/* Count live huge slots with a valid gct (mp_fill_nodes also fills these). */
+static uint32_t mp_count_huge(global_State *g)
+{
+  GCRef *slots = mref(g->gc.hugeset, GCRef);
+  MSize hmask = g->gc.hugesetmask;
+  MSize hi;
+  uint32_t count = 0;
+  if (slots == NULL) return 0;
+  for (hi = 0; hi <= hmask; hi++) {
+    uintptr_t u = gcrefu(slots[hi]);
+    GCobj *o;
+    if (!hugeset_slot_live(u)) continue;
+    o = hugeset_slot_obj(u);
+    if (gct_to_idx(o->gch.gct) >= 0) count++;
+  }
+  return count;
+}
+
+/* Fill nodes[] from arena + huge + fixed roots. Returns the next free index. */
+static uint32_t mp_fill_nodes(global_State *g, MpGNode *nodes, uint32_t from)
+{
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  MSize n = g->gc.arenastop, i;
+  uint32_t k = from;
+  if (arenas != NULL) {
+    for (i = 0; i < n; i++) {
+      GCArena *a = arenas[i];
+      GCCellID cell;
+      if (a == NULL) continue;
+      for (cell = MinCellId; cell < (GCCellID)a->celltop; ) {
+	GCBlockword bw = a->block[arena_blockidx(cell)];
+	if (!(bw & arena_blockbit(cell))) { cell++; continue; }
+	{
+	  GCobj *o = (GCobj *)arena_cellptr(a, cell);
+	  uint32_t gct = o->gch.gct;
+	  GCCellID extent = 1;
+	  int tidx = gct_to_idx(gct);
+	  while (cell + extent < (GCCellID)a->celltop) {
+	    if (arena_cellstate(a, (GCCellID)(cell + extent)) != CellState_Extent)
+	      break;
+	    extent++;
+	  }
+	  if (tidx >= 0) {
+	    nodes[k].addr = (uintptr_t)o;
+	    nodes[k].gct = gct;
+	    nodes[k].shallow = mp_shallow_size(o);
+	    k++;
+	  }
+	  cell = (GCCellID)(cell + extent);
+	}
+      }
+    }
+  }
+  /* huge set. */
+  {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    MSize hmask = g->gc.hugesetmask;
+    MSize hi;
+    if (slots != NULL) {
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	GCobj *o;
+	if (!hugeset_slot_live(u)) continue;
+	o = hugeset_slot_obj(u);
+	if (gct_to_idx(o->gch.gct) >= 0) {
+	  nodes[k].addr = (uintptr_t)o;
+	  nodes[k].gct = o->gch.gct;
+	  nodes[k].shallow = mp_shallow_size(o);
+	  k++;
+	}
+      }
+    }
+  }
+  /* SFIXED roots: mainthread + vmthread (not in arena/huge). */
+  if (gcrefu(g->mainthref) != 0) {
+    lua_State *mt = mainthread(g);
+    nodes[k].addr = (uintptr_t)obj2gco(mt);
+    nodes[k].gct = (uint32_t)~LJ_TTHREAD;
+    nodes[k].shallow = (uint32_t)(sizeof(lua_State) + sizeof(TValue) * (size_t)mt->stacksize);
+    k++;
+  }
+  if (gcrefu(g->vmthref) != 0) {
+    lua_State *vt = vmthread(g);
+    if ((uintptr_t)obj2gco(vt) != (uintptr_t)obj2gco(mainthread(g))) {
+      nodes[k].addr = (uintptr_t)obj2gco(vt);
+      nodes[k].gct = (uint32_t)~LJ_TTHREAD;
+      nodes[k].shallow = (uint32_t)(sizeof(lua_State) + sizeof(TValue) * (size_t)vt->stacksize);
+      k++;
+    }
+  }
+  return k;
+}
+
+/* Binary search nodes[0..nnodes-1] (sorted by addr) for addr. Returns index
+** or -1. Node 0 (super-root, addr 0) is included in the search range. */
+static int32_t mp_node_lookup(const MpGraph *gr, uintptr_t addr)
+{
+  int32_t lo = 0, hi = (int32_t)gr->nnodes - 1;
+  while (lo <= hi) {
+    int32_t mid = lo + (hi - lo) / 2;
+    if (gr->nodes[mid].addr < addr) lo = mid + 1;
+    else if (gr->nodes[mid].addr > addr) hi = mid - 1;
+    else return mid;
+  }
+  return -1;
+}
+
+static int mp_cmp_node_addr(const void *a, const void *b)
+{
+  const MpGNode *x = (const MpGNode *)a, *y = (const MpGNode *)b;
+  if (x->addr < y->addr) return -1;
+  if (x->addr > y->addr) return 1;
+  return 0;
+}
+
+/* Edge callback contexts. */
+typedef struct MpCountCtx {
+  const MpGraph *gr;
+  uint32_t count;
+} MpCountCtx;
+
+static void mp_cb_count(void *ctx, GCobj *target)
+{
+  MpCountCtx *c = (MpCountCtx *)ctx;
+  int32_t id = mp_node_lookup(c->gr, (uintptr_t)target);
+  if (id > 0) c->count++;  /* skip super-root (0) and not-found (-1) */
+}
+
+typedef struct MpEmitCtx {
+  const MpGraph *gr;
+  uint32_t *dst;
+  uint32_t *cur;	/* per-node fill cursor. */
+  uint32_t node;	/* current source node id. */
+} MpEmitCtx;
+
+static void mp_cb_emit(void *ctx, GCobj *target)
+{
+  MpEmitCtx *e = (MpEmitCtx *)ctx;
+  int32_t id = mp_node_lookup(e->gr, (uintptr_t)target);
+  if (id > 0)
+    e->dst[e->cur[e->node]++] = (uint32_t)id;
+}
+
+/* Build the graph: enumerate nodes, sort by addr, count + fill CSR adjacency.
+** Returns 0 on success, nonzero on OOM. */
+static int mp_graph_build(lua_State *L, int do_fullgc, MpGraph *gr)
+{
+  global_State *g = G(L);
+  uint32_t n_arena, nnodes, i;
+  MpGNode *nodes;
+  uint32_t *head, *dst, *cur;
+  MpCountCtx cc;
+  MpEmitCtx ec;
+
+  gr->g = g; gr->nodes = NULL; gr->head = NULL; gr->dst = NULL;
+  gr->nnodes = 0;
+
+  if (do_fullgc)
+    lj_gc_fullgc(L);  /* consistent live set; marks cleared after. */
+
+  n_arena = mp_count_arena(g);
+  {
+    uint32_t n_huge = mp_count_huge(g);
+    /* +2 for mainthread + vmthread, +1 for super-root. */
+    nnodes = n_arena + n_huge + 2 + 1;
+  }
+  nodes = (MpGNode *)mp_alloc(g, (size_t)nnodes * sizeof(MpGNode));
+  if (nodes == NULL) return 1;
+  /* super-root = node 0 (addr 0 sorts first). */
+  nodes[0].addr = 0; nodes[0].gct = 0; nodes[0].shallow = 0;
+  {
+    uint32_t filled = mp_fill_nodes(g, nodes, 1);
+    nnodes = filled;  /* filled = next free index = total nodes (super-root at 0). */
+  }
+  qsort(nodes, (size_t)nnodes, sizeof(MpGNode), mp_cmp_node_addr);
+  gr->nodes = nodes;
+  gr->nnodes = nnodes;
+
+  head = (uint32_t *)mp_alloc(g, (size_t)(nnodes + 1) * sizeof(uint32_t));
+  if (head == NULL) { mp_free(g, nodes, (size_t)nnodes * sizeof(MpGNode)); gr->nodes=NULL; return 1; }
+  gr->head = head;
+
+  /* Count out-edges per node -> prefix-sum into head. */
+  head[0] = 0;
+  cc.gr = gr;
+  for (i = 0; i < nnodes; i++) {
+    cc.count = 0;
+    if (i == 0)
+      mp_enum_root_refs(g, (void *)&cc, (MpRefCb)mp_cb_count);
+    else {
+      mp_enum_refs(g, (GCobj *)nodes[i].addr, (void *)&cc, (MpRefCb)mp_cb_count);
+    }
+    head[i + 1] = head[i] + cc.count;
+  }
+
+  dst = (uint32_t *)mp_alloc(g, (size_t)head[nnodes] * sizeof(uint32_t));
+  if (dst == NULL && head[nnodes] > 0) {
+    mp_free(g, head, (size_t)(nnodes + 1) * sizeof(uint32_t));
+    mp_free(g, nodes, (size_t)nnodes * sizeof(MpGNode));
+    gr->head = NULL; gr->nodes = NULL; return 1;
+  }
+  gr->dst = dst;
+  if (head[nnodes] == 0) return 0;
+
+  cur = (uint32_t *)mp_alloc(g, (size_t)nnodes * sizeof(uint32_t));
+  if (cur == NULL) {
+    mp_free(g, dst, (size_t)head[nnodes] * sizeof(uint32_t));
+    mp_free(g, head, (size_t)(nnodes + 1) * sizeof(uint32_t));
+    mp_free(g, nodes, (size_t)nnodes * sizeof(MpGNode));
+    gr->dst = NULL; gr->head = NULL; gr->nodes = NULL; return 1;
+  }
+  for (i = 0; i < nnodes; i++) cur[i] = head[i];
+
+  ec.gr = gr; ec.dst = dst; ec.cur = cur;
+  for (i = 0; i < nnodes; i++) {
+    ec.node = i;
+    if (i == 0)
+      mp_enum_root_refs(g, (void *)&ec, (MpRefCb)mp_cb_emit);
+    else
+      mp_enum_refs(g, (GCobj *)nodes[i].addr, (void *)&ec, (MpRefCb)mp_cb_emit);
+  }
+  mp_free(g, cur, (size_t)nnodes * sizeof(uint32_t));
+  return 0;
+}
+
+static void mp_graph_free(global_State *g, MpGraph *gr)
+{
+  if (gr->dst) mp_free(g, gr->dst, (size_t)gr->head[gr->nnodes] * sizeof(uint32_t));
+  if (gr->head) mp_free(g, gr->head, (size_t)(gr->nnodes + 1) * sizeof(uint32_t));
+  if (gr->nodes) mp_free(g, gr->nodes, (size_t)gr->nnodes * sizeof(MpGNode));
+  gr->dst = NULL; gr->head = NULL; gr->nodes = NULL; gr->nnodes = 0;
+}
+
+/* -- dominator tree (Cooper-Harvey-Kennedy) ------------------------------ */
+
+static uint32_t mp_intersect(uint32_t b1, uint32_t b2, const int32_t *idom,
+			     const int32_t *postnum)
+{
+  while (b1 != b2) {
+    while (postnum[b1] < postnum[b2]) b1 = (uint32_t)idom[b1];
+    while (postnum[b2] < postnum[b1]) b2 = (uint32_t)idom[b2];
+  }
+  return b1;
+}
+
+/* Build reverse CSR (predecessors) from the forward graph. */
+static int mp_build_rev(global_State *g, const MpGraph *gr,
+			uint32_t **prhead, uint32_t **prdst)
+{
+  uint32_t nnodes = gr->nnodes, i, e;
+  uint32_t *rhead = (uint32_t *)mp_alloc(g, (size_t)(nnodes + 1) * sizeof(uint32_t));
+  uint32_t *rdst, *rcur;
+  if (rhead == NULL) return 1;
+  /* count in-degrees into rhead[1..nnodes]. */
+  for (i = 0; i < nnodes; i++) rhead[i] = 0;
+  for (i = 0; i < nnodes; i++)
+    for (e = gr->head[i]; e < gr->head[i + 1]; e++)
+      rhead[gr->dst[e] + 1]++;
+  /* prefix sum. */
+  for (i = 0; i < nnodes; i++) rhead[i + 1] += rhead[i];
+  rdst = (uint32_t *)mp_alloc(g, (size_t)rhead[nnodes] * sizeof(uint32_t));
+  if (rdst == NULL && rhead[nnodes] > 0) { mp_free(g, rhead, (size_t)(nnodes+1)*sizeof(uint32_t)); return 1; }
+  if (rhead[nnodes] == 0) { *prhead = rhead; *prdst = rdst; return 0; }
+  rcur = (uint32_t *)mp_alloc(g, (size_t)nnodes * sizeof(uint32_t));
+  if (rcur == NULL) {
+    mp_free(g, rdst, (size_t)rhead[nnodes] * sizeof(uint32_t));
+    mp_free(g, rhead, (size_t)(nnodes + 1) * sizeof(uint32_t));
+    return 1;
+  }
+  for (i = 0; i < nnodes; i++) rcur[i] = rhead[i];
+  for (i = 0; i < nnodes; i++)
+    for (e = gr->head[i]; e < gr->head[i + 1]; e++) {
+      uint32_t m = gr->dst[e];
+      rdst[rcur[m]++] = i;
+    }
+  mp_free(g, rcur, (size_t)nnodes * sizeof(uint32_t));
+  *prhead = rhead; *prdst = rdst;
+  return 0;
+}
+
+/* Compute idom[] (immediate dominator per node) and postnum[] (post-order
+** number; -1 if unreachable from super-root). Returns 0 on success, nonzero
+** on OOM. idom[0]=0 (super-root dominates itself). */
+static int mp_dominators(global_State *g, const MpGraph *gr,
+			 int32_t **pidom, int32_t **ppostnum, uint32_t **ppo,
+			 uint32_t *ppocount)
+{
+  uint32_t nnodes = gr->nnodes, i, e;
+  uint32_t *rhead = NULL, *rdst = NULL;
+  uint32_t *iter, *stack, *po;
+  uint8_t *visited;
+  int32_t *idom, *postnum;
+  uint32_t pocount = 0, sp = 0;
+  int changed;
+
+  *pidom = NULL; *ppostnum = NULL; *ppo = NULL; *ppocount = 0;
+  if (nnodes == 0) return 1;
+
+  if (mp_build_rev(g, gr, &rhead, &rdst) != 0) return 1;
+
+  iter    = (uint32_t *)mp_alloc(g, (size_t)nnodes * sizeof(uint32_t));
+  stack   = (uint32_t *)mp_alloc(g, (size_t)nnodes * sizeof(uint32_t));
+  po      = (uint32_t *)mp_alloc(g, (size_t)nnodes * sizeof(uint32_t));
+  visited = (uint8_t *)mp_alloc(g, (size_t)nnodes);
+  idom    = (int32_t *)mp_alloc(g, (size_t)nnodes * sizeof(int32_t));
+  postnum = (int32_t *)mp_alloc(g, (size_t)nnodes * sizeof(int32_t));
+  if (!iter || !stack || !po || !visited || !idom || !postnum) {
+    mp_free(g, iter, (size_t)nnodes * sizeof(uint32_t));
+    mp_free(g, stack, (size_t)nnodes * sizeof(uint32_t));
+    mp_free(g, po, (size_t)nnodes * sizeof(uint32_t));
+    mp_free(g, visited, (size_t)nnodes);
+    mp_free(g, idom, (size_t)nnodes * sizeof(int32_t));
+    mp_free(g, postnum, (size_t)nnodes * sizeof(int32_t));
+    if (rdst) mp_free(g, rdst, (size_t)rhead[nnodes] * sizeof(uint32_t));
+    mp_free(g, rhead, (size_t)(nnodes + 1) * sizeof(uint32_t));
+    return 1;
+  }
+
+  for (i = 0; i < nnodes; i++) { postnum[i] = -1; idom[i] = -1; visited[i] = 0; iter[i] = gr->head[i]; }
+
+  /* iterative post-order DFS from super-root (node 0). */
+  stack[sp++] = 0; visited[0] = 1;
+  while (sp > 0) {
+    uint32_t n = stack[sp - 1];
+    if (iter[n] < gr->head[n + 1]) {
+      uint32_t m = gr->dst[iter[n]++];
+      if (!visited[m]) { visited[m] = 1; stack[sp++] = m; }
+    } else {
+      postnum[n] = (int32_t)pocount;
+      po[pocount++] = n;
+      sp--;
+    }
+  }
+
+  /* CHK fixpoint: process nodes in reverse post-order (super-root first).
+  ** po[pocount-1] == 0 (super-root, highest postnum); skip it. */
+  idom[0] = 0;
+  do {
+    changed = 0;
+    for (i = pocount - 1; i-- > 0; ) {  /* skip the last (super-root). */
+      uint32_t n = po[i];
+      int32_t new_idom = -1;
+      for (e = rhead[n]; e < rhead[n + 1]; e++) {
+	uint32_t p = rdst[e];
+	if (postnum[p] != -1 && idom[p] != -1) {
+	  if (new_idom == -1) new_idom = (int32_t)p;
+	  else new_idom = (int32_t)mp_intersect((uint32_t)new_idom, p, idom, postnum);
+	}
+      }
+      if (new_idom != -1 && idom[n] != new_idom) {
+	idom[n] = new_idom;
+	changed = 1;
+      }
+    }
+  } while (changed);
+
+  /* Unreachable nodes: dominated by the super-root (retained = shallow). */
+  for (i = 0; i < nnodes; i++)
+    if (postnum[i] == -1) idom[i] = 0;
+
+  mp_free(g, iter, (size_t)nnodes * sizeof(uint32_t));
+  mp_free(g, stack, (size_t)nnodes * sizeof(uint32_t));
+  mp_free(g, visited, (size_t)nnodes);
+  if (rdst) mp_free(g, rdst, (size_t)rhead[nnodes] * sizeof(uint32_t));
+  mp_free(g, rhead, (size_t)(nnodes + 1) * sizeof(uint32_t));
+
+  *pidom = idom; *ppostnum = postnum; *ppo = po; *ppocount = pocount;
+  return 0;
+}
+
+/* Retained size per node: shallow + sum over dominator-tree children.
+** Process nodes in increasing post-order (leaves first); each node adds its
+** retained to its dominator (which has a higher postnum, not yet processed). */
+static uint64_t *mp_retained_sizes(global_State *g, const MpGraph *gr,
+				   const int32_t *idom, const uint32_t *po,
+				   uint32_t pocount)
+{
+  uint32_t i;
+  uint64_t *retained = (uint64_t *)mp_alloc(g, (size_t)gr->nnodes * sizeof(uint64_t));
+  if (retained == NULL) return NULL;
+  for (i = 0; i < gr->nnodes; i++) retained[i] = gr->nodes[i].shallow;
+  for (i = 0; i < pocount; i++) {
+    uint32_t n = po[i];
+    int32_t d;
+    if (n == 0) continue;  /* super-root: no dominator to accumulate into. */
+    d = idom[n];
+    if (d >= 0 && (uint32_t)d != n)
+      retained[d] += retained[n];
+  }
+  return retained;
+}
+
+/* -- public C entry points (called by lib_memprof.c) --------------------- */
+
+/* Sort entry for retained{top=N}. */
+typedef struct MpRetEntry {
+  uint32_t id;
+  uint64_t retained;
+} MpRetEntry;
+
+static int mp_cmp_ret_desc(const void *a, const void *b)
+{
+  const MpRetEntry *x = (const MpRetEntry *)a, *y = (const MpRetEntry *)b;
+  if (x->retained < y->retained) return 1;
+  if (x->retained > y->retained) return -1;
+  return 0;
+}
+
+/* lj_memprof_retained: push a Lua array of {addr,type,shallow,retained} sorted
+** by retained desc, top N entries (excluding the super-root). Returns 1. */
+LJ_FUNC int lj_memprof_retained(lua_State *L, int top, int do_fullgc)
+{
+  global_State *g = G(L);
+  MpGraph gr;
+  int32_t *idom = NULL, *postnum = NULL;
+  uint32_t *po = NULL, pocount = 0;
+  uint64_t *retained = NULL;
+  MpRetEntry *arr = NULL;
+  uint32_t i, k, nreal, limit;
+  GCtab *res;
+  int rc;
+
+  rc = mp_graph_build(L, do_fullgc, &gr);
+  if (rc != 0)
+    return luaL_error(L, "memprof.retained: out of memory building graph");
+  if (mp_dominators(g, &gr, &idom, &postnum, &po, &pocount) != 0) {
+    mp_graph_free(g, &gr);
+    return luaL_error(L, "memprof.retained: out of memory computing dominators");
+  }
+  retained = mp_retained_sizes(g, &gr, idom, po, pocount);
+  if (retained == NULL) {
+    mp_free(g, idom, (size_t)gr.nnodes * sizeof(int32_t));
+    mp_free(g, postnum, (size_t)gr.nnodes * sizeof(int32_t));
+    mp_free(g, po, (size_t)pocount * sizeof(uint32_t));
+    mp_graph_free(g, &gr);
+    return luaL_error(L, "memprof.retained: out of memory");
+  }
+
+  nreal = gr.nnodes - 1;  /* exclude super-root. */
+  arr = (MpRetEntry *)mp_alloc(g, (size_t)nreal * sizeof(MpRetEntry));
+  if (arr == NULL && nreal > 0) {
+    mp_free(g, retained, (size_t)gr.nnodes * sizeof(uint64_t));
+    mp_free(g, idom, (size_t)gr.nnodes * sizeof(int32_t));
+    mp_free(g, postnum, (size_t)gr.nnodes * sizeof(int32_t));
+    mp_free(g, po, (size_t)pocount * sizeof(uint32_t));
+    mp_graph_free(g, &gr);
+    return luaL_error(L, "memprof.retained: out of memory");
+  }
+  for (i = 1, k = 0; i < gr.nnodes; i++, k++) {
+    arr[k].id = i;
+    arr[k].retained = retained[i];
+  }
+  if (nreal > 0)
+    qsort(arr, (size_t)nreal, sizeof(MpRetEntry), mp_cmp_ret_desc);
+
+  limit = (uint32_t)top;
+  if (limit == 0 || limit > nreal) limit = nreal;
+
+  res = lj_tab_new_ah(L, (int)limit, 0);
+  for (i = 0; i < limit; i++) {
+    GCtab *row = lj_tab_new_ah(L, 0, 4);
+    TValue kv, vv, key;
+    uint32_t id = arr[i].id;
+    setstrV(L, &kv, lj_str_newlit(L, "addr"));
+    setnumV(&vv, (lua_Number)gr.nodes[id].addr);
+    copyTV(L, lj_tab_set(L, row, &kv), &vv);
+    setstrV(L, &kv, lj_str_newlit(L, "type"));
+    setstrV(L, &vv, lj_str_newz(L, gct_name(gr.nodes[id].gct)));
+    copyTV(L, lj_tab_set(L, row, &kv), &vv);
+    setstrV(L, &kv, lj_str_newlit(L, "shallow"));
+    setnumV(&vv, (lua_Number)gr.nodes[id].shallow);
+    copyTV(L, lj_tab_set(L, row, &kv), &vv);
+    setstrV(L, &kv, lj_str_newlit(L, "retained"));
+    setnumV(&vv, (lua_Number)arr[i].retained);
+    copyTV(L, lj_tab_set(L, row, &kv), &vv);
+    setnumV(&key, (lua_Number)(i + 1));
+    settabV(L, lj_tab_set(L, res, &key), row);
+  }
+
+  mp_free(g, arr, (size_t)nreal * sizeof(MpRetEntry));
+  mp_free(g, retained, (size_t)gr.nnodes * sizeof(uint64_t));
+  mp_free(g, idom, (size_t)gr.nnodes * sizeof(int32_t));
+  mp_free(g, postnum, (size_t)gr.nnodes * sizeof(int32_t));
+  mp_free(g, po, (size_t)pocount * sizeof(uint32_t));
+  mp_graph_free(g, &gr);
+
+  settabV(L, L->top++, res);
+  return 1;
+}
+
+/* lj_memprof_retainers: push the retaining path for `addr` as a Lua array of
+** {addr,type} from the object up to a root (excluding the synthetic
+** super-root). Returns 1 (array, possibly empty) or pushes nil if addr is not
+** a live in-graph object. */
+LJ_FUNC int lj_memprof_retainers(lua_State *L, lua_Number addr_num, int do_fullgc)
+{
+  global_State *g = G(L);
+  MpGraph gr;
+  uint32_t *rhead = NULL, *rdst = NULL;
+  uint8_t *vis = NULL;
+  int32_t *prev = NULL;
+  uint32_t *queue = NULL;
+  int32_t target;
+  uint32_t qh, qt, e, n, steps = 0;
+  GCtab *res;
+  int rc;
+
+  rc = mp_graph_build(L, do_fullgc, &gr);
+  if (rc != 0)
+    return luaL_error(L, "memprof.retainers: out of memory building graph");
+  if (mp_build_rev(g, &gr, &rhead, &rdst) != 0) {
+    mp_graph_free(g, &gr);
+    return luaL_error(L, "memprof.retainers: out of memory");
+  }
+
+  target = mp_node_lookup(&gr, (uintptr_t)(lua_Number)addr_num);
+  if (target <= 0) {
+    /* not a live in-graph object (or is the super-root). */
+    if (rdst) mp_free(g, rdst, (size_t)rhead[gr.nnodes] * sizeof(uint32_t));
+    mp_free(g, rhead, (size_t)(gr.nnodes + 1) * sizeof(uint32_t));
+    mp_graph_free(g, &gr);
+    lua_pushnil(L);
+    return 1;
+  }
+
+  vis   = (uint8_t *)mp_alloc(g, (size_t)gr.nnodes);
+  prev  = (int32_t *)mp_alloc(g, (size_t)gr.nnodes * sizeof(int32_t));
+  queue = (uint32_t *)mp_alloc(g, (size_t)gr.nnodes * sizeof(uint32_t));
+  if (!vis || !prev || !queue) {
+    mp_free(g, vis, (size_t)gr.nnodes);
+    mp_free(g, prev, (size_t)gr.nnodes * sizeof(int32_t));
+    mp_free(g, queue, (size_t)gr.nnodes * sizeof(uint32_t));
+    if (rdst) mp_free(g, rdst, (size_t)rhead[gr.nnodes] * sizeof(uint32_t));
+    mp_free(g, rhead, (size_t)(gr.nnodes + 1) * sizeof(uint32_t));
+    mp_graph_free(g, &gr);
+    return luaL_error(L, "memprof.retainers: out of memory");
+  }
+  for (n = 0; n < gr.nnodes; n++) { vis[n] = 0; prev[n] = -1; }
+
+  /* BFS from target over reverse edges (predecessors) to super-root (node 0). */
+  qh = 0; qt = 0;
+  queue[qt++] = (uint32_t)target;
+  vis[target] = 1;
+  prev[target] = -2;  /* sentinel: start of path. */
+  while (qh < qt) {
+    n = queue[qh++];
+    if (n == 0) break;  /* reached super-root. */
+    if (++steps > gr.nnodes) break;  /* anti-loop (shouldn't happen). */
+    for (e = rhead[n]; e < rhead[n + 1]; e++) {
+      uint32_t p = rdst[e];
+      if (!vis[p]) { vis[p] = 1; prev[p] = (int32_t)n; queue[qt++] = p; }
+    }
+  }
+
+  res = lj_tab_new_ah(L, 0, 0);
+  if (vis[0]) {
+    /* reconstruct path: prev[0] = first real root R; walk back to target. */
+    int32_t idx = prev[0];
+    uint32_t count = 0, i;
+    /* first pass: count nodes on the path (R .. target). */
+    while (idx >= 0) {
+      count++;
+      if ((uint32_t)idx == (uint32_t)target) break;
+      idx = prev[idx];
+    }
+    /* Build the array directly in reverse: path is [target, ..., R]. */
+    {
+      int32_t *order = (int32_t *)mp_alloc(g, (size_t)count * sizeof(int32_t));
+      if (order == NULL) {
+	mp_free(g, vis, (size_t)gr.nnodes);
+	mp_free(g, prev, (size_t)gr.nnodes * sizeof(int32_t));
+	mp_free(g, queue, (size_t)gr.nnodes * sizeof(uint32_t));
+	if (rdst) mp_free(g, rdst, (size_t)rhead[gr.nnodes] * sizeof(uint32_t));
+	mp_free(g, rhead, (size_t)(gr.nnodes + 1) * sizeof(uint32_t));
+	mp_graph_free(g, &gr);
+	return luaL_error(L, "memprof.retainers: out of memory");
+      }
+      idx = prev[0];
+      for (i = 0; i < count; i++) {
+	order[count - 1 - i] = idx;
+	if ((uint32_t)idx == (uint32_t)target) break;
+	idx = prev[idx];
+      }
+      for (i = 0; i < count; i++) {
+	GCtab *row = lj_tab_new_ah(L, 0, 2);
+	TValue kv, vv, ka;
+	uint32_t id = (uint32_t)order[i];
+	setstrV(L, &kv, lj_str_newlit(L, "addr"));
+	setnumV(&vv, (lua_Number)gr.nodes[id].addr);
+	copyTV(L, lj_tab_set(L, row, &kv), &vv);
+	setstrV(L, &kv, lj_str_newlit(L, "type"));
+	setstrV(L, &vv, lj_str_newz(L, gct_name(gr.nodes[id].gct)));
+	copyTV(L, lj_tab_set(L, row, &kv), &vv);
+	setnumV(&ka, (lua_Number)(i + 1));
+	settabV(L, lj_tab_set(L, res, &ka), row);
+      }
+      mp_free(g, order, (size_t)count * sizeof(int32_t));
+    }
+  }
+
+  mp_free(g, vis, (size_t)gr.nnodes);
+  mp_free(g, prev, (size_t)gr.nnodes * sizeof(int32_t));
+  mp_free(g, queue, (size_t)gr.nnodes * sizeof(uint32_t));
+  if (rdst) mp_free(g, rdst, (size_t)rhead[gr.nnodes] * sizeof(uint32_t));
+  mp_free(g, rhead, (size_t)(gr.nnodes + 1) * sizeof(uint32_t));
+  mp_graph_free(g, &gr);
+
+  settabV(L, L->top++, res);
+  return 1;
+}
+
+/* ======================================================================== **
 ** v1: Event-stream mode (Capability B, design doc 2.2/3/9).
 **
 ** While active (GCF_MEMPROF set in g->gc.gcmarkflags), every GC-object

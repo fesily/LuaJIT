@@ -95,6 +95,57 @@ LJLIB_CF(memprof_diff)
 #endif
 }
 
+/* memprof.retained{top=N, gc="full"|"none"}
+** Returns a Lua array of {addr, type, shallow, retained} sorted by retained
+** desc (top N entries, or all if top omitted/<=0). Builds a read-only dominator
+** tree over the live-object reference graph. gc defaults to "full" for a
+** consistent reachable live set. */
+LJLIB_CF(memprof_retained)
+{
+#if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
+  int top = 0, do_fullgc = 1;
+  if (L->base < L->top && tvistab(L->base)) {
+    GCtab *arg = tabV(L->base);
+    TValue k;
+    const TValue *v;
+    setstrV(L, &k, lj_str_newlit(L, "top"));
+    v = lj_tab_get(L, arg, &k);
+    if (tvisnum(v)) top = (int)numV(v);
+    setstrV(L, &k, lj_str_newlit(L, "gc"));
+    v = lj_tab_get(L, arg, &k);
+    if (tvisstr(v)) {
+      const char *s = strdata(strV(v));
+      if (s[0] == 'n') do_fullgc = 0;  /* "none" */
+    }
+  }
+  return lj_memprof_retained(L, top, do_fullgc);
+#else
+  return luaL_error(L, "memprof not enabled (build with -DLUAJIT_ENABLE_MEMPROF)");
+#endif
+}
+
+/* memprof.retainers(addr [, gc])
+** Returns the retaining path for the object at `addr` as a Lua array of
+** {addr, type} from the object up to a root, or nil if addr is not a live
+** object. gc defaults to "full". */
+LJLIB_CF(memprof_retainers)
+{
+#if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
+  lua_Number addr;
+  int do_fullgc = 1;
+  if (!(L->base < L->top) || !tvisnum(L->base))
+    return luaL_error(L, "memprof.retainers: address (number) required");
+  addr = numV(L->base);
+  if (L->base + 1 < L->top && tvisstr(L->base + 1)) {
+    const char *s = strdata(strV(L->base + 1));
+    if (s[0] == 'n') do_fullgc = 0;  /* "none" */
+  }
+  return lj_memprof_retainers(L, addr, do_fullgc);
+#else
+  return luaL_error(L, "memprof not enabled (build with -DLUAJIT_ENABLE_MEMPROF)");
+#endif
+}
+
 /* memprof.start{mode="exact"|"sample", depth=1, out="path", interval=N}
 ** -> true | nil, err
 ** Starts the event-stream profiler. mode="exact" (default) emits every

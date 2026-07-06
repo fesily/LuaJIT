@@ -39,6 +39,23 @@ LJ_FUNC int lj_memprof_snapshot(lua_State *L, const MemprofOpts *opts);
 ** Pushes a {leak_suspects=, grown=, shrunk=} table. Returns 1. */
 LJ_FUNC int lj_memprof_diff(lua_State *L);
 
+/* v0.5: retained-size + retaining-path (read-only dominator tree over the
+** live-object reference graph). Both build the graph on demand (snapshot-style),
+** compute, push a Lua result, and free all scratch via g->allocf. The graph
+** walk is strictly read-only — it never mutates GC color/marks.
+**
+** lj_memprof_retained: push a Lua array (length top, or all if top<=0) of
+** {addr=, type=, shallow=, retained=} sorted by retained desc, excluding the
+** synthetic super-root. do_fullgc=1 runs a full GC first for a consistent
+** reachable live set. Returns 1. */
+LJ_FUNC int lj_memprof_retained(lua_State *L, int top, int do_fullgc);
+
+/* lj_memprof_retainers: push the retaining path for the object at `addr` as a
+** Lua array of {addr=, type=} from the object up to a root (excluding the
+** synthetic super-root). Pushes nil if addr is not a live in-graph object.
+** Returns 1. */
+LJ_FUNC int lj_memprof_retainers(lua_State *L, lua_Number addr, int do_fullgc);
+
 /* -- v1: event-stream mode (Capability B) ------------------------------- */
 
 /* Start emitting ALLOC/REALLOC/FREE events to `outpath`. depth is the stack
