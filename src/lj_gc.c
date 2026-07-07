@@ -109,6 +109,7 @@ static void gc_mark_start(global_State *g)
   gc_markobj(g, vmthread(g));
   gc_marktv(g, &g->registrytv);
   gc_mark_gcroot(g);
+  g->gc.gccycle++;
   g->gc.state = GCSpropagate;
 }
 
@@ -919,6 +920,8 @@ int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
   global_State *g = G(L);
   uint64_t timelim = (uint64_t)g->gc.stepmultime;  /* ns */
   int32_t ostate = g->vmstate;
+  if (g->gc.total > g->gc.threshold)
+    g->gc.debt += g->gc.total - g->gc.threshold;
   setvmstate(g, GC);
   if (timelim == 0)
     timelim = (uint64_t)1e5;  /* large limit, e.g., 100 us (1e5 ns) */
@@ -939,10 +942,16 @@ int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
 #endif
 
 uint64_t elapsed;
+  GCSize work = 0;
   do {
-    if (g->gc.total > g->gc.threshold)
-      g->gc.debt += g->gc.total - g->gc.threshold;
-    gc_onestep(L, 1);
+    size_t cost = gc_onestep(L, 1);
+    if (cost >= LJ_MAX_MEM) {
+      /* On-trace defer sentinel: the atomic/finalize phase cannot run while
+      ** a trace is active and gc_onestep makes no progress. Stop instead of
+      ** spinning until the whole time slice is burned. */
+      break;
+    }
+    work += (GCSize)cost;
     if (g->gc.state == GCSpause) {
       g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
       g->vmstate = ostate;
@@ -958,14 +967,19 @@ uint64_t elapsed;
     clock_gettime(CLOCK_MONOTONIC, &now);
     elapsed = (uint64_t)((now.tv_sec - start.tv_sec) * 1e9 + (now.tv_nsec - start.tv_nsec));
 #endif
-  } while (elapsed < timelim && g->gc.total >= g->gc.threshold);
+  } while (elapsed < timelim);
 
-  if (g->gc.debt < GCSTEPSIZE) {
+  /* Pay down debt by the work actually performed this slice instead of a
+  ** fixed GCSTEPSIZE. A time-driven step runs many gc_onestep iterations
+  ** per call, so settling only one GCSTEPSIZE would let debt drift up
+  ** unboundedly under sustained allocation pressure. */
+  if (g->gc.debt <= work) {
+    g->gc.debt = 0;
     g->gc.threshold = g->gc.total + GCSTEPSIZE;
     g->vmstate = ostate;
     return -1;
   } else {
-    g->gc.debt -= GCSTEPSIZE;
+    g->gc.debt -= work;
     g->gc.threshold = g->gc.total;
     g->vmstate = ostate;
     return 0;

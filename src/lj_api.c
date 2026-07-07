@@ -1285,20 +1285,11 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
   case LUA_GCCOUNTB:
     res = (int)(g->gc.total & 0x3ff);
     break;
-  case LUA_GCSTEP2:
   case LUA_GCSTEP: {
-#if LJ_DS_DISABLE_GC_STEP
-      if (what == LUA_GCSTEP)
-        return -1;
-#endif
     GCSize a = (GCSize)data << 10;
     g->gc.threshold = (a <= g->gc.total) ? (g->gc.total - a) : 0;
-#if LJ_DS_ENABLE_GC_STEP_TIME
-      if (lj_gc_step_timelimit(L) > 0) {
-#else
     while (g->gc.total >= g->gc.threshold)
       if (lj_gc_step(L) > 0) {
-#endif
 	res = 1;
 	break;
       }
@@ -1316,11 +1307,22 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
     res = (g->gc.threshold != LJ_MAX_MEM);
     break;
 #if LJ_DS_ENABLE_GC_STEP_TIME
+  case LUA_GCSTEP2: {
+    GCSize a = (GCSize)data << 10;
+    g->gc.threshold = (a <= g->gc.total) ? (g->gc.total - a) : 0;
+    if (lj_gc_step_timelimit(L) > 0)
+      res = 1;
+    break;
+  }
   case LUA_GCSTEPTIME:
     res = (int)(g->gc.stepmultime);
     g->gc.stepmultime = (MSize)data;
     break;
 #endif
+  case LUA_GCCYCLE: {
+    res = g->gc.gccycle;
+    break;
+  }
   default:
     res = -1;  /* Invalid option. */
   }

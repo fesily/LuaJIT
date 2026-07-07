@@ -306,6 +306,7 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.total = sizeof(GG_State);
   g->gc.pause = LUAI_GCPAUSE;
+  g->gc.gccycle = 0;
   g->gc.stepmul = LUAI_GCMUL;
   lj_dispatch_init((GG_State *)L);
   L->status = LUA_ERRERR+1;  /* Avoid touching the stack upon memory error. */

@@ -218,7 +218,7 @@ LUA_API int  (lua_status) (lua_State *L);
 /*
 ** garbage-collection function and options
 */
-
+#define LUA_GCCYCLE -1
 #define LUA_GCSTOP		0
 #define LUA_GCRESTART		1
 #define LUA_GCCOLLECT		2
