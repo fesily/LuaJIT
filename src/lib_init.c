@@ -37,12 +37,6 @@ static luaL_Reg lj_lib_load[] = {
   { NULL,		NULL }
 };
 
-#if LJ_DS_DEFAULTLIB_UPDATER
-static luaL_Reg *_lj_lib_load = lj_lib_load;
-#else
-#define _lj_lib_load lj_lib_load;
-#endif
-
 static const luaL_Reg lj_lib_preload[] = {
 #if LJ_HASFFI
   { LUA_FFILIBNAME,	luaopen_ffi },
@@ -69,7 +63,7 @@ static void handle_luainit(lua_State *L)
 LUALIB_API void luaL_openlibs(lua_State *L)
 {
   const luaL_Reg *lib;
-  for (lib = _lj_lib_load; lib->func; lib++) {
+  for (lib = lj_lib_load; lib->func; lib++) {
     lua_pushcfunction(L, lib->func);
     lua_pushstring(L, lib->name);
     lua_call(L, 1, 0);
@@ -94,27 +88,3 @@ LUALIB_API void luaL_openlibs(lua_State *L)
   handle_luainit(L);
 #endif
 }
-
-#if LJ_DS_DEFAULTLIB_UPDATER
-LUALIB_API void luaL_defaultlib_update(luaL_Reg* newlib) {
-  luaL_Reg *lib;
-  for (lib = _lj_lib_load; lib->func; lib++) {
-    if (strcmp(lib->name, newlib->name) == 0) {
-      lib->func = newlib->func;
-      return;
-    }
-  }
-
-  int sz = (lib - _lj_lib_load + 2);
-  luaL_Reg * new_lj_lib_load = malloc(sz * sizeof(luaL_Reg));
-  memset(new_lj_lib_load, 0, sz * sizeof(luaL_Reg));
-  memcpy(new_lj_lib_load, _lj_lib_load, (sz - 1) * sizeof(luaL_Reg));
-  if (_lj_lib_load != lj_lib_load) {
-    free(_lj_lib_load);
-  }
-  new_lj_lib_load[sz - 2] = *newlib; // replace the last element with newlib
-  new_lj_lib_load[sz - 1] = (luaL_Reg) { NULL, NULL }; // set the last element to NULL
-
-  _lj_lib_load = new_lj_lib_load;
-}
-#endif

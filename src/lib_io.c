@@ -568,15 +568,3 @@ LUALIB_API int luaopen_io(lua_State *L)
   io_std_new(L, stderr, "stderr");
   return 1;
 }
-
-#if LJ_DS_LIB_IO2
-LUALIB_API int luaopen_io2(lua_State *L)
-{
-  LJ_LIB_REG(L, NULL, io_method);
-  copyTV(L, L->top, L->top-1); L->top++;
-  lua_setfield(L, LUA_REGISTRYINDEX, LUA_FILEHANDLE);
-  LJ_LIB_REG(L, LUA_IO2LIBNAME, io);
-  return 1;
-}
-#endif
-

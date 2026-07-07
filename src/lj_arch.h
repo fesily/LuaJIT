@@ -895,25 +895,12 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_DEBUG_GETINFO_PATCH LJ_DS
 #endif
 
-#ifndef LJ_DS_JIT_DEFAULT_OPT_PATCH
-#define LJ_DS_JIT_DEFAULT_OPT_PATCH LJ_DS
-#endif
-
 #ifndef LJ_DS_FULL_GC_HOOK
 #define LJ_DS_FULL_GC_HOOK LJ_DS
 #endif
 
 #ifndef LJ_DS_PATCH_READLINE
 #define LJ_DS_PATCH_READLINE 0
-#endif
-
-#ifndef LJ_DS_DEFAULTLIB_UPDATER
-#define LJ_DS_DEFAULTLIB_UPDATER LJ_DS
-#endif
-
-#ifndef LJ_DS_LIB_IO2
-#define LJ_DS_LIB_IO2 LJ_DS
-#define LUA_IO2LIBNAME "io2"
 #endif
 
 #ifndef LJ_DS_NEW_PROXY_PATCH
