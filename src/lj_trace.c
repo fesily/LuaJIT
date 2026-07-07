@@ -127,7 +127,7 @@ GCtrace * LJ_FASTCALL lj_trace_alloc(lua_State *L, GCtrace *T)
   size_t sz = sztr + szins +
 	      T->nsnap*sizeof(SnapShot) +
 	      T->nsnapmap*sizeof(SnapEntry);
-  GCtrace *T2 = lj_mem_newt(L, (MSize)sz, GCtrace);
+  GCtrace *T2 = (GCtrace *)lj_mem_newagco(L, (MSize)sz, 1);
   char *p = (char *)T2 + sztr;
   T2->gct = ~LJ_TTRACE;
   T2->marked = 0;
@@ -148,8 +148,10 @@ static void trace_save(jit_State *J, GCtrace *T)
   size_t szins = (J->cur.nins-J->cur.nk)*sizeof(IRIns);
   char *p = (char *)T + sztr;
   memcpy(T, &J->cur, sizeof(GCtrace));
+#if !LJ_HASGCMARK
   setgcrefr(T->nextgc, J2G(J)->gc.root);
   setgcrefp(J2G(J)->gc.root, T);
+#endif
   newwhite(J2G(J), T);
   T->gct = ~LJ_TTRACE;
   T->ir = (IRIns *)p - J->cur.nk;  /* The IR has already been copied above. */
@@ -178,7 +180,7 @@ void LJ_FASTCALL lj_trace_free(global_State *g, GCtrace *T)
       J->freetrace = T->traceno;
     setgcrefnull(J->trace[T->traceno]);
   }
-  lj_mem_free(g, T,
+  lj_mem_freegco(g, T,
     ((sizeof(GCtrace)+7)&~7) + (T->nins-T->nk)*sizeof(IRIns) +
     T->nsnap*sizeof(SnapShot) + T->nsnapmap*sizeof(SnapEntry));
 }

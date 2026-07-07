@@ -573,7 +573,7 @@ LJLIB_CF(ffi_typeinfo)
       setintV(lj_tab_setstr(L, t, lj_str_newlit(L, "sib")), (int32_t)ct->sib);
     if (gcref(ct->name)) {
       GCstr *s = gco2str(gcref(ct->name));
-      if (isdead(G(L), obj2gco(s))) flipwhite(obj2gco(s));
+      if (gc_obj_isdead(G(L), obj2gco(s))) gc_obj_resurrect(G(L), obj2gco(s));
       setstrV(L, lj_tab_setstr(L, t, lj_str_newlit(L, "name")), s);
     }
     lj_gc_check(L);

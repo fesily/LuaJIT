@@ -28,6 +28,9 @@
 #include "lj_prng.h"
 #include "lj_lex.h"
 #include "lj_alloc.h"
+#if LJ_HASGCARENA
+#include "lj_arena.h"
+#endif
 #include "luajit.h"
 
 /* -- Stack handling ------------------------------------------------------ */
@@ -202,6 +205,15 @@ static TValue *cpluaopen(lua_State *L, lua_CFunction dummy, void *ud)
   fixstring(lj_err_str(L, LJ_ERR_ERRMEM));  /* Preallocate memory error msg. */
   fixstring(lj_err_str(L, LJ_ERR_ERRERR));  /* Preallocate err in err msg. */
   g->gc.threshold = 4*g->gc.total;
+#if LJ_HASGCMARK
+  {
+    MSize ssbsz = 1024;
+    GCobj **ssb = lj_mem_newvec(L, ssbsz, GCobj *);
+    setmref(g->gc.ssb, ssb);
+    setmref(g->gc.ssbtop, ssb);
+    setmref(g->gc.ssblim, ssb + ssbsz);
+  }
+#endif
 #if LJ_HASFFI
   lj_ctype_initfin(L);
 #endif
@@ -215,6 +227,9 @@ static void close_state(lua_State *L)
 {
   global_State *g = G(L);
   lj_func_closeuv(L, tvref(L->stack));
+#if LJ_HASGCMARK
+  lj_gc_graywork_free(g);  /* Discard stale gray worklists before freeall. */
+#endif
   lj_gc_freeall(g);
   lj_assertG(gcref(g->gc.root) == obj2gco(L),
 	     "main thread is not first GC object");
@@ -225,12 +240,18 @@ static void close_state(lua_State *L)
 #endif
   lj_str_freetab(g);
   lj_buf_free(g, &g->tmpbuf);
+#if LJ_HASGCMARK
+  lj_mem_freevec(g, mref(g->gc.ssb, GCobj *), 1024, GCobj *);
+#endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
 #if LJ_64
   if (mref(g->gc.lightudseg, uint32_t)) {
     MSize segnum = g->gc.lightudnum ? (2 << lj_fls(g->gc.lightudnum)) : 2;
     lj_mem_freevec(g, mref(g->gc.lightudseg, uint32_t), segnum, uint32_t);
   }
+#endif
+#if LJ_HASGCARENA
+  lj_arena_freeall(g);
 #endif
   lj_assertG(g->gc.total == sizeof(GG_State),
 	     "memory leak of %lld bytes",
@@ -276,11 +297,19 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   L = &GG->L;
   g = &GG->g;
   L->gct = ~LJ_TTHREAD;
+#if LJ_HASGCMARK
+  L->marked = LJ_GC_FIXED | LJ_GC_SFIXED;  /* Bitmap GC: root, no header color. */
+#else
   L->marked = LJ_GC_WHITE0 | LJ_GC_FIXED | LJ_GC_SFIXED;  /* Prevent free. */
+#endif
   L->dummy_ffid = FF_C;
   setmref(L->glref, g);
+#if LJ_HASGCMARK
+  g->strempty.marked = LJ_GC_FIXED | LJ_GC_SFIXED;  /* Bitmap GC: root, no color. */
+#else
   g->gc.currentwhite = LJ_GC_WHITE0 | LJ_GC_FIXED;
   g->strempty.marked = LJ_GC_WHITE0;
+#endif
   g->strempty.gct = ~LJ_TSTR;
   g->allocf = allocf;
   g->allocd = allocd;
@@ -374,13 +403,26 @@ lua_State *lj_state_new(lua_State *L)
   setmrefr(L1->glref, L->glref);
   setgcrefr(L1->env, L->env);
   stack_init(L1, L);  /* init stack */
+#if LJ_HASGCMARK
+  lj_assertL(gc_obj_iswhite(G(L), obj2gco(L1)) || isgray(obj2gco(L1)),
+	     "new thread object is not white or gray");
+#else
   lj_assertL(iswhite(obj2gco(L1)), "new thread object is not white");
+#endif
   return L1;
 }
 
 void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
 {
   lj_assertG(L != mainthread(g), "free of main thread");
+#if LJ_HASGCMARK && defined(LUA_USE_ASSERT)
+  {
+    GCobj **graythread = mref(g->gc.graythread, GCobj *);
+    MSize i;
+    for (i = 0; i < g->gc.graythreadtop; i++)
+      lj_assertG(graythread[i] != obj2gco(L), "free of thread on graythread stack");
+  }
+#endif
   if (obj2gco(L) == gcref(g->cur_L))
     setgcrefnull(g->cur_L);
 #if LJ_HASFFI
@@ -393,6 +435,6 @@ void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
     lj_assertG(gcref(L->openupval) == NULL, "stale open upvalues");
   }
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
-  lj_mem_freet(g, L);
+  lj_mem_freegco(g, L, sizeof(lua_State));
 }
 

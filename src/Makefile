@@ -451,6 +451,9 @@ ifneq (,$(findstring LJ_ABI_SHADOW_STACK 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D SHADOW_STACK
   TARGET_ARCH+= -DLJ_ABI_SHADOW_STACK=1
 endif
+ifneq (,$(findstring LJ_HASGCMARK 1,$(TARGET_TESTARCH)))
+  DASM_AFLAGS+= -D LJ_HASGCMARK
+endif
 DASM_AFLAGS+= -D VER=$(subst LJ_ARCH_VERSION_,,$(filter LJ_ARCH_VERSION_%,$(subst LJ_ARCH_VERSION ,LJ_ARCH_VERSION_,$(TARGET_TESTARCH))))
 ifeq (Windows,$(TARGET_SYS))
   DASM_AFLAGS+= -D WIN
@@ -512,9 +515,12 @@ LJVM_MODE= elfasm
 LJLIB_O= lib_base.o lib_math.o lib_bit.o lib_string.o lib_table.o \
 	 lib_io.o lib_os.o lib_package.o lib_debug.o lib_jit.o lib_ffi.o \
 	 lib_buffer.o
+ifneq (,$(findstring DLUAJIT_ENABLE_MEMPROF,$(XCFLAGS)))
+  LJLIB_O += lib_memprof.o
+endif
 LJLIB_C= $(LJLIB_O:.o=.c)
 
-LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
+LJCORE_O= lj_assert.o lj_gc_arena.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
 	  lj_str.o lj_tab.o lj_func.o lj_udata.o lj_meta.o lj_debug.o \
 	  lj_prng.o lj_state.o lj_dispatch.o lj_vmevent.o lj_vmmath.o \
 	  lj_strscan.o lj_strfmt.o lj_strfmt_num.o lj_serialize.o \
@@ -526,8 +532,11 @@ LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
 	  lj_asm.o lj_trace.o lj_gdbjit.o \
 	  lj_ctype.o lj_cdata.o lj_cconv.o lj_ccall.o lj_ccallback.o \
 	  lj_carith.o lj_clib.o lj_cparse.o \
-	  lj_lib.o lj_alloc.o lib_aux.o \
+	  lj_lib.o lj_alloc.o lj_arena.o lib_aux.o \
 	  $(LJLIB_O) lib_init.o
+ifneq (,$(findstring DLUAJIT_ENABLE_MEMPROF,$(XCFLAGS)))
+  LJCORE_O += lj_memprof.o
+endif
 
 LJVMCORE_O= $(LJVM_O) $(LJCORE_O)
 LJVMCORE_DYNO= $(LJVMCORE_O:.o=_dyn.o)

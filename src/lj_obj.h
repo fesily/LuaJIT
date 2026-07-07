@@ -593,13 +593,84 @@ typedef enum {
 #define basemt_obj(g, o)	((g)->gcroot[GCROOT_BASEMT+itypemap(o)])
 #define mmname_str(g, mm)	(strref((g)->gcroot[GCROOT_MMNAME+(mm)]))
 
+#if LJ_HASGCMARK
+/* GC instrumentation counters. Compiled in on all arena (bitmap GC) builds
+** at near-zero cost (plain uint64_t increments via gcstat_inc/gcstat_add).
+** The nanosecond timing tier is opt-in via LUAJIT_ENABLE_GCSTATS_TIMING.
+** Exposed through collectgarbage("stats") / collectgarbage("statsreset").
+** nsteps has 6 entries indexed by g->gc.state: GCSpause..GCSfinalize. */
+typedef struct GCstats {
+  uint64_t nsteps[6];		/* Per-phase step counts (GCSpause..GCSfinalize). */
+  uint64_t sweep_bitmap_steps;	/* GCSsweep steps in bitmap sub-phase. */
+  uint64_t sweep_rebuild_steps; /* GCSsweep steps in rebuild sub-phase. */
+  uint64_t cycles;		/* Full GC cycles completed. */
+  uint64_t mark_calls;		/* propagatemark invocations. */
+  uint64_t mark_cost;		/* Total traverse cost returned by propagatemark. */
+  uint64_t hugegray_pops;	/* gc_hugegray_pop calls. */
+  uint64_t grayarena_pops;	/* gc_grayarena_pop calls (non-NULL return). */
+  uint64_t sweep_cells;		/* Dead objects freed by bitmap sweep. */
+  uint64_t pod_sweeps;		/* lj_arena_podsweep calls. */
+  uint64_t rebuild_prologue;	/* Rebuild sub-phase dispatch counts. */
+  uint64_t rebuild_threadscan;
+  uint64_t rebuild_hugescan;
+  uint64_t rebuild_epilogue;
+  uint64_t rebuild_clearmarks;
+  uint64_t barrierback;		/* lj_gc_barrierback_arena calls. */
+  uint64_t gray_notify;		/* lj_gc_grayarena_notify calls. */
+  uint64_t ssb_overflow;	/* SSB flush triggered by overflow. */
+  uint64_t arenas_created;	/* arena_create calls. */
+  uint64_t arenas_destroyed;	/* arena_destroy calls. */
+  uint64_t findspace_calls;	/* lj_arena_findspace calls. */
+  uint64_t arenas_shrunk;	/* Arenas released by lj_arena_shrink. */
+  uint64_t huge_allocs;		/* lj_hugeblock_alloc calls. */
+  uint64_t huge_frees;		/* lj_hugeblock_free calls. */
+  uint64_t strings_chains_swept; /* gc_sweepstr calls. */
+  uint64_t strings_live_walked;	/* strings kept (survivor) during gc_sweepstr. */
+  uint64_t strings_dead_freed;	/* strings freed during gc_sweepstr. */
+  uint64_t finalizers;		/* gc_finalize calls. */
+  MSize last_arenastop;		/* Per-cycle snapshot (at cycle end). */
+  MSize last_hugenum;
+  GCSize last_hugemem;
+#ifdef LUAJIT_ENABLE_GCSTATS_TIMING
+  uint64_t time_pause_ns;	/* Per-phase total nanoseconds. */
+  uint64_t time_propagate_ns;
+  uint64_t time_atomic_ns;
+  uint64_t time_sweepstring_ns;
+  uint64_t time_sweep_bitmap_ns;
+  uint64_t time_sweep_rebuild_ns;
+  uint64_t time_finalize_ns;
+  uint64_t maxpause_pause_ns;	/* Per-phase max single-step ns (pause proxy). */
+  uint64_t maxpause_propagate_ns;
+  uint64_t maxpause_atomic_ns;
+  uint64_t maxpause_sweepstring_ns;
+  uint64_t maxpause_sweep_bitmap_ns;
+  uint64_t maxpause_sweep_rebuild_ns;
+  uint64_t maxpause_finalize_ns;
+#endif
+} GCstats;
+
+/* Counter increment macros. Plain increments on arena builds, no-ops on
+** classic GC builds. Never call from lj_gc_classic.c. */
+#define gcstat_inc(g, f)	((void)((g)->gc.stats.f++))
+#define gcstat_add(g, f, n)	((void)((g)->gc.stats.f += (uint64_t)(n)))
+#endif
+
 /* Garbage collector state. */
 typedef struct GCState {
   GCSize total;		/* Memory currently allocated. */
   GCSize threshold;	/* Memory threshold. */
+#if LJ_HASGCMARK
+  uint8_t unused_currentwhite;	/* No currentwhite under bitmap GC. */
+#else
   uint8_t currentwhite;	/* Current white color. */
+#endif
   uint8_t state;	/* GC state. */
   uint8_t gccycle;	/* GC cycle counter. */
+#if LJ_HASGCMARK
+  uint8_t gcmarkflags;	/* GC mark flags: bit 0=bitmapsweep, bit 1=markalloc. */
+#else
+  uint8_t unused0;
+#endif
 #if LJ_64
   uint8_t lightudnum;	/* Number of lightuserdata segments - 1. */
 #else
@@ -610,6 +681,13 @@ typedef struct GCState {
   MRef sweep;		/* Sweep position in root list. */
   GCRef gray;		/* List of gray objects. */
   GCRef grayagain;	/* List of objects for atomic traversal. */
+#if LJ_HASGCMARK
+  MRef ssb;		/* GCobj **: SSB base. */
+  MRef ssbtop;		/* GCobj **: SSB write pointer. */
+  MRef ssblim;		/* GCobj **: SSB limit. */
+#else
+  MRef unused_ssb[3];
+#endif
   GCRef weak;		/* List of weak tables (to be cleared). */
   GCRef mmudata;	/* List of userdata (to be finalized). */
   GCSize debt;		/* Debt (how much GC is behind schedule). */
@@ -621,6 +699,61 @@ typedef struct GCState {
 #endif
 #if LJ_DS_ENABLE_GC_STEP_TIME
   MSize stepmultime; /* Time spent in each GC step (in nanoseconds). */
+#endif
+#if LJ_HASGCARENA
+  MRef arena;		/* Current non-traversable allocation arena. */
+  MRef travarena;	/* Current traversable allocation arena. */
+  MRef podarena;	/* Current POD-only allocation arena (closures, protos). */
+  MRef udatarena;	/* Current userdata-only allocation arena (GCudata). */
+  MRef cdatavarena;	/* Current VLA/over-aligned cdata arena (GCcdataVar). */
+  MRef arenas;		/* Vector of all arenas (GCArena **). */
+  MRef chunks;		/* List of reserved OS memory chunks. */
+  MSize arenassz;	/* Size of arena vector. */
+  MSize arenastop;	/* Number of arenas. */
+  MSize hugenum;	/* Number of huge blocks. */
+  GCSize hugemem;	/* Memory in huge blocks (rounded to arena size). */
+  MRef hugeset;		/* GCRef *: address-keyed set of live huge objects. */
+  MSize hugesetmask;	/* Capacity-1 (power of two); 0 when unallocated. */
+  MSize hugesetnum;	/* Live entries in the huge set. */
+  MSize hugesettomb;	/* Tombstone entries (drive rehash). */
+#if LJ_HASGCMARK
+  MSize sweepa;		/* Bitmap sweep: current arena index. */
+  uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */
+  uint8_t sweepphase;	/* 0=bitmap sweep, 1=rebuild chain, 2=done. */
+  uint8_t rebuildphase;	/* Resumable rebuild sub-phase (RebuildPhase). */
+  uint8_t rebuild_mmu_started;	/* mmudata ring walk has snapshotted its root. */
+  MSize rebuild_hugehi;	/* HugeScan: current slot index cursor. */
+  MSize rebuild_hugegen;	/* HugeScan: hugesetgen snapshot for rehash restart. */
+  MSize hugesetgen;	/* Monotonic huge-set rehash generation. */
+  GCRef rebuild_mmu_cursor;	/* mmudata ring walk cursor. */
+  MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
+  MSize grayastop;	/* Gray arena stack: number of entries. */
+  MSize grayasz;	/* Gray arena stack: allocated capacity. */
+  /* Contiguous worklists that replace the global gclist gray/grayagain lists.
+  ** Both are raw-allocated (g->allocf), never GC memory; see lj_gc.c. The
+  ** mainthread and huge objects are intentionally outside the per-arena gray
+  ** stacks: the mainthread is SFIXED and pre-arena; huge objects live in the
+  ** address-keyed hugeset (design doc), not in any arena. */
+  MRef hugegray;	/* GCobj **: worklist of gray huge traversable objects. */
+  MSize hugegraytop;	/* Huge gray stack: number of entries. */
+  MSize hugegraysz;	/* Huge gray stack: allocated capacity. */
+  MRef graythread;	/* GCobj **: threads greyed this cycle (atomic re-scan). */
+  MSize graythreadtop;	/* Thread gray stack: number of entries. */
+  MSize graythreadsz;	/* Thread gray stack: allocated capacity. */
+  MRef sweepthreads;	/* GCobj **: live coroutine threads snapshot for sweep openupval walk (Design A). */
+  MSize sweepthreadstop; /* sweepthreads: number of entries. */
+  MSize sweepthreadssz;	/* sweepthreads: allocated capacity. */
+  MRef weakkey;		/* GCobj **: tables with weak keys only. */
+  MSize weakkeytop;	/* Weak-key stack: number of entries. */
+  MSize weakkeysz;	/* Weak-key stack: allocated capacity. */
+  MRef weakval;		/* GCobj **: tables with weak values only. */
+  MSize weakvaltop;	/* Weak-value stack: number of entries. */
+  MSize weakvalsz;	/* Weak-value stack: allocated capacity. */
+  MRef weakall;		/* GCobj **: tables with weak keys and values. */
+  MSize weakalltop;	/* All-weak stack: number of entries. */
+  MSize weakallsz;	/* All-weak stack: allocated capacity. */
+  GCstats stats;	/* Instrumentation counters (LJ_HASGCMARK only). */
+#endif
 #endif
 } GCState;
 
@@ -634,6 +767,9 @@ typedef struct StrInternState {
   uint8_t second;	/* String interning table uses secondary hashing. */
   uint8_t unused1;
   uint8_t unused2;
+#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+  MSize tombs;		/* Open-addressing: tombstone count. */
+#endif
   LJ_ALIGN(8) uint64_t seed;	/* Random string seed. */
 } StrInternState;
 
@@ -921,7 +1057,11 @@ static LJ_AINLINE void checklivetv(lua_State *L, TValue *o, const char *msg)
 	       "mismatch of TValue type %d vs GC type %d",
 	       ~itype(o), gcval(o)->gch.gct);
     /* Copy of isdead check from lj_gc.h to avoid circular include. */
+#if LJ_HASGCMARK
+    UNUSED(msg);  /* Header-white is not authoritative for arena objects. */
+#else
     lj_assertL(!(gcval(o)->gch.marked & (G(L)->gc.currentwhite ^ 3) & 3), msg);
+#endif
   }
 #endif
 }

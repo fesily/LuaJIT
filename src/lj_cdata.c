@@ -31,7 +31,7 @@ GCcdata *lj_cdata_newv(lua_State *L, CTypeID id, CTSize sz, CTSize align)
   global_State *g;
   MSize extra = sizeof(GCcdataVar) + sizeof(GCcdata) +
 		(align > CT_MEMALIGN ? (1u<<align) - (1u<<CT_MEMALIGN) : 0);
-  char *p = lj_mem_newt(L, extra + sz, char);
+  char *p = (char *)lj_mem_newgcocv(L, extra + sz);
   uintptr_t adata = (uintptr_t)p + sizeof(GCcdataVar) + sizeof(GCcdata);
   uintptr_t almask = (1u << align) - 1u;
   GCcdata *cd = (GCcdata *)(((adata + almask) & ~almask) - sizeof(GCcdata));
@@ -40,8 +40,19 @@ GCcdata *lj_cdata_newv(lua_State *L, CTypeID id, CTSize sz, CTSize align)
   cdatav(cd)->extra = extra;
   cdatav(cd)->len = sz;
   g = G(L);
+#if LJ_HASGCMARK
+  /* VLA cdata live in CdataV arenas (small) or the hugeset (huge), enumerated
+  ** by the rebuild prologue CdataV-arena bitmap scan + hugeset CDATAV slots.
+  ** No nextgc chain link in either branch. A huge VLA block is registered in
+  ** the hugeset by its BASE p (a GCcdataVar prefix), but the GCobj is
+  ** cd = p + offset. Tag the slot so GC consumers translate base->cd;
+  ** otherwise makewhite(g, p) clobbers cd->nextgc. */
+  if (lj_arena_ishuge(p))
+    lj_huge_set_cdatav(g, p);
+#else
   setgcrefr(cd->nextgc, g->gc.root);
   setgcref(g->gc.root, obj2gco(cd));
+#endif
   newwhite(g, obj2gco(cd));
   cd->marked |= 0x80;
   cd->gct = ~LJ_TCDATA;
@@ -63,6 +74,17 @@ void LJ_FASTCALL lj_cdata_free(global_State *g, GCcdata *cd)
 {
   if (LJ_UNLIKELY(cd->marked & LJ_GC_CDATA_FIN)) {
     GCobj *root;
+    /* T1: keep the arena/huge MARK SET (do NOT clear it). This object is
+    ** GC-reachable via the mmudata ring until gc_finalize runs its __gc.
+    ** Under raw-marks-authoritative-during-rebuild (T3/T4, DEADAUTH gone),
+    ** a mark0 pending-finalizer cdata would look dead to a HugeScan restart
+    ** after a hugeset rehash mid-yield and be RE-LINKED onto mmudata ->
+    ** double-link / double-finalize / ring corruption. gc_obj_resurrect
+    ** sets the MARK (live survivor); makewhite cleans the header (stale
+    ** gray/white from the dead cell). gc_finalize (~L1642) still makewhites
+    ** before invoking the finalizer, and the next cycle's markinit +
+    ** gc_mark_mmudata re-mark normally. */
+    gc_obj_resurrect(g, obj2gco(cd));
     makewhite(g, obj2gco(cd));
     markfinalized(obj2gco(cd));
     if ((root = gcref(g->gc.mmudata)) != NULL) {
@@ -78,9 +100,9 @@ void LJ_FASTCALL lj_cdata_free(global_State *g, GCcdata *cd)
     CTSize sz = ctype_hassize(ct->info) ? ct->size : CTSIZE_PTR;
     lj_assertG(ctype_hassize(ct->info) || ctype_isfunc(ct->info) ||
 	       ctype_isextern(ct->info), "free of ctype without a size");
-    lj_mem_free(g, cd, sizeof(GCcdata) + sz);
+    lj_mem_freegco(g, cd, sizeof(GCcdata) + sz);
   } else {
-    lj_mem_free(g, memcdatav(cd), sizecdatav(cd));
+    lj_mem_freegco(g, memcdatav(cd), sizecdatav(cd));
   }
 }
 

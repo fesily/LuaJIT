@@ -31,6 +31,14 @@ typedef struct lj_Debug {
 
 LJ_FUNC cTValue *lj_debug_frame(lua_State *L, int level, int *size);
 LJ_FUNC BCLine LJ_FASTCALL lj_debug_line(GCproto *pt, BCPos pc);
+#if defined(LUAJIT_ENABLE_MEMPROF)
+/* Exported wrapper around the static debug_frameline for memprof line-precise
+** attribution. Returns the actual source line for a Lua function frame (the
+** line of the currently executing bytecode), or (BCLine)-1 if it cannot be
+** derived (non-Lua frame, no PC). The entire addition is flag-gated so a
+** flag-off build is byte-identical. */
+LJ_FUNC BCLine lj_debug_frameline(lua_State *L, GCfunc *fn, cTValue *nextframe);
+#endif
 LJ_FUNC const char *lj_debug_uvname(GCproto *pt, uint32_t idx);
 LJ_FUNC const char *lj_debug_uvnamev(cTValue *o, uint32_t idx, TValue **tvp,
 				     GCobj **op);

@@ -19,6 +19,7 @@
 #include "lauxlib.h"
 
 #include "lj_assert.c"
+#include "lj_gc_arena.c"
 #include "lj_gc.c"
 #include "lj_err.c"
 #include "lj_char.c"
@@ -42,6 +43,7 @@
 #include "lj_serialize.c"
 #include "lj_api.c"
 #include "lj_profile.c"
+#include "lj_memprof.c"
 #include "lj_lex.c"
 #include "lj_parse.c"
 #include "lj_bcread.c"
@@ -73,6 +75,7 @@
 #include "lj_trace.c"
 #include "lj_gdbjit.c"
 #include "lj_alloc.c"
+#include "lj_arena.c"
 
 #include "lib_aux.c"
 #include "lib_base.c"
@@ -87,5 +90,6 @@
 #include "lib_jit.c"
 #include "lib_ffi.c"
 #include "lib_buffer.c"
+#include "lib_memprof.c"
 #include "lib_init.c"
 

@@ -43,7 +43,7 @@ static LJ_AINLINE GCcdata *lj_cdata_new(CTState *cts, CTypeID id, CTSize sz)
   lj_assertCTS((ctype_hassize(ct->info) ? ct->size : CTSIZE_PTR) == sz,
 	       "inconsistent size of fixed-size cdata alloc");
 #endif
-  cd = (GCcdata *)lj_mem_newgco(cts->L, sizeof(GCcdata) + sz);
+  cd = (GCcdata *)lj_mem_newgcot(cts->L, sizeof(GCcdata) + sz);
   cd->gct = ~LJ_TCDATA;
   cd->ctypeid = ctype_check(cts, id);
   return cd;
@@ -52,7 +52,7 @@ static LJ_AINLINE GCcdata *lj_cdata_new(CTState *cts, CTypeID id, CTSize sz)
 /* Variant which works without a valid CTState. */
 static LJ_AINLINE GCcdata *lj_cdata_new_(lua_State *L, CTypeID id, CTSize sz)
 {
-  GCcdata *cd = (GCcdata *)lj_mem_newgco(L, sizeof(GCcdata) + sz);
+  GCcdata *cd = (GCcdata *)lj_mem_newgcot(L, sizeof(GCcdata) + sz);
   cd->gct = ~LJ_TCDATA;
   cd->ctypeid = id;
   return cd;

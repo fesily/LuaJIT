@@ -13,7 +13,7 @@
 
 GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
 {
-  GCudata *ud = lj_mem_newt(L, sizeof(GCudata) + sz, GCudata);
+  GCudata *ud = (GCudata *)lj_mem_newgcou(L, sizeof(GCudata) + sz);
   global_State *g = G(L);
   newwhite(g, ud);  /* Not finalized. */
   ud->gct = ~LJ_TUDATA;
@@ -22,15 +22,19 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   /* NOBARRIER: The GCudata is new (marked white). */
   setgcrefnull(ud->metatable);
   setgcref(ud->env, obj2gco(env));
-  /* Chain to userdata list (after main thread). */
+#if !LJ_HASGCMARK
+  /* Classic GC: chain to mainthread->nextgc for lj_gc_separateudata.
+  ** Arena GC (LJ_HASGCMARK) enumerates udata via the udata-arena bitmaps
+  ** instead, so no chain link is needed there. */
   setgcrefr(ud->nextgc, mainthread(g)->nextgc);
   setgcref(mainthread(g)->nextgc, obj2gco(ud));
+#endif
   return ud;
 }
 
 void LJ_FASTCALL lj_udata_free(global_State *g, GCudata *ud)
 {
-  lj_mem_free(g, ud, sizeudata(ud));
+  lj_mem_freegco(g, ud, sizeudata(ud));
 }
 
 #if LJ_64
@@ -59,4 +63,3 @@ void *lj_lightud_intern(lua_State *L, void *p)
   return (void *)(((uint64_t)segnum << LJ_LIGHTUD_BITS_LO) | lightudlo(u));
 }
 #endif
-

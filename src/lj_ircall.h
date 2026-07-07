@@ -63,6 +63,12 @@ typedef struct CCallInfo {
 /* Helpers for conditional function definitions. */
 #define IRCALLCOND_ANY(x)		x
 
+#if LJ_HASGCMARK
+#define IRCALLCOND_GCMARK(x)		x
+#else
+#define IRCALLCOND_GCMARK(x)		NULL
+#endif
+
 #if LJ_TARGET_X86ORX64 || LJ_TARGET_ARM64
 #define IRCALLCOND_FPMATH(x)		NULL
 #else
@@ -193,6 +199,8 @@ typedef struct CCallInfo {
   _(ANY,	lj_tab_len_hint,	2,  FL, INT, 0) \
   _(ANY,	lj_gc_step_jit,		2,  FS, NIL, CCI_L) \
   _(ANY,	lj_gc_barrieruv,	2,  FS, NIL, 0) \
+  _(GCMARK,	lj_gc_ssb_flush,	1,  FS, NIL, 0) \
+  _(GCMARK,	lj_gc_barrierback_arena, 2, FS, NIL, 0) \
   _(ANY,	lj_mem_newgco,		2,  FA, PGC, CCI_L|CCI_T) \
   _(ANY,	lj_prng_u64d,		1,  FS, NUM, CCI_CASTU64) \
   _(ANY,	lj_vm_modi,		2,  FN, INT, 0) \

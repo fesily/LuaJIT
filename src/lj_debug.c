@@ -146,6 +146,13 @@ static BCLine debug_frameline(lua_State *L, GCfunc *fn, cTValue *nextframe)
   return -1;
 }
 
+#if defined(LUAJIT_ENABLE_MEMPROF)
+BCLine lj_debug_frameline(lua_State *L, GCfunc *fn, cTValue *nextframe)
+{
+  return debug_frameline(L, fn, nextframe);
+}
+#endif
+
 /* -- Variable names ------------------------------------------------------ */
 
 /* Get name of a local variable from slot number and PC. */

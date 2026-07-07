@@ -1913,11 +1913,19 @@ static void asm_cnew(ASMState *as, IRIns *ir)
   }
 
   /* Combine initialization of marked, gct and ctypeid. */
+#if LJ_HASGCMARK
+  /* Arena/bitmap GC: header carries no white bit (liveness is the arena mark
+  ** bitmap). New cdata is light-gray, matching the C allocator's newwhite()
+  ** under bitmap GC = LJ_GC_GRAY only. */
+  emit_movmroi(as, RID_RET, (int32_t)offsetof(GCcdata, marked),
+	       (int32_t)((LJ_GC_GRAY)+(~LJ_TCDATA<<8)+(id<<16)));
+#else
   emit_movtomro(as, RID_ECX, RID_RET, offsetof(GCcdata, marked));
   emit_gri(as, XG_ARITHi(XOg_OR), RID_ECX,
 	   (int32_t)((~LJ_TCDATA<<8)+(id<<16)));
   emit_gri(as, XG_ARITHi(XOg_AND), RID_ECX, LJ_GC_WHITES);
   emit_opgl(as, XO_MOVZXb, RID_ECX, gc.currentwhite);
+#endif
 
   args[0] = ASMREF_L;     /* lua_State *L */
   args[1] = ASMREF_TMP1;  /* MSize size   */
@@ -1930,6 +1938,30 @@ static void asm_cnew(ASMState *as, IRIns *ir)
 
 static void asm_tbar(ASMState *as, IRIns *ir)
 {
+#if LJ_HASGCMARK
+  /* Backward barrier. Keep only the steady-state hot path inline: if the table
+  ** is already gray, skip everything. Otherwise call the shared C helper, which
+  ** sets gray and pushes to the SSB when the table is black. Inlining the full
+  ** quad-color body (set gray, test arena mark bit, SSB push + cold flush)
+  ** overflowed the asm red zone (MCLIM_REDZONE); the non-gray case is cold, so
+  ** a call costs nothing real. Mirrors asm_obar. The vm_x64.dasc barrierback
+  ** macro keeps the full inline body — the interpreter has room for it. */
+  const CCallInfo *ci = &lj_ir_callinfo[IRCALL_lj_gc_barrierback_arena];
+  IRRef args[2];
+  MCLabel l_end;
+  Reg tab;
+  ra_evictset(as, RSET_SCRATCH);
+  l_end = emit_label(as);
+  args[0] = ASMREF_TMP1;  /* global_State *g     */
+  args[1] = ir->op1;      /* GCobj *o (the table) */
+  asm_gencall(as, ci, args);
+  emit_loada(as, ra_releasetmp(as, ASMREF_TMP1), J2G(as->J));
+  tab = IR(ir->op1)->r;
+  /* Hot path: skip the whole barrier if tab is already gray. */
+  emit_sjcc(as, CC_NZ, l_end);
+  emit_i8(as, LJ_GC_GRAY);
+  emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+#else
   Reg tab = ra_alloc1(as, ir->op1, RSET_GPR);
   Reg tmp = ra_scratch(as, rset_exclude(RSET_GPR, tab));
   MCLabel l_end = emit_label(as);
@@ -1941,6 +1973,7 @@ static void asm_tbar(ASMState *as, IRIns *ir)
   emit_sjcc(as, CC_Z, l_end);
   emit_i8(as, LJ_GC_BLACK);
   emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
+#endif
 }
 
 static void asm_obar(ASMState *as, IRIns *ir)
@@ -1958,6 +1991,12 @@ static void asm_obar(ASMState *as, IRIns *ir)
   asm_gencall(as, ci, args);
   emit_loada(as, ra_releasetmp(as, ASMREF_TMP1), J2G(as->J));
   obj = IR(ir->op1)->r;
+#if LJ_HASGCMARK
+  emit_sjcc(as, CC_NZ, l_end);
+  emit_i8(as, LJ_GC_GRAY);
+  emit_rmro(as, XO_GROUP3b, XOg_TEST, obj,
+	    (int32_t)offsetof(GCupval, marked)-(int32_t)offsetof(GCupval, tv));
+#else
   emit_sjcc(as, CC_Z, l_end);
   emit_i8(as, LJ_GC_WHITES);
   if (irref_isk(ir->op2)) {
@@ -1971,6 +2010,7 @@ static void asm_obar(ASMState *as, IRIns *ir)
   emit_i8(as, LJ_GC_BLACK);
   emit_rmro(as, XO_GROUP3b, XOg_TEST, obj,
 	    (int32_t)offsetof(GCupval, marked)-(int32_t)offsetof(GCupval, tv));
+#endif
 }
 
 /* -- FP/int arithmetic and logic operations ------------------------------ */

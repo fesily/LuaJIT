@@ -16,6 +16,12 @@
 #include "lj_arch.h"
 
 #include <stdlib.h>
+#include <string.h>
+
+#if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
+LUALIB_API int luaopen_memprof(lua_State *L);
+#define LUA_MEMPROFLIBNAME	"memprof"
+#endif
 
 static luaL_Reg lj_lib_load[] = {
   { "",			luaopen_base },
@@ -40,6 +46,9 @@ static luaL_Reg *_lj_lib_load = lj_lib_load;
 static const luaL_Reg lj_lib_preload[] = {
 #if LJ_HASFFI
   { LUA_FFILIBNAME,	luaopen_ffi },
+#endif
+#if LJ_HASGCMARK && defined(LUAJIT_ENABLE_MEMPROF)
+  { LUA_MEMPROFLIBNAME,	luaopen_memprof },
 #endif
   { NULL,		NULL }
 };
@@ -109,4 +118,3 @@ LUALIB_API void luaL_defaultlib_update(luaL_Reg* newlib) {
   _lj_lib_load = new_lj_lib_load;
 }
 #endif
-
