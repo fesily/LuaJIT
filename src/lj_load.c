@@ -22,6 +22,7 @@
 #include "lj_lex.h"
 #include "lj_bcdump.h"
 #include "lj_parse.h"
+#define LJ_IO_PATCH_IMPLEMENTATION
 #include "lj_io_patch.h"
 
 /* -- Load Lua source code and bytecode ----------------------------------- */
@@ -261,4 +262,3 @@ LUA_API int lua_dump(lua_State *L, lua_Writer writer, void *data)
   else
     return 1;
 }
-

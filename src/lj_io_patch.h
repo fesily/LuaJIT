@@ -5,42 +5,47 @@
 #include "lj_arch.h"
 
 #if LJ_DS_IO_FOPEN_PATCH
-LUA_DATA_API FILE *(*lj_fopen)(char const *f, const char *mode) = fopen;
-LUA_DATA_API int (*lj_fclose)(FILE *) = fclose;
-LUA_DATA_API int (*lj_fscanf)(FILE *const _Stream, char const *const _Format, ...) = fscanf;
-LUA_DATA_API char *(*lj_fgets)(char *_Buffer, int _MaxCount, FILE *_Stream) = fgets;
-LUA_DATA_API size_t (*lj_fread)(
+#ifdef LJ_IO_PATCH_IMPLEMENTATION
+#define LJ_IO_PATCH_STORAGE LUA_DATA_API
+#define LJ_IO_PATCH_DATA(init) = init
+#else
+#define LJ_IO_PATCH_STORAGE extern LUA_DATA_API
+#define LJ_IO_PATCH_DATA(init)
+#endif
+LJ_IO_PATCH_STORAGE FILE *(*lj_fopen)(char const *f, const char *mode) LJ_IO_PATCH_DATA(fopen);
+LJ_IO_PATCH_STORAGE int (*lj_fclose)(FILE *) LJ_IO_PATCH_DATA(fclose);
+LJ_IO_PATCH_STORAGE int (*lj_fscanf)(FILE *const _Stream, char const *const _Format, ...) LJ_IO_PATCH_DATA(fscanf);
+LJ_IO_PATCH_STORAGE char *(*lj_fgets)(char *_Buffer, int _MaxCount, FILE *_Stream) LJ_IO_PATCH_DATA(fgets);
+LJ_IO_PATCH_STORAGE size_t (*lj_fread)(
     void *_Buffer,
     size_t _ElementSize,
     size_t _ElementCount,
-    FILE *_Stream) = fread;
-LUA_DATA_API size_t (*lj_fwrite)(
+    FILE *_Stream) LJ_IO_PATCH_DATA(fread);
+LJ_IO_PATCH_STORAGE size_t (*lj_fwrite)(
     void const *_Buffer,
     size_t _ElementSize,
     size_t _ElementCount,
-    FILE *_Stream) = fwrite;
+    FILE *_Stream) LJ_IO_PATCH_DATA(fwrite);
 
-LUA_DATA_API int (*lj_ferror)
-(FILE *_Stream) = ferror;
-
-LUA_DATA_API int (*lj_feof)(
-    FILE* _Stream
-    ) = feof;
+LJ_IO_PATCH_STORAGE int (*lj_ferror)(FILE *_Stream) LJ_IO_PATCH_DATA(ferror);
+LJ_IO_PATCH_STORAGE int (*lj_feof)(FILE* _Stream) LJ_IO_PATCH_DATA(feof);
 
 #if LJ_TARGET_OSX
-LUA_DATA_API int (*lj_fseeko)(FILE *__stream, off_t __off, int __whence) = fseeko;
-LUA_DATA_API off_t (*lj_ftello)(FILE *_Stream) = ftello;
+LJ_IO_PATCH_STORAGE int (*lj_fseeko)(FILE *__stream, off_t __off, int __whence) LJ_IO_PATCH_DATA(fseeko);
+LJ_IO_PATCH_STORAGE off_t (*lj_ftello)(FILE *_Stream) LJ_IO_PATCH_DATA(ftello);
 #elif LJ_TARGET_POSIX
-LUA_DATA_API int (*lj_fseeko)(FILE *__stream, __off_t __off, int __whence) = fseeko;
-LUA_DATA_API __off64_t (*lj_ftello)(FILE *_Stream) = ftello;
+LJ_IO_PATCH_STORAGE int (*lj_fseeko)(FILE *__stream, __off_t __off, int __whence) LJ_IO_PATCH_DATA(fseeko);
+LJ_IO_PATCH_STORAGE __off64_t (*lj_ftello)(FILE *_Stream) LJ_IO_PATCH_DATA(ftello);
 #elif _MSC_VER >= 1400
-LUA_DATA_API int (*lj_fseeki64)(
+LJ_IO_PATCH_STORAGE int (*lj_fseeki64)(
     FILE *_Stream,
     __int64 _Offset,
-    int _Origin) = _fseeki64;
-LUA_DATA_API __int64 (*lj_ftelli64)(FILE *_Stream) = _ftelli64;
+    int _Origin) LJ_IO_PATCH_DATA(_fseeki64);
+LJ_IO_PATCH_STORAGE __int64 (*lj_ftelli64)(FILE *_Stream) LJ_IO_PATCH_DATA(_ftelli64);
 #endif
-LUA_DATA_API void (*lj_clearerr)(FILE* fp) = clearerr;
+LJ_IO_PATCH_STORAGE void (*lj_clearerr)(FILE* fp) LJ_IO_PATCH_DATA(clearerr);
+#undef LJ_IO_PATCH_STORAGE
+#undef LJ_IO_PATCH_DATA
 #else
 #define lj_fopen fopen
 #define lj_fclose fclose

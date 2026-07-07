@@ -220,7 +220,7 @@ static int debug_getupvalue(lua_State *L, int get)
     TValue *val = NULL;
     GCobj *o;
     int index = 2;
-    name = lj_debug_uvnamev(index2adr(L, 1), (uint32_t)(index-1), &val, &o);
+    name = lj_debug_uvnamev(lj_lib_checkany(L, 1), (uint32_t)(index-1), &val, &o);
     if (val && tvisfunc(val) && (!name || strlen(name) == 0)) {
       GCfunc *fn = funcV(val);
       if (iscfunc(fn)) {
@@ -477,4 +477,3 @@ LUALIB_API int luaopen_debug(lua_State *L)
   LJ_LIB_REG(L, LUA_DBLIBNAME, debug);
   return 1;
 }
-
