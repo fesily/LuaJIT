@@ -33,8 +33,13 @@
 #include "lj_vmevent.h"
 #include "lj_arena.h"
 
-#ifdef LUAJIT_ENABLE_GCSTATS_TIMING
+#if defined(LUAJIT_ENABLE_GCSTATS_TIMING) || LJ_DS_ENABLE_GC_STEP_TIME
 #include <time.h>
+#endif
+#if LJ_DS_ENABLE_GC_STEP_TIME && defined(_WIN32)
+#include <windows.h>
+#elif LJ_DS_ENABLE_GC_STEP_TIME && defined(__APPLE__)
+#include <mach/mach_time.h>
 #endif
 
 #define GCSTEPSIZE	1024u
@@ -1726,7 +1731,7 @@ static void gc_call_finalizer(global_State *g, lua_State *L,
   TValue *top;
   lj_trace_abort(g);
   hook_entergc(g);  /* Disable hooks and new traces during __gc. */
-  if (LJ_HASPROFILE && (oldh & HOOK_PROFILE)) lj_dispatch_update(g);
+  if (LJ_HASPROFILE && (oldh & HOOK_PROFILE)) lj_dispatch_update(g, 0);
   g->gc.threshold = LJ_MAX_MEM;  /* Prevent GC steps. */
   top = VL->top;
   copyTV(VL, top++, mo);
@@ -1736,7 +1741,7 @@ static void gc_call_finalizer(global_State *g, lua_State *L,
   errcode = lj_vm_pcall(VL, top, 1+0, -1);  /* Stack: |mo|o| -> | */
   setgcref(g->cur_L, obj2gco(L));
   hook_restore(g, oldh);
-  if (LJ_HASPROFILE && (oldh & HOOK_PROFILE)) lj_dispatch_update(g);
+  if (LJ_HASPROFILE && (oldh & HOOK_PROFILE)) lj_dispatch_update(g, 0);
   g->gc.threshold = oldt;  /* Restore GC threshold. */
   if (errcode) {
     lj_vmevent_send(g, ERRFIN,
@@ -2295,6 +2300,71 @@ int LJ_FASTCALL lj_gc_step(lua_State *L)
     return 0;
   }
 }
+
+#if LJ_DS_ENABLE_GC_STEP_TIME
+int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
+{
+  global_State *g = G(L);
+  uint64_t timelim = (uint64_t)g->gc.stepmultime;
+  int32_t ostate = g->vmstate;
+  if (g->gc.total > g->gc.threshold)
+    g->gc.debt += g->gc.total - g->gc.threshold;
+  setvmstate(g, GC);
+  if (timelim == 0)
+    timelim = (uint64_t)1e5;
+
+#if defined(_WIN32)
+  LJ_STATIC_ASSERT(sizeof(LARGE_INTEGER) == sizeof(uint64_t));
+  LARGE_INTEGER freq, start, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&start);
+#elif defined(__APPLE__)
+  uint64_t start, now;
+  mach_timebase_info_data_t tb;
+  mach_timebase_info(&tb);
+  start = mach_absolute_time();
+#else
+  struct timespec start, now;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
+
+  uint64_t elapsed;
+  GCSize work = 0;
+  do {
+    size_t cost = gc_onestep(L);
+    if (cost >= LJ_MAX_MEM)
+      break;
+    work += (GCSize)cost;
+    if (g->gc.state == GCSpause) {
+      g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+      g->vmstate = ostate;
+      return 1;
+    }
+#if defined(_WIN32)
+    QueryPerformanceCounter(&now);
+    elapsed = (uint64_t)((now.QuadPart - start.QuadPart) * 1e9 / freq.QuadPart);
+#elif defined(__APPLE__)
+    now = mach_absolute_time();
+    elapsed = (now - start) * tb.numer / tb.denom;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    elapsed = (uint64_t)((now.tv_sec - start.tv_sec) * 1e9 + (now.tv_nsec - start.tv_nsec));
+#endif
+  } while (elapsed < timelim);
+
+  if (g->gc.debt <= work) {
+    g->gc.debt = 0;
+    g->gc.threshold = g->gc.total + GCSTEPSIZE;
+    g->vmstate = ostate;
+    return -1;
+  } else {
+    g->gc.debt -= work;
+    g->gc.threshold = g->gc.total;
+    g->vmstate = ostate;
+    return 0;
+  }
+}
+#endif
 
 /* Ditto, but fix the stack top first. */
 void LJ_FASTCALL lj_gc_step_fixtop(lua_State *L)
@@ -2913,7 +2983,7 @@ void lj_gc_fullgc(lua_State *L)
 /* Backward barrier for arena objects (called from interpreter/JIT).
 ** Sets gray bit, then checks mark bitmap: black→dark-gray pushes to SSB,
 ** white→light-gray just sets gray (no push needed). */
-void lj_gc_barrierback_arena(global_State *g, GCobj *o)
+void LJ_FASTCALL lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
   gcstat_inc(g, barrierback);
   /* T4: removed the rebuild-window skip (GCF_BITMAPSWEEP && !GCF_DEADAUTH).

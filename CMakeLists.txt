@@ -167,13 +167,7 @@ ELSE()
   MESSAGE(STATUS "LuaJIT target ${TARGET_LJARCH}")
 ENDIF()
 
-FILE(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/jit)
 FILE(GLOB jit_files ${LUAJIT_DIR}/src/jit/*.lua)
-FILE(COPY ${jit_files} DESTINATION ${CMAKE_BINARY_DIR}/jit)
-install(
-    DIRECTORY ${CMAKE_BINARY_DIR}/jit
-    DESTINATION ${TARGET_MOD_DIR}/scripts
-)
 
 SET(DASM_ARCH ${TARGET_LJARCH})
 SET(DASM_FLAGS)
@@ -276,31 +270,10 @@ ELSEIF(NOT WIN32)
 ENDIF()
 
 
-add_executable(minilua ${LUAJIT_DIR}/src/host/minilua.c)
-SET_TARGET_PROPERTIES(minilua PROPERTIES COMPILE_DEFINITIONS "${TARGET_ARCH}")
 CHECK_LIBRARY_EXISTS(m sin "" MINILUA_USE_LIBM)
-if(MINILUA_USE_LIBM)
-  TARGET_LINK_LIBRARIES(minilua m)
-endif()
-
-add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h
-  COMMAND minilua ${LUAJIT_DIR}/dynasm/dynasm.lua ${DASM_FLAGS} -o ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
-  DEPENDS
-    ${LUAJIT_DIR}/dynasm/dynasm.lua
-    ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
-    ${LUAJIT_DIR}/src/lj_arch.h
-    ${LUAJIT_DIR}/src/lj_bc.h
-    minilua
-)
 
 add_custom_command(OUTPUT ${LUAJIT_DIR}/src/luajit_relver.txt
   COMMAND git show -s --format=%ct > ${LUAJIT_DIR}/src/luajit_relver.txt
-  WORKING_DIRECTORY ${LUAJIT_DIR}/src/
-)
-
-add_custom_command(OUTPUT ${LUAJIT_DIR}/src/luajit.h
-  COMMAND minilua ${LUAJIT_DIR}/src/host/genversion.lua
-  DEPENDS ${LUAJIT_DIR}/src/host/genversion.lua minilua ${LUAJIT_DIR}/src/luajit_relver.txt
   WORKING_DIRECTORY ${LUAJIT_DIR}/src/
 )
 
@@ -326,97 +299,193 @@ SET(SRC_LIBAUX
 )
 file (GLOB_RECURSE SRC_LJCORE   "${LUAJIT_DIR}/src/lj_*.c")
 list (APPEND SRC_LJCORE ${SRC_LJLIB} ${SRC_LIBAUX})
-file (GLOB_RECURSE SRC_BUILDVM  "${LUAJIT_DIR}/src/host/buildvm*.c")
-list (APPEND SRC_BUILDVM ${CMAKE_CURRENT_BINARY_DIR}/buildvm_arch.h)
-list (APPEND SRC_BUILDVM ${LUAJIT_DIR}/src/luajit.h)
+file (GLOB_RECURSE SRC_BUILDVM_BASE  "${LUAJIT_DIR}/src/host/buildvm*.c")
 
-## GENERATE
-ADD_EXECUTABLE(buildvm ${SRC_BUILDVM})
-SET_TARGET_PROPERTIES(buildvm PROPERTIES COMPILE_DEFINITIONS "${TARGET_ARCH}")
-
-macro(add_buildvm_target _target _mode)
-  add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${_target}
-    COMMAND buildvm ARGS -m ${_mode} -o ${CMAKE_CURRENT_BINARY_DIR}/${_target} ${ARGN}
+## GENERATE / COMPILE PER VARIANT
+function(add_buildvm_target_for_variant buildvm_target variant_binary_dir output_name mode)
+  add_custom_command(OUTPUT "${variant_binary_dir}/${output_name}"
+    COMMAND ${buildvm_target} ARGS -m ${mode} -o "${variant_binary_dir}/${output_name}" ${ARGN}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS buildvm ${ARGN}
+    DEPENDS ${buildvm_target} ${ARGN}
   )
-endmacro(add_buildvm_target)
+endfunction()
 
-if (WIN32)
-  add_buildvm_target ( lj_vm.obj peobj )
-  set (LJ_VM_SRC ${CMAKE_CURRENT_BINARY_DIR}/lj_vm.obj)
-else ()
-  add_buildvm_target ( lj_vm.S ${LJVM_MODE} )
-  set (LJ_VM_SRC ${CMAKE_CURRENT_BINARY_DIR}/lj_vm.S)
-endif ()
-add_buildvm_target ( lj_ffdef.h   ffdef   ${SRC_LJLIB} )
-add_buildvm_target ( lj_bcdef.h  bcdef  ${SRC_LJLIB} )
-add_buildvm_target ( lj_folddef.h folddef ${LUAJIT_DIR}/src/lj_opt_fold.c )
-add_buildvm_target ( lj_recdef.h  recdef  ${SRC_LJLIB} )
-add_buildvm_target ( lj_libdef.h  libdef  ${SRC_LJLIB} )
-add_buildvm_target ( vmdef.lua  vmdef  ${SRC_LJLIB} )
+function(add_luajit_variant)
+  set(options INSTALL_SUPPORT_FILES)
+  set(oneValueArgs NAME LIB_TARGET LIB_OUTPUT_NAME EXE_TARGET)
+  set(multiValueArgs COMPILE_DEFINITIONS)
+  cmake_parse_arguments(LJVAR "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-SET(DEPS
-  ${LJ_VM_SRC}
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_ffdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_bcdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_libdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_recdef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/lj_folddef.h
-  ${CMAKE_CURRENT_BINARY_DIR}/vmdef.lua
+  foreach(req NAME LIB_TARGET LIB_OUTPUT_NAME EXE_TARGET)
+    if(NOT DEFINED LJVAR_${req} OR LJVAR_${req} STREQUAL "")
+      message(FATAL_ERROR "add_luajit_variant: missing required argument '${req}'")
+    endif()
+  endforeach()
+
+  set(variant_binary_dir "${CMAKE_CURRENT_BINARY_DIR}/variants/${LJVAR_NAME}")
+  set(variant_jit_dir "${variant_binary_dir}/jit")
+  set(variant_dasm_flags ${DASM_FLAGS})
+  file(MAKE_DIRECTORY "${variant_binary_dir}")
+  file(MAKE_DIRECTORY "${variant_jit_dir}")
+  file(COPY ${jit_files} DESTINATION "${variant_jit_dir}")
+
+  list(FIND LJVAR_COMPILE_DEFINITIONS "LUAJIT_ENABLE_GCARENA" variant_uses_gc_arena)
+  if(NOT variant_uses_gc_arena EQUAL -1)
+    list(APPEND variant_dasm_flags -D LJ_HASGCMARK)
+  endif()
+
+  if(LJVAR_INSTALL_SUPPORT_FILES)
+    install(
+      DIRECTORY "${variant_jit_dir}"
+      DESTINATION ${TARGET_MOD_DIR}/scripts
+    )
+  endif()
+
+  set(minilua_target "minilua-${LJVAR_NAME}")
+  add_executable(${minilua_target} ${LUAJIT_DIR}/src/host/minilua.c)
+  target_compile_definitions(${minilua_target} PRIVATE ${TARGET_ARCH} ${LJVAR_COMPILE_DEFINITIONS})
+  target_include_directories(${minilua_target} PRIVATE
+    ${LUAJIT_DIR}
+    ${LUAJIT_DIR}/src
+    "${variant_binary_dir}")
+  if(MINILUA_USE_LIBM)
+    target_link_libraries(${minilua_target} m)
+  endif()
+
+  set(variant_buildvm_arch_h "${variant_binary_dir}/buildvm_arch.h")
+  add_custom_command(OUTPUT "${variant_buildvm_arch_h}"
+    COMMAND ${minilua_target} ${LUAJIT_DIR}/dynasm/dynasm.lua ${variant_dasm_flags} -o "${variant_buildvm_arch_h}" ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+    DEPENDS
+      ${LUAJIT_DIR}/dynasm/dynasm.lua
+      ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+      ${LUAJIT_DIR}/src/lj_arch.h
+      ${LUAJIT_DIR}/src/lj_bc.h
+      ${minilua_target}
   )
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/vmdef.lua DESTINATION  ${TARGET_MOD_DIR}/scripts/jit)
 
-## COMPILE
-include_directories(
-  ${LUAJIT_DIR}/dynasm
-  ${LUAJIT_DIR}/src
-  ${CMAKE_CURRENT_BINARY_DIR}
+  set(variant_luajit_relver_txt "${variant_binary_dir}/luajit_relver.txt")
+  add_custom_command(OUTPUT "${variant_luajit_relver_txt}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LUAJIT_DIR}/src/luajit_relver.txt "${variant_luajit_relver_txt}"
+    DEPENDS ${LUAJIT_DIR}/src/luajit_relver.txt
+  )
+
+  set(variant_luajit_h "${variant_binary_dir}/luajit.h")
+  add_custom_command(OUTPUT "${variant_luajit_h}"
+    COMMAND ${minilua_target} ${LUAJIT_DIR}/src/host/genversion.lua ${LUAJIT_DIR}/src/luajit_rolling.h "${variant_luajit_relver_txt}" "${variant_luajit_h}"
+    DEPENDS ${LUAJIT_DIR}/src/host/genversion.lua ${minilua_target} "${variant_luajit_relver_txt}" ${LUAJIT_DIR}/src/luajit_rolling.h
+    WORKING_DIRECTORY ${LUAJIT_DIR}/src/
+  )
+
+  set(variant_src_buildvm ${SRC_BUILDVM_BASE} "${variant_buildvm_arch_h}" "${variant_luajit_h}")
+  set(buildvm_target "buildvm-${LJVAR_NAME}")
+  add_executable(${buildvm_target} ${variant_src_buildvm})
+  target_compile_definitions(${buildvm_target} PRIVATE ${TARGET_ARCH} ${LJVAR_COMPILE_DEFINITIONS})
+  target_include_directories(${buildvm_target} PRIVATE
+    "${variant_binary_dir}"
+    ${LUAJIT_DIR}/src
+    ${LUAJIT_DIR}/dynasm)
+
+  if (WIN32)
+    add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" lj_vm.obj peobj)
+    set(variant_lj_vm_src "${variant_binary_dir}/lj_vm.obj")
+  else ()
+    add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" lj_vm.S ${LJVM_MODE})
+    set(variant_lj_vm_src "${variant_binary_dir}/lj_vm.S")
+  endif ()
+  add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" lj_ffdef.h ffdef ${SRC_LJLIB})
+  add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" lj_bcdef.h bcdef ${SRC_LJLIB})
+  add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" lj_folddef.h folddef ${LUAJIT_DIR}/src/lj_opt_fold.c)
+  add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" lj_recdef.h recdef ${SRC_LJLIB})
+  add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" lj_libdef.h libdef ${SRC_LJLIB})
+  add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" vmdef.lua vmdef ${SRC_LJLIB})
+
+  set(variant_vmdef_lua "${variant_binary_dir}/vmdef.lua")
+  set(variant_deps
+    ${variant_lj_vm_src}
+    "${variant_binary_dir}/lj_ffdef.h"
+    "${variant_binary_dir}/lj_bcdef.h"
+    "${variant_binary_dir}/lj_libdef.h"
+    "${variant_binary_dir}/lj_recdef.h"
+    "${variant_binary_dir}/lj_folddef.h"
+    "${variant_vmdef_lua}")
+
+  if(LJVAR_INSTALL_SUPPORT_FILES)
+    install(FILES "${variant_vmdef_lua}" DESTINATION ${TARGET_MOD_DIR}/scripts/jit)
+  endif()
+
+  if(WITH_SHARED_LUA)
+    if(WITH_AMALG)
+      add_library(${LJVAR_LIB_TARGET} SHARED ${LUAJIT_DIR}/src/ljamalg.c ${variant_deps})
+    else()
+      add_library(${LJVAR_LIB_TARGET} SHARED ${SRC_LJCORE} ${variant_deps})
+    endif()
+    set_target_properties(${LJVAR_LIB_TARGET} PROPERTIES OUTPUT_NAME "${LJVAR_LIB_OUTPUT_NAME}")
+  else()
+    if(WITH_AMALG)
+      add_library(${LJVAR_LIB_TARGET} STATIC ${LUAJIT_DIR}/src/ljamalg.c ${variant_deps})
+    else()
+      add_library(${LJVAR_LIB_TARGET} STATIC ${SRC_LJCORE} ${variant_deps})
+    endif()
+    if(LJVAR_NAME STREQUAL "default")
+      set(variant_static_output_name "luajit")
+    else()
+      set(variant_static_output_name "${LJVAR_LIB_OUTPUT_NAME}")
+    endif()
+    set_target_properties(${LJVAR_LIB_TARGET} PROPERTIES
+      PREFIX "lib" IMPORT_PREFIX "lib" OUTPUT_NAME "${variant_static_output_name}")
+  endif()
+
+  target_compile_definitions(${LJVAR_LIB_TARGET} PRIVATE DO_LUA_INIT ${LJVAR_COMPILE_DEFINITIONS})
+  target_include_directories(${LJVAR_LIB_TARGET} PRIVATE
+    "${variant_binary_dir}"
+    ${LUAJIT_DIR}/src
+    ${LUAJIT_DIR}/dynasm)
+  target_link_libraries(${LJVAR_LIB_TARGET} ${LIBS})
+  install(TARGETS ${LJVAR_LIB_TARGET} RUNTIME DESTINATION .)
+
+  if(WIN32)
+    add_executable(${LJVAR_EXE_TARGET} ${LUAJIT_DIR}/src/luajit.c)
+    target_compile_definitions(${LJVAR_EXE_TARGET} PRIVATE LUA_BUILD_AS_DLL LJ_DS_DEBUG_GETINFO_PATCH=0 ${LJVAR_COMPILE_DEFINITIONS})
+    target_include_directories(${LJVAR_EXE_TARGET} PRIVATE
+      "${variant_binary_dir}"
+      ${LUAJIT_DIR}/src
+      ${LUAJIT_DIR}/dynasm)
+    target_link_libraries(${LJVAR_EXE_TARGET} ${LJVAR_LIB_TARGET} ${LIBS})
+  else()
+    if(WITH_AMALG)
+      add_executable(${LJVAR_EXE_TARGET} ${LUAJIT_DIR}/src/luajit.c ${LUAJIT_DIR}/src/ljamalg.c ${variant_deps})
+      # When using WITH_AMALG, compile the executable after the variant library
+      # to avoid concurrent ljamalg.c builds for the same variant.
+      add_dependencies(${LJVAR_EXE_TARGET} ${LJVAR_LIB_TARGET})
+    else()
+      add_executable(${LJVAR_EXE_TARGET} ${LUAJIT_DIR}/src/luajit.c ${SRC_LJCORE} ${variant_deps})
+    endif()
+    target_link_libraries(${LJVAR_EXE_TARGET} ${LIBS})
+    set_target_properties(${LJVAR_EXE_TARGET} PROPERTIES ENABLE_EXPORTS ON)
+  endif()
+
+  target_compile_definitions(${LJVAR_EXE_TARGET} PRIVATE LJ_DS_DEBUG_GETINFO_PATCH=0 ${LJVAR_COMPILE_DEFINITIONS})
+  target_include_directories(${LJVAR_EXE_TARGET} PRIVATE
+    "${variant_binary_dir}"
+    ${LUAJIT_DIR}/src
+    ${LUAJIT_DIR}/dynasm)
+endfunction()
+
+add_luajit_variant(
+  NAME default
+  LIB_TARGET luajit-5.1
+  LIB_OUTPUT_NAME lua51DS
+  EXE_TARGET luajit
+  INSTALL_SUPPORT_FILES
 )
 
-IF(WITH_SHARED_LUA)
-    IF(WITH_AMALG)
-	add_library(luajit-5.1 SHARED ${LUAJIT_DIR}/src/ljamalg.c ${DEPS} )
-    ELSE()
-	add_library(luajit-5.1 SHARED ${SRC_LJCORE} ${DEPS} )
-    ENDIF()
-    SET_TARGET_PROPERTIES(luajit-5.1 PROPERTIES OUTPUT_NAME "lua51DS")
-ELSE()
-    IF(WITH_AMALG)
-	add_library(luajit-5.1 STATIC ${LUAJIT_DIR}/src/ljamalg.c ${DEPS} )
-    ELSE()
-	add_library(luajit-5.1 STATIC ${SRC_LJCORE} ${DEPS} )
-    ENDIF()
-    SET_TARGET_PROPERTIES(luajit-5.1 PROPERTIES
-	PREFIX "lib" IMPORT_PREFIX "lib" OUTPUT_NAME "luajit")
-ENDIF()
-
-target_compile_definitions(luajit-5.1 PRIVATE DO_LUA_INIT)
-target_link_libraries (luajit-5.1 ${LIBS} )
-
-IF(WIN32)
-  add_executable(luajit ${LUAJIT_DIR}/src/luajit.c)
-  target_compile_definitions(luajit PRIVATE LUA_BUILD_AS_DLL)
-  target_link_libraries(luajit luajit-5.1 ${LIBS})
-ELSE()
-  IF(WITH_AMALG)
-    add_executable(luajit ${LUAJIT_DIR}/src/luajit.c ${LUAJIT_DIR}/src/ljamalg.c ${DEPS})
-    # When using WITH_AMALG during a parallel build, its possible to run into
-    # false-positive "error: 'fold_hash' undeclared" compile errors due to a weird interaction
-    # when building two ljamalg.c at the same time.
-    #
-    # This adds a fake dependency from one to the other, forcing the build process to
-    # compile them sequentially rather than parallel.
-    #
-    # See https://github.com/torch/luajit-rocks/issues/39
-    add_dependencies(luajit luajit-5.1)
-  ELSE()
-    add_executable(luajit ${LUAJIT_DIR}/src/luajit.c ${SRC_LJCORE} ${DEPS})
-  ENDIF()
-  target_link_libraries(luajit ${LIBS})
-  SET_TARGET_PROPERTIES(luajit PROPERTIES ENABLE_EXPORTS ON)
-ENDIF()
-target_compile_definitions(luajit PRIVATE -DLJ_DS_DEBUG_GETINFO_PATCH=0)
+add_luajit_variant(
+  NAME arenagc
+  LIB_TARGET luajit-5.1-arenagc
+  LIB_OUTPUT_NAME lua51DS_arenagc
+  EXE_TARGET luajit-arenagc
+  COMPILE_DEFINITIONS LUAJIT_ENABLE_GCARENA
+)
 
 MACRO(LUAJIT_add_custom_commands luajit_target)
   SET(target_srcs "")
@@ -432,13 +501,13 @@ MACRO(LUAJIT_add_custom_commands luajit_target)
       math(EXPR _stripped_file_length "${_luajit_file_length} - ${_luajit_source_dir_length} - 1")
       string(SUBSTRING ${file} ${_begin} ${_stripped_file_length} stripped_file)
 
-      set(generated_file "${CMAKE_BINARY_DIR}/jitted_tmp/${stripped_file}_${luajit_target}_generated${CMAKE_C_OUTPUT_EXTENSION}")
+      set(generated_file "${CMAKE_BINARY_DIR}/jitted_tmp/${luajit_target}/${stripped_file}_generated${CMAKE_C_OUTPUT_EXTENSION}")
 
       add_custom_command(
         OUTPUT ${generated_file}
         MAIN_DEPENDENCY ${source_file}
-        DEPENDS luajit
-        COMMAND luajit
+        DEPENDS ${luajit_target}
+        COMMAND ${luajit_target}
         ARGS -bg
           ${source_file}
           ${generated_file}
@@ -465,5 +534,3 @@ MACRO(LUA_ADD_EXECUTABLE luajit_target)
   LUAJIT_add_custom_commands(${luajit_target} ${ARGN})
   add_executable(${luajit_target} ${target_srcs})
 ENDMACRO(LUA_ADD_EXECUTABLE luajit_target)
-
-install(TARGETS luajit-5.1 RUNTIME DESTINATION .)
