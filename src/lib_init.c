@@ -75,14 +75,10 @@ LUALIB_API void luaL_openlibs(lua_State *L)
     lua_setfield(L, -2, lib->name);
   }
   lua_pop(L, 1);
-#ifdef LJ_DS
-  const char* dump_fix = ""
-#if LUA_COMPAT_MATH
- "math.mod = math.fmod\n"
+#if LJ_DS && LUA_COMPAT_MATH
+  (luaL_loadstring(L, "math.mod = math.fmod\n") || lua_pcall(L, 0, 0, 0));
 #endif
-;
-  (luaL_loadstring(L, dump_fix) || lua_pcall(L, 0, 0, 0));
-#endif
+
 
 #if DO_LUA_INIT
   handle_luainit(L);

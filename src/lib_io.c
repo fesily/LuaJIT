@@ -28,11 +28,6 @@
 #include "lj_strscan.h"
 #include "lj_io_patch.h"
 
-#if LJ_DS_LIB_IO2
-#undef LUA_FILEHANDLE
-#define LUA_FILEHANDLE  "JIT_FILE*"
-#endif
-
 /* Userdata payload for I/O file. */
 typedef struct IOFileUD {
   FILE *fp;		/* File handle. */
