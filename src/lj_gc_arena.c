@@ -1249,6 +1249,18 @@ static size_t gc_bitmap_sweep(global_State *g)
 	GCCellID c = (w << 5) + bitidx;
 	GCobj *o = (GCobj *)arena_cellptr(a, c);
 	dead &= dead - 1;
+	/* A thread freed earlier in this same word may have side-effect-freed
+	** its dead open upvalues: gc_freefunc[LJ_TTHREAD] -> lj_state_free ->
+	** lj_func_closeuv -> lj_func_freeuv pushes them onto this arena's
+	** freelist, ASAN-poisoning the cell. While binned those cells keep
+	** block=1, so they remain in this cached `dead` word.
+	** lj_arena_flushbins (called after each thread free below) flips them
+	** to Free (block=0); re-check the live bitmap before any header load so
+	** we never read a poisoned gct/closed byte. (Pre-ASAN code relied on
+	** those header bytes surviving the freelist linkword write -- false
+	** under the arena ASAN poison contract.) */
+	if (arena_cellstate(a, c) < CellState_White)
+	  continue;
 	/* Skip open upvalues: they're on per-thread openupval chains,
 	** freed by lj_state_free (dead thread) or gc_fullsweep in rebuild. */
 	if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
@@ -1271,7 +1283,17 @@ static size_t gc_bitmap_sweep(global_State *g)
 	lj_assertG(gc_obj_isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		   "bitmap sweep freeing non-dead object: o=%p gct=%d marked=0x%02x",
 		   (void*)o, o->gch.gct, o->gch.marked);
-	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+	{
+	  /* Capture gct before the free: the cell is ASAN-poisoned afterwards.
+	  ** Freeing a thread runs lj_state_free -> closeuv, which side-effect-
+	  ** frees its dead open upvalues into this arena; flush bins so those
+	  ** cells become Free (block=0) and are skipped by the re-check above
+	  ** when reached later in this word. */
+	  unsigned gct = o->gch.gct;
+	  gc_freefunc[gct - ~LJ_TSTR](g, o);
+	  if (gct == ~LJ_TTHREAD)
+	    lj_arena_flushbins(a);
+	}
 	freed++;
       }
       w++;
@@ -1890,14 +1912,30 @@ void lj_gc_freeall(global_State *g)
 	  GCCellID c = (w << 5) + bitidx;
 	  GCobj *o = (GCobj *)arena_cellptr(a, c);
 	  alive &= alive - 1;
+	  /* A thread freed earlier in this word side-effect-frees its dead
+	  ** open upvalues (lj_state_free -> closeuv -> freeuv) into this arena,
+	  ** ASAN-poisoning those cells. While binned they keep block=1 and stay
+	  ** in this cached `alive` word. Flush bins after each thread free
+	  ** below flips them to Free (block=0); re-check the live bitmap before
+	  ** any header load so we never read a poisoned gct/closed byte. The
+	  ** pre-ASAN claim that "freeing never overwrites gct/closed" is false
+	  ** under the arena ASAN poison contract. */
+	  if (arena_cellstate(a, c) < CellState_White)
+	    continue;
 	  /* Open upvalues are freed through their owning thread's openupval
-	  ** chain (below); skip them here. Safe even if a thread already freed
-	  ** this cell: freeing never overwrites the gct/closed header bytes. */
+	  ** chain (gc_fullsweep + lj_state_free -> closeuv below); skip them
+	  ** here. Cells already side-effect-freed by an earlier thread free in
+	  ** this word are caught by the bitmap re-check above. */
 	  if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
 	    continue;
 	  if (o->gch.gct == ~LJ_TTHREAD)
 	    gc_fullsweep(g, &gco2th(o)->openupval);
-	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+	  {
+	    unsigned gct = o->gch.gct;
+	    gc_freefunc[gct - ~LJ_TSTR](g, o);
+	    if (gct == ~LJ_TTHREAD)
+	      lj_arena_flushbins(a);
+	  }
 	}
       }
     }
