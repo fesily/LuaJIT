@@ -151,6 +151,29 @@ XCFLAGS=
 ##############################################################################
 
 ##############################################################################
+# AddressSanitizer support for the arena GC (target only).
+#
+# ASAN=1 appends -fsanitize=address -fno-omit-frame-pointer to TARGET_CFLAGS
+# and -fsanitize=address to TARGET_LDFLAGS, so the target VM and its host-built
+# peers (minilua, buildvm) stay unsanitized and do not need the ASAN runtime.
+# Do NOT put -fsanitize=address in XCFLAGS alone: that compiles the target with
+# sanitizer instrumentation but does not link the runtime, breaking the build.
+# Do NOT combine ASAN=1 with LUAJIT_USE_SYSMALLOC: lj_arch.h disables
+# LJ_HASGCARENA under SYSMALLOC, so the arena GC (the only thing this recipe
+# instruments) would be compiled out. The arena ASAN poison contract lives in
+# src/lj_asan.h; without -fsanitize=address the helpers compile to no-ops.
+#
+# Recommended runtime flags for the test suite:
+#   ASAN_OPTIONS=detect_leaks=0:allow_user_poisoning=1:halt_on_error=1
+# For the positive use-after-poison regression (test_arena_asan_uaf):
+#   ASAN_OPTIONS=allow_user_poisoning=1:detect_leaks=0:exitcode=99:halt_on_error=1
+##############################################################################
+ifeq ($(ASAN),1)
+TARGET_CFLAGS+= -fsanitize=address -fno-omit-frame-pointer
+TARGET_LDFLAGS+= -fsanitize=address
+endif
+
+##############################################################################
 # Host system detection.
 ##############################################################################
 
