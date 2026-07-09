@@ -387,7 +387,7 @@ GCproto *lj_bcread_proto(LexState *ls)
     setmref(pt->uvinfo, NULL);
     setmref(pt->varinfo, NULL);
   }
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   pt->eflags = 0;
 #endif
   return pt;

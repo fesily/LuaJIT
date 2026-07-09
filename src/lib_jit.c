@@ -148,7 +148,7 @@ LJLIB_CF(jit_attach)
   return 0;
 }
 
-#if LJ_DS_DYNAMIC_DISABLE_TAILCALL
+#if LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
 LJLIB_CF(jit_disabletailcall)
 {
   int en = 0;

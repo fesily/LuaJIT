@@ -147,7 +147,7 @@ typedef struct FuncState {
   uint8_t need_vararg;
   uint8_t has_compat_arg;
 #endif
-#if LJ_DS_DYNAMIC_DISABLE_TAILCALL
+#if LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
   uint8_t eflags;
   #define FUNC_STATE_FLAG_DISABLE_TAILCALL	0x01
   #define FUNC_STATE_FLAG_PROTO_TAILCALL		0x02
@@ -1613,7 +1613,7 @@ static GCproto *fs_finish(LexState *ls, BCLine line)
   lj_vmevent_send(G(L), BC,
     setprotoV(V, V->top++, pt);
   );
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   pt->eflags = 0;
   if (fs->eflags & FUNC_STATE_FLAG_PROTO_TAILCALL) {
     pt->eflags |= PROTO_EFLAG_TAILCALL;
@@ -1650,7 +1650,7 @@ static void fs_init(LexState *ls, FuncState *fs)
   fs->need_vararg = 0;
   fs->has_compat_arg = 0;
 #endif
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   fs->eflags = 0;
 #endif 
   /* Anchor table of constants in stack to avoid being collected. */
@@ -1909,8 +1909,8 @@ static void parse_body(LexState *ls, ExpDesc *e, int needself, BCLine line)
   ptrdiff_t oldbase = pfs->bcbase - ls->bcstack;
   fs_init(ls, &fs);
   fscope_begin(&fs, &bl, 0);
-#if LJ_DS_TAILCALL_WRAPPER
-  if (tvisstr(&ls->tokval) && strcmp(strVdata(&ls->tokval), "LJ_DS_tailcall") == 0) {
+#if LUA_COMPAT_TAILCALL_WRAPPER
+  if (tvisstr(&ls->tokval) && strcmp(strVdata(&ls->tokval), "LUA_COMPAT_tailcall") == 0) {
     fs.eflags |= FUNC_STATE_FLAG_PROTO_TAILCALL;
     fs.eflags |= FUNC_STATE_FLAG_DISABLE_TAILCALL;
   }
@@ -2392,14 +2392,14 @@ static void parse_return(LexState *ls)
 	BCIns *ip = bcptr(fs, &e);
 	/* It doesn't pay off to add BC_VARGT just for 'return ...'. */
 	if (bc_op(*ip) == BC_VARG) goto notailcall;
-#if LJ_DS_DYNAMIC_DISABLE_TAILCALL
+#if LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
   if (G(ls->L)->parser_disable_tailcall)
     goto notailcall;
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   if (fs->eflags & FUNC_STATE_FLAG_DISABLE_TAILCALL)
     goto notailcall;
   lj_assertX(e.u.s.info == fs->pc - 1, "assert failed by ip");
-  GCstr* name = lj_str_newlit(ls->L, "LJ_DS_tailcall");
+  GCstr* name = lj_str_newlit(ls->L, "LUA_COMPAT_tailcall");
   ExpDesc wrapper;
   if (var_lookup_(fs, name, &wrapper, 1) >= 0 && wrapper.k == VUPVAL) {
     BCReg a = bc_a(*ip);
