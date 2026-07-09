@@ -24,15 +24,6 @@ void LJ_FASTCALL lj_func_freeproto(global_State *g, GCproto *pt)
 
 /* -- Upvalues ------------------------------------------------------------ */
 
-static void unlinkuv(global_State *g, GCupval *uv)
-{
-  UNUSED(g);
-  lj_assertG(uvprev(uvnext(uv)) == uv && uvnext(uvprev(uv)) == uv,
-	     "broken upvalue chain");
-  setgcrefr(uvnext(uv)->prev, uv->prev);
-  setgcrefr(uvprev(uv)->next, uv->next);
-}
-
 /* Find existing open upvalue for a stack slot or create a new one. */
 static GCupval *func_finduv(lua_State *L, TValue *slot)
 {
@@ -59,12 +50,6 @@ static GCupval *func_finduv(lua_State *L, TValue *slot)
   /* NOBARRIER: The GCupval is new (marked white) and open. */
   setgcrefr(uv->nextgc, *pp);  /* Insert into sorted list of open upvalues. */
   setgcref(*pp, obj2gco(uv));
-  setgcref(uv->prev, obj2gco(&g->uvhead));  /* Insert into GC list, too. */
-  setgcrefr(uv->next, g->uvhead.next);
-  setgcref(uvnext(uv)->prev, obj2gco(uv));
-  setgcref(g->uvhead.next, obj2gco(uv));
-  lj_assertG(uvprev(uvnext(uv)) == uv && uvnext(uvprev(uv)) == uv,
-	     "broken upvalue chain");
   return uv;
 }
 
@@ -93,7 +78,6 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
     if (gc_obj_isdead(g, o)) {
       lj_func_freeuv(g, uv);
     } else {
-      unlinkuv(g, uv);
       lj_gc_closeuv(g, uv);
     }
   }
@@ -101,8 +85,10 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
 
 void LJ_FASTCALL lj_func_freeuv(global_State *g, GCupval *uv)
 {
-  if (!uv->closed)
-    unlinkuv(g, uv);
+  /* Open upvalues are no longer linked into a global DLL (g->uvhead retired);
+  ** they live only on the per-thread openupval chain, unlinked by the caller
+  ** (lj_func_closeuv or the sweep) before this free. The prev/next union
+  ** fields are dead and left as-is. */
   lj_mem_freegco(g, uv, sizeof(GCupval));
 }
 
