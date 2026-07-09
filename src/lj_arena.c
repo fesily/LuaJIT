@@ -154,14 +154,20 @@ static void freelist_add(GCArena *a, ArenaFreeList *fl, GCCellID c, GCCellID n)
     uint32_t b = n - 1;
     a->block[arena_blockidx(c)] |= arena_blockbit(c);
     a->mark[arena_blockidx(c)] &= ~arena_blockbit(c);
-    *(GCCellID1 *)arena_cellptr(a, c) = fl->bins[b];
+    arena_linkword_set(a, c, fl->bins[b]);  /* poisoned free cell head */
     fl->bins[b] = (GCCellID1)c;
     fl->binmask |= 1u << b;
+    /* Contract item 5: poison the whole free block (idempotent if the
+    ** caller already poisoned it, e.g. an alloc split tail). */
+    lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
     return;
   }
   a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
   a->mark[arena_blockidx(c)] |= arena_blockbit(c);
   range_insert(fl, c, n);
+  /* Contract item 7: ranged free block keeps its link in fl->ranges[],
+  ** not in the cell, so poison the full n*CellSize with no exemption. */
+  lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
 }
 
 static void freelist_reset(ArenaFreeList *fl)
@@ -178,6 +184,8 @@ void lj_arena_freerange(GCArena *a, ArenaFreeList *fl, GCCellID c, GCCellID n)
   a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
   a->mark[arena_blockidx(c)] |= arena_blockbit(c);
   range_insert(fl, c, n);
+  /* Contract item 7: ranged free block, full poison, no head exemption. */
+  lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
 }
 
 /* -- Scavenging ---------------------------------------------------------- */
@@ -195,7 +203,7 @@ static void arena_flushbins(GCArena *a, ArenaFreeList *fl)
   for (w = 0; w < ArenaBins; w++) {
     GCCellID c = fl->bins[w];
     while (c != 0) {
-      GCCellID next = *(GCCellID1 *)arena_cellptr(a, c);
+      GCCellID next = arena_linkword_get(a, c);  /* poisoned free cell head */
       a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
       a->mark[arena_blockidx(c)] |= arena_blockbit(c);
       c = next;
@@ -361,7 +369,7 @@ static void *arena_fit(GCArena *a, ArenaFreeList *fl, GCCellID n)
     if (m) {  /* Exact or next-fit from the size-segregated bins. */
       uint32_t b = (n-1) + lj_ffs(m);
       c = fl->bins[b];
-      fl->bins[b] = *(GCCellID1 *)arena_cellptr(a, c);
+      fl->bins[b] = arena_linkword_get(a, c);  /* poisoned free cell head */
       if (fl->bins[b] == 0) fl->binmask &= ~(1u << b);
       len = b + 1;
       /* Binned blocks already have the allocated bitmap state. */
@@ -370,6 +378,9 @@ static void *arena_fit(GCArena *a, ArenaFreeList *fl, GCCellID n)
       a->freecells -= n;
       if (len > n)  /* Next-fit hit: the tail becomes a new free block. */
 	freelist_add(a, fl, c + n, len - n);
+      /* Contract item 4: unpoison the allocated slice; the tail (if any)
+      ** was re-poisoned by freelist_add. */
+      lj_asan_unpoison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
       return arena_cellptr(a, c);
     }
   }
@@ -395,18 +406,23 @@ static void *arena_fit(GCArena *a, ArenaFreeList *fl, GCCellID n)
     GCCellID r = c + n;
     for (k = 0; k < 16 && len >= (GCCellID)(r - c) + n; k++, r += n) {
       a->block[arena_blockidx(r)] |= arena_blockbit(r);
-      *(GCCellID1 *)arena_cellptr(a, r) = fl->bins[b];
+      arena_linkword_set(a, r, fl->bins[b]);  /* poisoned free cell head */
       fl->bins[b] = (GCCellID1)r;
       fl->binmask |= 1u << b;
     }
     a->freecells -= n;  /* Carved blocks stay accounted as free. */
     if (len > (GCCellID)(r - c))
       freelist_add(a, fl, r, len - (GCCellID)(r - c));
+    /* Contract item 4: unpoison the allocated block; carved free blocks
+    ** and the leftover tail were poisoned via freelist_add / linkword_set. */
+    lj_asan_unpoison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
     return arena_cellptr(a, c);
   }
   a->freecells -= n;
   if (len > n)  /* Split: the tail becomes a new free block. */
     freelist_add(a, fl, c + n, len - n);
+  /* Contract item 4: unpoison the allocated slice; tail re-poisoned above. */
+  lj_asan_unpoison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
   return arena_cellptr(a, c);
 }
 
@@ -456,14 +472,19 @@ void lj_arena_freeblock(global_State *g, GCArena *a, void *p, size_t size)
     a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
     a->mark[arena_blockidx(c)] &= ~arena_blockbit(c);
     a->celltop = (GCCellID1)c;
+    /* Contract item 5: rolled-back cells rejoin the always-poisoned bump
+    ** redzone [celltop, celltopmax). They were mutator-owned; re-poison. */
+    lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
     return;
   }
   a->freecells += n;
   if (fl != NULL) {
-    freelist_add(a, fl, c, n);
+    freelist_add(a, fl, c, n);  /* poisons the free block */
   } else {
     a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
     a->mark[arena_blockidx(c)] |= arena_blockbit(c);
+    /* Contract item 5: no free list yet; flip bitmap and poison the block. */
+    lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
   }
 }
 
