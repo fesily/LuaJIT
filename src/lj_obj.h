@@ -393,7 +393,7 @@ typedef struct GCproto {
   MRef lineinfo;	/* Compressed map from bytecode ins. to source line. */
   MRef uvinfo;		/* Upvalue names. */
   MRef varinfo;		/* Names and compressed extents of local variables. */
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   uint8_t eflags; /* Extra flags. */
   #define PROTO_EFLAG_TAILCALL	0x01	/* Tail call proto*/
 #endif
@@ -804,7 +804,7 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
-#if LJ_DS_DYNAMIC_DISABLE_TAILCALL
+#if LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
   uint8_t parser_disable_tailcall;
 #endif
 } global_State;

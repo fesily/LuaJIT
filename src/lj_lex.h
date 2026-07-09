@@ -48,7 +48,7 @@ typedef struct VarInfo {
   uint8_t info;		/* Variable/goto/label info. */
 } VarInfo;
 
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
 typedef struct ParserTailWrapper {
   const char *p;
   const char *pe;
@@ -84,7 +84,7 @@ typedef struct LexState {
   uint32_t level;	/* Syntactical nesting level. */
   int endmark;		/* Trust bytecode end marker, even if not at EOF. */
   int fr2;		/* Generate bytecode for LJ_FR2 mode. */
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   ParserTailWrapper *tailcall_wrapper;
 #endif
 } LexState;
