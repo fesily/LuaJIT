@@ -105,6 +105,18 @@
 #define lj_asan_unpoison(p, sz) ((void)0)
 #endif
 
+/*
+** Poison the entire arena data area [MinCellId, MaxCellId). Called on
+** create/reinit to establish the contract item 3 baseline (every free
+** cell and never-bumped cell is poisoned) and on destroy/shrink-decommit
+** before the pages leave mutator control. Metadata cells 0..MinCellId-1
+** (bitmaps/header) are NEVER poisoned. Touches only the ASAN shadow, not
+** the data pages, so decommitted (MADV_DONTNEED) pages stay decommitted.
+*/
+#define arena_poison_dataarea(a) \
+  lj_asan_poison(arena_cellptr((a), MinCellId), \
+		 (size_t)(MaxCellId - MinCellId) << CellSizeLog2)
+
 /* -- ASAN-safe freelist linkword accessors ------------------------------- */
 /*
 ** Binned free cells store the GCCellID1 next-id in the first 2 bytes of

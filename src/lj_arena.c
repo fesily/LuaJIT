@@ -495,6 +495,9 @@ static void arena_reinit(GCArena *a, uint32_t flags)
     freelist_reset(fl);
     fl->scavgen = a->freegen;
   }
+  /* Contract item 3: callers guarantee the arena is empty, so the whole
+  ** data area is free/never-bumped and must be re-poisoned. */
+  arena_poison_dataarea(a);
 }
 
 static int arena_registry_grow(global_State *g)
@@ -569,6 +572,11 @@ static GCArena *arena_create(global_State *g, int cls)
   a->id = g->gc.arenastop;
   setmref(a->chunk, c);
   mref(g->gc.arenas, GCArena *)[g->gc.arenastop++] = a;
+  /* Contract item 3: establish the poison baseline for the whole data
+  ** area. Freshly committed pages come up unpoisoned; the bump redzone
+  ** [celltop=MinCellId, celltopmax) and all never-bumped space must be
+  ** poisoned so a past-frontier or stale-free-cell access is caught. */
+  arena_poison_dataarea(a);
   return a;
 }
 
@@ -589,6 +597,10 @@ static void arena_destroy(global_State *g, GCArena *a)
   vec[i] = vec[--g->gc.arenastop];  /* Swap-remove from the registry. */
   vec[i]->id = i;
   c->freemap |= 1u << slot;
+  /* Contract item 5: poison the data area before the pages leave mutator
+  ** control. arena_poison_dataarea touches only the ASAN shadow, so the
+  ** decommit (MADV_DONTNEED) below still sees unaccessed data pages. */
+  arena_poison_dataarea(a);
   arena_os_decommit(a, ArenaSize);
   if (c->freemap == CHUNK_FULLMAP) {  /* Last arena gone: drop the chunk. */
     ArenaChunk *p = mref(g->gc.chunks, ArenaChunk);
@@ -1091,6 +1103,9 @@ void *lj_hugeblock_alloc(global_State *g, size_t size)
   }
   g->gc.hugemem += (GCSize)rsz;
   g->gc.hugenum++;
+  /* Contract item 4: fresh huge block is mutator-owned; unpoison the
+  ** whole rounded reservation so the caller can write the payload. */
+  lj_asan_unpoison(p, rsz);
   return p;
 }
 
@@ -1100,6 +1115,9 @@ void lj_hugeblock_free(global_State *g, void *p, size_t size)
   gcstat_inc(g, huge_frees);
   lj_assertG_(g, g->gc.hugenum > 0, "huge block underflow");
   huge_unregister(g, p);
+  /* Contract item 5: poison the whole rounded block before release so a
+  ** stale pointer deref after free is caught as use-after-poison. */
+  lj_asan_poison(p, rsz);
   arena_os_release(p, rsz);
   g->gc.hugemem -= (GCSize)rsz;
   g->gc.hugenum--;
