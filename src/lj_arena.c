@@ -251,6 +251,12 @@ static void arena_scavenge(GCArena *a, ArenaFreeList *fl)
     a->mark[arena_blockidx(runstart)] &= ~arena_blockbit(runstart);
     a->freecells -= (uint32_t)(top - runstart);
     a->celltop = (GCCellID1)runstart;
+    /* Contract item 2/5: the rolled-back range [runstart, old top) rejoins
+    ** the always-poisoned bump redzone [celltop, celltopmax). These cells
+    ** were free (already poisoned by freelist_add on the prior free, or
+    ** never-bumped and poisoned at create), so this is defensive/idempotent
+    ** but keeps the redzone invariant explicit after the frontier move. */
+    lj_asan_poison(arena_cellptr(a, runstart), (size_t)(top - runstart) << CellSizeLog2);
   }
   fl->scavgen = a->freegen;
 }
@@ -352,6 +358,17 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   ** freecells counts every free cell. */
   if (fl != NULL)
     arena_scavenge(a, fl);
+  /* Contract item 10 (lazy window): if fl == NULL the bitmap transform
+  ** above freed dead POD objects (White->Free) but no scavenge ran, so the
+  ** newly-freed cells are Free in the bitmap yet still UNPOISONED in the
+  ** ASAN shadow. They are re-poisoned lazily at the first freelist build
+  ** (the next allocslow -> scavenge). Until then a stale access to a just-
+  ** freed POD object is NOT caught. This is the accepted lazy window: a
+  ** fuzzer use-after-poison in this gap is a poisoning-boundary bug to fix,
+  ** not a real UAF to ignore. The bump redzone [celltop, celltopmax) stays
+  ** poisoned throughout (unchanged here, poisoned at create). Survivors
+  ** (Black->White) remain allocated and unpoisoned, so they must NOT be
+  ** poisoned by a blanket pass here. */
   lj_assertX(a->freecells <= (GCCellID)a->celltop - MinCellId,
 	     "podsweep freecells over capacity");
   return freed;
