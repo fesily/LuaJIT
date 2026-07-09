@@ -435,7 +435,9 @@ typedef struct GCupval {
   uint8_t immutable;	/* Immutable value. */
   union {
     TValue tv;		/* If closed: the value itself. */
-    struct {		/* If open: double linked list, anchored at thread. */
+    struct {		/* If open: dead DLL fields (g->uvhead retired).
+		** Retained as a union to keep sizeof(GCupval) stable; do NOT
+		** collapse -- arena cell accounting depends on the struct size. */
       GCRef prev;
       GCRef next;
     };
@@ -444,8 +446,6 @@ typedef struct GCupval {
   uint32_t dhash;	/* Disambiguation hash: dh1 != dh2 => cannot alias. */
 } GCupval;
 
-#define uvprev(uv_)	(&gcref((uv_)->prev)->uv)
-#define uvnext(uv_)	(&gcref((uv_)->next)->uv)
 #define uvval(uv_)	(mref((uv_)->v, TValue))
 
 /* -- Function object (closures) ------------------------------------------ */
@@ -787,7 +787,6 @@ typedef struct global_State {
   Node nilnode;		/* Fallback 1-element hash part (nil key and value). */
   TValue registrytv;	/* Anchor for registry. */
   GCRef vmthref;	/* Link to VM thread. */
-  GCupval uvhead;	/* Head of double-linked list of all open upvalues. */
   int32_t hookcount;	/* Instruction hook countdown. */
   int32_t hookcstart;	/* Start count for instruction hook counter. */
   lua_Hook hookf;	/* Hook function. */

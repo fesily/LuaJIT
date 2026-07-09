@@ -210,6 +210,12 @@ LJ_STATIC_ASSERT(sizeof(GCArena) == ArenaMetadataSize);
 #define arena_roundcells(size) \
   ((GCCellID)(((size) + (CellSize-1)) >> CellSizeLog2))
 
+/* Open upvalues are arena-allocated (lj_mem_newagco). Guard that a GCupval
+** stays a compact in-arena allocation (<= 4 cells) now that the former
+** uvhead DLL prev/next fields are dead union members -- a future bloat of
+** GCupval must not silently push it past a small cell count. */
+LJ_STATIC_ASSERT(arena_roundcells(sizeof(GCupval)) <= 4);
+
 static LJ_AINLINE CellState arena_cellstate(GCArena *a, GCCellID c)
 {
   uint32_t shift = c & BlocksetMask;
