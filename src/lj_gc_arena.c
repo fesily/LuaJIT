@@ -371,18 +371,6 @@ static void gc_mark_start(global_State *g)
   g->gc.state = GCSpropagate;
 }
 
-/* Mark open upvalues. */
-static void gc_mark_uv(global_State *g)
-{
-  GCupval *uv;
-  for (uv = uvnext(&g->uvhead); uv != &g->uvhead; uv = uvnext(uv)) {
-    lj_assertG(uvprev(uvnext(uv)) == uv && uvnext(uvprev(uv)) == uv,
-	       "broken upvalue chain");
-    if (isgray(obj2gco(uv)))
-      gc_marktv(g, uvval(uv));
-  }
-}
-
 /* Mark userdata in mmudata list. */
 static void gc_mark_mmudata(global_State *g)
 {
@@ -1977,7 +1965,6 @@ static void atomic(global_State *g, lua_State *L)
 {
   size_t udsize;
 
-  gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
   gc_weak_redirect_all(g);  /* Redirect weak tables to arena/huge gray stacks. */
