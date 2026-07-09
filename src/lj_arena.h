@@ -198,6 +198,8 @@ LJ_STATIC_ASSERT(sizeof(GCArena) == ArenaMetadataSize);
 #define arena_cellptr(a, c) \
   ((void *)((char *)(a) + ((size_t)(c) << CellSizeLog2)))
 
+#include "lj_asan.h"  /* ASAN poison/linkword helpers (no-op without ASAN). */
+
 /* Huge blocks are arena-aligned; objects inside arenas never are, */
 /* because the first MinCellId cells hold the arena metadata. */
 #define lj_arena_ishuge(p)	(((uintptr_t)(p) & ArenaCellMask) == 0)
