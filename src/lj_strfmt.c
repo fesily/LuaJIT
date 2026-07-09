@@ -529,7 +529,7 @@ GCstr * LJ_FASTCALL lj_strfmt_obj(lua_State *L, cTValue *o)
     char buf[8+2+2+16], *p = buf;
     p = lj_buf_wmem(p, lj_typename(o), (MSize)strlen(lj_typename(o)));
     *p++ = ':'; *p++ = ' ';
-#if !LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
+#if !LUA_COMPAT_DISABLE_FUNCTION_BUILTIN_INFO
     if (tvisfunc(o) && isffunc(funcV(o))) {
       p = lj_buf_wmem(p, "builtin#", 8);
       p = lj_strfmt_wint(p, funcV(o)->c.ffid);

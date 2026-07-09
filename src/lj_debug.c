@@ -351,7 +351,7 @@ void lj_debug_shortname(char *out, GCstr *str, BCLine line)
     size_t len;  /* Length, up to first control char. */
     for (len = 0; len < LUA_IDSIZE-12; len++)
       if (((const unsigned char *)src)[len] < ' ') break;
-#if !LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
+#if !LUA_COMPAT_DISABLE_FUNCTION_BUILTIN_INFO
     strcpy(out, line == ~(BCLine)0 ? "[builtin:" : "[string \""); out += 9;
 #else
     strcpy(out, "[string \""); out += 9;
@@ -363,7 +363,7 @@ void lj_debug_shortname(char *out, GCstr *str, BCLine line)
     } else {
       strcpy(out, src); out += len;
     }
-#if !LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
+#if !LUA_COMPAT_DISABLE_FUNCTION_BUILTIN_INFO
     strcpy(out, line == ~(BCLine)0 ? "]" : "\"]");
 #else
     strcpy(out, "\"]");
@@ -452,7 +452,7 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
   TValue *frame = NULL;
   TValue *nextframe = NULL;
   GCfunc *fn;
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   ar->name = NULL;
 #define istailcallfunc(fn) (isluafunc(fn) && funcproto(fn)->eflags & PROTO_EFLAG_TAILCALL)
 #endif
@@ -479,7 +479,7 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
       if (isluafunc(fn)) {
 	GCproto *pt = funcproto(fn);
 	BCLine firstline = pt->firstline;
-#if LJ_DS_BUILTIN_FUNCTION_INFO_TO_C
+#if LUA_COMPAT_BUILTIN_FUNCTION_INFO_TO_C
   if (firstline == ~(BCLine)0) goto wrapper_cfunction; /* builtin */
 #endif
 	GCstr *name = proto_chunkname(pt);
@@ -504,7 +504,7 @@ wrapper_cfunction:
     } else if (*what == 'u') {
       ar->nups = fn->c.nupvalues;
       if (ext) {
-#if LJ_DS_BUILTIN_FUNCTION_INFO_TO_C
+#if LUA_COMPAT_BUILTIN_FUNCTION_INFO_TO_C
 	if (isluafunc(fn) && funcproto(fn)->firstline != ~(BCLine)0) {
 #else
 	if (isluafunc(fn)) {
@@ -527,7 +527,7 @@ wrapper_cfunction:
       opt_f = 1;
     } else if (*what == 'L') {
       opt_L = 1;
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
     } else if (*what == 't') {
       /*unused, always do it*/
 #endif
@@ -562,7 +562,7 @@ wrapper_cfunction:
     }
     incr_top(L);
   }
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
   if (istailcallfunc(fn)) {
     ar->what = "tail";
     ar->name = ar->namewhat = "";
@@ -751,7 +751,7 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
     }
     lj_debug_getinfo(L1, "Snlf", &ar, 0);
     fn = funcV(L1->top-1); L1->top--;
-#if !LJ_DS_DISABLE_FUNCTION_BUILTIN_INFO
+#if !LUA_COMPAT_DISABLE_FUNCTION_BUILTIN_INFO
     if (isffunc(fn) && !*ar.namewhat)
       lua_pushfstring(L, "\n\t[builtin#%d]:", fn->c.ffid);
     else
@@ -765,12 +765,12 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
       if (*ar.what == 'm') {
 	lua_pushliteral(L, " in main chunk");
       } else if (*ar.what == 'C') {
-#if !LJ_DS_DEBUG_TRACE_C_DISABLE_ADDRESS
+#if !LUA_COMPAT_DEBUG_TRACE_C_DISABLE_ADDRESS
 	lua_pushfstring(L, " at %p", fn->c.f);
 #else
 	lua_pushliteral(L, " ?");
 #endif
-#if LJ_DS_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_WRAPPER
       } else if (ar.istailcall) {
   lua_pushliteral(L, " ?");
 #endif
