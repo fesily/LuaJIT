@@ -2766,7 +2766,7 @@ int lj_gc_checkheap(global_State *g)
 	  lj_assertG(0, "arena %d bin %d: free-list cycle", (int)ai, (int)b);
 	  bad++; break;
 	}
-	c = *(GCCellID1 *)arena_cellptr(a, c);
+	c = arena_linkword_get(a, c);  /* poisoned free cell head */
       }
     }
     /* -- Ranges: free blocks sorted ascending by cell count. -- */

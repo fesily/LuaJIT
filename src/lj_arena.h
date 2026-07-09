@@ -315,15 +315,19 @@ static LJ_AINLINE void *arena_alloc(GCArena *a, size_t size)
 	(fl->binmask & (1u << (ncells-1)))) {
       uint32_t b = ncells - 1;
       c = fl->bins[b];
-      fl->bins[b] = *(GCCellID1 *)arena_cellptr(a, c);
+      fl->bins[b] = arena_linkword_get(a, c);  /* poisoned free cell head */
       if (fl->bins[b] == 0) fl->binmask &= ~(1u << b);
       a->freecells -= ncells;
+      /* Contract item 4: unpoison the mutator-owned block. */
+      lj_asan_unpoison(arena_cellptr(a, c), (size_t)ncells << CellSizeLog2);
       return arena_cellptr(a, c);
     }
     return NULL;
   }
   a->celltop = (GCCellID1)(c + ncells);
   a->block[arena_blockidx(c)] |= arena_blockbit(c);
+  /* Contract item 4: unpoison the freshly bumped mutator-owned block. */
+  lj_asan_unpoison(arena_cellptr(a, c), (size_t)ncells << CellSizeLog2);
   return arena_cellptr(a, c);
 }
 

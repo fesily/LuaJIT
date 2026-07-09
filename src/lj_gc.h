@@ -511,6 +511,9 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
       a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
       a->mark[arena_blockidx(c)] &= ~arena_blockbit(c);
       a->celltop = (GCCellID1)c;
+      /* Contract item 5: rolled-back cells rejoin the always-poisoned
+      ** bump redzone; re-poison the mutator-owned block. */
+      lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
       return;
     }
     a->freecells += n;
@@ -518,22 +521,26 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
       /* Push onto the intrusive per-size free list. The block keeps its */
       /* allocated bitmap state, so no bitmap access here at all. */
       uint32_t b = n - 1;
-      *(GCCellID1 *)p = fl->bins[b];
+      arena_linkword_set(a, c, fl->bins[b]);  /* poisoned free cell head */
       fl->bins[b] = (GCCellID1)c;
       fl->binmask |= 1u << b;
+      /* Contract item 5: poison the whole free block after the link write. */
+      lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
       return;
     }
     if (fl != NULL) {
-      lj_arena_freerange(a, fl, c, n);
+      lj_arena_freerange(a, fl, c, n);  /* poisons the ranged free block */
     } else {
       /* No free list yet: flip to the Free bitmap state; the first */
       /* slow-path allocation scavenges these blocks into a new list. */
       a->block[arena_blockidx(c)] &= ~arena_blockbit(c);
       a->mark[arena_blockidx(c)] |= arena_blockbit(c);
+      /* Contract item 5: poison the free block. */
+      lj_asan_poison(arena_cellptr(a, c), (size_t)n << CellSizeLog2);
     }
   } else {
     g->gc.total -= (GCSize)osize;
-    lj_hugeblock_free(g, p, osize);
+    lj_hugeblock_free(g, p, osize);  /* poisons the huge block before release */
   }
 }
 
