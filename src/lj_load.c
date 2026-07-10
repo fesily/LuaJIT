@@ -26,18 +26,6 @@
 #include "lj_io_patch.h"
 
 /* -- Load Lua source code and bytecode ----------------------------------- */
-#if LUA_COMPAT_TAILCALL_WRAPPER
-const char * lj_parser_tail_wrapper (lua_State *L, void *ud, size_t *sz) {
-  ParserTailWrapper *tailcall_wrapper = (ParserTailWrapper *)ud;
-  if (tailcall_wrapper->p) {
-    *sz = tailcall_wrapper->pe - tailcall_wrapper->p;
-    const char *p = tailcall_wrapper->p;
-    tailcall_wrapper->p = NULL;  /* Reset to avoid re-reading. */
-    return p;
-  }
-  return tailcall_wrapper->rfunc(L, tailcall_wrapper->rdata, sz);
-}
-#endif
 
 static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
 {
@@ -64,24 +52,6 @@ static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
   if (bc) {
     pt = lj_bcread(ls);
   } else {
-#if LUA_COMPAT_TAILCALL_WRAPPER
-  do {
-    if (ls->tailcall_wrapper && ls->p) {
-      /* first return hook header */
-      const char *buffer = "local function LUA_COMPAT_tailcall(___tailcall, ...) return ___tailcall(...) end;";
-      ls->tailcall_wrapper->p = &ls->p[-1];
-      lj_assertX(*(ls->tailcall_wrapper->p) == ls->c, "");
-      ls->tailcall_wrapper->pe = ls->pe;
-      ls->tailcall_wrapper->rdata = ls->rdata;
-      ls->tailcall_wrapper->rfunc = ls->rfunc;
-      ls->pe = buffer + strlen(buffer);
-      ls->p = buffer + 1;
-      ls->c = buffer[0];
-      ls->rdata = ls->tailcall_wrapper;
-      ls->rfunc = lj_parser_tail_wrapper;
-    }
-  } while (0);
-#endif
     pt = lj_parse(ls);
   }
   if (ls->fr2 == LJ_FR2) {
@@ -95,16 +65,6 @@ static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
   return NULL;
 }
 
-#if LUA_COMPAT_DYNAMIC_TAILCALL_WRAPPER
-typedef char (*lj_check_slowtailcall_fn)(lua_State *L, const char *chunkname);
-static lj_check_slowtailcall_fn lj_ds_slowtailcall_cb = NULL;
-
-LUA_API void lua_ds_set_slowtailcall_cb(lj_check_slowtailcall_fn fn)
-{
-  lj_ds_slowtailcall_cb = fn;
-}
-#endif
-
 LUA_API int lua_loadx(lua_State *L, lua_Reader reader, void *data,
 		      const char *chunkname, const char *mode)
 {
@@ -115,13 +75,6 @@ LUA_API int lua_loadx(lua_State *L, lua_Reader reader, void *data,
   ls.chunkarg = chunkname ? chunkname : "?";
   ls.mode = mode;
   lj_buf_init(L, &ls.sb);
-#if LUA_COMPAT_DYNAMIC_TAILCALL_WRAPPER
-  ParserTailWrapper tailcall_wrapper;
-  if (lj_ds_slowtailcall_cb && lj_ds_slowtailcall_cb(L, chunkname))
-    ls.tailcall_wrapper = &tailcall_wrapper;
-  else
-    ls.tailcall_wrapper = NULL;
-#endif
   status = lj_vm_cpcall(L, NULL, &ls, cpparser);
   lj_lex_cleanup(L, &ls);
   lj_gc_check(L);
