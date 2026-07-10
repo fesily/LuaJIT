@@ -153,7 +153,7 @@ LJLIB_CF(debug_getinfo)
       break;
     case 'f': opt_f = 1; break;
     case 'L': opt_L = 1; break;
-#if LUA_COMPAT_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_DEBUG
     case 't':
       settabsb(L, "istailcall", ar.istailcall);
       break;

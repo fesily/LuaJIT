@@ -24,7 +24,7 @@ typedef struct lj_Debug {
   /* Extended fields. Only valid if lj_debug_getinfo() is called with ext = 1.*/
   int nparams;
   int isvararg;
-#if LUA_COMPAT_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_DEBUG
   int istailcall;
 #endif
 } lj_Debug;

@@ -29,10 +29,32 @@ cTValue *lj_debug_frame(lua_State *L, int level, int *size)
   for (nextframe = frame = L->base-1; frame > bot; ) {
     if (frame_gc(frame) == obj2gco(L))
       level++;  /* Skip dummy frames. See lj_err_optype_call(). */
+#if LUA_COMPAT_TAILCALL_COUNT
+    {
+      int tc = 0;
+      if (frame_islua(frame)) {
+	tc = frame_tailcalls(L, frame);
+	if (tc < 0) tc = 0;
+	if (tc > LJ_TAILCALL_COUNT_MAX) tc = LJ_TAILCALL_COUNT_MAX;
+      }
+      if (level-- == 0) {
+	*size = (int)(nextframe - frame);
+	return frame;  /* Level found. */
+      }
+      if (tc) {
+	level -= tc;
+	if (level < 0) {
+	  *size = -1;  /* Virtual tail; lua_getstack sets i_ci=0. */
+	  return NULL;
+	}
+      }
+    }
+#else
     if (level-- == 0) {
       *size = (int)(nextframe - frame);
       return frame;  /* Level found. */
     }
+#endif
     nextframe = frame;
     if (frame_islua(frame)) {
       frame = frame_prevl(frame);
@@ -311,6 +333,10 @@ const char *lj_debug_funcname(lua_State *L, cTValue *frame, const char **name)
     return NULL;
   if (frame_isvarg(frame))
     frame = frame_prevd(frame);
+#if LUA_COMPAT_TAILCALL_COUNT
+  if (frame_islua(frame) && frame_tailcalls(L, frame) > 0)
+    return NULL;
+#endif
   pframe = frame_prev(frame);
   fn = frame_func(pframe);
   pc = debug_framepc(L, fn, frame);
@@ -456,6 +482,45 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
   ar->name = NULL;
 #define istailcallfunc(fn) (isluafunc(fn) && funcproto(fn)->eflags & PROTO_EFLAG_TAILCALL)
 #endif
+#if LUA_COMPAT_TAILCALL_COUNT
+  if (*what != '>' && ar->i_ci == 0) {
+    for (; *what; what++) {
+      if (*what == 'S' || *what == 'l' || *what == 'u' || *what == 'n' ||
+	  *what == 't') {
+	/* filled below */
+      } else if (*what == 'f') {
+	opt_f = 1;
+      } else if (*what == 'L') {
+	opt_L = 1;
+      } else {
+	return 0;
+      }
+    }
+    ar->name = ar->namewhat = "";
+    ar->what = "tail";
+    ar->lastlinedefined = ar->linedefined = ar->currentline = -1;
+    ar->source = "=(tail call)";
+    strncpy(ar->short_src, ar->source + 1, LUA_IDSIZE);
+    ar->short_src[LUA_IDSIZE-1] = '\0';
+    ar->nups = 0;
+    if (ext) {
+      ar->nparams = 0;
+      ar->isvararg = 0;
+    }
+#if LUA_COMPAT_TAILCALL_DEBUG
+    ar->istailcall = 1;
+#endif
+    if (opt_f) {
+      setnilV(L->top);
+      incr_top(L);
+    }
+    if (opt_L) {
+      setnilV(L->top);
+      incr_top(L);
+    }
+    return 1;
+  }
+#endif
   if (*what == '>') {
     TValue *func = L->top - 1;
     if (!tvisfunc(func)) return 0;
@@ -527,9 +592,9 @@ wrapper_cfunction:
       opt_f = 1;
     } else if (*what == 'L') {
       opt_L = 1;
-#if LUA_COMPAT_TAILCALL_WRAPPER
+#if LUA_COMPAT_TAILCALL_DEBUG
     } else if (*what == 't') {
-      /*unused, always do it*/
+      /* filled below */
 #endif
     } else {
       return 0;  /* Bad option. */
@@ -578,6 +643,8 @@ wrapper_cfunction:
     }
     ar->istailcall = 0;
   }
+#elif LUA_COMPAT_TAILCALL_COUNT && LUA_COMPAT_TAILCALL_DEBUG
+  ar->istailcall = 0;
 #endif
   return 1;  /* Ok. */
 }
@@ -613,6 +680,11 @@ LUA_API int lua_getstack(lua_State *L, int level, lua_Debug *ar)
   if (frame) {
     ar->i_ci = (size << 16) + (int)(frame - tvref(L->stack));
     return 1;
+#if LUA_COMPAT_TAILCALL_COUNT
+  } else if (size < 0) {
+    ar->i_ci = 0;  /* Virtual tail level (Lua 5.1). */
+    return 1;
+#endif
   } else {
     ar->i_ci = level - size;
     return 0;
@@ -749,8 +821,18 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
       lim = 2147483647;
       continue;
     }
+#if LUA_COMPAT_TAILCALL_COUNT
+    if (ar.i_ci == 0) {
+      lj_debug_getinfo(L1, "S", &ar, 0);
+      lua_pushliteral(L, "\n\t(...tail calls...)");
+      if ((int)(L->top - L->base) - top >= 15)
+	lua_concat(L, (int)(L->top - L->base) - top);
+      continue;
+    }
+#endif
     lj_debug_getinfo(L1, "Snlf", &ar, 0);
     fn = funcV(L1->top-1); L1->top--;
+    UNUSED(fn);
 #if !LUA_COMPAT_DISABLE_FUNCTION_BUILTIN_INFO
     if (isffunc(fn) && !*ar.namewhat)
       lua_pushfstring(L, "\n\t[builtin#%d]:", fn->c.ffid);
