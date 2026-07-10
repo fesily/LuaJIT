@@ -80,6 +80,17 @@ static void resizestack(lua_State *L, MSize n)
   setmref(L->maxstack, st + n);
   while (oldsize < realsize)  /* Clear new slots. */
     setnilV(st + oldsize++);
+#if LUA_COMPAT_TAILCALL_COUNT
+  {
+    int *tc = (int *)lj_mem_realloc(L, mref(L->tailcalls, void),
+				    (MSize)(oldsize * sizeof(int)),
+				    (MSize)(realsize * sizeof(int)));
+    MSize i;
+    for (i = oldsize; i < realsize; i++)
+      tc[i] = 0;
+    setmref(L->tailcalls, tc);
+  }
+#endif
   L->stacksize = realsize;
   if ((size_t)(mref(G(L)->jit_base, char) - (char *)oldst) < (size_t)oldsize * sizeof(TValue))
     setmref(G(L)->jit_base, mref(G(L)->jit_base, char) + delta);
@@ -185,6 +196,15 @@ static void stack_init(lua_State *L1, lua_State *L)
   L1->base = L1->top = st;
   while (st < stend)  /* Clear new slots. */
     setnilV(st++);
+#if LUA_COMPAT_TAILCALL_COUNT
+  {
+    int *tc = lj_mem_newvec(L, L1->stacksize, int);
+    MSize i;
+    for (i = 0; i < L1->stacksize; i++)
+      tc[i] = 0;
+    setmref(L1->tailcalls, tc);
+  }
+#endif
 }
 
 /* -- State handling ------------------------------------------------------ */
@@ -244,6 +264,9 @@ static void close_state(lua_State *L)
   lj_mem_freevec(g, mref(g->gc.ssb, GCobj *), 1024, GCobj *);
 #endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
+#if LUA_COMPAT_TAILCALL_COUNT
+  lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
+#endif
 #if LJ_64
   if (mref(g->gc.lightudseg, uint32_t)) {
     MSize segnum = g->gc.lightudnum ? (2 << lj_fls(g->gc.lightudnum)) : 2;
@@ -435,6 +458,11 @@ void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
     lj_assertG(gcref(L->openupval) == NULL, "stale open upvalues");
   }
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
+#if LUA_COMPAT_TAILCALL_COUNT
+  lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
+#endif
   lj_mem_freegco(g, L, sizeof(lua_State));
 }
+
+
 

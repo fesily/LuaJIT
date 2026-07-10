@@ -110,6 +110,33 @@ enum { LJ_CONT_TAILCALL, LJ_CONT_FFI_CALLBACK };  /* Special continuations. */
 #define frame_prev(f)		(frame_islua(f)?frame_prevl(f):frame_prevd(f))
 /* Note: this macro does not skip over FRAME_VARG. */
 
+#if LUA_COMPAT_TAILCALL_COUNT
+#define LJ_TAILCALL_COUNT_MAX	1000000
+#define frame_tc_idx(L, f)	((MSize)((f) - tvref((L)->stack)))
+#define frame_tailcalls_raw(L, f) \
+  (mref((L)->tailcalls, int)[frame_tc_idx((L), (f))])
+#define frame_tailcalls(L, f) \
+  ((frame_tc_idx((L), (f)) < (L)->stacksize) ? \
+   frame_tailcalls_raw((L), (f)) : 0)
+#define frame_tailcalls_clear(L, f) \
+  do { \
+    MSize _i = frame_tc_idx((L), (f)); \
+    if (_i < (L)->stacksize) frame_tailcalls_raw((L), (f)) = 0; \
+  } while (0)
+#if LJ_TARGET_X64
+#define frame_tailcalls_inc(L, f) \
+  do { \
+    MSize _i = frame_tc_idx((L), (f)); \
+    if (_i < (L)->stacksize) { \
+      int *_p = &frame_tailcalls_raw((L), (f)); \
+      if (*_p < LJ_TAILCALL_COUNT_MAX) (*_p)++; \
+    } \
+  } while (0)
+#else
+#define frame_tailcalls_inc(L, f)	((void)0)
+#endif
+#endif
+
 /* -- C stack frame ------------------------------------------------------- */
 
 /* Macros to access and modify the C stack frame chain. */

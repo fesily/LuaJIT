@@ -848,6 +848,9 @@ struct lua_State {
   GCRef env;		/* Thread environment (table of globals). */
   void *cframe;		/* End of C stack frame chain. */
   MSize stacksize;	/* True stack size (incl. LJ_STACK_EXTRA). */
+#if LUA_COMPAT_TAILCALL_COUNT
+  MRef tailcalls;	/* int[] parallel to stack; Lua 5.1-style tail counts. */
+#endif
 };
 
 #define G(L)			(mref(L->glref, global_State))
