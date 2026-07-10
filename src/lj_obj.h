@@ -393,10 +393,6 @@ typedef struct GCproto {
   MRef lineinfo;	/* Compressed map from bytecode ins. to source line. */
   MRef uvinfo;		/* Upvalue names. */
   MRef varinfo;		/* Names and compressed extents of local variables. */
-#if LUA_COMPAT_TAILCALL_WRAPPER
-  uint8_t eflags; /* Extra flags. */
-  #define PROTO_EFLAG_TAILCALL	0x01	/* Tail call proto*/
-#endif
 } GCproto;
 
 /* Flags for prototype. */
