@@ -3304,4 +3304,16 @@ void lj_gc_stats_push(lua_State *L)
   settabV(L, L->top++, t);
 }
 
+
+#ifdef LUA_USE_ASSERT
+/* Assert-only test hook declared in lj_gc.h: single strong definition so
+** MSVC does not need selectany on a function (C2496). Counter itself is
+** weak/selectany in the header because the inline gc_obj_isdead increments
+** it from every TU that includes lj_gc.h. */
+uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
+{
+  return lj_gc_obj_isdead_nonsweep_counter;
+}
+#endif
+
 #endif

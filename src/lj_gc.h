@@ -216,35 +216,23 @@ static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
 /* Assert-only test hook: counts entries into the NEW non-sweep arena/huge
 ** branch of gc_obj_isdead -- i.e. an arena/huge object tested for death OUTSIDE
 ** the GCF_BITMAPSWEEP window, where the authoritative answer is "never dead".
-** gc_obj_isdead is a header inline pulled into several TUs, so the counter and
-** its accessor use weak linkage to collapse the per-TU copies into one symbol
-** at link time. The accessor has default visibility (NOT LJ_FUNC, which is
-** hidden on ELF and absent from .dynsym) so test_gc_obj_isdead_authority.lua
-** resolves it via ffi.C -- mirrors lj_str_rehash_sweep_hits (lj_str.h). */
+** gc_obj_isdead is a header inline pulled into several TUs, so the counter uses
+** weak/selectany linkage to collapse the per-TU copies into one symbol at link
+** time. The accessor is defined once in lj_gc_arena.c (NOT as a weak header
+** definition: MSVC rejects __declspec(selectany) on functions -- C2496) with
+** default visibility (NOT LJ_FUNC, which is hidden on ELF and absent from
+** .dynsym) so test_gc_obj_isdead_authority.lua resolves it via ffi.C --
+** mirrors lj_str_rehash_sweep_hits (lj_str.h / lj_str.c). */
 #if defined(_WIN32)
 __declspec(selectany) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
 __declspec(dllexport) uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
-__declspec(selectany) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
-{
-  return lj_gc_obj_isdead_nonsweep_counter;
-}
+#elif defined(__ELF__) || defined(__MACH__)
+__attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
+extern __attribute__((visibility("default")))
+       uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
 #else
 __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
-#if defined(__ELF__) || defined(__MACH__)
-extern __attribute__((weak, visibility("default")))
-       uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
-__attribute__((weak, visibility("default")))
-uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
-{
-  return lj_gc_obj_isdead_nonsweep_counter;
-}
-#else
-extern __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
-__attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
-{
-  return lj_gc_obj_isdead_nonsweep_counter;
-}
-#endif
+extern uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
 #endif
 #endif
 
