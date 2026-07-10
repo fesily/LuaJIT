@@ -250,6 +250,16 @@
 |.macro ins_call
 |  // BASE = new base, RB = LFUNC, RD = nargs+1
 |  mov [BASE-8], PC
+#if LUA_COMPAT_TAILCALL_COUNT
+|  // Clear tailcount for the new frame. RA is free here (BC_CALL already used it).
+|  mov RA, SAVE_L
+|  mov TMPR, L:RA->stack
+|  lea ITYPE, [BASE-8]
+|  sub ITYPE, TMPR
+|  mov TMPR, L:RA->tailcalls
+|  shr ITYPE, 3
+|  mov dword [TMPR+ITYPE*4], 0
+#endif
 |  ins_callt
 |.endmacro
 |
@@ -4198,6 +4208,18 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  test PCd, FRAME_TYPE
     |  jnz >7
     |1:
+#if LUA_COMPAT_TAILCALL_COUNT
+    |  // RA holds arg-source pointer — must not clobber before the move loop.
+    |  mov SAVE_PC, RA
+    |  mov RA, SAVE_L
+    |  mov TMPR, L:RA->stack
+    |  lea ITYPE, [BASE-8]
+    |  sub ITYPE, TMPR
+    |  mov TMPR, L:RA->tailcalls
+    |  shr ITYPE, 3
+    |  add dword [TMPR+ITYPE*4], 1
+    |  mov RA, SAVE_PC
+#endif
     |  mov [BASE-16], LFUNC:RB		// Copy func+tag down, reloaded below.
     |  mov MULTRES, NARGS:RDd
     |  sub NARGS:RDd, 1

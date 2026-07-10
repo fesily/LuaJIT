@@ -80,6 +80,9 @@ int lj_meta_tailcall(lua_State *L, cTValue *tv)
   TValue *base = L->base;
   TValue *top = L->top;
   const BCIns *pc = frame_pc(base-1);  /* Preserve old PC from frame. */
+#if LUA_COMPAT_TAILCALL_COUNT && LJ_TARGET_X64
+  frame_tailcalls_inc(L, base - 1);
+#endif
   copyTV(L, base-1-LJ_FR2, tv);  /* Replace frame with new object. */
   if (LJ_FR2)
     (top++)->u64 = LJ_CONT_TAILCALL;
