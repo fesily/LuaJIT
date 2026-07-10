@@ -79,7 +79,14 @@ ENDIF()
 
 if (LUAJIT_ENABLE_FSANITIZE)
       message(STATUS "luajit debug mode")
-      add_definitions(-DLUA_USE_APICHECK -DLUA_USE_ASSERT -DLUAJIT_USE_SYSMALLOC)
+      # ASSERT/APICHECK + ASan instrumentation are global.
+      # Do NOT define LUAJIT_USE_SYSMALLOC here: lj_arch.h disables LJ_HASGCARENA
+      # (and thus LJ_HASGCMARK) under SYSMALLOC, while the arenagc variant still
+      # passes -D LJ_HASGCMARK to DynASM. That mismatch makes buildvm fail with
+      # undeclared LJ_GC_GRAY. Classic GC needs SYSMALLOC for ASan visibility of
+      # dlmalloc; apply it only to the default variant below. Arena GC has its
+      # own ASan poison helpers in lj_asan.h (same contract as Makefile ASAN=1).
+      add_definitions(-DLUA_USE_APICHECK -DLUA_USE_ASSERT)
       if (NOT MSVC)
         add_link_options(-fsanitize=address)
         add_compile_options(-fsanitize=address)
@@ -302,9 +309,18 @@ list (APPEND SRC_LJCORE ${SRC_LJLIB} ${SRC_LIBAUX})
 file (GLOB_RECURSE SRC_BUILDVM_BASE  "${LUAJIT_DIR}/src/host/buildvm*.c")
 
 ## GENERATE / COMPILE PER VARIANT
+# buildvm intentionally leaks (one-shot host tool). Under ASan that would
+# fail the custom command with exit code 1 unless leak detection is off.
+# Use TARGET_FILE so cmake -E env gets a real path (not a bare target name).
+if(LUAJIT_ENABLE_FSANITIZE)
+  set(BUILDVM_HOST_ENV ${CMAKE_COMMAND} -E env "ASAN_OPTIONS=detect_leaks=0")
+else()
+  set(BUILDVM_HOST_ENV)
+endif()
+
 function(add_buildvm_target_for_variant buildvm_target variant_binary_dir output_name mode)
   add_custom_command(OUTPUT "${variant_binary_dir}/${output_name}"
-    COMMAND ${buildvm_target} ARGS -m ${mode} -o "${variant_binary_dir}/${output_name}" ${ARGN}
+    COMMAND ${BUILDVM_HOST_ENV} $<TARGET_FILE:${buildvm_target}> -m ${mode} -o "${variant_binary_dir}/${output_name}" ${ARGN}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS ${buildvm_target} ${ARGN}
   )
@@ -471,12 +487,20 @@ function(add_luajit_variant)
     ${LUAJIT_DIR}/dynasm)
 endfunction()
 
+# Classic GC + ASan: SYSMALLOC so the system allocator is visible to ASan.
+# Arena GC deliberately omits SYSMALLOC (see FSANITIZE block above).
+set(LUAJIT_DEFAULT_VARIANT_DEFS)
+if(LUAJIT_ENABLE_FSANITIZE)
+  list(APPEND LUAJIT_DEFAULT_VARIANT_DEFS LUAJIT_USE_SYSMALLOC)
+endif()
+
 add_luajit_variant(
   NAME default
   LIB_TARGET luajit-5.1
   LIB_OUTPUT_NAME lua51DS
   EXE_TARGET luajit
   INSTALL_SUPPORT_FILES
+  COMPILE_DEFINITIONS ${LUAJIT_DEFAULT_VARIANT_DEFS}
 )
 
 add_luajit_variant(
