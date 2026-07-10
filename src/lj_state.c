@@ -78,8 +78,13 @@ static void resizestack(lua_State *L, MSize n)
   setmref(L->stack, st);
   delta = (char *)st - (char *)oldst;
   setmref(L->maxstack, st + n);
-  while (oldsize < realsize)  /* Clear new slots. */
-    setnilV(st + oldsize++);
+  /* Do not clobber oldsize: LUA_COMPAT_TAILCALL_COUNT realloc/zeroing and the
+  ** jit_base range check below still need the pre-resize stack length. */
+  {
+    MSize i = oldsize;
+    while (i < realsize)  /* Clear new slots. */
+      setnilV(st + i++);
+  }
 #if LUA_COMPAT_TAILCALL_COUNT
   {
     int *tc = (int *)lj_mem_realloc(L, mref(L->tailcalls, void),
