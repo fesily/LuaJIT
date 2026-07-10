@@ -478,10 +478,6 @@ int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar, int ext)
   TValue *frame = NULL;
   TValue *nextframe = NULL;
   GCfunc *fn;
-#if LUA_COMPAT_TAILCALL_WRAPPER
-  ar->name = NULL;
-#define istailcallfunc(fn) (isluafunc(fn) && funcproto(fn)->eflags & PROTO_EFLAG_TAILCALL)
-#endif
 #if LUA_COMPAT_TAILCALL_COUNT
   if (*what != '>' && ar->i_ci == 0) {
     for (; *what; what++) {
@@ -627,23 +623,7 @@ wrapper_cfunction:
     }
     incr_top(L);
   }
-#if LUA_COMPAT_TAILCALL_WRAPPER
-  if (istailcallfunc(fn)) {
-    ar->what = "tail";
-    ar->name = ar->namewhat = "";
-    ar->lastlinedefined = ar->linedefined = ar->currentline = -1;
-    ar->source = "(tail call)";
-    strncpy(ar->short_src, ar->source, LUA_IDSIZE);
-    ar->nups = 0;
-    ar->istailcall = 1;
-  } else {
-    if (ar->name && strcmp(ar->name, "___tailcall") == 0) {
-      ar->name = NULL;
-      ar->namewhat = "";
-    }
-    ar->istailcall = 0;
-  }
-#elif LUA_COMPAT_TAILCALL_COUNT && LUA_COMPAT_TAILCALL_DEBUG
+#if LUA_COMPAT_TAILCALL_DEBUG
   ar->istailcall = 0;
 #endif
   return 1;  /* Ok. */
@@ -851,10 +831,6 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
 	lua_pushfstring(L, " at %p", fn->c.f);
 #else
 	lua_pushliteral(L, " ?");
-#endif
-#if LUA_COMPAT_TAILCALL_WRAPPER
-      } else if (ar.istailcall) {
-  lua_pushliteral(L, " ?");
 #endif
       } else {
 	lua_pushfstring(L, " in function <%s:%d>",
