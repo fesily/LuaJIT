@@ -911,6 +911,25 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_NEW_PROXY_PATCH LJ_DS
 #endif
 
+/* Match Don't Starve Together game lua_State sizeof/offsets (linux x64).
+** Game hardcodes L+0xB8/0xC0/0xC1 (reserved/userdata/flag). Mainthread L
+** sits immediately before global_State in GG_State; without pad those stores
+** clobber g->gc.ssbtop. Off by default when LJ_DS=0 or non-x64.
+** Override: -DLJ_DS_LUA_STATE_LAYOUT=0/1 */
+#ifndef LJ_DS_LUA_STATE_LAYOUT
+#if LJ_DS && LJ_TARGET_X64
+#define LJ_DS_LUA_STATE_LAYOUT	1
+#else
+#define LJ_DS_LUA_STATE_LAYOUT	0
+#endif
+#endif
+
+#if LJ_DS_LUA_STATE_LAYOUT
+#define LJ_DST_LUA_STATE_SIZE		200	/* 0xc8 */
+#define LJ_DST_LUA_STATE_RESERVED	184	/* 0xb8 */
+#define LJ_DST_LUA_STATE_USERDATA	192	/* 0xc0 */
+#endif
+
 #ifndef LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
 #define LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL LUAJIT_ENABLE_LUA51COMPAT
 #endif

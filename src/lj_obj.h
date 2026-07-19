@@ -846,7 +846,25 @@ struct lua_State {
 #if LUA_COMPAT_TAILCALL_COUNT
   MRef tailcalls;	/* int[] parallel to stack; Lua 5.1-style tail counts. */
 #endif
+#if LJ_DS_LUA_STATE_LAYOUT
+  /* Pad to game lua_State layout (lj_arch.h: LJ_DS_LUA_STATE_LAYOUT).
+  ** Core ends @0x68 with tailcalls / @0x60 without (LJ_GC64 x64). */
+#if LUA_COMPAT_TAILCALL_COUNT
+  char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x68];
+#else
+  char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x60];
+#endif
+  char reserved[8];	/* Game lua51 reserved[8] @ 0xb8. */
+  void *userdata;	/* Engine binding (cSimulation*) via lua_setuserdata. */
+#endif
 };
+
+#if LJ_DS_LUA_STATE_LAYOUT
+/* Game layout lock: update _dst_pad bases if core fields change size. */
+LJ_STATIC_ASSERT(sizeof(lua_State) == LJ_DST_LUA_STATE_SIZE);
+LJ_STATIC_ASSERT(offsetof(lua_State, reserved) == LJ_DST_LUA_STATE_RESERVED);
+LJ_STATIC_ASSERT(offsetof(lua_State, userdata) == LJ_DST_LUA_STATE_USERDATA);
+#endif
 
 #define G(L)			(mref(L->glref, global_State))
 #define registry(L)		(&G(L)->registrytv)

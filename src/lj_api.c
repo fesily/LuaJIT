@@ -773,6 +773,26 @@ LUA_API void *lua_newuserdata(lua_State *L, size_t size)
   return uddata(ud);
 }
 
+/* DST engine binding: cSimulation* (and similar) lives at L+0xC0. */
+LUA_API void lua_setuserdata(lua_State *L, void *p)
+{
+#if LJ_DS_LUA_STATE_LAYOUT
+  L->userdata = p;
+#else
+  UNUSED(L); UNUSED(p);
+#endif
+}
+
+LUA_API void *lua_getuserdata(lua_State *L)
+{
+#if LJ_DS_LUA_STATE_LAYOUT
+  return L->userdata;
+#else
+  UNUSED(L);
+  return NULL;
+#endif
+}
+
 LUA_API void lua_concat(lua_State *L, int n)
 {
   lj_checkapi_slot(n);

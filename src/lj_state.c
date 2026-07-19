@@ -424,6 +424,9 @@ lua_State *lj_state_new(lua_State *L)
   L1->stacksize = 0;
   setmref(L1->stack, NULL);
   L1->cframe = NULL;
+#if LJ_DS_LUA_STATE_LAYOUT
+  L1->userdata = NULL;
+#endif
   /* NOBARRIER: The lua_State is new (marked white). */
   setgcrefnull(L1->openupval);
   setmrefr(L1->glref, L->glref);
