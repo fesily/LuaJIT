@@ -72,19 +72,21 @@ GCcdata *lj_cdata_newx(CTState *cts, CTypeID id, CTSize sz, CTInfo info)
 /* Free a C data object. */
 void LJ_FASTCALL lj_cdata_free(global_State *g, GCcdata *cd)
 {
+#if LJ_HASGCMARK
+  /* ArenaGC F2: pure free. Registry separate runs before sweep, so CDATA_FIN
+  ** must not reach free during GCSsweep. */
+  lj_assertG(!(cd->marked & LJ_GC_CDATA_FIN) || g->gc.state != GCSsweep,
+	     "CDATA_FIN reached free (missed registry separate): ptr=%p",
+	     (void *)cd);
+  lj_assertG(!lj_gc_fin_has(g, obj2gco(cd)),
+	     "cdata free with fin registry entry: ptr=%p", (void *)cd);
+  cd->marked &= (uint8_t)~LJ_GC_CDATA_FIN;
+#else
+  /* Classic: cdata finalizers are not separated before sweep (unlike udata).
+  ** When sweep "frees" a CDATA_FIN object, divert to mmudata instead of
+  ** releasing memory; GCSfinalize/gc_finalize will run the fin and re-link. */
   if (LJ_UNLIKELY(cd->marked & LJ_GC_CDATA_FIN)) {
     GCobj *root;
-    /* T1: keep the arena/huge MARK SET (do NOT clear it). This object is
-    ** GC-reachable via the mmudata ring until gc_finalize runs its __gc.
-    ** Under raw-marks-authoritative-during-rebuild (T3/T4, DEADAUTH gone),
-    ** a mark0 pending-finalizer cdata would look dead to a HugeScan restart
-    ** after a hugeset rehash mid-yield and be RE-LINKED onto mmudata ->
-    ** double-link / double-finalize / ring corruption. gc_obj_resurrect
-    ** sets the MARK (live survivor); makewhite cleans the header (stale
-    ** gray/white from the dead cell). gc_finalize (~L1642) still makewhites
-    ** before invoking the finalizer, and the next cycle's markinit +
-    ** gc_mark_mmudata re-mark normally. */
-    gc_obj_resurrect(g, obj2gco(cd));
     makewhite(g, obj2gco(cd));
     markfinalized(obj2gco(cd));
     if ((root = gcref(g->gc.mmudata)) != NULL) {
@@ -95,7 +97,10 @@ void LJ_FASTCALL lj_cdata_free(global_State *g, GCcdata *cd)
       setgcref(cd->nextgc, obj2gco(cd));
       setgcref(g->gc.mmudata, obj2gco(cd));
     }
-  } else if (LJ_LIKELY(!cdataisv(cd))) {
+    return;
+  }
+#endif
+  if (LJ_LIKELY(!cdataisv(cd))) {
     CType *ct = ctype_raw(ctype_ctsG(g), cd->ctypeid);
     CTSize sz = ctype_hassize(ct->info) ? ct->size : CTSIZE_PTR;
     lj_assertG(ctype_hassize(ct->info) || ctype_isfunc(ct->info) ||
@@ -108,9 +113,24 @@ void LJ_FASTCALL lj_cdata_free(global_State *g, GCcdata *cd)
 
 void lj_cdata_setfin(lua_State *L, GCcdata *cd, GCobj *obj, uint32_t it)
 {
+#if LJ_HASGCMARK
+  /* F3: registry authority only. GCROOT_FFI_FIN is NULL; close-gate is
+  ** g->gc.fin_closed (with fin_tab; set in lj_gc_finalize_cdata). */
+  global_State *g = G(L);
+  if (g->gc.fin_closed)
+    return;  /* Disabled during/after lua_close finalizer drain. */
+  if (it == LJ_TNIL) {
+    cd->marked &= ~LJ_GC_CDATA_FIN;
+    lj_gc_fin_unregister(g, obj2gco(cd));
+  } else {
+    cd->marked |= LJ_GC_CDATA_FIN;
+    lj_gc_fin_register(L, obj2gco(cd), FIN_KIND_CDATA, obj, it);
+  }
+#else
   GCtab *t = tabref(G(L)->gcroot[GCROOT_FFI_FIN]);
-  if (gcref(t->metatable)) {
-    /* Add cdata to finalizer table, if still enabled. */
+  if (!gcref(t->metatable))
+    return;  /* Disabled after close (finalize_cdata). */
+  {
     TValue *tv, tmp;
     setcdataV(L, &tmp, cd);
     lj_gc_anybarriert(L, t);
@@ -123,6 +143,7 @@ void lj_cdata_setfin(lua_State *L, GCcdata *cd, GCobj *obj, uint32_t it)
       cd->marked |= LJ_GC_CDATA_FIN;
     }
   }
+#endif
 }
 
 /* -- C data indexing ----------------------------------------------------- */

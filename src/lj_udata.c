@@ -19,7 +19,7 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
   ud->gct = ~LJ_TUDATA;
   ud->udtype = UDTYPE_USERDATA;
   ud->len = sz;
-  /* NOBARRIER: The GCudata is new (marked white). */
+  /* NOBARRIER: The GCudata is new (marked white / light-gray). */
   setgcrefnull(ud->metatable);
   setgcref(ud->env, obj2gco(env));
 #if !LJ_HASGCMARK
@@ -34,6 +34,10 @@ GCudata *lj_udata_new(lua_State *L, MSize sz, GCtab *env)
 
 void LJ_FASTCALL lj_udata_free(global_State *g, GCudata *ud)
 {
+#if LJ_HASGCMARK
+  lj_assertG(!lj_gc_fin_has(g, obj2gco(ud)),
+	     "udata free with fin registry entry: ptr=%p", (void *)ud);
+#endif
   lj_mem_freegco(g, ud, sizeudata(ud));
 }
 

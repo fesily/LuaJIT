@@ -662,8 +662,9 @@ typedef struct GCState {
   uint8_t currentwhite;	/* Current white color. */
 #endif
   uint8_t state;	/* GC state. */
+  uint8_t gccycle;	/* GC cycle counter. */
 #if LJ_HASGCMARK
-  uint8_t gcmarkflags;	/* GC mark flags: bit 0=bitmapsweep, bit 1=markalloc. */
+  uint8_t gcmarkflags;	/* Phase 3: only GCF_MEMPROF (bit3) when enabled; bits 0-2 free. */
 #else
   uint8_t unused0;
 #endif
@@ -711,6 +712,13 @@ typedef struct GCState {
   MSize hugesettomb;	/* Tombstone entries (drive rehash). */
 #if LJ_HASGCMARK
   MSize sweepa;		/* Bitmap sweep: current arena index. */
+  MSize sweep_aend;	/* Snapshot of arenastop at atomic end; sweep scans [0, sweep_aend). */
+  /* Arena-epoch model: epoch is the current free-generation; bumped once at
+  ** atomic end. swept_gen on each arena records the epoch at which it was last
+  ** swept (or born); other(a) = (swept_gen != epoch). huge_swept_gen is the
+  ** isomorphic global for the huge set (written at hugescan completion). */
+  uint32_t epoch;	/* Current free-generation; ++ at atomic end. */
+  uint32_t huge_swept_gen;	/* epoch at last hugescan completion. */
   uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */
   uint8_t sweepphase;	/* 0=bitmap sweep, 1=rebuild chain, 2=done. */
   uint8_t rebuildphase;	/* Resumable rebuild sub-phase (RebuildPhase). */
@@ -730,12 +738,9 @@ typedef struct GCState {
   MRef hugegray;	/* GCobj **: worklist of gray huge traversable objects. */
   MSize hugegraytop;	/* Huge gray stack: number of entries. */
   MSize hugegraysz;	/* Huge gray stack: allocated capacity. */
-  MRef graythread;	/* GCobj **: threads greyed this cycle (atomic re-scan). */
+  MRef graythread;	/* GCobj **: mark re-scan; live-thread list until atomic openupval sweep. */
   MSize graythreadtop;	/* Thread gray stack: number of entries. */
   MSize graythreadsz;	/* Thread gray stack: allocated capacity. */
-  MRef sweepthreads;	/* GCobj **: live coroutine threads snapshot for sweep openupval walk (Design A). */
-  MSize sweepthreadstop; /* sweepthreads: number of entries. */
-  MSize sweepthreadssz;	/* sweepthreads: allocated capacity. */
   MRef weakkey;		/* GCobj **: tables with weak keys only. */
   MSize weakkeytop;	/* Weak-key stack: number of entries. */
   MSize weakkeysz;	/* Weak-key stack: allocated capacity. */
@@ -745,10 +750,30 @@ typedef struct GCState {
   MRef weakall;		/* GCobj **: tables with weak keys and values. */
   MSize weakalltop;	/* All-weak stack: number of entries. */
   MSize weakallsz;	/* All-weak stack: allocated capacity. */
+  /* Finalizer registry. */
+  MRef fin_tab;		/* FinEntry *: open-addressing finalizer registry. */
+  MRef fin_order;	/* GCRef *: registration order (LIFO separate). */
+  MSize fin_mask;	/* Capacity-1 (power of two); 0 when unallocated. */
+  MSize fin_num;	/* Live registry entries (= fin_order length). */
+  MSize fin_tomb;	/* Tombstone entries (drive rehash). */
+  MSize fin_ordersz;	/* Capacity of fin_order array. */
+  uint8_t fin_closed;	/* lua_close gate: reject new cdata fin_register. */
+  uint8_t fin_backfill;	/* COMPAT: table gained __gc since last atomic. */
+  uint8_t fin_pad[3];
   GCstats stats;	/* Instrumentation counters (LJ_HASGCMARK only). */
 #endif
 #endif
 } GCState;
+
+#if LJ_HASGCMARK
+typedef struct FinEntry {
+  GCRef obj;		/* Object with a finalizer (udata or cdata). */
+  GCRef fin;		/* cdata: finalizer value; udata: unused (mt __gc). */
+  uint32_t fin_it;	/* Full itype of fin (not uint8: LJ_T* are ~N). */
+  uint8_t kind;		/* FIN_KIND_* (see lj_gc.h). */
+  uint8_t pad[3];
+} FinEntry;
+#endif
 
 /* String interning state. */
 typedef struct StrInternState {
@@ -760,8 +785,8 @@ typedef struct StrInternState {
   uint8_t second;	/* String interning table uses secondary hashing. */
   uint8_t unused1;
   uint8_t unused2;
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
-  MSize tombs;		/* Open-addressing: tombstone count. */
+#if LJ_HASGCMARK
+  MSize tombs;		/* Open-addressing: tombstone count (arena). */
 #endif
   LJ_ALIGN(8) uint64_t seed;	/* Random string seed. */
 } StrInternState;

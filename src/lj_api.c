@@ -686,7 +686,12 @@ LUA_API void lua_pushcclosure(lua_State *L, lua_CFunction f, int n)
   while (n--)
     copyTV(L, &fn->c.upvalue[n], L->top+n);
   setfuncV(L, L->top, fn);
-  lj_assertL(gc_obj_iswhite(G(L), obj2gco(fn)), "new GC object is not white");
+  /* NOBARRIER: The GCfunc is new (marked white / light-gray). */
+#if LJ_HASGCMARK
+  lj_assertL(isgray(obj2gco(fn)), "new GC object is not light-gray");
+#else
+  lj_assertL(iswhite(obj2gco(fn)), "new GC object is not white");
+#endif
   incr_top(L);
 }
 
@@ -1032,6 +1037,9 @@ LUA_API int lua_setmetatable(lua_State *L, int idx)
     setgcref(udataV(o)->metatable, obj2gco(mt));
     if (mt)
       lj_gc_objbarrier(L, udataV(o), mt);
+#if LJ_HASGCMARK
+    lj_gc_fin_update_udata(L, udataV(o));
+#endif
   } else {
     /* Flush cache, since traces specialize to basemt. But not during __gc. */
     if (lj_trace_flushall(L))
@@ -1280,6 +1288,9 @@ LUA_API int lua_gc(lua_State *L, int what, int data)
     break;
   case LUA_GCISRUNNING:
     res = (g->gc.threshold != LJ_MAX_MEM);
+    break;
+  case LUA_GCCYCLE:
+    res = g->gc.gccycle;
     break;
   default:
     res = -1;  /* Invalid option. */

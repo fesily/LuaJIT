@@ -28,20 +28,23 @@ enum {
 #define LJ_GC_CDATA_FIN	0x10
 #define LJ_GC_FIXED	0x20
 #define LJ_GC_SFIXED	0x40
+#define LJ_GC_HASGC	0x80	/* Table sticky bit (TF_HASGC): set on first __gc
+				 * key insert via lj_tab_newkey, never cleared
+				 * (survives makewhite/sweep). Table-only; the
+				 * cdata cdataisv bit reuses the same 0x80 slot
+				 * on cdata headers, so do not test on cdata. */
 #if LJ_HASGCMARK
 #define LJ_GC_GRAY	0x01	/* Inline gray bit (reuses WHITE0 slot). */
 
-/* gcmarkflags bits in GCState. */
-#define GCF_BITMAPSWEEP	0x01	/* Bitmap sweep active for this GC cycle. */
-#define GCF_MARKALLOC	0x02	/* Allocate-black: mark new arena objects. */
-/* T4 removed GCF_DEADAUTH (0x04): marks are now authoritative through the
-** ENTIRE sweep+rebuild window (T3 stopped mid-yield MARK teardown, T1 keeps
-** finalized-cdata MARK set), so the gc_obj_is* readers read raw marks under
-** GCF_BITMAPSWEEP directly -- no separate death-authority gate needed. */
+/* gcmarkflags bits in GCState. Phase 3 (docs/arenagc-arena-epoch-white.md)
+** deleted GCF_BITMAPSWEEP (0x01) and GCF_SWEEP_NURSERY (0x04): the free
+** window is now identified by gc.state == GCSsweep (scheduling only) plus
+** per-arena swept_gen == epoch (phase-independent isdead predicate).
+** 0x01 and 0x04 are free; bit1 was the removed allocate-black flag. */
+/* 0x02 reserved (was GCF_MARKALLOC allocate-black; removed). */
 /* v1 memprof: set while the event-stream profiler is active. The hot alloc/
-** free inlines test this (one predictable-not-taken branch, same shape as
-** GCF_MARKALLOC) and call an out-of-line LJ_NOINLINE emitter. The whole hook
-** is gated behind LUAJIT_ENABLE_MEMPROF, so flag-OFF builds are byte-identical. */
+** free inlines test this (one predictable-not-taken branch) and call an
+** out-of-line LJ_NOINLINE emitter. Gated behind LUAJIT_ENABLE_MEMPROF. */
 #if defined(LUAJIT_ENABLE_MEMPROF)
 #define GCF_MEMPROF	0x08	/* Memory profiler event stream active. */
 #endif
@@ -157,7 +160,7 @@ LJ_FUNC void lj_memprof_emit_podfree(global_State *g, uint32_t cellcount,
 ** that base for a VLA cdata and o for every other object; header reads (gct,
 ** marked) and recolor macros (makewhite/flipwhite) still use o, which carries a
 ** valid GCcdata header. This unifies small (in-arena) and huge VLA cdata: both
-** key on the cell base / hugeset base, matching the MARKALLOC mark site. */
+** key on the cell base / hugeset base, matching the mark site. */
 static LJ_AINLINE void *gc_obj_key(GCobj *o)
 {
 #if LJ_HASFFI
@@ -198,87 +201,76 @@ static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)
   return 0;
 }
 
+/* Pure black = marked ∧ !GRAY. Header GRAY first so barriers skip black-gray /
+** light-gray without touching the mark bitmap (classic isblack semantics). */
 static LJ_AINLINE int gc_obj_isblack(global_State *g, GCobj *o)
 {
-  void *k = gc_obj_key(o);
+  void *k;
+  if (isgray(o))
+    return 0;
+  k = gc_obj_key(o);
   if (gc_obj_inarena(g, o))
-    return arena_obj_ismarked(ptr2arena(k), ptr2cell(k)) && !isgray(o);
+    return arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
   if (gc_obj_inhugeset(g, o))
-    return huge_obj_ismarked(g, k) && !isgray(o);
+    return huge_obj_ismarked(g, k);
   /* The two dlmalloc FIXED|SFIXED roots are permanently reachable: report black
   ** so barriers treat them as already-marked (never re-greyed via the header). */
   lj_assertG(o == obj2gco(mainthread(g)) || o == obj2gco(&g->strempty),
 	     "non-arena/non-huge object is not a FIXED root: gct=%d", o->gch.gct);
-  return !isgray(o);
+  return 1;
+}
+
+/* Bitmap/slot mark only (black or black-gray). light-gray = !ismarked && GRAY.
+** Not a barrier filter: use gc_obj_isblack for write barriers (pure-black frontier). */
+static LJ_AINLINE int gc_obj_ismarked(global_State *g, GCobj *o)
+{
+  void *k = gc_obj_key(o);
+  if (gc_obj_inarena(g, o))
+    return arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
+  if (gc_obj_inhugeset(g, o))
+    return huge_obj_ismarked(g, k);
+  /* FIXED roots: permanently live; treat as marked. */
+  lj_assertG(o == obj2gco(mainthread(g)) || o == obj2gco(&g->strempty),
+	     "non-arena/non-huge object is not a FIXED root: gct=%d", o->gch.gct);
+  return 1;
 }
 
 #ifdef LUA_USE_ASSERT
-/* Assert-only test hook: counts entries into the NEW non-sweep arena/huge
-** branch of gc_obj_isdead -- i.e. an arena/huge object tested for death OUTSIDE
-** the GCF_BITMAPSWEEP window, where the authoritative answer is "never dead".
-** gc_obj_isdead is a header inline pulled into several TUs, so the counter and
-** its accessor use weak linkage to collapse the per-TU copies into one symbol
-** at link time. The accessor has default visibility (NOT LJ_FUNC, which is
-** hidden on ELF and absent from .dynsym) so test_gc_obj_isdead_authority.lua
-** resolves it via ffi.C -- mirrors lj_str_rehash_sweep_hits (lj_str.h). */
+/* Phase 3: dual-track and nonsweep counter removed. isdead is now
+** phase-independent (!mark ∧ other); the dual-track assert was a Phase 1
+** transition aid. The weak/exported symbol is kept for ABI compat with
+** test_gc_obj_isdead_authority.lua (returns 0, no longer advances). */
 #if defined(_WIN32)
 __declspec(selectany) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
 __declspec(dllexport) uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
-__declspec(selectany) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
-{
-  return lj_gc_obj_isdead_nonsweep_counter;
-}
+#elif defined(__ELF__) || defined(__MACH__)
+__attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
+extern __attribute__((visibility("default")))
+       uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
 #else
 __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_counter = 0;
-#if defined(__ELF__) || defined(__MACH__)
-extern __attribute__((weak, visibility("default")))
-       uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
-__attribute__((weak, visibility("default")))
-uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
-{
-  return lj_gc_obj_isdead_nonsweep_counter;
-}
-#else
-extern __attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
-__attribute__((weak)) uint32_t lj_gc_obj_isdead_nonsweep_hits(void)
-{
-  return lj_gc_obj_isdead_nonsweep_counter;
-}
-#endif
+extern uint32_t lj_gc_obj_isdead_nonsweep_hits(void);
 #endif
 #endif
 
-/* Mark-authoritative death test for ALL GC phases. An arena/huge object is
-** dead only when (a) it is unmarked AND (b) the collector has reached the
-** sweep window for it (GCF_BITMAPSWEEP). T4: the old GCF_DEADAUTH gate was
-** removed -- marks are now authoritative through the ENTIRE sweep+rebuild
-** window (T3 stopped mid-yield MARK teardown, T1 keeps finalized-cdata MARK
-** set), so reading raw marks under GCF_BITMAPSWEEP is correct for both the
-** bitmap-sweep and rebuild phases. Outside the sweep window -- in mark/pause,
-** or outside any collection -- an arena/huge object is NEVER dead. Non-arena/
-** non-huge objects are only the FIXED/SFIXED roots (mainthread, strempty),
-** never collected, so the isdead fallback is the constant 0 too. */
+/* Phase-independent isdead (D2 / arenagc-arena-epoch-white):
+**   isdead ≜ !mark ∧ other(meta)
+** other(arena) = swept_gen != epoch; other(huge) = huge_swept_gen != epoch.
+** I1 free exit: all arenas current ⇒ isdead≡false outside free. */
 static LJ_AINLINE int gc_obj_isdead(global_State *g, GCobj *o)
 {
   void *k = gc_obj_key(o);
   if (gc_obj_inarena(g, o)) {
-    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
-      return !arena_obj_ismarked(ptr2arena(k), ptr2cell(k));
-#ifdef LUA_USE_ASSERT
-    lj_gc_obj_isdead_nonsweep_counter++;
-#endif
-    return 0;  /* Outside the sweep window an arena object is never dead. */
+    GCArena *a = ptr2arena(k);
+    return !arena_obj_ismarked(a, ptr2cell(k)) && a->swept_gen != g->gc.epoch;
   }
-  if (gc_obj_inhugeset(g, o)) {
-    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP)
-      return !huge_obj_ismarked(g, k);
-#ifdef LUA_USE_ASSERT
-    lj_gc_obj_isdead_nonsweep_counter++;
-#endif
-    return 0;  /* Outside the sweep window a huge object is never dead. */
-  }
-  return isdead(g, o) != 0;
+  if (gc_obj_inhugeset(g, o))
+    return !huge_obj_ismarked(g, k) && g->gc.huge_swept_gen != g->gc.epoch;
+  UNUSED(g);
+  return 0;
 }
+
+#define gc_assert_isdead_dualtrack(g, o)	((void)0)
 
 static LJ_AINLINE void gc_obj_makewhite(global_State *g, GCobj *o)
 {
@@ -309,6 +301,7 @@ static LJ_AINLINE void gc_obj_resurrect(global_State *g, GCobj *o)
 #else
 #define gc_obj_iswhite(g, o)		(iswhite((o)) != 0)
 #define gc_obj_isblack(g, o)		(isblack((o)) != 0)
+#define gc_obj_ismarked(g, o)		(isblack((o)) != 0)
 #define gc_obj_isdead(g, o)		(isdead((g), (o)) != 0)
 #define gc_obj_makewhite(g, o)		makewhite((g), (o))
 #define gc_obj_resurrect(g, o)		flipwhite((o))
@@ -351,10 +344,26 @@ LJ_FUNC void lj_gc_closeuv(global_State *g, GCupval *uv);
 LJ_FUNC void lj_gc_barriertrace(global_State *g, uint32_t traceno);
 #endif
 #if LJ_HASGCMARK
-LJ_FUNC void lj_gc_barrierback_arena(global_State *g, GCobj *o);
+LJ_FUNCA void LJ_FASTCALL lj_gc_barrierback_arena(global_State *g, GCobj *o);
 LJ_FUNC void lj_gc_grayarena_notify(global_State *g, MSize idx);
 LJ_FUNC void lj_gc_graywork_free(global_State *g);
 LJ_FUNCA void lj_gc_ssb_flush(global_State *g);
+/* Free-window: white child store is a residual bug — abort (no soft rescue). */
+LJ_FUNC void lj_gc_nursery_forbid_white(global_State *g, GCobj *v);
+
+/* Finalizer registry (docs/arenagc-finalizer-registry.md). F1 dual-track. */
+#define FIN_KIND_EMPTY	0
+#define FIN_KIND_TOMB	1
+#define FIN_KIND_UDATA	2
+#define FIN_KIND_CDATA	3
+LJ_FUNC void lj_gc_fin_register(lua_State *L, GCobj *o, int kind,
+				GCobj *fin, uint32_t it);
+LJ_FUNC void lj_gc_fin_unregister(global_State *g, GCobj *o);
+LJ_FUNC int lj_gc_fin_has(global_State *g, GCobj *o);
+LJ_FUNC void lj_gc_fin_update_udata(lua_State *L, GCudata *ud);
+LJ_FUNC void lj_gc_fin_backfill_udata(global_State *g);
+LJ_FUNC void lj_gc_fin_free(global_State *g);
+LJ_FUNC void lj_gc_fin_dual_assert_udata(global_State *g);
 #endif
 
 /* Move the GC propagation frontier back for tables (make it gray again). */
@@ -362,8 +371,7 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
 {
   GCobj *o = obj2gco(t);
 #if LJ_HASGCMARK
-  lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !gc_obj_isdead(g, o),
-	     "bad object states for backward barrier");
+  lj_assertG(!gc_obj_isdead(g, o), "backward barrier on dead table");
   lj_gc_barrierback_arena(g, o);
 #else
   lj_assertG(isblack(o) && !isdead(g, o),
@@ -376,17 +384,30 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
 #endif
 }
 
-/* Barrier for stores to table objects. TValue and GCobj variant. */
+/* Table store barriers. GCMARK: !GRAY parent + white child (classic shape).
+** D2: forbid only isdead (corpse) children — not all iswhite (curwhite ok). */
 #if LJ_HASGCMARK
 #define lj_gc_anybarriert(L, t)  \
-  { if (LJ_UNLIKELY(!(obj2gco(t)->gch.marked & LJ_GC_GRAY))) \
+  { if (LJ_UNLIKELY(!isgray(obj2gco(t)))) \
       lj_gc_barrierback(G(L), (t)); }
 #define lj_gc_barriert(L, t, tv) \
-  { if (LJ_UNLIKELY(!(obj2gco(t)->gch.marked & LJ_GC_GRAY))) \
-      lj_gc_barrierback(G(L), (t)); }
-#define lj_gc_objbarriert(L, t, o)  \
-  { if (LJ_UNLIKELY(!(obj2gco(t)->gch.marked & LJ_GC_GRAY))) \
-      lj_gc_barrierback(G(L), (t)); }
+  { if (tvisgcv(tv) && !isgray(obj2gco(t)) && \
+	gc_obj_iswhite(G(L), gcV(tv))) { \
+      global_State *g_ = G(L); \
+      if (LJ_UNLIKELY(gc_obj_isdead(g_, gcV(tv)))) \
+	lj_gc_nursery_forbid_white(g_, gcV(tv)); \
+      else \
+	lj_gc_barrierback(g_, (t)); \
+    } }
+#define lj_gc_objbarriert(L, t, o) \
+  { if (!isgray(obj2gco(t)) && \
+	gc_obj_iswhite(G(L), obj2gco(o))) { \
+      global_State *g_ = G(L); \
+      if (LJ_UNLIKELY(gc_obj_isdead(g_, obj2gco(o)))) \
+	lj_gc_nursery_forbid_white(g_, obj2gco(o)); \
+      else \
+	lj_gc_barrierback(g_, (t)); \
+    } }
 #else
 #define lj_gc_anybarriert(L, t)  \
   { if (LJ_UNLIKELY(isblack(obj2gco(t)))) lj_gc_barrierback(G(L), (t)); }
@@ -398,13 +419,13 @@ static LJ_AINLINE void lj_gc_barrierback(global_State *g, GCtab *t)
       lj_gc_barrierback(G(L), (t)); }
 #endif
 
-/* Barrier for stores to any other object. TValue and GCobj variant. */
+/* Barriers for stores to non-table objects. */
 #if LJ_HASGCMARK
 #define lj_gc_barrier(L, p, tv) \
-  { if (LJ_UNLIKELY(!(obj2gco(p)->gch.marked & LJ_GC_GRAY))) \
+  { if (tvisgcv(tv) && !isgray(obj2gco(p))) \
       lj_gc_barrierf(G(L), obj2gco(p), gcV(tv)); }
 #define lj_gc_objbarrier(L, p, o) \
-  { if (LJ_UNLIKELY(!(obj2gco(p)->gch.marked & LJ_GC_GRAY))) \
+  { if (!isgray(obj2gco(p))) \
       lj_gc_barrierf(G(L), obj2gco(p), obj2gco(o)); }
 #else
 #define lj_gc_barrier(L, p, tv) \
@@ -470,11 +491,7 @@ static LJ_AINLINE void *lj_mem_newgco_arena(lua_State *L, GCSize size,
       ** path) and the POD branch of gc_bitmap_sweep (bulk path); all three
       ** stay balanced for the shutdown total assertion. */
       g->gc.total += (cls == ArenaClass_POD) ?
-		     ((GCSize)arena_roundcells(size) << CellSizeLog2) : size;
-#if LJ_HASGCMARK
-      if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC))
-	arena_obj_setmark(a, ptr2cell(o));
-#endif
+			     ((GCSize)arena_roundcells(size) << CellSizeLog2) : size;
 #if defined(LUAJIT_ENABLE_MEMPROF)
       if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
 	lj_memprof_emit_alloc(L, o, size, cls, link);

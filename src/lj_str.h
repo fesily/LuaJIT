@@ -22,7 +22,7 @@ LJ_FUNCA GCstr *lj_str_new(lua_State *L, const char *str, size_t len);
 LJ_FUNC void LJ_FASTCALL lj_str_free(global_State *g, GCstr *s);
 LJ_FUNC void LJ_FASTCALL lj_str_init(lua_State *L);
 
-#if defined(LUA_USE_ASSERT) && !(LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR))
+#if defined(LUA_USE_ASSERT) && !LJ_HASGCMARK
 /* Assert-only test hook: entry count for the GCSsweepstring bitmap branch of
 ** lj_str_rehash_chain. Default visibility (not LJ_FUNC, which is hidden on ELF
 ** and absent from .dynsym) so test_str_rehash_sweep.lua resolves it via ffi.C. */
@@ -37,7 +37,7 @@ extern uint32_t lj_str_rehash_sweep_hits(void);
 #define lj_str_freetab(g) \
   (lj_mem_freevec(g, g->str.tab, g->str.mask+1, GCRef))
 
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+#if LJ_HASGCMARK
 #define STRTAB_OA_TOMB	((uintptr_t)1)
 LJ_FUNC MSize lj_strtab_remove(global_State *g, GCstr *s);
 /* P4 debug/test hooks (default visibility so test/lua resolves via ffi.C). */

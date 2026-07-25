@@ -711,6 +711,24 @@
 #define LJ_HASGCMARK		0
 #endif
 
+/* Open-addressing string intern table is inseparable from arena GC.
+** Arena NonTrav string free uses bitmap sweep + lj_strtab_remove; the classic
+** chain intern + GCSsweepstring path is not the arena design. Force the two
+** together: arena builds always get OPENADDR; non-arena never keeps it.
+*/
+#if LJ_HASGCARENA
+#undef LUAJIT_STRTAB_OPENADDR
+#define LUAJIT_STRTAB_OPENADDR	1
+#else
+#undef LUAJIT_STRTAB_OPENADDR
+#endif
+
+/* 0=strict (mt must already have __gc); 1=5.1 compat + late-bound __gc backfill.
+** Default 1: LuaJIT is 5.1-based (newproxy; mt.__gc after setmetatable). */
+#ifndef LUAJIT_ENABLE_FIN_UDATA_COMPAT
+#define LUAJIT_ENABLE_FIN_UDATA_COMPAT	1
+#endif
+
 #ifndef LJ_TARGET_UNALIGNED
 #define LJ_TARGET_UNALIGNED	0
 #endif

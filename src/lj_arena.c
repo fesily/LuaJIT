@@ -13,6 +13,7 @@
 
 #include "lj_obj.h"
 #include "lj_arena.h"
+#include "lj_gc.h"
 #include "lj_err.h"
 
 #include <string.h>
@@ -295,24 +296,20 @@ static GCCellID arena_count_freecells(GCArena *a)
 }
 
 /*
-** Word-parallel sweep of a POD-only arena (closures, protos): the design
-** doc's bitmap-trick sweep. Applies the major-collection transform to every
-** bitmap word in one linear metadata pass, with NO access to the object data
-** area at all (the design's core promise):
+** Word-parallel free of a POD-only arena (closures, protos). Metadata only:
 **
 **   block' = block & mark   mark' = block ^ mark
 **
-** Per cell this maps:  Black(11)->White(10)  [survivor demoted to white]
-**                      White(10)->Free(01)   [dead head freed]
-**                      Free(01)->Free(01)    Extent(00)->Extent(00)
+** Per cell:  Black(11)->White(10)  survivor demoted (is_curwhite: current ∧ !mark)
+**            White(10)->Free(01)   dead head freed
+**            Free(01)->Free(01)    Extent(00)->Extent(00)
 **
-** So a single pass frees all dead objects AND recolors survivors black->white,
-** fusing what the per-object path does as separate free + makewhite + mark
-** clear passes. Multi-cell objects keep their extent (00) cells; the run
-** lengths are rediscovered by arena_scavenge from the bitmap alone.
+** D3: survivors are demoted to White (mark cleared). Safe because the caller
+** sets swept_gen=epoch BEFORE this transform, so demoted survivors are
+** is_curwhite (current ∧ !mark), not isdead. Multi-cell extents stay 00;
+** scavenge rediscovers free runs from the bitmap alone.
 **
-** Returns the number of cells freed, computed as the drop in allocated cells
-** (block-bitmap based, cross-cycle stable) for cell-space gc.total accounting.
+** Returns cells newly freed (free-head delta) for cell-space gc.total.
 */
 GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
 {
@@ -341,7 +338,7 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   for (w = UnusedBlockWords; w <= wtop; w++) {
     GCBlockword b = a->block[w], m = a->mark[w];
     a->block[w] = b & m;
-    a->mark[w]  = b ^ m;
+    a->mark[w]  = b ^ m;  /* D3: survivor Black→White, dead White→Free */
   }
   free_post = arena_count_freecells(a);
   lj_assertX(free_post >= free_pre, "podsweep freed negative cells");
@@ -366,9 +363,8 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   ** freed POD object is NOT caught. This is the accepted lazy window: a
   ** fuzzer use-after-poison in this gap is a poisoning-boundary bug to fix,
   ** not a real UAF to ignore. The bump redzone [celltop, celltopmax) stays
-  ** poisoned throughout (unchanged here, poisoned at create). Survivors
-  ** (Black->White) remain allocated and unpoisoned, so they must NOT be
-  ** poisoned by a blanket pass here. */
+  ** poisoned throughout (unchanged here, poisoned at create). Survivors are
+  ** demoted to White (is_curwhite) by the D3 transform. */
   lj_assertX(a->freecells <= (GCCellID)a->celltop - MinCellId,
 	     "podsweep freecells over capacity");
   return freed;
@@ -514,7 +510,7 @@ static int arena_isempty(GCArena *a)
 }
 
 /* Reset an empty arena to its pristine state. */
-static void arena_reinit(GCArena *a, uint32_t flags)
+static void arena_reinit(global_State *g, GCArena *a, uint32_t flags)
 {
   uint32_t w, wtop = arena_blockidx(a->celltop - 1);
   ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
@@ -528,6 +524,7 @@ static void arena_reinit(GCArena *a, uint32_t flags)
   a->celltop = (GCCellID1)MinCellId;
   a->freecells = 0;
   a->freegen++;
+  a->swept_gen = g->gc.epoch;	/* Reborn into the current generation. */
   a->flags = (uint16_t)flags;
   if (fl != NULL) {
     freelist_reset(fl);
@@ -608,6 +605,7 @@ static GCArena *arena_create(global_State *g, int cls)
   a->celltopmax = (GCCellID1)MaxUsableCellId;
   a->flags = (uint16_t)arena_classflags(cls);
   a->id = g->gc.arenastop;
+  a->swept_gen = g->gc.epoch;	/* New arenas are born currentwhite. */
   setmref(a->chunk, c);
   mref(g->gc.arenas, GCArena *)[g->gc.arenastop++] = a;
   /* Contract item 3: establish the poison baseline for the whole data
@@ -667,12 +665,25 @@ void *lj_arena_findspace(global_State *g, size_t size, int cls)
   uint32_t want = arena_classflags(cls);
   void *p;
   MSize i;
+#if LJ_HASGCMARK
+  /* Epoch model: never bump/reuse other arenas (swept_gen != epoch) during
+  ** sweep. New objects must live only in current arenas so bitmap free of
+  ** other arenas cannot reclaim them. */
+  int nursery = (g->gc.state == GCSsweep);
+#else
+  int nursery = 0;
+#endif
   gcstat_inc(g, findspace_calls);
-  if (cur != NULL && (p = lj_arena_allocslow(g, cur, size)) != NULL)
+  if (cur != NULL &&
+      !(nursery && !arena_is_current(g, cur)) &&
+      (p = lj_arena_allocslow(g, cur, size)) != NULL)
     return p;
   for (i = 0; i < g->gc.arenastop; i++) {
     GCArena *a = mref(g->gc.arenas, GCArena *)[i];
     if (a == cur)
+      continue;
+    /* During sweep, only allocate from current arenas. */
+    if (nursery && !arena_is_current(g, a))
       continue;
     if ((a->flags & (ArenaFlag_TravObjs|ArenaFlag_PODOnly|ArenaFlag_UdataOnly|ArenaFlag_CdataVOnly)) != want) {
       /* Repurpose an empty arena of another class. Never steal another
@@ -682,9 +693,9 @@ void *lj_arena_findspace(global_State *g, size_t size, int cls)
 	  a == mref(g->gc.podarena, GCArena) ||
 	  a == mref(g->gc.udatarena, GCArena) ||
 	  a == mref(g->gc.cdatavarena, GCArena) ||
-	  !arena_isempty(a))
+	!arena_isempty(a))
 	continue;
-      arena_reinit(a, want);
+      arena_reinit(g, a, want);
     }
     if ((p = arena_alloc(a, size)) != NULL) {
       setmref(*curref, a);  /* Has space left: make it current. */
@@ -737,7 +748,7 @@ void lj_arena_shrink(global_State *g)
 	gcstat_inc(g, arenas_shrunk);
 	continue;  /* Do not advance: the slot was swap-filled. */
       }
-      arena_reinit(a, a->flags);
+      arena_reinit(g, a, a->flags);
       keepempty--;
     }
     i++;
@@ -912,15 +923,10 @@ void lj_arena_gc_markinit(global_State *g)
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
-  /* Clear huge-set slot marks: stale MARKALLOC marks from the previous sweep
-  ** window must not persist into this mark cycle (gc_mark dedup at
-  ** lj_gc_arena.c would skip tracing references of objects with a stale slot
-  ** mark). T3 removed the HUGESET_SWEPT restart-skip tag (marks are now
-  ** authoritative through rebuild, making SWEPT redundant), so only
-  ** HUGESET_MARK is cleared here. Symmetric counterpart to the arena mark
-  ** clearing above. (rebuild_clearmarks also clears huge marks at the end of
-  ** the rebuild for the post-fullgc mark0 invariant; this is the cycle-start
-  ** reset for the normal path.) */
+  /* Clear huge-set slot marks from the previous sweep window so gc_mark does
+  ** not skip tracing objects with a stale slot mark. Symmetric with arena
+  ** mark clearing above; rebuild_clearmarks also clears huge marks at rebuild
+  ** end for the post-fullgc mark0 invariant. */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
