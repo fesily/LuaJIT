@@ -360,7 +360,12 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   setgcref(g->gc.root, obj2gco(L));
   setmref(g->gc.sweep, &g->gc.root);
   g->gc.total = sizeof(GG_State);
+#if LJ_HASGCMARK
+  /* GenGC: lower pause (1.3×estimate) to cap free-window heap growth. */
+  g->gc.pause = LUAI_GCPAUSE_GCMARK;
+#else
   g->gc.pause = LUAI_GCPAUSE;
+#endif
   g->gc.gccycle = 0;
   g->gc.stepmul = LUAI_GCMUL;
   lj_dispatch_init((GG_State *)L);

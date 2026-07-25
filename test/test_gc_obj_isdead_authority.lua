@@ -1,26 +1,24 @@
--- Authority-based gc_obj_isdead across ALL GC phases (Phase 6 WAVE 1 prereq).
+-- Authority-based gc_obj_isdead across ALL GC phases (epoch dual-white model).
 --
 -- gc_obj_isdead (lj_gc.h) is the single seam every module uses to ask "is this
--- object dead?". For arena/huge objects it must give the MARK-AUTHORITATIVE
--- answer in every phase: dead only when (a) unmarked AND (b) the sweep window
--- (GCF_BITMAPSWEEP) is active for it. OUTSIDE a collection / before atomic an
--- arena/huge object is NEVER dead, so a still-reachable object tested by
--- gc_obj_isdead outside the sweep window must NOT be reported dead and must NOT
--- be wrongly resurrected or freed.
+-- object dead?". Phase-independent formula:
+--   isdead ≜ !mark ∧ other(meta)   where other(a) ≜ a.swept_gen != g.epoch
+-- Outside free (and after free completes I1: ∀a current), isdead is globally
+-- false. A still-reachable object must NOT be reported dead and must NOT be
+-- wrongly resurrected or freed.
 --
 -- This pins the observable behavior of the three Lua-reachable callers that hit
--- gc_obj_isdead outside the sweep window, interleaved with GC steps:
+-- gc_obj_isdead, interleaved with GC steps:
 --   * lj_func.c closeuv  -> open-upvalue resurrect / free decision
 --   * lj_str.c  intern   -> resurrect-if-dead on a matching interned string
 --   * lib_ffi.c typeinfo -> resurrect-if-dead on a ctype name string
 -- Liveness is verified by value identity + heap self-consistency
 -- (collectgarbage("checkheap") == 0) across many interleaved GC steps.
 --
--- On assert builds the C side exports lj_gc_obj_isdead_nonsweep_hits()
--- (incremented each time the NEW non-sweep arena/huge branch of gc_obj_isdead is
--- taken). This test polls it via ffi.C and asserts it advances >= 1, proving the
--- branch actually fires. Release builds lack the symbol, so the counter
--- assertion is skipped while every functional invariant still runs.
+-- On assert builds the C side exports lj_gc_obj_isdead_nonsweep_hits() (legacy
+-- counter; epoch formula no longer has a separate non-sweep branch, so it may
+-- stay 0). Functional invariants remain authoritative. Release builds lack the
+-- symbol; counter assertion is skipped.
 --
 -- Run: ./src/luajit -joff test/test_gc_obj_isdead_authority.lua
 
@@ -143,14 +141,22 @@ do
   end
 end
 
--- Counter proof: the NEW non-sweep arena/huge branch of gc_obj_isdead must have
--- fired at least once across the three paths above (closeuv / intern / typeinfo
--- all call gc_obj_isdead outside the sweep window on arena objects).
+-- Counter probe: Phase 1 counted entries into the "non-sweep branch" of
+-- gc_obj_isdead. Phase 2 (D2) unified the formula — there is no separate
+-- branch, so the counter no longer advances. The functional invariants above
+-- (upvalue closeuv / intern / cdata finalizer) are the authoritative proof
+-- that isdead is called and returns the correct (not-dead) answer across all
+-- phases. The counter assertion is kept non-fatal for Phase 2 compat.
 if has_counter then
   local seen = hits()
-  ok(seen > start,
-     "gc_obj_isdead non-sweep arena/huge branch entered (hits " .. start .. " -> " .. seen .. ")")
-  print("gc_obj_isdead non-sweep hit counter: " .. seen .. " (start " .. start .. ")")
+  if seen > start then
+    ok(true, "gc_obj_isdead non-sweep counter advanced (Phase 1 probe)")
+    print("gc_obj_isdead non-sweep hit counter: " .. seen .. " (start " .. start .. ")")
+  else
+    print("gc_obj_isdead non-sweep counter unchanged (Phase 2 unified formula) " ..
+          "-- functional invariants are authoritative")
+    pass = pass + 1  -- counter is Phase 1 legacy; non-fatal under Phase 2
+  end
 else
   print("gc_obj_isdead non-sweep hit counter: unavailable (release build) -- "
         .. "counter assertion skipped, functional invariants still run")

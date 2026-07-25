@@ -82,7 +82,7 @@ void lj_lib_register(lua_State *L, const char *libname,
   GCtab *tab = lib_create_table(L, libname, *p++);
   ptrdiff_t tpos = L->top - L->base;
 
-  /* Avoid barriers further down. */
+  /* Avoid barriers further down (table greys once; new funcs are light-gray). */
   lj_gc_anybarriert(L, tab);
   tab->nomm = 0;
 
@@ -167,7 +167,7 @@ void lj_lib_prereg(lua_State *L, const char *name, lua_CFunction f, GCtab *env)
 {
   luaL_findtable(L, LUA_REGISTRYINDEX, "_PRELOAD", 4);
   lua_pushcfunction(L, f);
-  /* NOBARRIER: The function is new (marked white). */
+  /* NOBARRIER: The function is new (marked white / light-gray). */
   setgcref(funcV(L->top-1)->c.env, obj2gco(env));
   lua_setfield(L, -2, name);
   L->top--;

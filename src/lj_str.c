@@ -105,7 +105,7 @@ static StrHash hash_sparse(uint64_t seed, const char *str, MSize len)
 }
 
 #if LUAJIT_SECURITY_STRHASH
-#if !(LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR))
+#if !LJ_HASGCMARK
 /* Keyed dense ARX string hash. Linear time. */
 static LJ_NOINLINE StrHash hash_dense(uint64_t seed, StrHash h,
 				      const char *str, MSize len)
@@ -136,8 +136,8 @@ static LJ_NOINLINE StrHash hash_dense(uint64_t seed, StrHash h,
 
 #define LJ_STR_MAXCOLL		32
 
-#if !(LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR))
-/* ===== Chain-path intern table (default build) ===== */
+#if !LJ_HASGCMARK
+/* ===== Chain-path intern table (classic GC only, !LJ_HASGCMARK) ===== */
 
 /* Resize the string interning hash table (grow and shrink). */
 void lj_str_resize(lua_State *L, MSize newmask)
@@ -229,9 +229,8 @@ void lj_str_resize(lua_State *L, MSize newmask)
 }
 
 #if LUAJIT_SECURITY_STRHASH
-#if LJ_HASGCMARK || defined(LUA_USE_ASSERT)
-/* Observation-only entry count for the bitmap-liveness branch below; no
-** behavior change. Polled via ffi.C by test_str_rehash_sweep.lua (assert). */
+#if defined(LUA_USE_ASSERT)
+/* Classic chain rehash sweep hit counter (assert builds only). */
 static uint32_t lj_str_rehash_sweep_hits_counter;
 #endif
 
@@ -240,14 +239,7 @@ static LJ_NOINLINE GCstr *lj_str_rehash_chain(lua_State *L, StrHash hashc,
 					      const char *str, MSize len)
 {
   global_State *g = G(L);
-#if LJ_HASGCMARK
-  /* During GCSsweepstring the mark bitmap / hugeset slot is the sole liveness
-  ** authority (GCF_BITMAPSWEEP stays set throughout that state), so only the
-  ** "are we sweeping?" question remains -- no currentwhite read needed. */
-  int sweeping = (g->gc.state == GCSsweepstring);
-#else
   int ow = g->gc.state == GCSsweepstring ? otherwhite(g) : 0;  /* Sweeping? */
-#endif
   GCRef *strtab = g->str.tab;
   MSize strmask = g->str.mask;
   GCobj *o = gcref(strtab[hashc & strmask]);
@@ -258,27 +250,6 @@ static LJ_NOINLINE GCstr *lj_str_rehash_chain(lua_State *L, StrHash hashc,
     GCobj *next = gcnext(o);
     GCstr *s = gco2str(o);
     StrHash hash;
-#if LJ_HASGCMARK
-    if (sweeping) {  /* Must sweep while rechaining. */
-      /* Mark authority decides liveness, not the stale header white: cell
-      ** bitmap for arena strings, hugeset slot for huge strings. strempty is
-      ** dlmalloc (non-arena/huge) -- ptr2arena must not touch it. FIXED is
-      ** never freed even if unmarked. GCF_BITMAPSWEEP is invariably set during
-      ** GCSsweepstring, so the legacy header path is unreachable here. */
-      int live = (o == obj2gco(&g->strempty)) ||
-		 (o->gch.marked & LJ_GC_FIXED) ||
-		 (lj_arena_ishuge(o)
-		    ? huge_obj_ismarked(g, o)
-		    : arena_obj_ismarked(ptr2arena(o), ptr2cell(o)));
-      lj_str_rehash_sweep_hits_counter++;  /* Count each branch entry. */
-      if (!live) {  /* Free dead string. */
-	lj_str_free(g, s);
-	o = next;
-	continue;
-      }
-      /* Live: keep and rechain below. Mark is authoritative; no makewhite. */
-    }
-#else
     if (ow) {  /* Must sweep while rechaining. */
       if (((o->gch.marked ^ LJ_GC_WHITES) & ow)) {  /* String alive? */
 	lj_assertG(!isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
@@ -292,7 +263,6 @@ static LJ_NOINLINE GCstr *lj_str_rehash_chain(lua_State *L, StrHash hashc,
 	continue;
       }
     }
-#endif
     hash = s->hash;
     if (!s->hashalg) {  /* Rehash with secondary hash. */
       hash = hash_dense(g->str.seed, hash, strdata(s), s->len);
@@ -418,7 +388,7 @@ GCstr *lj_str_new(lua_State *L, const char *str, size_t lenx)
 }
 
 #else
-/* ===== Open-addressing intern table (LUAJIT_STRTAB_OPENADDR) ===== */
+/* ===== Open-addressing intern table (arena GC / LJ_HASGCMARK) ===== */
 /*
 ** Robin Hood open-addressing hash set of GCstr* (P4). Replaces the P1 plain
 ** linear-probe + tombstone scheme with Robin Hood displacement + probe-cap
@@ -727,7 +697,7 @@ GCstr *lj_str_new(lua_State *L, const char *str, size_t lenx)
   }
 }
 
-#endif /* LUAJIT_STRTAB_OPENADDR */
+#endif /* LJ_HASGCMARK open-addressing strtab */
 
 void LJ_FASTCALL lj_str_free(global_State *g, GCstr *s)
 {

@@ -46,6 +46,13 @@
 #define GCSWEEPMAX	40
 #define GCSWEEPCOST	10
 #define GCFINALIZECOST	100
+/* D: GenGC bitmap free budget per onestep. Cost return is intentionally NOT
+ * scaled (stays GCSWEEPMAX*GCSWEEPCOST) so the pacer runs ~5 onesteps per
+ * lj_gc_step, each freeing up to 256 cells (was 40) — ~6.4x free throughput.
+ * Shrinks the free window during which nursery alloc promotes survivors to
+ * Old. ~4KB/onestep (256*CellSize) keeps each call in microseconds. Classic
+ * sweep still uses GCSWEEPMAX. */
+#define GCSWEEP_BITMAP_MAX	256
 
 /* Macros to set GCobj colors and flags. */
 #define white2gray(x) \
@@ -73,12 +80,17 @@
 
 /* Mark a string object. The only non-arena/non-huge string is strempty, an
 ** SFIXED constant-live root with no bitmap/slot and no header color -- nothing
-** to mark. */
+** to mark. newwhite is light-gray (GRAY only); strings never gray-traverse, so
+** clear header GRAY when setting the arena/huge mark — free window forbids
+** mark∧GRAY residuals (gc_assert_atomic_end). Classic gc_mark_str clears
+** whites for the same leaf-mark effect. */
 #define gc_mark_str(g, s) do { \
-  if (gc_inarena(g, obj2gco(s))) \
-    arena_obj_setmark(ptr2arena(s), ptr2cell(s)); \
-  else if (lj_arena_ishuge(obj2gco(s))) \
-    huge_obj_setmark(g, obj2gco(s)); \
+  GCstr *_s = (s); \
+  if (gc_inarena(g, obj2gco(_s))) \
+    arena_obj_setmark(ptr2arena(_s), ptr2cell(_s)); \
+  else if (lj_arena_ishuge(obj2gco(_s))) \
+    huge_obj_setmark(g, obj2gco(_s)); \
+  (_s)->marked &= (uint8_t)~LJ_GC_GRAY; \
   } while (0)
 
 static void gc_hugegray_push(global_State *g, GCobj *o);
@@ -87,9 +99,9 @@ static GCobj *gc_hugegray_pop(global_State *g);
 static void gc_hugegray_reset(global_State *g);
 static void gc_graythread_push(global_State *g, GCobj *o);
 static int gc_graythread_empty(global_State *g);
-static GCobj *gc_graythread_pop(global_State *g);
 static void gc_graythread_reset(global_State *g);
-static void gc_sweepthreads_reset(global_State *g);
+static void gc_atomic_rescan_threads(global_State *g);
+static void gc_atomic_sweep_openupvals(global_State *g);
 static void gc_weak_push(global_State *g, GCobj *o, int weak);
 static void gc_weak_reset(global_State *g);
 static void gc_weak_redirect_all(global_State *g);
@@ -270,6 +282,10 @@ static LJ_AINLINE void gc_assert_root_anchor_only(global_State *g)
 #define gc_assert_root_anchor_only(g)		((void)0)
 #endif
 
+#if LJ_HASGCMARK
+static FinEntry *fin_tab_find(global_State *g, GCobj *o, int *found);
+#endif
+
 /* Mark a GCobj. */
 static void gc_mark(global_State *g, GCobj *o)
 {
@@ -284,25 +300,39 @@ static void gc_mark(global_State *g, GCobj *o)
   if (inarena) {
     a = ptr2arena(key);
     c = ptr2cell(key);
-    if (arena_obj_ismarked(a, c))
+    if (arena_obj_ismarked(a, c)) {
+      /* Already marked: do not re-push. Object may still be on greystack/SSB
+      ** (legit mark∧GRAY) or pure black. Orphans off every worklist violate
+      ** free-window design (Debug: gc_assert_atomic_end). Re-queue floods. */
       return;
+    }
   } else if (inhuge) {
-    if (huge_obj_ismarked(g, key))  /* Slot mark is the dedup gate. */
+    if (huge_obj_ismarked(g, key)) {  /* Slot mark is the dedup gate. */
       return;
+    }
   } else {
-    /* Non-arena/non-huge = SFIXED roots (mainthread, strempty). They are
-    ** constant-live and traversed explicitly, never reached through gc_mark. */
-    lj_assertG(0, "gc_mark of a non-arena/non-huge FIXED root: gct=%d", gct);
+    /* SFIXED roots (mainthread, strempty) and any other non-arena object:
+    ** always live. Empty string "" is strempty and is a normal table key —
+    ** gc_mark must be a no-op, not an assert. */
+    lj_assertG(o == obj2gco(mainthread(g)) || o == obj2gco(&g->strempty) ||
+	       (o->gch.marked & LJ_GC_SFIXED),
+	       "gc_mark of unexpected non-arena object: gct=%d marked=0x%02x",
+	       gct, o->gch.marked);
     return;
   }
-  white2gray(o);
+  /* Set the mark bit first. Leaves (STR/CDATA/UDATA/UPVAL) are born light-gray
+  ** via newwhite (marked = LJ_GC_GRAY); gray2black below clears that birth GRAY
+  ** so the free-window residual invariant holds (zero mark∧GRAY). white2gray is
+  ** NOT called on leaves — it would be a no-op (GRAY already set). Non-leaves
+  ** call white2gray in the else branch below before being pushed onto a gray
+  ** stack (they are not born GRAY-painted by newwhite in the leaf sense). */
   if (inarena)
     arena_obj_setmark(a, c);
   else
     huge_obj_setmark(g, key);
   if (LJ_UNLIKELY(gct == ~LJ_TUDATA)) {
     GCtab *mt = tabref(gco2ud(o)->metatable);
-    gray2black(o);  /* Userdata are never gray. */
+    gray2black(o);  /* Clear birth GRAY (newwhite); mark set above. */
     if (mt) gc_markobj(g, mt);
     gc_markobj(g, tabref(gco2ud(o)->env));
     if (LJ_HASBUFFER && gco2ud(o)->udtype == UDTYPE_BUFFER) {
@@ -317,12 +347,38 @@ static void gc_mark(global_State *g, GCobj *o)
   } else if (LJ_UNLIKELY(gct == ~LJ_TUPVAL)) {
     GCupval *uv = gco2uv(o);
     gc_marktv(g, uvval(uv));
+    /* P3a (classic-aligned): closed UV → pure black (gray2black clears birth
+    ** GRAY so the free-window residual invariant holds for closed UVs); open
+    ** UV → mark set, GRAY kept (NOT gray2black'd). Open UV is the deliberate
+    ** mark∧GRAY residual exception: its value aliases a stack slot re-marked
+    ** by gc_atomic_rescan_threads, the UV header is re-closed by lj_gc_closeuv
+    ** (gray2black on close during prop/atomic), and dead open UVs are freed
+    ** by gc_atomic_sweep_openupvals / per-thread fullsweep (bitmap sweep skips
+    ** !closed). GCMARK barriers prefilter !isgray, so a mark∧GRAY open UV
+    ** correctly skips lj_gc_barrierf / barrierback — no path assumes open UV
+    ** is pure-black. */
     if (uv->closed)
-      gray2black(o);  /* Closed upvalues are never gray. */
-  } else if (gct != ~LJ_TSTR && gct != ~LJ_TCDATA) {
+      gray2black(o);
+  } else if (gct == ~LJ_TSTR || gct == ~LJ_TCDATA) {
+    /* Leaves: never pushed to a gray worklist. gray2black clears the birth
+    ** GRAY so the cell is pure black (mark set, GRAY clear) — same end state
+    ** as gc_mark_str. white2gray omitted (no-op on light-gray leaves). */
+    gray2black(o);
+#if LJ_HASFFI
+    /* Registry holds fin outside the mark graph (no FFI_FIN strong values).
+    ** Keep fin live for both live CDATA_FIN objects and mmudata re-mark. */
+    if (gct == ~LJ_TCDATA && (o->gch.marked & LJ_GC_CDATA_FIN)) {
+      int found = 0;
+      FinEntry *e = fin_tab_find(g, o, &found);
+      if (found && e != NULL && gcref(e->fin) != NULL)
+	gc_markobj(g, gcref(e->fin));
+    }
+#endif
+  } else {
     lj_assertG(gct == ~LJ_TFUNC || gct == ~LJ_TTAB ||
 	       gct == ~LJ_TTHREAD || gct == ~LJ_TPROTO || gct == ~LJ_TTRACE,
 	       "bad GC type %d", gct);
+    white2gray(o);
     lj_assertG(o->gch.marked & LJ_GC_GRAY,
       "gc_mark push without gray bit: gct=%d marked=0x%02x",
       o->gch.gct, o->gch.marked);
@@ -353,26 +409,29 @@ static void gc_mark_start(global_State *g)
 {
   gc_hugegray_reset(g);
   gc_graythread_reset(g);
-  gc_sweepthreads_reset(g);
   gc_weak_reset(g);
   g->gc.grayastop = 0;
+  /* Cycle restart: marks are cleared below, so residual header GRAY without
+  ** mark is harmless light-gray. Still drop SSB entries explicitly. */
   setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));
   {
     MSize i;
     for (i = 0; i < g->gc.arenastop; i++) {
       GCArena *a = mref(g->gc.arenas, GCArena *)[i];
-      a->flags &= (uint16_t)~ArenaFlag_InGrayHeap;  /* Heap drained above. */
+      a->flags &= (uint16_t)~ArenaFlag_InGrayHeap;
       if (mref(a->greybase, GCCellID1) != NULL)
 	arena_gray_reset(a);
     }
   }
   lj_arena_gc_markinit(g);
-  gc_markobj(g, mainthread(g));
+  /* mainthread is SFIXED: gc_mark early-returns at the non-arena/non-huge
+  ** assert branch. gc_traverse_mainthread below walks its stack frames. */
   gc_markobj(g, tabref(mainthread(g)->env));
   gc_markobj(g, vmthread(g));
   gc_marktv(g, &g->registrytv);
   gc_mark_gcroot(g);
   gc_traverse_mainthread(g);
+  g->gc.gccycle++;
   g->gc.state = GCSpropagate;
 }
 
@@ -390,91 +449,445 @@ static void gc_mark_mmudata(global_State *g)
   }
 }
 
-/* Per-udata predicate + mmudata ring splice, factored out so the arena
-** bitmap scan and the hugeset scan share the IDENTICAL logic that the old
-** mainthread->nextgc chain walk applied. Returns the sizeudata bytes counted
-** toward the finalize budget (matching the legacy return accounting). */
-static size_t sepudata_one(global_State *g, GCobj *o, int all)
+/* Link o onto the circular mmudata ring (tail insert). */
+static void fin_mmudata_link(global_State *g, GCobj *o)
 {
-  if (!(gc_obj_iswhite(g, o) || all) || isfinalized(gco2ud(o)))
-    return 0;  /* Nothing to do. */
-  if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
-    markfinalized(o);  /* No __gc metamethod: mark finalized, leave in place. */
-    return 0;
-  }
-  /* Has __gc: move to mmudata ring. markfinalized before splice so a
-  ** re-encounter during this same scan (ring members live in udata arenas)
-  ** is skipped by the isfinalized test above. */
-  size_t sz = sizeudata(gco2ud(o));
-  markfinalized(o);
-  if (gcref(g->gc.mmudata)) {  /* Link to end of circular mmudata list. */
+  if (gcref(g->gc.mmudata)) {
     GCobj *root = gcref(g->gc.mmudata);
     setgcrefr(o->gch.nextgc, root->gch.nextgc);
     setgcref(root->gch.nextgc, o);
     setgcref(g->gc.mmudata, o);
-  } else {  /* Create circular list. */
+  } else {
     setgcref(o->gch.nextgc, o);
     setgcref(g->gc.mmudata, o);
   }
-  return sz;
 }
 
-/* Separate userdata objects to be finalized to mmudata list.
-**
-** T4: enumerates udata by scanning the ArenaFlag_UdataOnly arenas' block
-** bitmaps (every allocated cell is a GCudata by class invariant) plus the
-** hugeset slots whose gct == ~LJ_TUDATA. This replaces the old
-** mainthread->nextgc chain walk, which is no longer maintained at alloc
-** time (T3). The predicate is identical to the legacy chain walk — only
-** the enumeration source changed.
-**
-** Preconditions (hold at the atomic() call site, before GCF_BITMAPSWEEP):
-**   - gc_obj_iswhite(arena obj) == !arena_obj_ismarked (mark is authoritative).
-**   - lj_arena_flushbins(a) is called per arena so binned free blocks read as
-**     Free (block=0,mark=1), not Allocated (1,0) — a free block's payload is
-**     a freelist cell ID, not a valid GCudata header. */
-size_t lj_gc_separateudata(global_State *g, int all)
+/* Udata: white (or all) + has __gc + !FINALIZED → mmudata. */
+static size_t sepudata_one(global_State *g, GCobj *o, int all)
 {
-  size_t m = 0;
+  if (!(gc_obj_iswhite(g, o) || all) || isfinalized(gco2ud(o)))
+    return 0;
+  if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
+    markfinalized(o);
+    lj_gc_fin_unregister(g, o);
+    return 0;
+  }
+  {
+    size_t sz = sizeudata(gco2ud(o));
+    markfinalized(o);
+    fin_mmudata_link(g, o);
+    return sz;
+  }
+}
+
+#if LJ_HASFFI
+/* Cdata: registry entry is authority (F3); CDATA_FIN kept in sync for JIT. */
+static size_t sepcdata_one(global_State *g, GCobj *o, int all)
+{
+  if (!(gc_obj_iswhite(g, o) || all) || (o->gch.marked & LJ_GC_FINALIZED))
+    return 0;
+  o->gch.marked |= LJ_GC_CDATA_FIN;
+  markfinalized(o);
+  fin_mmudata_link(g, o);
+  return 0;
+}
+#endif
+
+/* -- Finalizer registry (F2 authority; docs/arenagc-finalizer-registry.md) */
+
+#define FIN_TAB_INIT	16
+
+static LJ_AINLINE MSize fin_hash(GCobj *o, MSize mask)
+{
+  uintptr_t u = u64ptr(o);
+  u ^= u >> 4;
+  return (MSize)(u & (uintptr_t)mask);
+}
+
+#if defined(LUA_USE_ASSERT)
+static int fin_on_mmudata(global_State *g, GCobj *o)
+{
+  GCobj *root = gcref(g->gc.mmudata);
+  GCobj *u;
+  if (root == NULL) return 0;
+  u = root;
+  do {
+    u = gcnext(u);
+    if (u == o) return 1;
+  } while (u != root);
+  return 0;
+}
+#endif
+
+static void fin_tab_rehash(global_State *g, MSize newmask)
+{
+  FinEntry *old = mref(g->gc.fin_tab, FinEntry);
+  MSize oldmask = g->gc.fin_mask;
+  MSize nsz = (newmask + 1) * sizeof(FinEntry);
+  FinEntry *tab = (FinEntry *)g->allocf(g->allocd, NULL, 0, nsz);
   MSize i;
-  GCArena **arenas = mref(g->gc.arenas, GCArena *);
-  /* Scan udata arenas: every allocated cell is a GCudata (class invariant). */
+  if (LJ_UNLIKELY(tab == NULL))
+    lj_err_mem(mainthread(g));
+  memset(tab, 0, nsz);
+  g->gc.fin_tomb = 0;
+  if (old != NULL && oldmask != 0) {
+    for (i = 0; i <= oldmask; i++) {
+      if (old[i].kind == FIN_KIND_UDATA || old[i].kind == FIN_KIND_CDATA) {
+	GCobj *o = gcref(old[i].obj);
+	MSize h = fin_hash(o, newmask);
+	while (tab[h].kind != FIN_KIND_EMPTY)
+	  h = (h + 1) & newmask;
+	tab[h] = old[i];
+      }
+    }
+    g->allocf(g->allocd, old, (oldmask + 1) * sizeof(FinEntry), 0);
+  }
+  setmref(g->gc.fin_tab, tab);
+  g->gc.fin_mask = newmask;
+}
+
+static FinEntry *fin_tab_find(global_State *g, GCobj *o, int *found)
+{
+  FinEntry *tab = mref(g->gc.fin_tab, FinEntry);
+  MSize mask = g->gc.fin_mask;
+  MSize h, n;
+  *found = 0;
+  if (tab == NULL || mask == 0) return NULL;
+  h = fin_hash(o, mask);
+  for (n = 0; n <= mask; n++) {
+    uint8_t k = tab[h].kind;
+    if (k == FIN_KIND_EMPTY) return &tab[h];
+    if ((k == FIN_KIND_UDATA || k == FIN_KIND_CDATA) && gcref(tab[h].obj) == o) {
+      *found = 1;
+      return &tab[h];
+    }
+    h = (h + 1) & mask;
+  }
+  return NULL;
+}
+
+static FinEntry *fin_tab_insert_slot(global_State *g, GCobj *o)
+{
+  FinEntry *tab = mref(g->gc.fin_tab, FinEntry);
+  MSize mask = g->gc.fin_mask;
+  MSize h = fin_hash(o, mask);
+  MSize n;
+  FinEntry *tomb = NULL;
+  lj_assertG(tab != NULL && mask != 0, "fin_tab_insert_slot: empty table");
+  for (n = 0; n <= mask; n++) {
+    uint8_t k = tab[h].kind;
+    if (k == FIN_KIND_EMPTY)
+      return tomb ? tomb : &tab[h];
+    if (k == FIN_KIND_TOMB) {
+      if (tomb == NULL) tomb = &tab[h];
+    } else if (gcref(tab[h].obj) == o) {
+      return &tab[h];
+    }
+    h = (h + 1) & mask;
+  }
+  return tomb;
+}
+
+static void fin_order_grow(global_State *g)
+{
+  MSize osz = g->gc.fin_ordersz;
+  MSize nsz = osz ? osz * 2 : FIN_TAB_INIT;
+  GCRef *norder = (GCRef *)g->allocf(g->allocd, mref(g->gc.fin_order, GCRef),
+				     osz * sizeof(GCRef), nsz * sizeof(GCRef));
+  if (LJ_UNLIKELY(norder == NULL))
+    lj_err_mem(mainthread(g));
+  if (osz == 0)
+    memset(norder, 0, nsz * sizeof(GCRef));
+  setmref(g->gc.fin_order, norder);
+  g->gc.fin_ordersz = nsz;
+}
+
+static void fin_order_append(global_State *g, GCobj *o)
+{
+  GCRef *order;
+  if (g->gc.fin_num >= g->gc.fin_ordersz)
+    fin_order_grow(g);
+  order = mref(g->gc.fin_order, GCRef);
+  setgcref(order[g->gc.fin_num], o);
+}
+
+static void fin_order_remove(global_State *g, GCobj *o)
+{
+  GCRef *order = mref(g->gc.fin_order, GCRef);
+  MSize i, n = g->gc.fin_num;
+  if (order == NULL || n == 0) return;
+  for (i = 0; i < n; i++) {
+    if (gcref(order[i]) == o) {
+      if (i + 1 < n)
+	setgcrefr(order[i], order[n - 1]);
+      setgcrefnull(order[n - 1]);
+      return;
+    }
+  }
+}
+
+void lj_gc_fin_register(lua_State *L, GCobj *o, int kind, GCobj *fin, uint32_t it)
+{
+  global_State *g = G(L);
+  FinEntry *e;
+  int found;
+  lj_assertG(kind == FIN_KIND_UDATA || kind == FIN_KIND_CDATA,
+	     "fin_register bad kind %d", kind);
+  if (g->gc.fin_mask == 0 ||
+      (g->gc.fin_num + g->gc.fin_tomb) * 3 > (g->gc.fin_mask + 1) * 2)
+    fin_tab_rehash(g, g->gc.fin_mask ? (g->gc.fin_mask << 1) + 1 : FIN_TAB_INIT - 1);
+  e = fin_tab_find(g, o, &found);
+  if (!found) {
+    e = fin_tab_insert_slot(g, o);
+    lj_assertG(e != NULL, "fin_register: no free slot after rehash");
+    if (e->kind == FIN_KIND_TOMB)
+      g->gc.fin_tomb--;
+    fin_order_append(g, o);
+    g->gc.fin_num++;
+  }
+  setgcref(e->obj, o);
+  e->kind = (uint8_t)kind;
+  if (kind == FIN_KIND_CDATA && fin != NULL) {
+    setgcref(e->fin, fin);
+    e->fin_it = it;
+    lj_gc_objbarrier(L, o, fin);
+  } else {
+    setgcrefnull(e->fin);
+    e->fin_it = 0;
+  }
+}
+
+void lj_gc_fin_unregister(global_State *g, GCobj *o)
+{
+  int found;
+  FinEntry *e = fin_tab_find(g, o, &found);
+  if (!found || e == NULL) return;
+  setgcrefnull(e->obj);
+  setgcrefnull(e->fin);
+  e->kind = FIN_KIND_TOMB;
+  e->fin_it = 0;
+  fin_order_remove(g, o);
+  g->gc.fin_num--;
+  g->gc.fin_tomb++;
+  /* Do not free the table here: separateudata may unregister mid-scan. */
+}
+
+int lj_gc_fin_has(global_State *g, GCobj *o)
+{
+  int found;
+  fin_tab_find(g, o, &found);
+  return found;
+}
+
+void lj_gc_fin_update_udata(lua_State *L, GCudata *ud)
+{
+  /* Registration policy: LUAJIT_ENABLE_FIN_UDATA_COMPAT (lj_arch.h).
+  ** 0 (default): 5.2+ — register only if mt currently has __gc.
+  ** 1 (LJ_DS forces): 5.1 compat — register if mt ever had __gc (sticky
+  **    TF_HASGC bit) OR currently has __gc; late-bound mt.__gc works via
+  **    the atomic backfill walk (lj_gc_fin_backfill_udata).
+  ** sepudata_one always re-checks __gc at death (nil → drop, no call). */
+  global_State *g = G(L);
+  GCtab *mt = tabref(ud->metatable);
+  GCobj *o = obj2gco(ud);
+  if (mt == NULL) {
+    lj_gc_fin_unregister(g, o);
+    return;
+  }
+  {
+#if LUAJIT_ENABLE_FIN_UDATA_COMPAT
+    int has_gc = (mt->marked & LJ_GC_HASGC) ||
+		 lj_meta_fastg(g, mt, MM_gc) != NULL;
+#else
+    int has_gc = lj_meta_fastg(g, mt, MM_gc) != NULL;
+#endif
+    if (has_gc)
+      lj_gc_fin_register(L, o, FIN_KIND_UDATA, NULL, 0);
+    else
+      lj_gc_fin_unregister(g, o);
+  }
+}
+
+/* COMPAT backfill (LJ 3.0 Finalizers.zh.md §6.3(C)). Called once at atomic,
+** BEFORE lj_gc_separateudata, when a table gained __gc (TF_HASGC) since the
+** last atomic. Some udata may already carry that mt without being registered
+** (setmetatable happened before __gc was inserted). Walk ONLY UdataOnly
+** arenas + the huge set and register the missing udata. A dead-but-unswept
+** udata found here is registered then immediately judged dead by separate →
+** resurrected and finalized (the correct "same-cycle supplement" behavior).
+**
+** Routing invariant: udata live in UdataOnly arenas or in the huge set. If a
+** udata is found elsewhere it is a routing bug; the per-cell gct assert
+** inside the UdataOnly walk catches a mis-routed non-udata cell, and the
+** huge walk skips non-udata. We do NOT walk other TravObjs arenas here. */
+void lj_gc_fin_backfill_udata(global_State *g)
+{
+#if LUAJIT_ENABLE_FIN_UDATA_COMPAT
+  MSize i;
+  GCArena **arenas;
+  GCRef *slots;
+  MSize hmask;
+  if (!g->gc.fin_backfill) return;
+  g->gc.fin_backfill = 0;
+  arenas = mref(g->gc.arenas, GCArena *);
   for (i = 0; i < g->gc.arenastop; i++) {
     GCArena *a = arenas[i];
     uint32_t w, wtop;
     if (!(a->flags & ArenaFlag_UdataOnly)) continue;
-    lj_arena_flushbins(a);  /* Free blocks read as Free, not Allocated. */
+    lj_arena_flushbins(a);
     wtop = arena_blockidx((GCCellID)a->celltop - 1);
     for (w = UnusedBlockWords; w <= wtop; w++) {
-      GCBlockword heads = a->block[w];
-      while (heads) {
-	uint32_t bitidx = lj_ffs(heads);
+      GCBlockword alive = a->block[w];
+      while (alive) {
+	uint32_t bitidx = lj_ffs(alive);
 	GCCellID c = (w << 5) + bitidx;
-	GCobj *o = (GCobj *)arena_cellptr(a, c);
-	heads &= heads - 1;
-	lj_assertG(o->gch.gct == ~LJ_TUDATA,
-		   "non-udata in Udata arena: gct=%d cell=%d",
-		   (int)o->gch.gct, (int)c);
-	m += sepudata_one(g, o, all);
-      }
-    }
-  }
-  /* Scan hugeset for huge udata (huge objects have no arena class). */
-  {
-    GCRef *slots = mref(g->gc.hugeset, GCRef);
-    if (slots != NULL) {
-      MSize hi, hmask = g->gc.hugesetmask;
-      for (hi = 0; hi <= hmask; hi++) {
-	uintptr_t u = gcrefu(slots[hi]);
 	GCobj *o;
-	if (!hugeset_slot_live(u)) continue;
-	hugeset_slot_assert(g, u);
-	o = hugeset_slot_obj(u);
-	if (o->gch.gct != ~LJ_TUDATA) continue;
-	m += sepudata_one(g, o, all);
+	GCudata *ud;
+	GCtab *mt;
+	alive &= alive - 1;
+	o = (GCobj *)arena_cellptr(a, c);
+	/* Routing invariant: UdataOnly arena holds only userdata. A non-udata
+	 * gct here means a cell was mis-routed into the wrong arena class. */
+	lj_assertG(o->gch.gct == ~LJ_TUDATA,
+		   "fin backfill: non-udata in UdataOnly arena: gct=0x%02x",
+		   o->gch.gct);
+	if (arena_cellstate(a, c) < CellState_White) continue;
+	if (lj_gc_fin_has(g, o)) continue;
+	ud = gco2ud(o);
+	/* Skip finalized udata: its finalizer already ran (it was resurrected
+	 * by an earlier cycle's separate, makewhite by gc_finalize, and
+	 * survived the intervening sweep). Re-registering would create an
+	 * orphan entry that separate cannot process (sepudata_one skips
+	 * finalized objects); sweep frees it directly. */
+	if (isfinalized(ud)) continue;
+	mt = tabref(ud->metatable);
+	if (mt == NULL) continue;
+	if ((mt->marked & LJ_GC_HASGC) ||
+	    lj_meta_fastg(g, mt, MM_gc) != NULL)
+	  lj_gc_fin_register(mainthread(g), o, FIN_KIND_UDATA, NULL, 0);
       }
     }
   }
+  /* Huge udata: no cell bitmap; walk the address-keyed huge set. */
+  slots = mref(g->gc.hugeset, GCRef);
+  if (slots == NULL) return;
+  hmask = g->gc.hugesetmask;
+  for (i = 0; i <= hmask; i++) {
+    uintptr_t u = gcrefu(slots[i]);
+    GCobj *o;
+    GCudata *ud;
+    GCtab *mt;
+    if (!hugeset_slot_live(u)) continue;
+    o = hugeset_slot_obj(u);
+    if (o->gch.gct != ~LJ_TUDATA) continue;
+    if (lj_gc_fin_has(g, o)) continue;
+    ud = gco2ud(o);
+    if (isfinalized(ud)) continue;  /* see arena-loop comment */
+    mt = tabref(ud->metatable);
+    if (mt == NULL) continue;
+    if ((mt->marked & LJ_GC_HASGC) ||
+	lj_meta_fastg(g, mt, MM_gc) != NULL)
+      lj_gc_fin_register(mainthread(g), o, FIN_KIND_UDATA, NULL, 0);
+  }
+#else
+  UNUSED(g);
+#endif
+}
+
+void lj_gc_fin_free(global_State *g)
+{
+  if (g->gc.fin_mask != 0) {
+    g->allocf(g->allocd, mref(g->gc.fin_tab, FinEntry),
+	      (g->gc.fin_mask + 1) * sizeof(FinEntry), 0);
+    setmref(g->gc.fin_tab, NULL);
+    g->gc.fin_mask = 0;
+  }
+  if (g->gc.fin_ordersz != 0) {
+    g->allocf(g->allocd, mref(g->gc.fin_order, GCRef),
+	      g->gc.fin_ordersz * sizeof(GCRef), 0);
+    setmref(g->gc.fin_order, NULL);
+    g->gc.fin_ordersz = 0;
+  }
+  g->gc.fin_num = 0;
+  g->gc.fin_tomb = 0;
+}
+
+/* F3: registry is authoritative. Postcondition after separate:
+** - white udata with __gc / white cdata must be FINALIZED and on mmudata
+** - every registry CDATA entry keeps LJ_GC_CDATA_FIN (cache sync, not
+**   authority; O(1) presence cache for JIT/mark fast paths)
+** Reverse (bit without registry) is checked on free, not a full-heap scan. */
+void lj_gc_fin_dual_assert_udata(global_State *g)
+{
+#if defined(LUA_USE_ASSERT)
+  FinEntry *tab = mref(g->gc.fin_tab, FinEntry);
+  MSize i, mask = g->gc.fin_mask;
+  if (tab == NULL || mask == 0) return;
+  for (i = 0; i <= mask; i++) {
+    GCobj *o;
+    if (tab[i].kind != FIN_KIND_UDATA && tab[i].kind != FIN_KIND_CDATA)
+      continue;
+    o = gcref(tab[i].obj);
+    lj_assertG(o != NULL, "fin registry empty obj");
+    if (tab[i].kind == FIN_KIND_UDATA) {
+      cTValue *mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
+      if (gc_obj_iswhite(g, o) && mo != NULL)
+	lj_assertG(isfinalized(gco2ud(o)) && fin_on_mmudata(g, o),
+		   "fin F3: white __gc udata not on mmudata: ptr=%p", (void *)o);
+    }
+#if LJ_HASFFI
+    else {
+      /* Presence cache (registry ⇒ bit; cache sync, not authority).
+      ** Reverse direction (bit ⇒ registry) is checked on free. */
+      lj_assertG((o->gch.marked & LJ_GC_CDATA_FIN),
+		 "fin F3: cdata cache sync — registry entry missing CDATA_FIN bit: ptr=%p marked=0x%02x",
+		 (void *)o, o->gch.marked);
+      if (gc_obj_iswhite(g, o)) {
+	lj_assertG((o->gch.marked & LJ_GC_FINALIZED) && fin_on_mmudata(g, o),
+		   "fin F3: white registry cdata not on mmudata: ptr=%p", (void *)o);
+      }
+    }
+#endif
+  }
+#else
+  UNUSED(g);
+#endif
+}
+
+/* Separate finalizable objects onto mmudata.
+** Walk fin_order reverse (LIFO ≈ classic) via a snapshot so mid-scan
+** unregister (no __gc) cannot skip entries. all=1: include black objs. */
+size_t lj_gc_separateudata(global_State *g, int all)
+{
+  size_t m = 0;
+  MSize n = g->gc.fin_num, i;
+  GCRef *order = mref(g->gc.fin_order, GCRef);
+  GCRef *snap;
+  if (n == 0 || order == NULL) return 0;
+  snap = (GCRef *)g->allocf(g->allocd, NULL, 0, n * sizeof(GCRef));
+  if (LJ_UNLIKELY(snap == NULL))
+    lj_err_mem(mainthread(g));
+  memcpy(snap, order, n * sizeof(GCRef));
+  for (i = n; i > 0; ) {
+    GCobj *o = gcref(snap[--i]);
+    int found = 0;
+    FinEntry *e;
+    if (o == NULL) continue;
+    e = fin_tab_find(g, o, &found);
+    if (!found || e == NULL) continue;
+    if (e->kind == FIN_KIND_UDATA) {
+      lj_assertG(o->gch.gct == ~LJ_TUDATA, "fin reg udata kind mismatch");
+      m += sepudata_one(g, o, all);
+    }
+#if LJ_HASFFI
+    else if (e->kind == FIN_KIND_CDATA) {
+      lj_assertG(o->gch.gct == ~LJ_TCDATA, "fin reg cdata kind mismatch");
+      m += sepcdata_one(g, o, all);
+    }
+#endif
+  }
+  g->allocf(g->allocd, snap, n * sizeof(GCRef), 0);
   return m;
 }
 
@@ -497,15 +910,10 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
       else if (c == 'v') weak |= LJ_GC_WEAKVAL;
     }
     if (weak) {  /* Weak tables are cleared in the atomic phase. */
-#if LJ_HASFFI
-      if (gcref(g->gcroot[GCROOT_FFI_FIN]) == obj2gco(t)) {
-	weak = (int)(~0u & ~LJ_GC_WEAKVAL);
-      } else
-#endif
-      {
-	t->marked = (uint8_t)((t->marked & ~LJ_GC_WEAK) | weak);
-	gc_weak_push(g, obj2gco(t), weak);
-      }
+      /* No FFI_FIN special case here (classic lj_gc.c has one): Arena F3
+      ** keeps cdata finalizers in fin_registry, not a weak FFI_FIN table. */
+      t->marked = (uint8_t)((t->marked & ~LJ_GC_WEAK) | weak);
+      gc_weak_push(g, obj2gco(t), weak);
     }
   }
   if (weak == LJ_GC_WEAK)  /* Nothing to mark if both keys/values are weak. */
@@ -622,18 +1030,23 @@ static MSize gc_traverse_frames(global_State *g, lua_State *th)
   return (MSize)(top - bot);  /* Return minimum needed stack size. */
 }
 
-/* Traverse a thread object. */
+/* Traverse a thread object.
+** Mark only [stack+1+FR2, th->top) — same as classic lj_gc.c. Do NOT expand
+** mark range to frame framesize high-water: that reserves the whole frame for
+** shrinkstack sizing, but slots past th->top may hold stale pointers to
+** already-dropped locals (dead coroutines, closed-UV factories). Marking them
+** keeps one residual object alive per full GC (openuv g5/r3).
+** JIT/C paths that leave top low already call lj_gc_step_fixtop /
+** lj_gc_step_jit which set L->top = curr_topL(L) before stepping. */
 static void gc_traverse_thread(global_State *g, lua_State *th)
 {
   TValue *o, *top = th->top;
   for (o = tvref(th->stack)+1+LJ_FR2; o < top; o++)
     gc_marktv(g, o);
-  /* Under single-white, always clear above top — not just at atomic.
-  ** With gc_marktv accepting gray objects, stale stack slots from
-  ** previous frames would otherwise keep dead objects alive. */
-  {
-    TValue *stend = tvref(th->stack) + th->stacksize;
-    for (; o < stend; o++)
+  /* Clear unmarked slots only at atomic — same as classic lj_gc.c. */
+  if (g->gc.state == GCSatomic) {
+    top = tvref(th->stack) + th->stacksize;
+    for (; o < top; o++)
       setnilV(o);
   }
   gc_markobj(g, tabref(th->env));
@@ -654,17 +1067,24 @@ static size_t propagatemark(global_State *g
 {
   int gct = o->gch.gct;
   gcstat_inc(g, mark_calls);
+  /* Duplicate worklist entries are possible: barrierback may re-enqueue a
+  ** table already on a gray stack / SSB. First visit clears GRAY; later
+  ** visits are no-ops. */
+  if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
+    return 0;
   lj_assertG(isgray(o), "propagation of non-gray object");
-  lj_assertG(o->gch.marked & LJ_GC_GRAY,
-    "gray object missing gray bit: gct=%d marked=0x%02x ptr=%p state=%d",
-    o->gch.gct, o->gch.marked, (void*)o, g->gc.state);
   /* Header bit 0x04 is a free slot under bitmap GC (no writer remains),
   ** so there is nothing to assert here. */
   gray2black(o);
   if (LJ_LIKELY(gct == ~LJ_TTAB)) {
     GCtab *t = gco2tab(o);
-    if (gc_traverse_tab(g, t) > 0)
-      black2gray(o);  /* Keep weak tables gray. */
+    /* Keep gray only when header WEAK bits are set. Do not use the traverse
+    ** return value alone: FFI_FIN sets a synthetic non-zero weak without
+    ** LJ_GC_WEAK, which would leave non-weak mark∧GRAY residuals. */
+    gc_traverse_tab(g, t);
+    if (t->marked & LJ_GC_WEAK) {
+      black2gray(o);  /* Keep weak tables gray until clearweak. */
+    }
     return sizeof(GCtab) + sizeof(TValue) * t->asize +
 			   (t->hmask ? sizeof(Node) * (t->hmask + 1) : 0);
   } else if (LJ_LIKELY(gct == ~LJ_TFUNC)) {
@@ -678,8 +1098,27 @@ static size_t propagatemark(global_State *g
     return pt->sizept;
   } else if (LJ_LIKELY(gct == ~LJ_TTHREAD)) {
     lua_State *th = gco2th(o);
+    /* Permanent-gray THREAD (classic-aligned, mirrors weak-table keep-gray
+    ** above and classic lj_gc.c "threads are never black"). The shared
+    ** gray2black at entry cleared GRAY; restore it so the thread ends
+    ** mark∧GRAY for the whole cycle — stack slots cannot pay write
+    ** barriers, so a thread is never pure black. graythread is the
+    ** enumeration set for atomic stack rescan + openupval fullsweep,
+    ** NOT a "pure black after first visit" scheme.
+    **
+    ** Re-visit safety: gc_mark only fires when gc_obj_iswhite is true
+    ** (mark bitmap clear), so a marked thread is never re-enqueued to
+    ** arena gray/SSB by barriers (none exist for stacks). The early-out
+    ** `if (!(marked & GRAY)) return 0` above does NOT early-out for a
+    ** permanent-gray thread — if one somehow appears on a gray stack
+    ** twice, prop re-traverses it (idempotent) and graythread gains a
+    ** duplicate. Rescan (gc_atomic_rescan_threads) and fullsweep
+    ** (gc_atomic_sweep_openupvals) tolerate duplicates; the bound is
+    ** N_threads not N_visits. Push-once membership is not cheap on the
+    ** ptrstack, so duplicates are accepted rather than adding a
+    ** per-thread dedup structure. */
+    black2gray(o);
     gc_graythread_push(g, o);
-    black2gray(o);  /* Threads are never black. */
     gc_traverse_thread(g, th);
     return sizeof(lua_State) + sizeof(TValue) * th->stacksize;
   } else {
@@ -737,7 +1176,10 @@ static void grayheap_siftdown(global_State *g, MSize *heap, MSize n, MSize pos)
   heap[pos] = val;
 }
 
-/* Pop the arena with the largest gray stack from the heap. */
+/* Take the arena with the largest gray stack from the heap.
+** Removes it immediately so priorities stay consistent while the caller
+** drains the whole stack (GCSpropagate step = one arena). Same-arena
+** re-push during the drain re-inserts via lj_gc_grayarena_notify. */
 static GCArena *gc_grayarena_pop(global_State *g)
 {
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
@@ -745,33 +1187,43 @@ static GCArena *gc_grayarena_pop(global_State *g)
   while (g->gc.grayastop > 0) {
     MSize idx = heap[0];
     GCArena *a = arenas[idx];
-    if ((a->flags & ArenaFlag_TravObjs) && !arena_gray_empty(a)) {
-      gcstat_inc(g, grayarena_pops);
-      return a;
-    }
-    /* Stale entry — remove from heap and drop its membership flag. */
+    /* Always detach root from the heap (work or stale). */
     a->flags &= (uint16_t)~ArenaFlag_InGrayHeap;
     g->gc.grayastop--;
     if (g->gc.grayastop > 0) {
       heap[0] = heap[g->gc.grayastop];
       grayheap_siftdown(g, heap, g->gc.grayastop, 0);
     }
+    if ((a->flags & ArenaFlag_TravObjs) && !arena_gray_empty(a)) {
+      gcstat_inc(g, grayarena_pops);
+      return a;
+    }
+    /* Stale empty entry — try next root. */
   }
   return NULL;
 }
 
-/* Pop one gray object from an arena and propagate it. */
+/* Drain every gray cell currently on this arena's gray stack.
+** Same-arena children pushed during the drain are included (locality).
+** Cross-arena / huge work is left for later GCSpropagate steps.
+** One GCSpropagate step = one arena (not one object) so large heaps finish
+** mark before mutator allocation doubles the live set again. */
 static size_t gc_propagate_arena(global_State *g, GCArena *a)
 {
-  GCCellID1 cellid = arena_gray_pop(a);
-  GCobj *o = (GCobj *)arena_cellptr(a, cellid);
-  lj_assertG(isgray(o), "arena gray stack: non-gray object cellid=%u gct=%d marked=0x%02x",
-    (unsigned)cellid, o->gch.gct, o->gch.marked);
-  {
-    size_t c = propagatemark(g, o);
-    gcstat_add(g, mark_cost, c);
-    return c;
+  size_t m = 0;
+  while (!arena_gray_empty(a)) {
+    GCCellID1 cellid = arena_gray_pop(a);
+    GCobj *o = (GCobj *)arena_cellptr(a, cellid);
+    /* Non-gray: duplicate worklist entry or already processed. */
+    if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
+      continue;
+    {
+      size_t c = propagatemark(g, o);
+      gcstat_add(g, mark_cost, c);
+      m += c;
+    }
   }
+  return m;
 }
 
 /* -- Non-arena gray worklists (huge objects + threads) ------------------- */
@@ -831,8 +1283,6 @@ static LJ_AINLINE void gc_hugegray_reset(global_State *g)
   g->gc.hugegraytop = 0;
 }
 
-/* Thread gray worklist: coroutine threads greyed this cycle, re-scanned at
-** the atomic phase (replaces the former grayagain list). */
 static LJ_AINLINE void gc_graythread_push(global_State *g, GCobj *o)
 {
   gc_ptrstack_push(g, &g->gc.graythread, &g->gc.graythreadtop,
@@ -842,26 +1292,9 @@ static LJ_AINLINE int gc_graythread_empty(global_State *g)
 {
   return g->gc.graythreadtop == 0;
 }
-static LJ_AINLINE GCobj *gc_graythread_pop(global_State *g)
-{
-  return mref(g->gc.graythread, GCobj *)[--g->gc.graythreadtop];
-}
 static LJ_AINLINE void gc_graythread_reset(global_State *g)
 {
   g->gc.graythreadtop = 0;
-}
-
-/* Snapshot of live coroutine threads for the O(threads) sweep openupval walk
-** (replaces rebuild_threadscan's O(threads) thread scan — consumed in T2).
-** Captured in atomic() from graythread after the final propagation. */
-static LJ_AINLINE void gc_sweepthreads_push(global_State *g, GCobj *o)
-{
-  gc_ptrstack_push(g, &g->gc.sweepthreads, &g->gc.sweepthreadstop,
-		   &g->gc.sweepthreadssz, o);
-}
-static LJ_AINLINE void gc_sweepthreads_reset(global_State *g)
-{
-  g->gc.sweepthreadstop = 0;
 }
 
 /* Weak table worklists: split by mode for clearer atomic processing. */
@@ -930,30 +1363,38 @@ void lj_gc_graywork_free(global_State *g)
 		   &g->gc.hugegraysz);
   gc_ptrstack_free(g, &g->gc.graythread, &g->gc.graythreadtop,
 		   &g->gc.graythreadsz);
-  gc_ptrstack_free(g, &g->gc.sweepthreads, &g->gc.sweepthreadstop,
-		   &g->gc.sweepthreadssz);
   gc_ptrstack_free(g, &g->gc.weakkey, &g->gc.weakkeytop,
 		   &g->gc.weakkeysz);
   gc_ptrstack_free(g, &g->gc.weakval, &g->gc.weakvaltop,
 		   &g->gc.weakvalsz);
   gc_ptrstack_free(g, &g->gc.weakall, &g->gc.weakalltop,
 		   &g->gc.weakallsz);
+  lj_gc_fin_free(g);
 }
 
-/* Propagate all gray objects. */
+/* Propagate all gray objects.
+** SSB is part of the gray work: barrierback paints GRAY into SSB first, and
+** only ssb_flush moves them onto per-arena greystacks. A drain that ignores
+** SSB leaves mark∧GRAY parents off every worklist (free-window design break;
+** Debug: gc_assert_atomic_end). Fixed-point: flush SSB, drain huge+arenas,
+** repeat until SSB and all gray stacks are empty. */
 static size_t gc_propagate_gray(global_State *g)
 {
   size_t m = 0;
-  /* Drain huge gray objects (non-arena worklist). */
-  while (!gc_hugegray_empty(g)) {
-    size_t c = propagatemark(g, gc_hugegray_pop(g));
-    gcstat_add(g, mark_cost, c);
-    m += c;
-  }
-  /* Drain all arena gray stacks. */
-  {
+  for (;;) {
+    GCobj **ssb, **ssbtop;
     GCArena *a;
+    lj_gc_ssb_flush(g);
+    /* Drain huge gray objects (non-arena worklist). */
+    while (!gc_hugegray_empty(g)) {
+      size_t c = propagatemark(g, gc_hugegray_pop(g));
+      gcstat_add(g, mark_cost, c);
+      m += c;
+    }
+    /* Drain all arena gray stacks (one take = whole stack). */
     while ((a = gc_grayarena_pop(g)) != NULL) {
+      m += gc_propagate_arena(g, a);
+      /* Same-arena re-push during drain re-inserts; finish if still gray. */
       while (!arena_gray_empty(a))
 	m += gc_propagate_arena(g, a);
       /* Also drain any huge objects pushed during arena traversal. */
@@ -963,6 +1404,14 @@ static size_t gc_propagate_gray(global_State *g)
 	m += c;
       }
     }
+    /* Barriers during the drain may have refilled SSB; loop until quiet. */
+    ssb = mref(g->gc.ssb, GCobj *);
+    ssbtop = mref(g->gc.ssbtop, GCobj *);
+    if (ssb != NULL && ssbtop != NULL && ssbtop > ssb)
+      continue;
+    if (!gc_hugegray_empty(g) || g->gc.grayastop != 0)
+      continue;
+    break;
   }
   return m;
 }
@@ -993,23 +1442,34 @@ static const GCFreeFunc gc_freefunc[] = {
   (GCFreeFunc)lj_udata_free
 };
 
-/* Full sweep of a GC list. */
 #define gc_fullsweep(g, p)	gc_sweep(g, (p), ~(uint32_t)0)
 
-/* Partial sweep of a GC list. */
 static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 {
-  /* Mask with other white and LJ_GC_FIXED. Or LJ_GC_SFIXED on shutdown. */
   GCobj *o;
   while ((o = gcref(*p)) != NULL && lim-- > 0) {
-    if (o->gch.gct == ~LJ_TTHREAD)  /* Need to sweep open upvalues, too. */
+    if (o->gch.gct == ~LJ_TTHREAD)
       gc_fullsweep(g, &gco2th(o)->openupval);
-    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) && !lj_arena_ishuge(o) &&
+    if ((g->gc.state == GCSatomic || g->gc.state == GCSsweep) &&
+	!lj_arena_ishuge(o) &&
 	o != obj2gco(mainthread(g))) {
       if ((o->gch.marked & LJ_GC_FIXED) ||
 	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
-	/* Survivor: keep in the chain. Stale GRAY tolerated across cycles
-	** (Oracle-verified) — liveness is the MARK bit, not the header. */
+	/* P3a (classic-aligned): open UV and arena THREAD are the legit
+	** mark∧GRAY residuals. Open UV is left gray (value aliases a stack
+	** slot — see gc_mark UPVAL). THREAD is permanent-gray (stack slots
+	** cannot pay write barriers — see propagatemark THREAD branch).
+	** Closed UV and every other survivor must still be pure black. This
+	** walk only sees openupval chains via the gc.state==GCSatomic|
+	** GCSsweep mark-authority branch (gc_fullsweep on per-thread/
+	** mainthread openupval; the incremental gc_sweep path is shutdown-
+	** only). mainthread is excluded by the o != mainthread(g) guard
+	** above, so it never reaches this assert. */
+	if (!(o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed) &&
+	    !(o->gch.gct == ~LJ_TTHREAD))
+	  lj_assert_check(g, !(o->gch.marked & LJ_GC_GRAY),
+			   "survivor GRAY in sweep: gct=%d marked=0x%02x p=%p",
+			   o->gch.gct, o->gch.marked, (void *)o);
 	p = &o->gch.nextgc;
       } else {
 	setgcrefr(*p, o->gch.nextgc);
@@ -1017,74 +1477,16 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
       }
       continue;
     }
-    /* Shutdown sweep (GCF_BITMAPSWEEP clear): the only way to reach here under
-    ** LJ_HASGCMARK, since a normal cycle keeps the flag set. Free by the fixed
-    ** SFIXED-root identity -- equal to the legacy test with ow == LJ_GC_SFIXED
-    ** since ((marked ^ WHITES) & SFIXED) == (marked & SFIXED) -- so shutdown
-    ** reads no currentwhite and no longer depends on the atomic white flip. */
-    if (o->gch.marked & LJ_GC_SFIXED) {  /* Super-fixed root: keep. */
+    if (o->gch.marked & LJ_GC_SFIXED) {
       p = &o->gch.nextgc;
-    } else {  /* Everything else dies at shutdown. */
+    } else {
       setgcrefr(*p, o->gch.nextgc);
       gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
     }
-    continue;
   }
   return p;
 }
 
-/* Sweep one string interning table chain. Preserves hashalg bit. */
-#if !(LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR))
-static void gc_sweepstr(global_State *g, GCRef *chain)
-{
-  gcstat_inc(g, strings_chains_swept);
-  /* Mask with other white and LJ_GC_FIXED. Or LJ_GC_SFIXED on shutdown. */
-  uintptr_t u = gcrefu(*chain);
-  GCRef q;
-  GCRef *p = &q;
-  GCobj *o;
-  setgcrefp(q, (u & ~(uintptr_t)1));
-  while ((o = gcref(*p)) != NULL) {
-    if ((g->gc.gcmarkflags & GCF_BITMAPSWEEP) &&
-	o != obj2gco(&g->strempty)) {
-      int live = (o->gch.marked & LJ_GC_FIXED) ||
-		 (lj_arena_ishuge(o)
-		    ? huge_obj_ismarked(g, o)
-		    : arena_obj_ismarked(ptr2arena(o), ptr2cell(o)));
-      if (live) {
-	/* Live: the mark is authoritative for string color -- the cell bitmap
-	** for arena strings, the hugeset slot for huge strings. No header
-	** recolor needed; the mark is reset per cycle by gc_rebuild_rootchain
-	** (arena second pass mark[w] &= ~block[w] for cells, the ~LJ_TSTR slot
-	** clear for huge strings). */
-	gcstat_inc(g, strings_live_walked);
-	p = &o->gch.nextgc;
-      } else {
-	gcstat_inc(g, strings_dead_freed);
-	setgcrefr(*p, o->gch.nextgc);
-	lj_str_free(g, gco2str(o));
-      }
-      continue;
-    }
-    /* Shutdown sweep (GCF_BITMAPSWEEP clear): the only way to reach here under
-    ** LJ_HASGCMARK. Free by the fixed SFIXED identity -- equal to the legacy
-    ** test with ow == LJ_GC_SFIXED since ((marked ^ WHITES) & SFIXED) ==
-    ** (marked & SFIXED) -- so shutdown reads no currentwhite. No interned
-    ** string is SFIXED (strempty is excluded above), so every string is freed,
-    ** matching lj_gc_freeall's "free everything except super-fixed" contract. */
-    if (o->gch.marked & LJ_GC_SFIXED) {  /* Super-fixed: keep. */
-      p = &o->gch.nextgc;
-    } else {  /* Otherwise free it. */
-      setgcrefr(*p, o->gch.nextgc);
-      lj_str_free(g, gco2str(o));
-    }
-    continue;
-  }
-  setgcrefp(*chain, (gcrefu(q) | (u & 1)));
-}
-#endif
-
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
 /* Open-addressing string sweep: free every interned string. Called only from
 ** the shutdown/freeall path (P2 folds incremental string reclaim into the
 ** GCSsweep bitmap pass; the GCSsweepstring case is a defensive no-op under
@@ -1103,7 +1505,7 @@ static MSize gc_sweepstr_oa(global_State *g, MSize start, MSize count)
     /* Shutdown skip: keep only super-fixed roots (strempty + mainthread are
     ** SFIXED). FIXED-but-not-SFIXED strings (reserved words, fixed error
     ** messages) MUST be freed here so g->str.num is driven to 0 -- matching
-    ** the chain-path shutdown sweep (gc_sweepstr above) which keeps only
+    ** classic chain shutdown which keeps only
     ** SFIXED. Skipping on LJ_GC_FIXED instead leaves those strings alive and
     ** trips close_state's `leaked N strings` assert. strempty is FIXED|SFIXED
     ** so the explicit pointer check is redundant but kept defensively. */
@@ -1114,19 +1516,17 @@ static MSize gc_sweepstr_oa(global_State *g, MSize start, MSize count)
   }
   return i;
 }
-#endif
 
 /*
 ** Bitmap-driven sweep: scan arena mark bitmaps to locate dead objects.
 ** Replaces the linked-list gc_sweep for traversable arena objects.
-** String sweep (gc_sweepstr) is kept as-is since dead strings must be
-** unlinked from the hash-chain-based intern table.
+** Strings: openaddr NonTrav bitmap free + lj_strtab_remove (no chain sweep).
 */
 
 /* Sweep phase constants. */
 enum {
   SweepPhase_Bitmap,	/* Scanning arena bitmaps, freeing dead objects. */
-  SweepPhase_Rebuild,	/* Rebuilding the root chain from surviving objects. */
+  SweepPhase_Rebuild,	/* Post-sweep: CdataV/huge free, anchor root, clear marks. */
   SweepPhase_Done	/* Bitmap sweep complete. */
 };
 
@@ -1134,19 +1534,42 @@ enum {
 ** to completion (no chunking yet) and advances to the next; the GCSsweep
 ** driver re-enters the dispatcher until Rebuild_Done. */
 enum {
-  Rebuild_Prologue,	/* CdataV-arena scan + mmudata mark-clear. */
-  Rebuild_ThreadScan,	/* Pass-1: O(threads) sweep of live coroutine openupval chains (snapshot from atomic). */
-  Rebuild_HugeScan,	/* Huge-set scan: free dead, keep survivors (stale GRAY OK). */
-  Rebuild_Epilogue,	/* Terminate udata sub-chain + anchor root on mainthread. */
-  Rebuild_ClearMarks,	/* Pass-2: clear arena mark bits. */
-  Rebuild_Done		/* Rebuild complete. */
+  Rebuild_Prologue,	/* Arm HugeScan (CdataV dead free folded into bitmap
+			   sweep by P3b; no CdataV scan slice here). */
+  Rebuild_HugeScan,	/* Huge-set: free dead; survivor MARK cleared in ClearMarks. */
+  Rebuild_Epilogue,	/* Anchor root on mainthread. */
+  Rebuild_ClearMarks,	/* Clear arena/huge MARK only. */
+  Rebuild_Done
 };
+
+#include "lj_gc_markalloc_debug.h"
+
+/* D3: demote survivors at arena free completion. Clear mark bits on all
+** allocated cells (block=1): Black(1,1)→White(1,0). Called AFTER
+** swept_gen=epoch so survivors are is_curwhite (current ∧ !mark), not isdead.
+** Dead cells were already freed (block cleared by gc_freefunc); their marks
+** are untouched (Free/Extent encoding is stable). */
+static LJ_AINLINE void gc_arena_demote_survivors(GCArena *a)
+{
+  if ((GCCellID)a->celltop > MinCellId) {
+    uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    for (w = UnusedBlockWords; w <= wtop; w++)
+      a->mark[w] &= ~a->block[w];
+  }
+}
+
 
 /*
 ** Incremental bitmap sweep. Scans trav arenas for dead objects
 ** (block=1, mark=0) and frees them. Returns a cost estimate.
-** The root chain becomes stale during this phase — it is rebuilt
-** after all arenas have been scanned (SweepPhase_Rebuild).
+** The root chain (g->gc.root) is NOT rebuilt here: it stays anchored on
+** the (super-fixed) main thread. SweepPhase_Rebuild does CdataV/huge
+** dead-free, re-anchors the root on mainthread, and clears huge marks.
+**
+** Epoch model (D4): aend = sweep_aend (snapshot of arenastop at atomic end).
+** Current arenas (swept_gen == epoch) are skipped — they are nursery (born or
+** already swept this cycle); only other arenas have freeable dead objects.
+** Free is incremental (GCSWEEP_BITMAP_MAX / word / POD-arena budget).
 */
 static size_t gc_bitmap_sweep(global_State *g)
 {
@@ -1154,26 +1577,44 @@ static size_t gc_bitmap_sweep(global_State *g)
   MSize ai = g->gc.sweepa;
   uint32_t w = g->gc.sweepw;
   uint32_t freed = 0;
+  MSize aend = g->gc.sweep_aend;
 
-  while (ai < g->gc.arenastop && freed < GCSWEEPMAX) {
+  if (ai == 0 && w == UnusedBlockWords) {
+    MARKALLOC_PROGRESS_LOG(
+	      "[markalloc-progress] free enter aend=%u arenastop=%u "
+	      "total=%zu estimate=%zu strnum=%u hugenum=%u hugemem=%zu state=%u\n",
+	      (unsigned)aend,
+	      (unsigned)g->gc.arenastop, (size_t)g->gc.total,
+	      (size_t)g->gc.estimate, (unsigned)g->str.num,
+	      (unsigned)g->gc.hugenum, (size_t)g->gc.hugemem,
+	      (unsigned)g->gc.state);
+  }
+
+  while (ai < aend && freed < GCSWEEP_BITMAP_MAX) {
     GCArena *a = arenas[ai];
     uint32_t wtop;
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
+    /* Nursery: current arenas (swept_gen == epoch) have no dead objects —
+    ** all cells are is_curwhite (!mark ∧ current), not isdead. Skip. */
+    if (arena_is_current(g, a)) {
+      ai++;
+      w = UnusedBlockWords;
+      continue;
+    }
     /* P2: NonTrav string-arena reclaim, reached BEFORE the TravObjs skip below.
-    ** Under the flag, ArenaClass_NonTrav arenas are de-facto strings-only
+    ** ArenaClass_NonTrav arenas are de-facto strings-only
     ** (verified by gc_arena_verify); they lack ArenaFlag_TravObjs and would
     ** otherwise be skipped at the `!(TravObjs)` continue, leaking every dead
     ** arena string. Word-parallel scan: dead = block & ~mark. For each dead
     ** ~LJ_TSTR cell (not FIXED, not strempty): lj_strtab_remove STRICTLY before
     ** lj_str_free (the freed cell head may be overwritten by freelist metadata
-    ** or unmapped). Probe count is billed against GCSWEEPMAX so a large die-off
+    ** or unmapped). Probe count is billed against GCSWEEP_BITMAP_MAX so a large die-off
     ** cannot blow the incremental step. Survivors (mark=1) are untouched here;
     ** their marks clear in rebuild_clearmarks. */
     if (!(a->flags & (ArenaFlag_TravObjs | ArenaFlag_PODOnly |
 		      ArenaFlag_UdataOnly | ArenaFlag_CdataVOnly))) {
       lj_arena_flushbins(a);
       wtop = arena_blockidx((GCCellID)a->celltop - 1);
-      while (w <= wtop && freed < GCSWEEPMAX) {
+      while (w <= wtop && freed < GCSWEEP_BITMAP_MAX) {
 	GCBlockword dead = a->block[w] & ~a->mark[w];
 	while (dead) {
 	  uint32_t bitidx = lj_ffs(dead);
@@ -1197,6 +1638,56 @@ static size_t gc_bitmap_sweep(global_State *g)
 	w++;
       }
       if (w > wtop) {
+	a->swept_gen = g->gc.epoch;
+	gc_arena_demote_survivors(a);
+	ai++;
+	w = UnusedBlockWords;
+      }
+      continue;
+    }
+#if LJ_HASFFI
+    /* P3b: CdataV-arena dead free folded into the main bitmap sweep (was a
+    ** separate resumable scan in Rebuild_Prologue). ArenaFlag_CdataVOnly
+    ** arenas lack ArenaFlag_TravObjs and would otherwise be skipped at the
+    ** `!(TravObjs)` continue below, leaking every dead VLA cdata. Word-parallel
+    ** scan: dead = block & ~mark (liveness authority is the BASE cell's mark).
+    ** For each dead base cell p: cd = p + GCcdataVar.offset (base->cd
+    ** translation); cdatav_cell_assert validates it; gc_freefunc[cd->gct-...]
+    ** frees via pure lj_cdata_free (F2). Bounded by GCSWEEP_BITMAP_MAX cells
+    ** per slice. Survivor (mark=1) cells keep MARK until rebuild_clearmarks;
+    ** pending-finalizer cdata stay marked via mmudata from atomic.
+    **
+    ** Nursery aend note: the old rebuild_prologue_cdatav scanned ALL arenas
+    ** (arenastop); folding into the epoch-model sweep (current arenas skipped
+    ** per-arena via arena_is_current) matches the TravObjs nursery isolation --
+    ** dead nursery CdataV free next cycle when other. Consistent with the rest
+    ** of gc_bitmap_sweep. */
+    if (a->flags & ArenaFlag_CdataVOnly) {
+      lj_arena_flushbins(a);
+      wtop = arena_blockidx((GCCellID)a->celltop - 1);
+      while (w <= wtop && freed < GCSWEEP_BITMAP_MAX) {
+	GCBlockword dead = a->block[w] & ~a->mark[w];
+	while (dead) {
+	  uint32_t bitidx = lj_ffs(dead);
+	  GCCellID c = (w << 5) + bitidx;
+	  char *p = (char *)arena_cellptr(a, c);
+	  GCcdata *cd;
+	  dead &= dead - 1;
+	  /* Defensive: re-check the base cell state before the offset
+	  ** translation + header load, mirroring the TravObjs ASAN-freelist
+	  ** race guard (same pattern as TravObjs sweep). */
+	  if (arena_cellstate(a, c) < CellState_White)
+	    continue;
+	  cdatav_cell_assert(g, p);
+	  cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
+	  gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
+	  freed++;
+	}
+	w++;
+      }
+      if (w > wtop) {
+	a->swept_gen = g->gc.epoch;
+	gc_arena_demote_survivors(a);
 	ai++;
 	w = UnusedBlockWords;
       }
@@ -1204,6 +1695,9 @@ static size_t gc_bitmap_sweep(global_State *g)
     }
 #endif
     if (!(a->flags & ArenaFlag_TravObjs)) {
+      /* No objects to free (or FFI-off CdataV). Stamp current + demote for I1. */
+      a->swept_gen = g->gc.epoch;
+      gc_arena_demote_survivors(a);
       ai++;
       w = UnusedBlockWords;
       continue;
@@ -1212,17 +1706,19 @@ static size_t gc_bitmap_sweep(global_State *g)
     ** metadata pass frees all dead objects and recolors survivors white,
     ** touching no object data. Whole-arena atomic (the transform + scavenge
     ** must pair without an intervening allocation), so it ignores the per-word
-    ** cursor and bills its cost as a fixed chunk of the GCSWEEPMAX budget.
+    ** cursor and bills its cost as a fixed chunk of the GCSWEEP_BITMAP_MAX budget.
     ** Cell-space accounting: freed cells * CellSize, derived from the bitmap
     ** by lj_arena_podsweep, matches the cell-space alloc accounting. */
     if (a->flags & ArenaFlag_PODOnly) {
+      /* D3: FIRST swept_gen=epoch, THEN podsweep demotes (mark'=b^m). */
+      a->swept_gen = g->gc.epoch;
       GCCellID fcells = lj_arena_podsweep(g, a);
       g->gc.total -= (GCSize)fcells << CellSizeLog2;
 #if defined(LUAJIT_ENABLE_MEMPROF)
       if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
 	lj_memprof_emit_podfree(g, (uint32_t)fcells, (size_t)fcells << CellSizeLog2);
 #endif
-      freed += GCSWEEPMAX/2;  /* Bill ~half a step's worth per POD arena. */
+      freed += GCSWEEP_BITMAP_MAX/2;
       ai++;
       w = UnusedBlockWords;
       continue;
@@ -1235,7 +1731,7 @@ static size_t gc_bitmap_sweep(global_State *g)
     ** sweep itself pushes to bins. */
     lj_arena_flushbins(a);
     wtop = arena_blockidx((GCCellID)a->celltop - 1);
-    while (w <= wtop && freed < GCSWEEPMAX) {
+    while (w <= wtop && freed < GCSWEEP_BITMAP_MAX) {
       GCBlockword dead = a->block[w] & ~a->mark[w];
       while (dead) {
 	uint32_t bitidx = lj_ffs(dead);
@@ -1258,21 +1754,16 @@ static size_t gc_bitmap_sweep(global_State *g)
 	** freed by lj_state_free (dead thread) or gc_fullsweep in rebuild. */
 	if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
 	  continue;
-	/* Strings are swept by gc_sweepstr (hash table phase); skip them. */
+	/* Strings reclaimed on NonTrav OPENADDR path above; skip here. */
 	if (o->gch.gct == ~LJ_TSTR)
 	  continue;
-	/* Dead finalized cdata are not freed here: lj_cdata_free detects the
-	** LJ_GC_CDATA_FIN flag and links them onto the mmudata ring (resurrecting
-	** the mark + clearing the gray header + marking finalized) instead of
-	** releasing the cell. The cell stays allocated (block=1, mark=1) -- live
-	** to GC -- until rebuild_clearmarks / next markinit, then gc_finalize
-	** runs the __gc callback and re-roots the object. Keeping mark=1 through
-	** the rebuild window prevents a HugeScan restart from re-linking the
-	** same cdata onto mmudata (T1). */
+	/* F2: pending-finalizer cdata are re-marked via mmudata at atomic, so
+	** they do not appear as dead here. lj_cdata_free is pure free. */
 	/* The bitmap (block=1, mark=0) is the sole dead test under HASGCMARK;
-	** the header white bit is vestigial. During GCF_BITMAPSWEEP
-	** gc_obj_isdead returns exactly !arena_obj_ismarked, so this assert is
-	** the mark-based dead invariant, independent of any header color. */
+	** the header white bit is vestigial. Phase-independent isdead
+	** (!mark ∧ other) holds inside the free window (the arena is "other"
+	** until swept_gen=epoch at this arena's free completion), so this
+	** assert is the mark-based dead invariant, independent of header color. */
 	lj_assertG(gc_obj_isdead(g, o) || (o->gch.marked & LJ_GC_FIXED),
 		   "bitmap sweep freeing non-dead object: o=%p gct=%d marked=0x%02x",
 		   (void*)o, o->gch.gct, o->gch.marked);
@@ -1292,6 +1783,8 @@ static size_t gc_bitmap_sweep(global_State *g)
       w++;
     }
     if (w > wtop) {
+      a->swept_gen = g->gc.epoch;
+      gc_arena_demote_survivors(a);
       ai++;
       w = UnusedBlockWords;
     }
@@ -1300,29 +1793,39 @@ static size_t gc_bitmap_sweep(global_State *g)
   g->gc.sweepa = ai;
   g->gc.sweepw = (uint16_t)w;
   gcstat_add(g, sweep_cells, freed);
-  if (ai >= g->gc.arenastop) {
-    /* Last bitmap free is done. Transition to the rebuild phase. T4 removed
-    ** the GCF_DEADAUTH drop that used to live here: DEADAUTH no longer exists,
-    ** and T3 made marks authoritative through the rebuild window (no mid-yield
-    ** teardown), so there is no half-cleared mark for mutator barriers to
-    ** observe. Link-suppression (GCF_BITMAPSWEEP) stays set until Done. */
+  MARKALLOC_PROGRESS_LOG(
+	    "[markalloc-progress] free step ai=%u/%u w=%u freed=%u\n",
+	    (unsigned)ai, (unsigned)aend, (unsigned)w, (unsigned)freed);
+  if (ai >= aend) {
+    /* All other arenas swept (current arenas were skipped per-arena). */
+    MARKALLOC_PROGRESS_LOG(
+	      "[markalloc-progress] free done → Rebuild aend=%u total=%zu "
+	      "strnum=%u hugenum=%u hugemem=%zu\n",
+	      (unsigned)aend, (size_t)g->gc.total, (unsigned)g->str.num,
+	      (unsigned)g->gc.hugenum, (size_t)g->gc.hugemem);
     g->gc.sweepphase = SweepPhase_Rebuild;
     g->gc.rebuildphase = Rebuild_Prologue;
-    /* Arm the CdataV-arena scan cursor (sweepa, sweepw) for the prologue's
-    ** first slice; rebuild_mmu_started == 0 gates the CdataV scan. (T2: the
-    ** mmudata ring mark-clear walk was removed -- vestigial, and clearing
-    ** mmudata marks would undo T1's finalized-cdata MARK set.) */
+    /* P3b: CdataV-arena dead free is now folded into the bitmap sweep above
+    ** (ArenaFlag_CdataVOnly branch), no longer a resumable scan in
+    ** Rebuild_Prologue. The (sweepa, sweepw) cursor is armed for HugeScan's
+    ** first slice instead. rebuild_mmu_started is set to 1 for vestigial
+    ** readers: the field name predates T2 (it once gated the mmudata ring
+    ** mark-clear walk), then was repurposed as the CdataV-scan-in-progress
+    ** (0) vs done (1) marker within Rebuild_Prologue; with CdataV free moved
+    ** into the bitmap sweep there is no in-progress state to gate, so it is
+    ** unconditionally "done" (1). The T1 finalized-cdata MARK is preserved
+    ** (no mmudata mark-clear walk runs). */
     g->gc.sweepa = 0;
     g->gc.sweepw = UnusedBlockWords;
-    g->gc.rebuild_mmu_started = 0;
+    g->gc.rebuild_mmu_started = 1;
   }
   return freed;
 }
 
-/*
-** Post-sweep pass: sweep each thread's open upvalue list, free dead huge
-** objects, and clear arena mark bits. Survivor header GRAY is left stale
-** (Oracle-verified: liveness is the MARK bit/slot, not the header).
+	/*
+	** Post-sweep pass: sweep each thread's open upvalue list, free dead huge
+	 ** objects, and clear arena mark bits. Header GRAY is already zero at free
+	 ** entry (atomic blacken + empty worklists); ClearMarks clears MARK only.
 **
 ** The root chain (g->gc.root) is NOT rebuilt: all former consumers now
 ** enumerate arena objects via the block bitmaps directly. The root reference
@@ -1331,77 +1834,21 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** The work is split into ordered sub-phases (RebuildPhase) driven by
 ** g->gc.rebuildphase. gc_rebuild_rootchain is a dispatcher that runs one
 ** sub-phase per call and the GCSsweep driver re-enters it once per onestep.
- ** Prologue (T4), ThreadScan (T5), and HugeScan (T6) are chunked: they yield
- ** mid-phase via their persisted cursors (the CdataV-arena scan and the
- ** arena/huge scans use the (sweepa, sweepw) / rebuild_hugehi cursors; the
- ** mmudata ring uses a snapshot-root + persisted cursor). Epilogue (T7) is
- ** O(1) and ClearMarks (T8) is one-shot — neither yields; they run to Done
- ** in the dispatcher's internal loop in the same onestep.
+** P3b folded the CdataV-arena dead free into gc_bitmap_sweep, so Prologue is
+** now one-shot (just arms HugeScan); only HugeScan is chunked and yields
+** mid-phase via its persisted cursor (rebuild_hugehi; (sweepa, sweepw) is
+** armed for the huge dead-free scan). Epilogue and ClearMarks are one-shot —
+** neither yields; they run to Done in the dispatcher's internal loop in the
+** same onestep.
 */
 
-/* Resumable CdataV-arena bitmap scan slice. Replaces the legacy VLA-cdata
-** chain walk. Scans ArenaFlag_CdataVOnly arenas via the (sweepa, sweepw)
-** cursor (same shape as gc_bitmap_sweep), and for each allocated cell base p
-** computes cd = p + GCcdataVar.offset (base->cd translation), then frees
-** dead (block=1, mark=0) via gc_freefunc; survivors keep stale GRAY
-** (block=1, mark=1). Mark authority is on the BASE cell (ptr2arena(p),
-** ptr2cell(p)), matching MARKALLOC and gc_obj_key; header reads (gct) use
-** cd, which carries the valid GCcdata header.
-** Bounded by GCSWEEPMAX cells per slice, then yields. Returns nonzero while
-** the scan is still in progress. */
-/* Survivor liveness is the MARK bit on the base cell; stale GRAY is tolerated
-** across cycles (Oracle-verified). The per-survivor makewhite that used to
-** clear the header GRAY frontier bit is dropped — same class as eb71f9d3. */
-#if LJ_HASFFI
-static int rebuild_prologue_cdatav(global_State *g)
-{
-  GCArena **arenas = mref(g->gc.arenas, GCArena *);
-  MSize ai = g->gc.sweepa;
-  uint32_t w = g->gc.sweepw;
-  uint32_t freed = 0;
-  lj_assertG(g->gc.state == GCSsweep, "CdataV scan outside GCSsweep");
-  while (ai < g->gc.arenastop && freed < GCSWEEPMAX) {
-    GCArena *a = arenas[ai];
-    uint32_t wtop;
-    if (!(a->flags & ArenaFlag_CdataVOnly)) {
-      ai++;
-      w = UnusedBlockWords;
-      continue;
-    }
-    lj_arena_flushbins(a);
-    wtop = arena_blockidx((GCCellID)a->celltop - 1);
-    while (w <= wtop && freed < GCSWEEPMAX) {
-      GCBlockword alloc = a->block[w];
-      while (alloc) {
-	uint32_t bitidx = lj_ffs(alloc);
-	GCCellID c = (w << 5) + bitidx;
-	char *p = (char *)arena_cellptr(a, c);
-	GCcdata *cd;
-	alloc &= alloc - 1;
-	cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
-	cdatav_cell_assert(g, p);
-	if (!arena_obj_ismarked(a, c)) {
-	  gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
-	  freed++;
-	}
-	/* Survivor: keep stale GRAY — liveness is the MARK bit, not the header. */
-      }
-      w++;
-    }
-    if (w > wtop) {
-      ai++;
-      w = UnusedBlockWords;
-    }
-  }
-  g->gc.sweepa = ai;
-  g->gc.sweepw = (uint16_t)w;
-  return ai < g->gc.arenastop;
-}
-#endif
-
-/* Prologue: sweep dead VLA cdata from CdataV arenas, then arm ThreadScan.
+/* Prologue: arm HugeScan. P3b folded the CdataV-arena dead free into the
+** main bitmap sweep (gc_bitmap_sweep's ArenaFlag_CdataVOnly branch), so
+** Rebuild_Prologue no longer runs a CdataV scan slice -- it just resets the
+** (sweepa, sweepw) cursor for HugeScan and advances the rebuild phase.
+**
 ** The former mmudata ring mark-clear walk (rebuild_prologue_mmu) was vestigial
-** post the ThreadScan rewrite (the arena survivor scan it protected was
+** post the survivor-scan removal (the arena survivor scan it protected was
 ** deleted): no remaining rebuild phase re-links mmudata members, and
 ** gc_mark_mmudata re-marks + gc_finalize whitens at the next atomic. Keeping
 ** mmudata members' marks SET through rebuild is also required by T1, which
@@ -1411,47 +1858,9 @@ static int rebuild_prologue_cdatav(global_State *g)
 static void rebuild_prologue(global_State *g)
 {
   lj_assertG(g->gc.state == GCSsweep, "rebuild prologue outside GCSsweep");
-  if (!g->gc.rebuild_mmu_started) {
-    /* CdataV-arena dead sweep runs first (rebuild_mmu_started is the
-    ** cross-slice phase marker: 0 = CdataV scan in progress). */
-#if LJ_HASFFI
-    if (rebuild_prologue_cdatav(g))
-      return;  /* CdataV scan not finished: yield. */
-#endif
-    g->gc.rebuild_mmu_started = 1;  /* CdataV done; no mmudata walk (T2). */
-  }
-
-  /* Prologue done. Arm the ThreadScan cursor. */
-  g->gc.sweepa = 0;
-  g->gc.sweepw = UnusedBlockWords;
-  g->gc.rebuildphase = Rebuild_ThreadScan;
-}
-
-/* Pass-1 thread openupval sweep, one-shot O(threads). The live coroutine
-** set was snapshotted at atomic (g->gc.sweepthreads, captured from the
-** graythread stack after the final gc_propagate_gray). Each entry's open-
-** upval chain is full-swept here to free dead open upvalues. This replaces
-** the former O(live) arena survivor scan which walked every live object
-** (~92% of sweep time at 16M objects) only to locate the few live threads.
-** mainthread is excluded from the snapshot (swept by rebuild_epilogue).
-** Snapshot entries are guaranteed still arena-marked here: atomic-live
-** => survives this cycle (bitmap_sweep frees only mark=0), so no entry is
-** freed during the sweep window. */
-static void rebuild_threadscan(global_State *g)
-{
-  GCobj **thr = mref(g->gc.sweepthreads, GCobj *);
-  MSize i, n = g->gc.sweepthreadstop;
-  lj_assertG(g->gc.state == GCSsweep, "thread scan outside GCSsweep");
-  for (i = 0; i < n; i++) {
-    GCobj *o = thr[i];
-    lj_assertG(o->gch.gct == ~LJ_TTHREAD, "sweepthreads non-thread");
-    lj_assertG(o != obj2gco(mainthread(g)), "mainthread in sweepthreads");
-    lj_assertG(arena_obj_ismarked(ptr2arena(o), ptr2cell(o)) ||
-	       lj_arena_ishuge(o), "sweepthreads entry not live at rebuild");
-    gc_fullsweep(g, &gco2th(o)->openupval);
-  }
-  /* Arm the HugeScan cursor: snapshot the hugeset generation so a rehash
-  ** between slices is detected (rebuild_hugegen != hugesetgen -> restart). */
+  /* rebuild_mmu_started is left at 1 (set by gc_bitmap_sweep on transition);
+  ** it no longer gates a CdataV scan here -- vestigial field name, see the
+  ** transition comment in gc_bitmap_sweep. */
   g->gc.sweepa = 0;
   g->gc.sweepw = UnusedBlockWords;
   g->gc.rebuild_hugehi = 0;
@@ -1461,7 +1870,7 @@ static void rebuild_threadscan(global_State *g)
 
 static void rebuild_hugescan(global_State *g)
 {
-  /* Resumable huge-set scan. Bounded by GCSWEEPMAX slots per slice, then
+  /* Resumable huge-set scan. Bounded by GCSWEEP_BITMAP_MAX slots per slice, then
   ** yields to the dispatcher. Cursor (rebuild_hugehi) persists across slices;
   ** generation snapshot (rebuild_hugegen) detects rehashes — if the hugeset
   ** was rehashed between slices, slot positions changed and the cursor
@@ -1481,12 +1890,12 @@ static void rebuild_hugescan(global_State *g)
   ** of which clear all live huge slot marks. This preserves the post-fullgc
   ** mark0 invariant checked by gc_arena_verify.
   **
-  ** Huge STRINGS are not freed here (owned by gc_sweepstr); they keep MARK
+  ** Huge STRINGS freed in OPENADDR branch above; survivors keep MARK
   ** set through the yield (cleared by rebuild_clearmarks/markinit). Upvalues
   ** are never huge. */
   GCRef *slots;
   MSize hmask;
-  MSize budget = GCSWEEPMAX;
+  MSize budget = GCSWEEP_BITMAP_MAX;
 
   if (g->gc.rebuild_hugegen != g->gc.hugesetgen) {
     g->gc.rebuild_hugehi = 0;
@@ -1495,6 +1904,7 @@ static void rebuild_hugescan(global_State *g)
   slots = mref(g->gc.hugeset, GCRef);
   hmask = g->gc.hugesetmask;
   if (slots == NULL) {
+    g->gc.huge_swept_gen = g->gc.epoch;  /* Empty huge set: trivially current. */
     g->gc.rebuildphase = Rebuild_Epilogue;
     return;
   }
@@ -1508,57 +1918,39 @@ static void rebuild_hugescan(global_State *g)
     { /* o = GCobj (cd for CDATAV slots); mark authority is the slot itself. */
       o = hugeset_slot_obj(u);
       if (o->gch.gct == ~LJ_TSTR) {
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
-	/* P2: huge strings reclaimed here, symmetric to the arena bitmap sweep.
-	** strtab_remove BEFORE lj_str_free (huge unmap invalidates the cell).
-	** lj_str_free -> lj_hugeblock_free tombstones this hugeset slot, so a
-	** restart skips it via !hugeset_slot_live. Survivors (MARK set) keep
-	** their slot MARK through the yield (cleared by rebuild_clearmarks).
-	** strtab_remove touches the intern table, not hugeset slot order, so
-	** the hugesetgen/restart machinery is unaffected. */
+	/* Huge strings: openaddr reclaim here (symmetric to arena NonTrav). */
 	if (!(u & HUGESET_MARK)) {
 	  lj_strtab_remove(g, gco2str(o));
 	  gcstat_inc(g, strings_dead_freed);
 	  lj_str_free(g, gco2str(o));
 	}
-#endif
-	continue;  /* Huge strings: not freed by the generic gc_freefunc path. */
+	continue;  /* not generic gc_freefunc */
       }
       lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
       if (!(u & HUGESET_MARK)) {
-	/* Dead: gc_freefunc -> lj_hugeblock_free tombstones this slot.
-	** A restart skips it by !hugeset_slot_live (TOMB). */
-	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
-      } else {
-	/* Survivor: keep MARK SET through the yield (T3). A restart sees
-	** MARK set and skips the dead-free branch (no re-free, no re-link).
-	** MARK clearing is deferred to rebuild_clearmarks + next markinit.
-	** Thread openupval fullsweep is idempotent across restarts. */
-	if (o->gch.gct == ~LJ_TTHREAD)
-	  gc_fullsweep(g, &gco2th(o)->openupval);
-      }
+		gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+	      } else {
+		lj_assertG(o->gch.gct != ~LJ_TTHREAD, "unexpected huge thread");
+	      }
     }
   }
   if (g->gc.rebuild_hugehi > hmask) {
     /* Main walk done. Survivor slot MARKs persist past this point and are
     ** cleared by rebuild_clearmarks (one-shot, non-yielding, runs next in
-    ** the dispatcher) and the next cycle's lj_arena_gc_markinit. */
+    ** the dispatcher) and the next cycle's lj_arena_gc_markinit.
+    ** Phase 1 dual-track: the huge set is now fully scanned, so every live
+    ** huge object is "current" for the new isdead formula. Mirror the per-
+    ** arena swept_gen write with the global huge_swept_gen (per-slot
+    ** isomorphic encoding deferred to Phase 3, D5). */
+    g->gc.huge_swept_gen = g->gc.epoch;
     g->gc.rebuildphase = Rebuild_Epilogue;
   }
 }
 
 static void rebuild_epilogue(global_State *g)
 {
-  /* Anchor the root reference on mainthread. No other objects are chained.
-  ** O(1): a single bounded slice — no cursor needed. The dispatcher yields
-  ** after this slice (T7) so the mutator runs before ClearMarks.
-  ** mainthread's header GRAY is left stale — survivor liveness is the
-  ** MARK bit/slot, not the header; stale GRAY is tolerated across cycles
-  ** (Oracle-verified). */
-  gc_fullsweep(g, &mainthread(g)->openupval);
   setgcref(g->gc.root, obj2gco(mainthread(g)));
   gc_assert_root_anchor_only(g);
-
   g->gc.rebuildphase = Rebuild_ClearMarks;
 }
 
@@ -1567,45 +1959,32 @@ static void rebuild_clearmarks(global_State *g)
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
   MSize i;
   GCSize total_before;
-  /* Monotonicity (G11): ClearMarks is reached only after ThreadScan+HugeScan+
-  ** Epilogue. Rebuild_ClearMarks is set exclusively by rebuild_epilogue, so the
-  ** dispatcher arriving here proves the ordered predecessors already completed. */
   lj_assertG(g->gc.rebuildphase == Rebuild_ClearMarks,
 	     "ClearMarks entered with rebuildphase=%d (expected Rebuild_ClearMarks)",
 	     g->gc.rebuildphase);
   lj_assertG(g->gc.state == GCSsweep, "ClearMarks outside GCSsweep");
-  /* T4 removed GCF_DEADAUTH entirely. Marks were authoritative right up to this
-  ** one-shot clear (T3 stopped mid-yield teardown). A back-barrier reading an
-  ** unmarked survivor after this pass is benign (this cycle's gray already
-  ** drained at atomic; next cycle re-marks from roots with a reset bitmap).
-  ** That makes a YIELDING ClearMarks safe -- pass-2 is word-parallel
-  ** O(arenas*words). Measured ~2.5-3ms at 16M objects (see .omo/evidence/
-  ** task-8-*), still far below the 5ms inc_pause_assert threshold. The one-shot
-  ** form is the simplest correct change; T3 made chunking the escape hatch
-  ** should a future pathological heap push pass-2 over budget -- not needed
-  ** today. This is NOT the incremental-GC spike (that was pass-1 ThreadScan,
-  ** fixed by T5). */
-  /* No-free assert (G7): ClearMarks only clears bitmap words, never frees. The
-  ** total memory counter must be unchanged across this call -- any decrease
-  ** would indicate a gc_freefunc was invoked, which this pass must never do. */
   total_before = g->gc.total;
-  /* Second pass: clear mark bits on all arenas now that openupval sweeps
-  ** are done and no longer need to read them. POD arenas were already left
-  ** in final state by lj_arena_podsweep (survivors white, free cells Free),
-  ** so skip them. */
+  /* Phase 3 D3: the per-arena free-complete already demoted survivors
+  ** (mark &= ~block for TravObjs/CdataV/NonTrav; mark'=block^mark in POD).
+  ** The loop below is now idempotent (mark already 0 on survivors) but
+  ** kept to clear any residual (e.g. open-UV bitmap marks left by the
+  ** free-path skip, finalized-cdata marks) and as the demote point for
+  ** huge slots. Do NOT re-XOR: `mark &= ~block` is idempotent and avoids
+  ** the double-wrong-demote the goal #3 warns about. */
+  /* I1 assert: leaving free requires every live arena to be current
+  ** (swept_gen == epoch), otherwise !mark survivors read isdead next cycle. */
   for (i = 0; i < g->gc.arenastop; i++) {
     GCArena *a = arenas[i];
-    uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
-    if (a->flags & ArenaFlag_PODOnly) continue;
+    uint32_t w, wtop;
+    lj_assertG(a->swept_gen == g->gc.epoch,
+	       "ClearMarks: arena %u not current (I1 broken): swept_gen=%u epoch=%u",
+	       (unsigned)i, (unsigned)a->swept_gen, (unsigned)g->gc.epoch);
+    if ((GCCellID)a->celltop <= MinCellId) continue;
+    wtop = arena_blockidx((GCCellID)a->celltop - 1);
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
-  /* T3: also clear all live huge slot MARKs. HugeScan no longer clears
-  ** survivor/string marks mid-yield (marks are authoritative during rebuild),
-  ** so the per-cycle mark0 reset for huge objects lands here — one-shot,
-  ** non-yielding, symmetric with the arena mark clear above. This preserves
-  ** the post-fullgc mark0 invariant checked by gc_arena_verify (huge color
-  ** cross-check). The next cycle's markinit also clears (redundant, harmless). */
+  /* Huge: clear slot MARK only. */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -1618,28 +1997,27 @@ static void rebuild_clearmarks(global_State *g)
     }
   }
   lj_assertG(g->gc.total == total_before,
-	     "ClearMarks freed memory (total %lu -> %lu); no gc_freefunc expected",
-	     (unsigned long)total_before, (unsigned long)g->gc.total);
+		     "ClearMarks freed memory (total %lu -> %lu); no gc_freefunc expected",
+		     (unsigned long)total_before, (unsigned long)g->gc.total);
 
+  MARKALLOC_PROGRESS_LOG(
+	    "[markalloc-progress] rebuild ClearMarks done total=%zu strnum=%u "
+	    "arenastop=%u\n",
+	    (size_t)g->gc.total, (unsigned)g->str.num, (unsigned)g->gc.arenastop);
   g->gc.rebuildphase = Rebuild_Done;
-  /* sweepphase = SweepPhase_Done is set by the dispatcher on Rebuild_Done;
-  ** the GCSsweep driver then clears gcmarkflags and runs finalization. */
 }
 
 static void gc_rebuild_rootchain(global_State *g)
 {
-  /* T4: GCF_DEADAUTH no longer exists -- marks are authoritative through the
-  ** rebuild window (T3), so the rebuild entry asserts only BITMAPSWEEP +
-  ** MARKALLOC invariants. */
-  lj_assertG(g->gc.gcmarkflags & GCF_BITMAPSWEEP,
-	     "GCF_BITMAPSWEEP must be set during rebuild");
-  lj_assertG(g->gc.gcmarkflags & GCF_MARKALLOC,
-	     "GCF_MARKALLOC must be set during rebuild");
+  /* Rebuild runs inside GCSsweep; marks are authoritative through the yield
+  ** (T3). Phase 3 dropped the GCF flags, so the entry asserts only the GC
+  ** state (scheduling authority), not a free-window predicate. */
+  lj_assertG(g->gc.state == GCSsweep,
+	     "rebuild entered outside GCSsweep");
   for (;;) {
     uint8_t phase = g->gc.rebuildphase;
     switch (phase) {
     case Rebuild_Prologue:   gcstat_inc(g, rebuild_prologue);   rebuild_prologue(g);   break;
-    case Rebuild_ThreadScan:  gcstat_inc(g, rebuild_threadscan);  rebuild_threadscan(g);  break;
     case Rebuild_HugeScan:   gcstat_inc(g, rebuild_hugescan);   rebuild_hugescan(g);   break;
     case Rebuild_Epilogue:   gcstat_inc(g, rebuild_epilogue);   rebuild_epilogue(g);   break;
     case Rebuild_ClearMarks: gcstat_inc(g, rebuild_clearmarks); rebuild_clearmarks(g); break;
@@ -1647,8 +2025,6 @@ static void gc_rebuild_rootchain(global_State *g)
       lj_assertG(0, "bad rebuild phase %d", g->gc.rebuildphase);
       return;
     }
-    /* Sub-phase monotonicity: rebuildphase only increases. Chunked phases
-    ** stay on the same phase (equal); completed phases advance (greater). */
     lj_assertG(g->gc.rebuildphase >= phase,
 	       "rebuild phase went backward: %d -> %d",
 	       (int)phase, (int)g->gc.rebuildphase);
@@ -1656,16 +2032,9 @@ static void gc_rebuild_rootchain(global_State *g)
       g->gc.sweepphase = SweepPhase_Done;
       return;
     }
-    /* Yield the onestep so the mutator runs between sub-phases. Prologue
-    ** (T4) and HugeScan (T6) are chunked — they yield mid-phase (staying
-    ** on the same phase) via their persisted cursors. ThreadScan (T5) is
-    ** one-shot O(threads) and always advances to HugeScan in one call, so
-    ** it never yields. Epilogue (T7) is O(1) and ClearMarks (T8) is one-
-    ** shot — neither yields. They run to Done in the same onestep as the
-    ** dispatcher's internal loop. */
     if ((phase == Rebuild_Prologue || phase == Rebuild_HugeScan) &&
 	g->gc.rebuildphase == phase)
-      return;  /* Chunked phase still mid-walk: yield. */
+      return;
   }
 }
 
@@ -1710,6 +2079,8 @@ static void gc_clearweak_tab(global_State *g, GCtab *t)
 	setnilV(&n->val);
     }
   }
+  /* Weak tables stay mark∧GRAY through clearweak; drop GRAY for free window. */
+  gray2black(obj2gco(t));
 }
 
 
@@ -1769,33 +2140,33 @@ static void gc_finalize(lua_State *L)
   GCobj *o = gcnext(gcref(g->gc.mmudata));
   cTValue *mo;
   lj_assertG(tvref(g->jit_base) == NULL, "finalizer called on trace");
-  /* Unchain from list of userdata to be finalized. */
   if (o == gcref(g->gc.mmudata))
     setgcrefnull(g->gc.mmudata);
   else
     setgcrefr(gcref(g->gc.mmudata)->gch.nextgc, o->gch.nextgc);
 #if LJ_HASFFI
   if (o->gch.gct == ~LJ_TCDATA) {
-    TValue tmp, *tv;
-    /* Add cdata back to the GC list and make it white. */
+    TValue tmp;
+    int found = 0;
+    FinEntry *e = fin_tab_find(g, o, &found);
+    GCobj *finobj = NULL;
+    uint32_t fin_it = 0;
+    if (found && e != NULL && e->kind == FIN_KIND_CDATA) {
+      finobj = gcref(e->fin);
+      fin_it = e->fin_it;
+    }
+    lj_gc_fin_unregister(g, o);
     gc_obj_makewhite(g, o);
     o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
-    /* Resolve finalizer. */
-    setcdataV(L, &tmp, gco2cd(o));
-    tv = lj_tab_set(L, tabref(g->gcroot[GCROOT_FFI_FIN]), &tmp);
-    if (!tvisnil(tv)) {
-      copyTV(L, &tmp, tv);
-      setnilV(tv);  /* Clear entry in finalizer table. */
+    if (finobj != NULL) {
+      setgcV(L, &tmp, finobj, fin_it);
       gc_call_finalizer(g, L, &tmp, o);
     }
     return;
   }
 #endif
-  /* Make the resurrected userdata white for the next cycle. Its arena cell
-  ** stays in the udata arena (no chain to re-link onto); isfinalized prevents
-  ** re-finalization. */
+  lj_gc_fin_unregister(g, o);
   gc_obj_makewhite(g, o);
-  /* Resolve the __gc metamethod. */
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
   if (mo)
     gc_call_finalizer(g, L, mo, o);
@@ -1809,24 +2180,11 @@ void lj_gc_finalize_udata(lua_State *L)
 }
 
 #if LJ_HASFFI
-/* Finalize all cdata objects from finalizer table. */
+/* Close: disable new cdata fin_register (classic: FFI_FIN metatable=NULL).
+** F3 cdata fin runs from mmudata via registry; gate lives next to fin_tab. */
 void lj_gc_finalize_cdata(lua_State *L)
 {
-  global_State *g = G(L);
-  GCtab *t = tabref(g->gcroot[GCROOT_FFI_FIN]);
-  Node *node = noderef(t->node);
-  ptrdiff_t i;
-  setgcrefnull(t->metatable);  /* Mark finalizer table as disabled. */
-  for (i = (ptrdiff_t)t->hmask; i >= 0; i--)
-    if (!tvisnil(&node[i].val) && tviscdata(&node[i].key)) {
-      GCobj *o = gcV(&node[i].key);
-      TValue tmp;
-      gc_obj_makewhite(g, o);
-      o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
-      copyTV(L, &tmp, &node[i].val);
-      setnilV(&node[i].val);
-      gc_call_finalizer(g, L, &tmp, o);
-    }
+  G(L)->gc.fin_closed = 1;
 }
 #endif
 
@@ -1835,8 +2193,9 @@ void lj_gc_freeall(global_State *g)
 {
   MSize i;
   /* Free everything, except super-fixed objects (the main thread). */
-  /* Force the deterministic shutdown path: with GCF_BITMAPSWEEP clear, the
-  ** residual gc_sweep/gc_sweepstr calls below free by the SFIXED-root identity
+  /* Force the deterministic shutdown path: gcmarkflags cleared so the
+  ** mark-authority branch of gc_sweep (gc.state==GCSatomic|GCSsweep) does
+  ** NOT run here. The residual freeall paths free by the SFIXED-root identity
   ** (independent of currentwhite). The bitmap branch must NOT run here -- the
   ** direct cell scan below frees arena objects, so reading their cell marks
   ** afterwards would be a use-after-free. */
@@ -1933,7 +2292,7 @@ void lj_gc_freeall(global_State *g)
       }
     }
     /* Huge objects: walk the huge set (no cell bitmap exists for them).
-    ** Strings are owned by gc_sweepstr; VLA cdata were freed above. */
+    ** Strings: gc_sweepstr_oa below; VLA cdata were freed above. */
     {
       GCRef *slots = mref(g->gc.hugeset, GCRef);
       if (slots != NULL) {
@@ -1944,7 +2303,7 @@ void lj_gc_freeall(global_State *g)
 	  if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
 	  hugeset_slot_assert(g, u);
 	  o = hugeset_slot_obj(u);
-	  if (o->gch.gct == ~LJ_TSTR) continue;  /* Owned by gc_sweepstr. */
+	  if (o->gch.gct == ~LJ_TSTR) continue;  /* freeall: gc_sweepstr_oa owns strings. */
 	  gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
 	}
       }
@@ -1955,132 +2314,150 @@ void lj_gc_freeall(global_State *g)
     setgcref(g->gc.root, obj2gco(mainthread(g)));
     gc_assert_root_anchor_only(g);
   }
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
-  gc_sweepstr_oa(g, 0, g->str.mask + 1);  /* Free all string slots. */
-#else
-  for (i = g->str.mask; i != ~(MSize)0; i--)  /* Free all string hash chains. */
-    gc_sweepstr(g, &g->str.tab[i]);
-#endif
+  gc_sweepstr_oa(g, 0, g->str.mask + 1);  /* Free all open-addr string slots. */
 }
 
 /* -- Collector ----------------------------------------------------------- */
+
+/* Atomic re-scan of coroutine stacks (no stack barriers). Threads are
+** permanent-gray (mark∧GRAY) after propagatemark; walk graythread to
+** re-mark stack slots without re-greying the thread itself. */
+static void gc_atomic_rescan_threads(global_State *g)
+{
+  GCobj **thr = mref(g->gc.graythread, GCobj *);
+  MSize i, n = g->gc.graythreadtop;
+  if (thr == NULL) return;
+  for (i = 0; i < n; i++) {
+    GCobj *o = thr[i];
+    if (o == NULL || o == obj2gco(mainthread(g))) continue;
+    lj_assertG(o->gch.gct == ~LJ_TTHREAD, "graythread non-thread at rescan");
+    lj_assertG(gc_inarena(g, o), "non-arena thread in graythread");
+    gc_traverse_thread(g, gco2th(o));
+  }
+}
+
+/* Free dead open upvalues. Called at atomic end after epoch++ with gc.state
+** == GCSatomic, so gc_sweep takes its mark-authority branch (keeps marked UVs,
+** frees unmarked). Threads are permanent-gray (mark∧GRAY); closed UVs are
+** pure black; open UVs are left mark∧GRAY (P3a allowed residual — see
+** gc_mark UPVAL). gc_fullsweep frees unmarked UVs and keeps marked ones;
+** the survivor GRAY assert in gc_sweep excludes open UV and THREAD. */
+static void gc_atomic_sweep_openupvals(global_State *g)
+{
+  GCobj **thr = mref(g->gc.graythread, GCobj *);
+  MSize i, n = g->gc.graythreadtop;
+  gc_fullsweep(g, &mainthread(g)->openupval);
+  if (thr != NULL) {
+    for (i = 0; i < n; i++) {
+      GCobj *o = thr[i];
+      if (o == NULL || o == obj2gco(mainthread(g))) continue;
+      lj_assertG(o->gch.gct == ~LJ_TTHREAD, "graythread non-thread at UV sweep");
+      gc_fullsweep(g, &gco2th(o)->openupval);
+    }
+  }
+  gc_graythread_reset(g);
+}
 
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
 static void atomic(global_State *g, lua_State *L)
 {
   size_t udsize;
 
+  /* (1) Drain any leftover gray work from the mark phase. gc_propagate_gray
+  ** fixed-points SSB + arena gray + hugegray, so this leaves every worklist
+  ** empty before root marks begin. */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
-  gc_weak_redirect_all(g);  /* Redirect weak tables to arena/huge gray stacks. */
+  /* (2) Mark roots: running thread L, mainthread stack slots (no barriers),
+  ** current trace, and the fixed GC roots. Weak tables are NOT redirected
+  ** here — their strong slots get re-marked once root marks have been
+  ** emitted, so redirect happens in step (3) after these marks. */
   lj_assertG(!gc_obj_iswhite(g, obj2gco(mainthread(g))), "main thread turned white");
   gc_markobj(g, L);  /* Mark running thread. */
   gc_traverse_mainthread(g);  /* Stack slots have no barriers. */
   gc_traverse_curtrace(g);  /* Traverse current trace. */
   gc_mark_gcroot(g);  /* Mark GC roots (again). */
-  gc_propagate_gray(g);  /* Propagate all of the above. */
 
-  lj_gc_ssb_flush(g);  /* Drain SSB into per-arena gray stacks. */
-  /* Drain graythread (thread objects only): redirect arena threads to arena
-  ** gray stacks for the atomic re-scan. The mainthread is handled directly. */
-  while (!gc_graythread_empty(g)) {
-    GCobj *o = gc_graythread_pop(g);
-    lj_assertG(o->gch.gct == ~LJ_TTHREAD, "graythread contains non-thread");
-    lj_assertG(gc_inarena(g, o), "non-arena thread in graythread");
-    arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
-  }
-  gc_propagate_gray(g);  /* Propagate it. */
+  /* (3) Redirect weak tables to arena/huge gray stacks AFTER root marks. This
+  ** is the arena analog of classic lj_gc.c re-traversing weak tables once
+  ** the world is marked: the strong key/value slots of a weak table must be
+  ** re-marked after the new root marks have been emitted, because a
+  ** root-reachable strong slot promoted by step (2) would be missed if we
+  ** redirected before the roots. The single propagate in step (5) drains
+  ** these redirects together with the root and rescan marks. */
+  gc_weak_redirect_all(g);  /* Redirect weak tables to arena/huge gray stacks. */
 
-  udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
-#if defined(LUA_USE_ASSERT)
-  /* Invariant 4 (T7): post-separateudata(g,0), no white + unfinalized + __gc
-  ** udata remains outside the mmudata ring. Read-only re-scan of udata arenas
-  ** + hugeset — must NOT mutate any state (no flushbins/markfinalized/splice).
-  ** Bins are already flushed from separateudata's per-arena flushbins call,
-  ** so a->block[w] reads only true allocated heads. GCF_BITMAPSWEEP is not yet
-  ** set (armed below), so gc_obj_iswhite(arena) == !arena_obj_ismarked. */
-  {
-    MSize vi;
-    GCArena **varenas = mref(g->gc.arenas, GCArena *);
-    for (vi = 0; vi < g->gc.arenastop; vi++) {
-      GCArena *a = varenas[vi];
-      uint32_t w, wtop;
-      if (!(a->flags & ArenaFlag_UdataOnly)) continue;
-      wtop = arena_blockidx((GCCellID)a->celltop - 1);
-      for (w = UnusedBlockWords; w <= wtop; w++) {
-	GCBlockword heads = a->block[w];
-	while (heads) {
-	  uint32_t bitidx = lj_ffs(heads);
-	  GCCellID c = (w << 5) + bitidx;
-	  GCobj *vo = (GCobj *)arena_cellptr(a, c);
-	  heads &= heads - 1;
-	  if (gc_obj_iswhite(g, vo) && !isfinalized(gco2ud(vo)) &&
-	      lj_meta_fastg(g, tabref(gco2ud(vo)->metatable), MM_gc))
-	    lj_assertG(0,
-		       "post-separateudata: white unfinalized __gc udata missed: "
-		       "ptr=%p gct=%d marked=0x%02x cell=%d",
-		       (void *)vo, vo->gch.gct, vo->gch.marked, (int)c);
-	}
-      }
-    }
-    {
-      GCRef *slots = mref(g->gc.hugeset, GCRef);
-      if (slots != NULL) {
-	MSize hi, hmask = g->gc.hugesetmask;
-	for (hi = 0; hi <= hmask; hi++) {
-	  uintptr_t u = gcrefu(slots[hi]);
-	  GCobj *vo;
-	  if (!hugeset_slot_live(u)) continue;
-	  hugeset_slot_assert(g, u);
-	  vo = hugeset_slot_obj(u);
-	  if (vo->gch.gct != ~LJ_TUDATA) continue;
-	  if (gc_obj_iswhite(g, vo) && !isfinalized(gco2ud(vo)) &&
-	      lj_meta_fastg(g, tabref(gco2ud(vo)->metatable), MM_gc))
-	    lj_assertG(0,
-		       "post-separateudata: white unfinalized __gc huge udata missed: "
-		       "ptr=%p gct=%d marked=0x%02x",
-		       (void *)vo, vo->gch.gct, vo->gch.marked);
-	}
-      }
-    }
-  }
-#endif
+  /* (4) Re-scan coroutine stacks (permanent-gray threads; mainthread
+  ** already above). No stack barriers — walks graythread without
+  ** re-greying the thread itself. */
+  gc_atomic_rescan_threads(g);
+
+  /* (5) ONE propagate drains root marks (2), weak redirects (3), and rescan
+  ** stack marks (4) together. gc_propagate_gray loops until SSB + arena gray
+  ** + hugegray are all empty (fixed-point), so no intermediate flush or
+  ** intermediate propagate is needed between roots, weak redirect, and
+  ** rescan — they only enqueue more gray work which this single call drains. */
+  gc_propagate_gray(g);
+
+  /* (6) F2 registry → mmudata (udata + cdata), mark, propagate.
+  ** Backfill runs first so udata whose mt gained __gc (TF_HASGC) since the
+  ** last atomic are registered before separate sees them. */
+  lj_gc_fin_backfill_udata(g);
+  udsize = lj_gc_separateudata(g, 0);
+  lj_gc_fin_dual_assert_udata(g);
   gc_mark_mmudata(g);  /* Mark them. */
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
 
-  /* Snapshot the live coroutine-thread set for the O(threads) sweep openupval
-** walk (replaces rebuild_threadscan's O(threads) thread scan — consumed in T2).
-  ** graythread holds every marked thread after the final propagation; copy
-  ** the non-main entries (mainthread is swept by rebuild_epilogue). Oracle-
-  ** approved snapshot point: AFTER gc_mark_mmudata + final gc_propagate_gray,
-  ** so finalizer-reachable threads discovered late are included. No dedup:
-  ** gc_fullsweep on an openupval chain is idempotent (a second pass over an
-  ** already-cleaned chain is a no-op) and thread counts are tiny. */
-  gc_sweepthreads_reset(g);
-  {
-    GCobj **gt = mref(g->gc.graythread, GCobj *);
-    MSize gi, gtop = g->gc.graythreadtop;
-    for (gi = 0; gi < gtop; gi++) {
-      GCobj *o = gt[gi];
-      if (o == obj2gco(mainthread(g))) continue;  /* epilogue handles main. */
-      gc_sweepthreads_push(g, o);
-    }
-  }
-
-  /* All marking done, clear weak tables. */
+  /* (7) All marking done, clear weak tables. */
   gc_clearweak_stacks(g);
 
   lj_buf_shrink(L, &g->tmpbuf);  /* Shrink temp buffer. */
 
-  /* Prepare for sweep phase. */
+  /* Free window: empty worklists; threads permanent-gray (mark∧GRAY);
+  ** closed UVs pure black; open UVs left mark∧GRAY (P3a residual exception
+  ** — see gc_mark UPVAL and gc_assert_atomic_end). gc_clearweak_stacks cannot refill SSB/arena-gray/
+  ** hugegray: gc_mayclear only leaf-marks strings (gc_mark_str, no push) and
+  ** gray2black's the weak tables; no barrierback runs during atomic (mutator
+  ** stopped). Rely on the empty-worklist asserts below instead of an
+  ** unconditional re-prop. */
+  {
+    GCobj **ssb = mref(g->gc.ssb, GCobj *);
+    GCobj **ssbtop = mref(g->gc.ssbtop, GCobj *);
+    lj_assert_check(g, ssb == NULL || ssbtop == ssb,
+		     "SSB non-empty at atomic→sweep: top=%p base=%p",
+		     (void *)ssbtop, (void *)ssb);
+  }
+  lj_assert_check(g, g->gc.grayastop == 0 && g->gc.hugegraytop == 0,
+				   "arena/huge gray non-empty at atomic→sweep: "
+				   "grayastop=%u hugegraytop=%u",
+				   (unsigned)g->gc.grayastop, (unsigned)g->gc.hugegraytop);
+  /* (8) Open free window: epoch++ FIRST (D1 / I2). This is the single
+  ** otherwhite boundary; before it isdead is globally false, after it every
+  ** pre-existing arena is "other" and its unmarked objects are dead.
+  ** gc_atomic_sweep_openupvals runs mark-authority via gc_sweep's
+  ** gc.state==GCSatomic branch (no GCF flag). */
+  g->gc.epoch++;
+  gc_atomic_sweep_openupvals(g);
+  gc_assert_atomic_end(g);
+
+  /* (9) Prepare for sweep phase. */
   /* No white flip: liveness is the mark bitmap, not a flipping header white.
   ** strempty is an SFIXED root, never swept; reset its vestigial header color
   ** to the exact value the old post-flip path produced (curwhite was 0 during
   ** sweep): FIXED|SFIXED with no white bit, so it reads as a reachable root. */
   g->strempty.marked = LJ_GC_FIXED | LJ_GC_SFIXED;
-  setmref(g->gc.sweep, &g->gc.root);
   g->gc.estimate = g->gc.total - (GCSize)udsize;  /* Initial estimate. */
-  g->gc.gcmarkflags |= GCF_BITMAPSWEEP | GCF_MARKALLOC;
+  /* Old snapshot BEFORE any mutator alloc in the sweep window. Nursery
+  ** allocations must not reuse these arenas (see lj_arena_findspace, which
+  ** gates on gc.state==GCSsweep + sweep_aend, not a GCF predicate). */
+  g->gc.sweep_aend = g->gc.arenastop;
+  setmref(g->gc.arena, NULL);
+  setmref(g->gc.travarena, NULL);
+  setmref(g->gc.podarena, NULL);
+  setmref(g->gc.udatarena, NULL);
+  setmref(g->gc.cdatavarena, NULL);
+  /* Enter free window: scheduling is driven by gc.state==GCSsweep (set after
+  ** atomic returns) plus sweepphase; the predicate layer reads swept_gen. */
   g->gc.sweepa = 0;
   g->gc.sweepw = UnusedBlockWords;
   g->gc.sweepphase = SweepPhase_Bitmap;
@@ -2092,72 +2469,86 @@ static size_t gc_onestep_raw(lua_State *L)
   global_State *g = G(L);
   switch (g->gc.state) {
   case GCSpause:
+    MARKALLOC_PROGRESS_LOG(
+	      "[markalloc-progress] mark_start total=%zu estimate=%zu "
+	      "arenastop=%u strnum=%u\n",
+	      (size_t)g->gc.total, (size_t)g->gc.estimate,
+	      (unsigned)g->gc.arenastop, (unsigned)g->str.num);
     gc_mark_start(g);  /* Start a new GC cycle by marking all GC roots. */
     return 0;
   case GCSpropagate:
-    if (!gc_hugegray_empty(g)) {
-      size_t c = propagatemark(g, gc_hugegray_pop(g));
-      gcstat_add(g, mark_cost, c);
-      return c;
-    }
     {
-      GCArena *a = gc_grayarena_pop(g);
-      if (a != NULL) {
-	size_t c = gc_propagate_arena(g, a);
-	gcstat_add(g, mark_cost, c);
-	return c;
+      size_t c;
+      GCobj **ssb, **ssbtop;
+      GCArena *a;
+      /* SSB is part of gray work: flush before each slice / empty check. */
+      lj_gc_ssb_flush(g);
+      /* One step drains a whole worklist unit: all hugegray, or one arena's
+      ** full gray stack (gc_propagate_arena). Not one object per step. */
+      if (!gc_hugegray_empty(g)) {
+	c = 0;
+	while (!gc_hugegray_empty(g)) {
+	  size_t n = propagatemark(g, gc_hugegray_pop(g));
+	  gcstat_add(g, mark_cost, n);
+	  c += n;
+	}
+	lj_gc_ssb_flush(g);
+	return c ? c : 1;
       }
+      a = gc_grayarena_pop(g);
+      if (a != NULL) {
+	/* mark_cost counted inside gc_propagate_arena. */
+	c = gc_propagate_arena(g, a);
+	/* Same-arena re-push (notify) during drain — finish this arena. */
+	while (!arena_gray_empty(a))
+	  c += gc_propagate_arena(g, a);
+	/* Huge objects marked from this arena. */
+	while (!gc_hugegray_empty(g)) {
+	  size_t n = propagatemark(g, gc_hugegray_pop(g));
+	  gcstat_add(g, mark_cost, n);
+	  c += n;
+	}
+	lj_gc_ssb_flush(g);
+	return c ? c : 1;
+      }
+      lj_gc_ssb_flush(g);
+      ssb = mref(g->gc.ssb, GCobj *);
+      ssbtop = mref(g->gc.ssbtop, GCobj *);
+      if ((ssb != NULL && ssbtop != NULL && ssbtop > ssb) ||
+	  !gc_hugegray_empty(g) || g->gc.grayastop != 0)
+	return 0;  /* Barriers refilled work; stay in propagate. */
+      g->gc.state = GCSatomic;
+      return 0;
     }
-    g->gc.state = GCSatomic;  /* End of mark phase. */
-    return 0;
   case GCSatomic:
     if (tvref(g->jit_base))  /* Don't run atomic phase on trace. */
       return LJ_MAX_MEM;
     atomic(g, L);
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
-    /* P2: string reclaim is folded into the GCSsweep bitmap pass (NonTrav
-    ** arena branch + huge-string reclaim in rebuild_hugescan). Skip
-    ** GCSsweepstring entirely: atomic() already armed GCF_BITMAPSWEEP, the
-    ** sweep cursors, and SweepPhase_Bitmap, so GCSsweep starts immediately.
-    ** The estimate accounting for string frees now happens in GCSsweep
-    ** (old - g->gc.total), not a separate GCSsweepstring step. */
-    g->gc.state = GCSsweep;
-#else
-    g->gc.state = GCSsweepstring;  /* Start of sweep phase. */
-    g->gc.sweepstr = 0;
-#endif
+    MARKALLOC_PROGRESS_LOG(
+	      "[markalloc-progress] atomic done total=%zu estimate=%zu "
+	      "strnum=%u flags=0x%x\n",
+	      (size_t)g->gc.total, (size_t)g->gc.estimate,
+	      (unsigned)g->str.num, (unsigned)g->gc.gcmarkflags);
+    g->gc.state = GCSsweep;  /* strings reclaimed in bitmap/hugescan (openaddr) */
     return 0;
-  case GCSsweepstring: {
-    GCSize old = g->gc.total;
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
-    /* P2: unreachable under the flag (atomic transitions straight to GCSsweep).
-    ** Defensive: if ever re-entered, do no reclaim here (reclaim lives in the
-    ** bitmap sweep) and advance immediately. */
+  case GCSsweepstring:
+    /* Unreachable under openaddr (atomic jumps straight to GCSsweep). Keep
+    ** enum slot for stats; jump to bitmap sweep if hit. */
     g->gc.state = GCSsweep;
-#else
-    gc_sweepstr(g, &g->str.tab[g->gc.sweepstr++]);  /* Sweep one chain. */
-    if (g->gc.sweepstr > g->str.mask)
-      g->gc.state = GCSsweep;  /* All string hash chains sweeped. */
-#endif
-    lj_assertG(old >= g->gc.total, "sweep increased memory");
-    g->gc.estimate -= old - g->gc.total;
     return GCSWEEPCOST;
-    }
   case GCSsweep: {
     GCSize old = g->gc.total;
-    if (g->gc.gcmarkflags & GCF_BITMAPSWEEP) {
-      if (g->gc.sweepphase == SweepPhase_Bitmap) {
-	gc_bitmap_sweep(g);
-      }
-      if (g->gc.sweepphase == SweepPhase_Rebuild) {
-	/* Run one rebuild dispatch per onestep. The dispatcher yields after
- ** each chunked sub-phase (Prologue/ThreadScan/HugeScan); Epilogue and
-	** ClearMarks run to Done in the same dispatch call. */
-	gc_rebuild_rootchain(g);
-      }
+    if (g->gc.sweepphase == SweepPhase_Rebuild) {
+      /* Run one rebuild dispatch per onestep. The dispatcher yields after
+      ** each chunked sub-phase (Prologue/HugeScan). Phase 3 dropped the
+      ** GCF flags; rebuild_clearmarks no longer clears a flag, so this branch
+      ** is keyed on sweepphase (set by gc_bitmap_sweep at aend), not a flag. */
+      gc_rebuild_rootchain(g);
       lj_assertG(old >= g->gc.total, "sweep increased memory");
       g->gc.estimate -= old - g->gc.total;
       if (g->gc.sweepphase == SweepPhase_Done) {
+	/* Phase 3: no free-window flags to clear (gcmarkflags now holds only
+	** MEMPROF); preserve MEMPROF, drop any residual bits. */
 #if defined(LUAJIT_ENABLE_MEMPROF)
 	g->gc.gcmarkflags &= GCF_MEMPROF;
 #else
@@ -2168,6 +2559,11 @@ static size_t gc_onestep_raw(lua_State *L)
 	lj_arena_shrink(g);
 	if (gcref(g->gc.mmudata)) {
 	  g->gc.state = GCSfinalize;
+	  MARKALLOC_PROGRESS_LOG(
+		    "[markalloc-progress] cycle → finalize total=%zu "
+		    "arenastop=%u strnum=%u\n",
+		    (size_t)g->gc.total, (unsigned)g->gc.arenastop,
+		    (unsigned)g->str.num);
 	} else {
 	  gcstat_inc(g, cycles);
 	  g->gc.stats.last_arenastop = g->gc.arenastop;
@@ -2175,33 +2571,25 @@ static size_t gc_onestep_raw(lua_State *L)
 	  g->gc.stats.last_hugemem = g->gc.hugemem;
 	  g->gc.state = GCSpause;
 	  g->gc.debt = 0;
+	  MARKALLOC_PROGRESS_LOG(
+		    "[markalloc-progress] cycle → pause total=%zu "
+		    "estimate=%zu arenastop=%u strnum=%u\n",
+		    (size_t)g->gc.total, (size_t)g->gc.estimate,
+		    (unsigned)g->gc.arenastop, (unsigned)g->str.num);
 	}
       }
       return GCSWEEPMAX*GCSWEEPCOST;
     }
-    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));
+    /* SweepPhase_Bitmap (normal GCMARK cycle). Phase 3 dropped the GCF
+    ** gate: sweepphase alone drives bitmap-vs-rebuild. The classic
+    ** linked-list incremental gc_sweep path is shutdown-only (lj_gc_freeall)
+    ** and never reached from the state machine under GCMARK. */
+    gc_bitmap_sweep(g);
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
-    if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
-#if defined(LUAJIT_ENABLE_MEMPROF)
-      g->gc.gcmarkflags &= GCF_MEMPROF;
-#else
-      g->gc.gcmarkflags = 0;
-#endif
-      if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
-	lj_str_resize(L, g->str.mask >> 1);  /* Shrink string table. */
-      lj_arena_shrink(g);  /* Coalesce free space, release empty arenas. */
-      if (gcref(g->gc.mmudata)) {  /* Need any finalizations? */
-	g->gc.state = GCSfinalize;
-      } else {  /* Otherwise skip this phase to help the JIT. */
-	gcstat_inc(g, cycles);
-	g->gc.stats.last_arenastop = g->gc.arenastop;
-	g->gc.stats.last_hugenum = g->gc.hugenum;
-	g->gc.stats.last_hugemem = g->gc.hugemem;
-	g->gc.state = GCSpause;  /* End of GC cycle. */
-	g->gc.debt = 0;
-      }
-    }
+    /* SweepPhase_Done is unreachable here: Done is only reached via the
+    ** rebuild branch above (ClearMarks completes the rebuild window).
+    ** gc_bitmap_sweep transitions Bitmap → Rebuild, never directly to Done. */
     return GCSWEEPMAX*GCSWEEPCOST;
     }
   case GCSfinalize:
@@ -2263,6 +2651,8 @@ static size_t gc_onestep(lua_State *L)
   uint8_t pre_state = g->gc.state;
   uint8_t pre_sweepphase = g->gc.sweepphase;
   size_t cost;
+  static uint32_t hb_nsteps;
+  static uint8_t hb_last_state = 0xff;
 #ifdef LUAJIT_ENABLE_GCSTATS_TIMING
   struct timespec ts0, ts1;
   clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -2283,6 +2673,41 @@ static size_t gc_onestep(lua_State *L)
       gcstat_inc(g, sweep_bitmap_steps);
   } else {
     g->gc.stats.nsteps[pre_state]++;
+  }
+  /* Progress heartbeat (MARKALLOC_PROGRESS). */
+  if (MARKALLOC_PROGRESS()) {
+    hb_nsteps++;
+    if (pre_state != hb_last_state || (hb_nsteps & 0x3ff) == 0) {
+      /* Gray work depth: distinguish slow drain vs livelock (depth not falling). */
+      MSize gray_cells = 0;
+      MSize gi;
+      GCobj **ssb = mref(g->gc.ssb, GCobj *);
+      GCobj **ssbtop = mref(g->gc.ssbtop, GCobj *);
+      MSize ssb_n = (ssb != NULL && ssbtop != NULL && ssbtop > ssb) ?
+		    (MSize)(ssbtop - ssb) : 0;
+      for (gi = 0; gi < g->gc.grayastop; gi++) {
+	MSize idx = mref(g->gc.grayastack, MSize)[gi];
+	GCArena *ga = mref(g->gc.arenas, GCArena *)[idx];
+	GCCellID1 *gt = mref(ga->greytop, GCCellID1);
+	GCCellID1 *gb = mref(ga->greybase, GCCellID1);
+	if (gt != NULL && gb != NULL && gt > gb)
+	  gray_cells += (MSize)(gt - gb);
+      }
+      MARKALLOC_PROGRESS_LOG(
+	      "[markalloc-progress] onestep n=%u pre_state=%u post_state=%u "
+	      "sweepphase=%u flags=0x%x cost=%zu total=%lu "
+	      "grayastop=%u gray_cells=%u hugegray=%u ssb=%u "
+	      "barrierback=%lu debt=%lu thr=%lu est=%lu\n",
+	      (unsigned)hb_nsteps, (unsigned)pre_state, (unsigned)g->gc.state,
+	      (unsigned)g->gc.sweepphase, (unsigned)g->gc.gcmarkflags,
+	      cost, (unsigned long)g->gc.total,
+	      (unsigned)g->gc.grayastop, (unsigned)gray_cells,
+	      (unsigned)g->gc.hugegraytop, (unsigned)ssb_n,
+	      (unsigned long)g->gc.stats.barrierback,
+	      (unsigned long)g->gc.debt, (unsigned long)g->gc.threshold,
+	      (unsigned long)g->gc.estimate);
+      hb_last_state = pre_state;
+    }
   }
 #if defined(LUA_USE_ASSERT) && !defined(LJ_GC_NOSTEPVERIFY)
   /* Read-only free-list consistency check after every incremental step, in
@@ -2307,13 +2732,18 @@ int LJ_FASTCALL lj_gc_step(lua_State *L)
   if (g->gc.total > g->gc.threshold)
     g->gc.debt += g->gc.total - g->gc.threshold;
   do {
-    lim -= (GCSize)gc_onestep(L);
+    size_t steped = gc_onestep(L);
+    /* Saturating subtract: whole-arena drain can return multi-MB cost. */
+    if (steped >= lim)
+      lim = 0;
+    else
+      lim -= (GCSize)steped;
     if (g->gc.state == GCSpause) {
       g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
       g->vmstate = ostate;
       return 1;  /* Finished a GC cycle. */
     }
-  } while (sizeof(lim) == 8 ? ((int64_t)lim > 0) : ((int32_t)lim > 0));
+  } while (lim > 0);
   if (g->gc.debt < GCSTEPSIZE) {
     g->gc.threshold = g->gc.total + GCSTEPSIZE;
     g->vmstate = ostate;
@@ -2467,10 +2897,7 @@ static void gc_arena_verify(global_State *g)
   GCobj *o;
   MSize i, dead = 0;
   lj_assertG(gc_hugegray_empty(g), "arena verify with pending huge gray objects");
-  /* Invariant 5 (T7): every mmudata ring member is finalized. The ring holds
-  ** udata (spliced by sepudata_one with markfinalized) and cdata (spliced by
-  ** lj_cdata_free with markfinalized). Both paths set LJ_GC_FINALIZED before
-  ** linking, so a non-finalized member means a ring splice regressed. */
+  /* Invariant 5 (T7): every mmudata member is FINALIZED (F2 registry separate). */
   {
     GCobj *mroot = gcref(g->gc.mmudata);
     if (mroot != NULL) {
@@ -2522,7 +2949,7 @@ static void gc_arena_verify(global_State *g)
   ** traces and udata. The bitmap scan finds all of them -- including open
   ** upvalues, which the root chain can't enumerate without per-thread walks.
     ** Huge objects are in the address-keyed huge set, not in any arena
-    ** bitmap. huge strings are still owned by gc_sweepstr. mainthread/strempty
+    ** bitmap. huge strings: openaddr hugescan. mainthread/strempty
     ** are dlmalloc (not in arenas). */
   {
     GCArena **arenas = mref(g->gc.arenas, GCArena *);
@@ -2583,7 +3010,6 @@ static void gc_arena_verify(global_State *g)
 	  lj_assertG(o2->gch.gct != ~LJ_TUDATA,
 		     "udata in NonTrav arena: gct=%d marked=0x%02x cell=%d flags=0x%x",
 		     (int)o2->gch.gct, o2->gch.marked, (int)c, a->flags);
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
 	  /* P2 §9 item 10: under the flag, NonTrav arenas are the string reclaim
 	  ** target, so every allocated cell MUST be ~LJ_TSTR. A non-string here
 	  ** would either leak (the bitmap-sweep string branch skips it) or mis-free
@@ -2591,12 +3017,10 @@ static void gc_arena_verify(global_State *g)
 	  lj_assertG(o2->gch.gct == ~LJ_TSTR,
 		     "non-string in NonTrav arena (OPENADDR): gct=%d marked=0x%02x cell=%d flags=0x%x",
 		     (int)o2->gch.gct, o2->gch.marked, (int)c, a->flags);
-#endif
 	}
       }
     }
-    /* Huge objects have no cell bitmap. Huge strings are still owned by
-    ** gc_sweepstr. */
+    /* Huge objects have no cell bitmap. Huge strings: openaddr hugescan. */
     {
       GCRef *slots = mref(g->gc.hugeset, GCRef);
       if (slots != NULL) {
@@ -2651,7 +3075,6 @@ static void gc_arena_verify(global_State *g)
     }
   }
 #endif
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
   for (i = 0; i <= g->str.mask; i++) {
     uintptr_t v = gcrefu(g->str.tab[i]);
     if (v == 0 || v == STRTAB_OA_TOMB) continue;
@@ -2659,23 +3082,13 @@ static void gc_arena_verify(global_State *g)
     if (!lj_arena_ishuge(o))
       arena_obj_shadowmark(o);
   }
-#else
-  for (i = 0; i <= g->str.mask; i++) {
-    GCRef r = g->str.tab[i];
-    /* Chain head low bit is the hashalg flag; mask it off. */
-    for (o = (GCobj *)(gcrefu(r) & ~(uintptr_t)1); o != NULL; o = gcnext(o))
-      if (!lj_arena_ishuge(o))
-	arena_obj_shadowmark(o);
-  }
-#endif
-  /* P3 (§3.4): under LUAJIT_STRTAB_OPENADDR, strings are allocated unlinked
+  /* P3 (§3.4): openaddr strings are allocated unlinked
   ** from g->gc.root (lj_str_alloc -> lj_mem_newagco link=0) and resurrection
   ** only sets the mark bit (gc_obj_resurrect never touches nextgc). So no
   ** ~LJ_TSTR may ever be reachable via the g->gc.root nextgc chain. This
   ** bounded walk locks that invariant; a fire is a genuine design-premise
   ** regression -- report it, do not paper over. Cheap: at verify time
   ** (after rebuild_epilogue) the root chain is mainthread alone. */
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
   {
     GCobj *ro = gcref(g->gc.root);
     uint32_t rn = 0;
@@ -2687,13 +3100,12 @@ static void gc_arena_verify(global_State *g)
       }
       rn++;
       lj_assertG(ro->gch.gct != ~LJ_TSTR,
-		 "string on g->gc.root chain under OPENADDR (design §3.4 violation): "
+		 "string on g->gc.root chain (openaddr design §3.4 violation): "
 		 "ptr=%p gct=%d marked=0x%02x",
 		 (void *)ro, ro->gch.gct, ro->gch.marked);
       ro = gcref(ro->gch.nextgc);
     }
   }
-#endif
   /* After a full GC nothing dead remains, so no allocated arena object may
   ** be left unmarked. */
   for (i = 0; i < g->gc.arenastop; i++)
@@ -2854,123 +3266,19 @@ void lj_gc_fullgc(lua_State *L)
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
     gc_hugegray_reset(g);  /* Reset worklists from partial propagation. */
     gc_graythread_reset(g);
-    gc_sweepthreads_reset(g);  /* Stale snapshot must not feed next cycle. */
     gc_weak_reset(g);
-    setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));  /* Discard SSB. */
-    /* Under single-white, the header-based sweep predicate can't reliably
-    ** distinguish alive-white from dead-white, so the preserving catch-up
-    ** sweep doesn't work.  Enumerate all arena objects via the block bitmaps
-    ** to reset MARK bits on huge objects (huge_obj_clearmark). The per-object
-    ** makewhite that used to clear the header GRAY frontier bit is dropped —
-    ** stale GRAY is tolerated across cycles (Oracle-verified). No objects are
-    ** freed — the partial mark phase hasn't reached sweep. */
     {
-      GCArena **arenas = mref(g->gc.arenas, GCArena *);
-      GCobj *o;
-      MSize ii;
-      /* Trav arenas: tables, funcs, protos, threads, upvalues, regular cdata,
-      ** traces and udata.  Strings are handled by the intern table walk below.
-      ** Open upvalues are found directly by the bitmap scan (no per-thread
-      ** walk needed). */
-      for (ii = 0; ii < g->gc.arenastop; ii++) {
-	GCArena *a = arenas[ii];
-	uint32_t w, wtop;
-	if (!(a->flags & ArenaFlag_TravObjs)) continue;
-	lj_arena_flushbins(a);
-	wtop = arena_blockidx((GCCellID)a->celltop - 1);
-	for (w = UnusedBlockWords; w <= wtop; w++) {
-	  GCBlockword alive = a->block[w];
-	  while (alive) {
-	    uint32_t bitidx = lj_ffs(alive);
-	    GCCellID c = (w << 5) + bitidx;
-	    o = (GCobj *)arena_cellptr(a, c);
-	    alive &= alive - 1;
-	    if (o->gch.gct == ~LJ_TSTR) continue;
-	    /* Stale GRAY tolerated across cycles (Oracle-verified). */
-	  }
-	}
+      /* Mid-cycle restart drops greystacks next — cannot flush into them.
+      ** gray2black all SSB GRAY entries, then clear the buffer. Residual
+      ** header GRAY on marked objects becomes light-gray after markinit. */
+      GCobj **ssb = mref(g->gc.ssb, GCobj *);
+      GCobj **top = mref(g->gc.ssbtop, GCobj *);
+      while (ssb != NULL && top != NULL && ssb < top) {
+	GCobj *o = *ssb++;
+	if (o != NULL && (o->gch.marked & LJ_GC_GRAY))
+	  gray2black(o);
       }
-      /* Huge objects have no cell bitmap. Huge strings are made white via the
-      ** intern-table walk below. */
-      {
-	GCRef *slots = mref(g->gc.hugeset, GCRef);
-	if (slots != NULL) {
-	  MSize hi, hmask = g->gc.hugesetmask;
-	  for (hi = 0; hi <= hmask; hi++) {
-	    uintptr_t u = gcrefu(slots[hi]);
-	    if (!hugeset_slot_live(u)) continue;
-	    hugeset_slot_assert(g, u);
-	    { /* base owns the slot mark; o = cd carries the GCcdata header. */
-	      GCobj *base = hugeset_slot_addr(u);
-	      o = hugeset_slot_obj(u);
-	      if (o->gch.gct == ~LJ_TSTR) continue;
-	      huge_obj_clearmark(g, base);  /* Reset slot mark with the header. */
-	      /* Stale GRAY tolerated across cycles (Oracle-verified). */
-	    }
-	  }
-	}
-      }
-      /* mainthread is not in any arena (dlmalloc). Stale GRAY tolerated
-      ** across cycles (Oracle-verified). */
-      /* Reset MARK bits on huge strings via the intern table walk.
-      ** The per-string makewhite is dropped — stale GRAY is tolerated across
-      ** cycles (Oracle-verified). */
-      {
-        MSize i;
-#if LJ_HASGCMARK && defined(LUAJIT_STRTAB_OPENADDR)
-        for (i = 0; i <= g->str.mask; i++) {
-          uintptr_t v = gcrefu(g->str.tab[i]);
-          GCobj *o2;
-          if (v == 0 || v == STRTAB_OA_TOMB) continue;
-          o2 = (GCobj *)(void *)v;
-          if (lj_arena_ishuge(o2))
-            huge_obj_clearmark(g, o2);
-        }
-#else
-        /* Chain HEAD stores the per-bucket hashalg marker in bit 0 (lj_str.c),
-        ** so mask it off before dereferencing; subsequent nextgc links carry
-        ** no marker. */
-        for (i = 0; i <= g->str.mask; i++) {
-          GCobj *o2 = (GCobj *)(gcrefu(g->str.tab[i]) & ~(uintptr_t)1);
-          while (o2 != NULL) {
-            if (lj_arena_ishuge(o2))
-              huge_obj_clearmark(g, o2);  /* Reset slot mark with the header. */
-            o2 = gcref(o2->gch.nextgc);
-          }
-        }
-#endif
-      }
-#if LJ_HASFFI
-      /* Reset state for VLA cdata in CdataV arenas (small VLA). Huge VLA
-      ** were handled by the hugeset walk above. Cell base is a GCcdataVar;
-      ** cd = base + offset carries the GCcdata header. The per-cdata
-      ** makewhite is dropped — stale GRAY is tolerated across cycles
-      ** (Oracle-verified). */
-      {
-	GCArena **cva = mref(g->gc.arenas, GCArena *);
-	MSize ci;
-	for (ci = 0; ci < g->gc.arenastop; ci++) {
-	  GCArena *a = cva[ci];
-	  uint32_t cw, cwtop;
-	  if (!(a->flags & ArenaFlag_CdataVOnly)) continue;
-	  lj_arena_flushbins(a);
-	  cwtop = arena_blockidx((GCCellID)a->celltop - 1);
-	  for (cw = UnusedBlockWords; cw <= cwtop; cw++) {
-	    GCBlockword alloc = a->block[cw];
-	    while (alloc) {
-	      uint32_t bitidx = lj_ffs(alloc);
-	      GCCellID c = (cw << 5) + bitidx;
-	      char *p = (char *)arena_cellptr(a, c);
-	      GCcdata *cd;
-	      alloc &= alloc - 1;
-	      cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
-	      cdatav_cell_assert(g, p);
-	      /* Stale GRAY tolerated across cycles (Oracle-verified). */
-	    }
-	  }
-	}
-      }
-#endif
+      setmref(g->gc.ssbtop, mref(g->gc.ssb, GCobj *));
     }
 #if defined(LUAJIT_ENABLE_MEMPROF)
     g->gc.gcmarkflags &= GCF_MEMPROF;
@@ -3006,31 +3314,56 @@ void lj_gc_fullgc(lua_State *L)
 /* -- Write barriers ------------------------------------------------------ */
 
 /* Backward barrier for arena objects (called from interpreter/JIT).
-** Sets gray bit, then checks mark bitmap: black→dark-gray pushes to SSB,
-** white→light-gray just sets gray (no push needed). */
+** Callers prefilter with !isgray; mark-bitmap checks stay here.
+** Never set GRAY without a worklist slot — that creates off-stack residual. */
 void LJ_FASTCALL lj_gc_barrierback_arena(global_State *g, GCobj *o)
 {
   gcstat_inc(g, barrierback);
-  /* T4: removed the rebuild-window skip (GCF_BITMAPSWEEP && !GCF_DEADAUTH).
-  ** Marks are now authoritative through the rebuild window (T3), so an
-  ** ismarked read here is trustworthy. A barrier on a marked (black) survivor
-  ** during rebuild pushes to SSB/hugegray -- extra work, NOT a liveness error:
-  ** this cycle's gray already drained at atomic, and next cycle re-marks from
-  ** roots (gc_mark dedups already-marked objects). */
-  o->gch.marked |= LJ_GC_GRAY;
+  /* Unmarked parent (!pure-black): not a black frontier — skip. */
+  if (!gc_obj_ismarked(g, o))
+    return;
+  /* C1: during sweep, barriers must not enqueue. gray2black only
+  ** (no traverse / no worklist); the free window is gc.state == GCSsweep. */
+  if (LJ_UNLIKELY(g->gc.state == GCSsweep)) {
+#if LJ_MARKALLOC_DEBUG
+    if (MARKALLOC_PROGRESS()) {
+      static uint32_t bb_n;
+      bb_n++;
+      if ((bb_n & 0xffff) == 0)
+	MARKALLOC_PROGRESS_LOG(
+		"[markalloc-progress] barrierback_nursery n=%u (no-enqueue)\n",
+		(unsigned)bb_n);
+    }
+#endif
+    gray2black(o);
+    return;
+  }
+  /* Callers (VM/JIT) prefilter !isgray. Gray here is still a no-op so a
+  ** missed prefilter cannot paint a second worklist edge. */
+  if (o->gch.marked & LJ_GC_GRAY)
+    return;
+  /* pure black → enqueue first, then GRAY (atomic w.r.t. residual invariant). */
   if (lj_arena_ishuge(o)) {
-    /* Every huge object carries black in its hugeset slot; gc_sweepstr still
-    ** unlinks dead huge strings from the intern table, but the slot owns
-    ** their color. */
-    if (huge_obj_ismarked(g, o))
+    if (huge_obj_ismarked(g, o)) {
+      o->gch.marked |= LJ_GC_GRAY;
       gc_hugegray_push(g, o);
+    }
     return;
   }
   if (arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
+    GCobj **base = mref(g->gc.ssb, GCobj *);
+    GCobj **lim = mref(g->gc.ssblim, GCobj *);
     GCobj **top = mref(g->gc.ssbtop, GCobj *);
+    /* Corrupt / uninit SSB is a hard bug (layout clobber, missed init).
+    ** Never soft-reset: that orphans mark∧GRAY entries already painted. */
+    lj_assert_check(g, base != NULL && lim != NULL && base < lim &&
+			 top >= base && top <= lim,
+		     "barrierback SSB corrupt: top=%p base=%p lim=%p",
+		     (void *)top, (void *)base, (void *)lim);
+    o->gch.marked |= LJ_GC_GRAY;
     *top++ = o;
     setmref(g->gc.ssbtop, top);
-    if (LJ_UNLIKELY(top >= mref(g->gc.ssblim, GCobj *))) {
+    if (LJ_UNLIKELY(top >= lim)) {
       gcstat_inc(g, ssb_overflow);
       lj_gc_ssb_flush(g);
     }
@@ -3043,8 +3376,25 @@ void lj_gc_grayarena_notify(global_State *g, MSize idx)
   MSize *heap;
   gcstat_inc(g, gray_notify);
   GCArena *a = mref(g->gc.arenas, GCArena *)[idx];
-  if (a->flags & ArenaFlag_InGrayHeap)
-    return;  /* Already queued: skip duplicate insert (dedup guard). */
+  if (a->flags & ArenaFlag_InGrayHeap) {
+    /* Dedup: empty→non-empty while still in the gray-arena heap. InGrayHeap
+    ** without a heap slot is a worklist orphan (greystack holds GRAY that
+    ** gc_propagate_gray will never drain). */
+#if defined(LUA_USE_ASSERT)
+    {
+      MSize *h = mref(g->gc.grayastack, MSize);
+      MSize i, n = g->gc.grayastop;
+      int found = 0;
+      for (i = 0; i < n; i++) {
+	if (h[i] == idx) { found = 1; break; }
+      }
+      lj_assertG(found,
+		 "InGrayHeap set but arena not in grayastack: idx=%u grayastop=%u greystack_empty=%d",
+		 (unsigned)idx, (unsigned)n, arena_gray_empty(a));
+    }
+#endif
+    return;
+  }
   heap = mref(g->gc.grayastack, MSize);
   if (g->gc.grayastop >= g->gc.grayasz) {
     MSize oldsz = g->gc.grayasz;
@@ -3065,31 +3415,52 @@ void lj_gc_ssb_flush(global_State *g)
 {
   GCobj **base = mref(g->gc.ssb, GCobj *);
   GCobj **top = mref(g->gc.ssbtop, GCobj *);
+  GCobj **lim = mref(g->gc.ssblim, GCobj *);
+  if (base == NULL || top == NULL || lim == NULL)
+    return;
+  /* Out-of-range ssbtop means memory clobber (e.g. game L layout) — fail loud. */
+  lj_assert_check(g, top >= base && top <= lim,
+		   "ssbtop out of range: top=%p base=%p lim=%p",
+		   (void *)top, (void *)base, (void *)lim);
+  if (top == base)
+    return;
   setmref(g->gc.ssbtop, base);
   while (base < top) {
     GCobj *o = *base++;
-    if (o->gch.marked & LJ_GC_GRAY) {
+    if (o != NULL && (o->gch.marked & LJ_GC_GRAY))
       arena_gray_push(g, ptr2arena(o), (GCCellID1)ptr2cell(o));
-    }
   }
+}
+
+/* Abort on store of a freeable corpse (isdead). Name historical (nursery). */
+void lj_gc_nursery_forbid_white(global_State *g, GCobj *v)
+{
+  lj_assert_check(g, 0,
+		   "isdead store forbidden: "
+		   "gct=%d marked=0x%02x p=%p",
+		   v ? v->gch.gct : -1, v ? v->gch.marked : 0, (void *)v);
 }
 
 /* Move the GC propagation frontier forward. */
 void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 {
-  lj_assertG(!(o->gch.marked & LJ_GC_GRAY) && !gc_obj_isdead(g, o),
-	     "bad object states for forward barrier");
-  /* Note: unlike the header-color GC, the inline barrier fast path here only
-  ** tests the gray bit, so this is entered for non-gray (white OR black)
-  ** parents -- including white parents during GCSfinalize/GCSpause, where a
-  ** stock LuaJIT forward barrier never fires. That is benign: the else-branch
-  ** below just sets the gray bit. Hence no state assert under LJ_HASGCMARK. */
-  lj_assertG(o->gch.gct != ~LJ_TTAB, "barrier object is not a table");
-  /* Preserve invariant during propagation. Otherwise it doesn't matter. */
+  lj_assertG(!gc_obj_isdead(g, o), "forward barrier on dead object");
+  /* Macros only prefilter !isgray; bitmap work is here. */
+  if (!gc_obj_ismarked(g, o) || !gc_obj_iswhite(g, v))
+    return;
+  /* D2: only corpses (isdead) are forbidden; curwhite children are markable. */
+  if (LJ_UNLIKELY(gc_obj_isdead(g, v))) {
+    lj_gc_nursery_forbid_white(g, v);
+    return;
+  }
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
-    gc_mark(g, v);  /* Move frontier forward. */
+    gc_mark(g, v);
+  else if (o->gch.gct == ~LJ_TTAB)
+    lj_gc_barrierback(g, gco2tab(o));
   else
-    o->gch.marked |= LJ_GC_GRAY;  /* Set gray to avoid re-triggering barrier. */
+    /* Classic makewhite(o): never paint mark∧GRAY without a worklist.
+    ** Under GCMARK makewhite only clears header GRAY. */
+    makewhite(g, o);
 }
 
 /* Specialized barrier for closed upvalue. Pass &uv->tv. */
@@ -3097,10 +3468,17 @@ void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
 {
 #define TV2MARKED(x) \
   (*((uint8_t *)(x) - offsetof(GCupval, tv) + offsetof(GCupval, marked)))
+  /* Interpreter/JIT must only call this for GC values, but defend against
+  ** non-GC stores (nil/bool/number/lightud): gcV() asserts tvisgcv. */
+  if (!tvisgcv(tv))
+    return;
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)
     gc_mark(g, gcV(tv));
+  else if (LJ_UNLIKELY(gc_obj_isdead(g, gcV(tv))))
+    lj_gc_nursery_forbid_white(g, gcV(tv));
   else
-    TV2MARKED(tv) |= LJ_GC_GRAY;  /* Set gray to avoid re-triggering barrier. */
+    /* Classic makewhite(uv): clear GRAY only — never orphan mark∧GRAY. */
+    TV2MARKED(tv) &= (uint8_t)~LJ_GC_GRAY;
 #undef TV2MARKED
 }
 
@@ -3114,14 +3492,33 @@ void lj_gc_closeuv(global_State *g, GCupval *uv)
   uv->closed = 1;
   if ((o->gch.marked & LJ_GC_GRAY) && !gc_obj_iswhite(g, o)) {
     if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic) {
-      gray2black(o);  /* Make it black and preserve invariant. */
+      /* Open UV marked∧GRAY (P3a) or nursery light-gray born-GRAY: blacken on
+      ** close and barrier the closed value if it points to a white child. */
+      gray2black(o);
       if (tvisgcv(&uv->tv) && gc_obj_iswhite(g, gcV(&uv->tv)))
 	lj_gc_barrierf(g, o, gcV(&uv->tv));
+    } else if (LJ_UNLIKELY(g->gc.state == GCSsweep)) {
+      /* P3a: a surviving open UV enters closeuv as mark∧GRAY (the legit open-UV
+      ** residual) during sweep/nursery. makewhite clears GRAY → pure black;
+      ** the mark bit keeps it alive this cycle. Nursery-born light-gray
+      ** (!mark, GRAY) also lands here and is cleared the same way. The old
+      ** "mark∧GRAY after atomic is a hard bug" assert is gone — under P3a it
+      ** is the expected open-UV color at sweep entry. */
+      makewhite(g, o);
     } else {
-      makewhite(g, o);  /* Make it white, i.e. sweep the upvalue. */
+      makewhite(g, o);
       lj_assertG(g->gc.state != GCSfinalize && g->gc.state != GCSpause,
 		 "bad GC state");
     }
+  } else if (gc_obj_isblack(g, o)) {
+    /* Pure-black UV being closed (defensive: a closed UV gray2black'd at mark
+    ** time, or an open UV blackened by the prop/atomic branch above in a
+    ** prior close — closeuv is normally once-per-UV, so this is a safety net).
+    ** P3a: surviving OPEN UVs are NOT gray2black'd at atomic end — they enter
+    ** closeuv mark∧GRAY and take the first branch above. Barrier the closed
+    ** value if it points to a white child. */
+    if (tvisgcv(&uv->tv) && gc_obj_iswhite(g, gcV(&uv->tv)))
+      lj_gc_barrierf(g, o, gcV(&uv->tv));
   }
 }
 
@@ -3158,7 +3555,7 @@ void *lj_mem_realloc(lua_State *L, void *p, GCSize osz, GCSize nsz)
 /* Allocate new GC object and link it to the root set. */
 void * LJ_FASTCALL lj_mem_newgco(lua_State *L, GCSize size)
 {
-  return lj_mem_newgco_arena(L, size, 0, 1);
+  return lj_mem_newgco_arena(L, size, ArenaClass_Trav, 1);
 }
 
 
@@ -3186,17 +3583,10 @@ void *lj_mem_newgco_slow(lua_State *L, GCSize size, int cls, int link)
     g->gc.total += (GCSize)arena_roundcells(size) << CellSizeLog2;
   else
     g->gc.total += size;
-  if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MARKALLOC)) {
-    /* An object allocated during the sweep window must be slot/bitmap-black so
-    ** the sweep does not free it under the caller's nose. Huge objects (string
-    ** and non-string) carry color in their hugeset slot, in-arena objects in
-    ** the cell bitmap -- mark whichever applies, symmetric with the in-arena
-    ** fast path in lj_mem_newgco_arena. */
-    if (lj_arena_ishuge(o))
-      huge_obj_setmark(g, o);
-    else
-      arena_obj_setmark(ptr2arena(o), ptr2cell(o));
-  }
+  /* During sweep, new huge objects need MARK to survive hugescan. */
+  if (LJ_UNLIKELY(g->gc.state == GCSsweep &&
+		  lj_arena_ishuge(o)))
+    huge_obj_setmark(g, o);
 #if defined(LUAJIT_ENABLE_MEMPROF)
   if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
     lj_memprof_emit_alloc(L, o, size, cls, link);

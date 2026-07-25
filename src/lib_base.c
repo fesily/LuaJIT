@@ -819,7 +819,7 @@ static void setpc_wrap_aux(lua_State *L, GCfunc *fn)
 
 static void newproxy_weaktable(lua_State *L)
 {
-  /* NOBARRIER: The table is new (marked white). */
+  /* NOBARRIER: The table is new (marked white / light-gray). */
   GCtab *t = lj_tab_new(L, 0, 1);
   settabV(L, L->top++, t);
   setgcref(t->metatable, obj2gco(t));

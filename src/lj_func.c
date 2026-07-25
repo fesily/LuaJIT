@@ -72,7 +72,11 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
   while (gcref(L->openupval) != NULL &&
 	 uvval((uv = gco2uv(gcref(L->openupval)))) >= level) {
     GCobj *o = obj2gco(uv);
+#if !LJ_HASGCMARK
+    /* Classic: open upvalues stay white/gray until closed. Bitmap GC
+    ** gray2black's surviving open UVs at atomic end, so black is normal. */
     lj_assertG(!gc_obj_isblack(g, o), "bad black upvalue");
+#endif
     lj_assertG(!uv->closed && uvval(uv) != &uv->tv, "closed upvalue in chain");
     setgcrefr(L->openupval, uv->nextgc);  /* No longer in open list. */
     if (gc_obj_isdead(g, o)) {
@@ -100,7 +104,7 @@ GCfunc *lj_func_newC(lua_State *L, MSize nelems, GCtab *env)
   fn->c.gct = ~LJ_TFUNC;
   fn->c.ffid = FF_C;
   fn->c.nupvalues = (uint8_t)nelems;
-  /* NOBARRIER: The GCfunc is new (marked white). */
+  /* NOBARRIER: The GCfunc is new (marked white / light-gray). */
   setmref(fn->c.pc, &G(L)->bc_cfunc_ext);
   setgcref(fn->c.env, obj2gco(env));
   return fn;
@@ -128,7 +132,7 @@ static GCfunc *func_newL(lua_State *L, GCproto *pt, GCtab *env)
 #else
   fn->l.nupvalues = 0;  /* Set to zero until upvalues are initialized. */
 #endif
-  /* NOBARRIER: Really a setgcref. But the GCfunc is new (marked white). */
+  /* NOBARRIER: Really a setgcref. But the GCfunc is new (marked white / light-gray). */
   setmref(fn->l.pc, proto_bc(pt));
   setgcref(fn->l.env, obj2gco(env));
   /* Saturating 3 bit counter (0..7) for created closures. */
@@ -142,7 +146,7 @@ GCfunc *lj_func_newL_empty(lua_State *L, GCproto *pt, GCtab *env)
 {
   GCfunc *fn = func_newL(L, pt, env);
   MSize i, nuv = pt->sizeuv;
-  /* NOBARRIER: The GCfunc is new (marked white). */
+  /* NOBARRIER: The GCfunc is new (marked white / light-gray). */
   for (i = 0; i < nuv; i++) {
     GCupval *uv = func_emptyuv(L);
     int32_t v = proto_uv(pt)[i];
@@ -163,7 +167,7 @@ GCfunc *lj_func_newL_gc(lua_State *L, GCproto *pt, GCfuncL *parent)
   TValue *base;
   lj_gc_check_fixtop(L);
   fn = func_newL(L, pt, tabref(parent->env));
-  /* NOBARRIER: The GCfunc is new (marked white). */
+  /* NOBARRIER: The GCfunc is new (marked white / light-gray). */
   puv = parent->uvptr;
   nuv = pt->sizeuv;
   base = L->base;

@@ -513,13 +513,19 @@ LJLIB_CF(ffi_new)	LJLIB_REC(.)
     /* Handle ctype __gc metamethod. Use the fast lookup here. */
     cTValue *tv = lj_tab_getinth(cts->miscmap, -(int32_t)id);
     if (tv && tvistab(tv) && (tv = lj_meta_fast(L, tabV(tv), MM_gc))) {
+#if LJ_HASGCMARK
+      if (!G(L)->gc.fin_closed) {
+	cd->marked |= LJ_GC_CDATA_FIN;
+	lj_gc_fin_register(L, obj2gco(cd), FIN_KIND_CDATA, gcV(tv), itype(tv));
+      }
+#else
       GCtab *t = tabref(G(L)->gcroot[GCROOT_FFI_FIN]);
       if (gcref(t->metatable)) {
-	/* Add to finalizer table, if still enabled. */
 	copyTV(L, lj_tab_set(L, t, o-1), tv);
 	lj_gc_anybarriert(L, t);
 	cd->marked |= LJ_GC_CDATA_FIN;
       }
+#endif
     }
   }
   L->top = o;  /* Only return the cdata itself. */

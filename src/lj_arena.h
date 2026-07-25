@@ -171,16 +171,17 @@ typedef union GCArena {
 	GCCellID1 celltopmax;	/* Bump allocator limit. */
 	uint16_t flags;		/* ArenaFlag_*. */
 	uint16_t unused1;
-	MSize id;		/* Index in the arena registry. */
-	uint32_t freecells;	/* Total cells in free blocks. */
-	uint32_t freegen;	/* Incremented on every block free. */
-	MRef freelist;		/* ArenaFreeList *, lazily allocated. */
-	MRef chunk;		/* ArenaChunk this arena was carved from. */
-	/* Per-arena gray stack for mark propagation (LJ_HASGCMARK). */
-	MRef greytop;		/* GCCellID1 *, next free slot. */
-	MRef greybase;		/* GCCellID1 *, buffer start. */
-	MRef greyend;		/* GCCellID1 *, buffer end (overflow check). */
-      };
+ 	MSize id;		/* Index in the arena registry. */
+ 	uint32_t freecells;	/* Total cells in free blocks. */
+ 	uint32_t freegen;	/* Incremented on every block free. */
+ 	uint32_t swept_gen;	/* Last sweep epoch (g->gc.epoch); other = (!= epoch). */
+ 	MRef freelist;		/* ArenaFreeList *, lazily allocated. */
+ 	MRef chunk;		/* ArenaChunk this arena was carved from. */
+ 	/* Per-arena gray stack for mark propagation (LJ_HASGCMARK). */
+  	MRef greytop;		/* GCCellID1 *, next free slot. */
+  	MRef greybase;		/* GCCellID1 *, buffer start. */
+  	MRef greyend;		/* GCCellID1 *, buffer end (overflow check). */
+       };
       GCBlockword mark[MaxBlockWord];
     };
     GCBlockword block[MaxBlockWord];
@@ -269,6 +270,14 @@ static LJ_AINLINE void arena_obj_shadowmark(void *o)
 
 #if LJ_HASGCMARK
 /* -- Per-arena gray stack ------------------------------------------------- */
+
+/* Arena epoch: current(a) = (a->swept_gen == g->gc.epoch). Nursery arenas
+** (born or swept this cycle) are current; dead test (isdead) is false for
+** them. other(a) = !current(a); only other arenas have freeable objects. */
+static LJ_AINLINE int arena_is_current(global_State *g, GCArena *a)
+{
+  return a->swept_gen == g->gc.epoch;
+}
 
 enum {
   ArenaGrayInitSize = 256	/* Initial gray stack capacity (entries). */
