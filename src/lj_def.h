@@ -358,6 +358,7 @@ static LJ_AINLINE uint32_t lj_getu32(const void *v)
    (lj_assert_fail((g), __FILE__, __LINE__, __func__, __VA_ARGS__), 0))
 #define lj_checkapi(c, ...)	lj_assert_check(G(L), (c), __VA_ARGS__)
 #else
+#define lj_assert_check(g, c, ...)	((void)0)
 #define lj_checkapi(c, ...)	((void)L)
 #endif
 
