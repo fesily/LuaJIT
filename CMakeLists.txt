@@ -86,14 +86,9 @@ if (LUAJIT_ENABLE_FSANITIZE)
       # undeclared LJ_GC_GRAY. Classic GC needs SYSMALLOC for ASan visibility of
       # dlmalloc; apply it only to the default variant below. Arena GC has its
       # own ASan poison helpers in lj_asan.h (same contract as Makefile ASAN=1).
+      # ASan flags applied per shared library target (not host tools).
       add_definitions(-DLUA_USE_APICHECK -DLUA_USE_ASSERT)
-      if (NOT MSVC)
-        add_link_options(-fsanitize=address)
-        add_compile_options(-fsanitize=address)
-      else()
-        add_link_options(/fsanitize=address)
-        add_compile_options(/fsanitize=address)
-      endif()
+      add_definitions(-DLJ_GC_NOSTEPVERIFY)
 endif()
 
 CHECK_TYPE_SIZE("void*" SIZEOF_VOID_P)
@@ -318,6 +313,14 @@ else()
   set(BUILDVM_HOST_ENV)
 endif()
 
+# Avoid src/lj_*def.h shadowing variant-local buildvm outputs.
+foreach(_lj_gen_h lj_bcdef.h lj_ffdef.h lj_folddef.h lj_libdef.h lj_recdef.h)
+  if(EXISTS "${LUAJIT_DIR}/src/${_lj_gen_h}")
+    message(STATUS "Removing stale ${LUAJIT_DIR}/src/${_lj_gen_h}")
+    file(REMOVE "${LUAJIT_DIR}/src/${_lj_gen_h}")
+  endif()
+endforeach()
+
 function(add_buildvm_target_for_variant buildvm_target variant_binary_dir output_name mode)
   add_custom_command(OUTPUT "${variant_binary_dir}/${output_name}"
     COMMAND ${BUILDVM_HOST_ENV} $<TARGET_FILE:${buildvm_target}> -m ${mode} -o "${variant_binary_dir}/${output_name}" ${ARGN}
@@ -457,6 +460,15 @@ function(add_luajit_variant)
     ${LUAJIT_DIR}/src
     ${LUAJIT_DIR}/dynasm)
   target_link_libraries(${LJVAR_LIB_TARGET} ${LIBS})
+  if(LUAJIT_ENABLE_FSANITIZE)
+    if(NOT MSVC)
+      target_compile_options(${LJVAR_LIB_TARGET} PRIVATE -fsanitize=address)
+      target_link_options(${LJVAR_LIB_TARGET} PRIVATE -fsanitize=address)
+    else()
+      target_compile_options(${LJVAR_LIB_TARGET} PRIVATE /fsanitize=address)
+      target_link_options(${LJVAR_LIB_TARGET} PRIVATE /fsanitize=address)
+    endif()
+  endif()
   install(TARGETS ${LJVAR_LIB_TARGET} RUNTIME DESTINATION .)
 
   if(WIN32)
