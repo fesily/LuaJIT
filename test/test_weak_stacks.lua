@@ -92,7 +92,11 @@ end
 
 -- Mode mutation before full collection: the second atomic traversal must use
 -- the latest __mode and place the table on the correct weak stack.
+-- Stop GC during weak-value construction: values have no external root, so a
+-- mid-loop atomic (common under LUAI_GCPAUSE_GCMARK=130) would clear them and
+-- the check would measure GC scheduling rather than mode re-evaluation.
 do
+  collectgarbage("stop")
   local mt = { __mode = "v" }
   local t = setmetatable({}, mt)
   local keys = {}
@@ -103,6 +107,7 @@ do
     keys[i] = k
   end
   mt.__mode = "k"
+  collectgarbage("restart")
   collectgarbage("collect"); collectgarbage("collect")
   check("mode_mutation_to_weakkey", count_pairs(t) == 120, "n="..count_pairs(t))
   healthy("mode_mutation_checkheap")
