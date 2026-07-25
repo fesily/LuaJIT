@@ -375,13 +375,10 @@
 |.endmacro
 |
 |// Move table write barrier back. Overwrites reg.
+|// Call sites skip when header GRAY (§2.5: no stale black-gray on free entry;
+|// light-gray and on-stack/weak gray skip). C still does gc_obj_ismarked.
 |.macro barrierback, tab, reg
 |.if LJ_HASGCMARK
-|  // Gray-skip + C call barrier (matches JIT asm_tbar).
-|  // Hot path: already gray → skip. Cold: call lj_gc_barrierback_arena.
-|  test byte tab->marked, LJ_GC_GRAY
-|  jnz >9
-|  // Save all VM registers that may be clobbered by the C call.
 |  push RC				// rax (caller-save, return value)
 |  push TMPR				// r10 (caller-save)
 |  push ITYPE				// r11 (caller-save)
@@ -395,7 +392,6 @@
 |  pop ITYPE
 |  pop TMPR
 |  pop RC
-|9:
 |.else
 |  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
@@ -876,6 +872,9 @@ static void build_subroutines(BuildCtx *ctx)
   |  mov L:CARG1->base, BASE		// Caveat: CARG2/CARG3 may be BASE.
   |  mov CARG2, RB
   |  mov CARG3, RC
+  |  // Do NOT use TMP1 here: vmeta_tsets/tsetb keep the key TValue in TMP1
+  |  // (RC points at it). Clobbering TMP1 corrupts the key into a raw pointer
+  |  // (looks like a number) for __newindex / meta_tset.
   |  mov L:RB, L:CARG1
   |  mov SAVE_PC, PC
   |  call extern lj_meta_tset		// (lua_State *L, TValue *o, TValue *k)
@@ -3719,13 +3718,14 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |1:
     |  ins_next
     |
-    |2:  // Upvalue is black. Check if new value is collectable and white.
-    |.if not LJ_HASGCMARK
+    |2:  // Parent needs barrier. Value must be collectable (always).
+    |  // Classic also requires iswhite(v); bitmap GC marks any GC child.
     |  mov RD, RA
     |  sar RD, 47
     |  sub RDd, LJ_TISGCV
     |  cmp RDd, LJ_TNUMX - LJ_TISGCV			// tvisgcv(v)
     |  jbe <1
+    |.if not LJ_HASGCMARK
     |  cleartp GCOBJ:RA
     |  test byte GCOBJ:RA->gch.marked, LJ_GC_WHITES	// iswhite(v)
     |  jz <1

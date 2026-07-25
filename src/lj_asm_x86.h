@@ -1941,25 +1941,22 @@ static void asm_cnew(ASMState *as, IRIns *ir)
 static void asm_tbar(ASMState *as, IRIns *ir)
 {
 #if LJ_HASGCMARK
-  /* Backward barrier. Keep only the steady-state hot path inline: if the table
-  ** is already gray, skip everything. Otherwise call the shared C helper, which
-  ** sets gray and pushes to the SSB when the table is black. Inlining the full
-  ** quad-color body (set gray, test arena mark bit, SSB push + cold flush)
-  ** overflowed the asm red zone (MCLIM_REDZONE); the non-gray case is cold, so
-  ** a call costs nothing real. Mirrors asm_obar. The vm_x64.dasc barrierback
-  ** macro keeps the full inline body — the interpreter has room for it. */
+  /* GRAY → skip call; !GRAY → lj_gc_barrierback_arena.
+  ** Same control-flow shape as asm_gc_check: ra_evictset FIRST so reloads
+  ** sit at the join; l_end must be AFTER evict (not before). A jcc to a
+  ** pre-evict label skips reloads and leaves spilled frame regs dead.
+  ** tab is allocated after evict so its Reg is not a stale pre-spill number. */
   const CCallInfo *ci = &lj_ir_callinfo[IRCALL_lj_gc_barrierback_arena];
   IRRef args[2];
-  MCLabel l_end;
   Reg tab;
+  MCLabel l_end;
   ra_evictset(as, RSET_SCRATCH);
   l_end = emit_label(as);
-  args[0] = ASMREF_TMP1;  /* global_State *g     */
-  args[1] = ir->op1;      /* GCobj *o (the table) */
+  args[0] = ASMREF_TMP1;
+  args[1] = ir->op1;
   asm_gencall(as, ci, args);
   emit_loada(as, ra_releasetmp(as, ASMREF_TMP1), J2G(as->J));
-  tab = IR(ir->op1)->r;
-  /* Hot path: skip the whole barrier if tab is already gray. */
+  tab = ra_alloc1(as, ir->op1, RSET_GPR);
   emit_sjcc(as, CC_NZ, l_end);
   emit_i8(as, LJ_GC_GRAY);
   emit_rmro(as, XO_GROUP3b, XOg_TEST, tab, offsetof(GCtab, marked));
@@ -1986,19 +1983,22 @@ static void asm_obar(ASMState *as, IRIns *ir)
   Reg obj;
   /* No need for other object barriers (yet). */
   lj_assertA(IR(ir->op1)->o == IR_UREFC, "bad OBAR type");
+  /* Evict before l_end so both call and skip paths run reloads (asm_gc_check). */
   ra_evictset(as, RSET_SCRATCH);
   l_end = emit_label(as);
   args[0] = ASMREF_TMP1;  /* global_State *g */
   args[1] = ir->op1;      /* TValue *tv      */
   asm_gencall(as, ci, args);
   emit_loada(as, ra_releasetmp(as, ASMREF_TMP1), J2G(as->J));
-  obj = IR(ir->op1)->r;
 #if LJ_HASGCMARK
+  /* GRAY on open/closed UV → skip call; else barrieruv. */
+  obj = ra_alloc1(as, ir->op1, RSET_GPR);
   emit_sjcc(as, CC_NZ, l_end);
   emit_i8(as, LJ_GC_GRAY);
   emit_rmro(as, XO_GROUP3b, XOg_TEST, obj,
 	    (int32_t)offsetof(GCupval, marked)-(int32_t)offsetof(GCupval, tv));
 #else
+  obj = IR(ir->op1)->r;
   emit_sjcc(as, CC_Z, l_end);
   emit_i8(as, LJ_GC_WHITES);
   if (irref_isk(ir->op2)) {
