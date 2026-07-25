@@ -367,6 +367,11 @@ LJ_FUNC void lj_gc_fin_update_udata(lua_State *L, GCudata *ud);
 LJ_FUNC void lj_gc_fin_backfill_udata(global_State *g);
 LJ_FUNC void lj_gc_fin_free(global_State *g);
 LJ_FUNC void lj_gc_fin_dual_assert_udata(global_State *g);
+/* Pending-finalizer FIFO work queue (replaces mmudata ring under HASGCMARK). */
+LJ_FUNC void lj_gc_fin_queue_push(global_State *g, GCobj *o, int kind,
+				  GCobj *fin, uint32_t it);
+LJ_FUNC int lj_gc_fin_queue_pop(global_State *g, FinQueueEntry *out);
+LJ_FUNC int lj_gc_fin_queue_empty(global_State *g);
 #endif
 
 /* Move the GC propagation frontier back for tables (make it gray again). */

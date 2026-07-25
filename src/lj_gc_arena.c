@@ -809,8 +809,95 @@ void lj_gc_fin_free(global_State *g)
     setmref(g->gc.fin_order, NULL);
     g->gc.fin_ordersz = 0;
   }
+  if (g->gc.fin_qmask != 0) {
+    g->allocf(g->allocd, mref(g->gc.fin_queue, FinQueueEntry),
+	      (g->gc.fin_qmask + 1) * sizeof(FinQueueEntry), 0);
+    setmref(g->gc.fin_queue, NULL);
+    g->gc.fin_qmask = 0;
+  }
   g->gc.fin_num = 0;
   g->gc.fin_tomb = 0;
+  g->gc.fin_qhead = 0;
+  g->gc.fin_qtail = 0;
+}
+
+/* -- fin_queue: pending-finalizer FIFO work queue ------------------------- */
+/* Replaces the circular mmudata ring under LJ_HASGCMARK (design Finalizers
+** §3/§10). Power-of-two ring: O(1) push/pop with no nextgc re-link. Lazily
+** allocated on first push; freed above in lj_gc_fin_free. head==tail ⇒ empty;
+** (tail-head)==mask+1 ⇒ full (grow). head/tail wrap mod 2^N; & mask keeps
+** indexing correct across wraparound. Drain pops head-first, so finalize call
+** order == separateudata enqueue order == registration FIFO.
+**
+** T1: storage + helpers only, no consumer yet (mmudata ring still in use). */
+
+#define FIN_QUEUE_INIT	16	/* power of two; first allocation size. */
+
+static void fin_queue_grow(global_State *g)
+{
+  MSize oldmask = g->gc.fin_qmask;
+  MSize newmask = oldmask ? (oldmask << 1) | 1 : (MSize)(FIN_QUEUE_INIT - 1);
+  MSize newsz = newmask + 1;
+  FinQueueEntry *old = mref(g->gc.fin_queue, FinQueueEntry);
+  FinQueueEntry *nq = (FinQueueEntry *)g->allocf(g->allocd, NULL, 0,
+						 newsz * sizeof(FinQueueEntry));
+  MSize count, i;
+  if (LJ_UNLIKELY(nq == NULL))
+    lj_err_mem(mainthread(g));
+  count = g->gc.fin_qtail - g->gc.fin_qhead;
+  /* Linearize live entries out of the (possibly wrapped) old ring into the
+  ** dense base of the new buffer; old may be NULL on the very first alloc. */
+  for (i = 0; i < count; i++)
+    nq[i] = old[(g->gc.fin_qhead + i) & oldmask];
+  if (old != NULL)
+    g->allocf(g->allocd, old, (oldmask + 1) * sizeof(FinQueueEntry), 0);
+  setmref(g->gc.fin_queue, nq);
+  g->gc.fin_qmask = newmask;
+  g->gc.fin_qhead = 0;
+  g->gc.fin_qtail = count;
+}
+
+void lj_gc_fin_queue_push(global_State *g, GCobj *o, int kind,
+			  GCobj *fin, uint32_t fin_it)
+{
+  FinQueueEntry *q = mref(g->gc.fin_queue, FinQueueEntry);
+  MSize mask = g->gc.fin_qmask;
+  FinQueueEntry *e;
+  lj_assertG(kind == FIN_KIND_UDATA || kind == FIN_KIND_CDATA,
+	     "fin_queue_push bad kind %d", kind);
+  if (q == NULL || (g->gc.fin_qtail - g->gc.fin_qhead) >= mask + 1) {
+    fin_queue_grow(g);
+    q = mref(g->gc.fin_queue, FinQueueEntry);
+    mask = g->gc.fin_qmask;
+  }
+  e = &q[g->gc.fin_qtail & mask];
+  setgcref(e->obj, o);
+  if (kind == FIN_KIND_CDATA && fin != NULL) {
+    setgcref(e->fin, fin);
+    e->fin_it = fin_it;
+  } else {
+    setgcrefnull(e->fin);
+    e->fin_it = 0;
+  }
+  e->kind = (uint8_t)kind;
+  e->pad[0] = e->pad[1] = e->pad[2] = 0;
+  g->gc.fin_qtail++;
+}
+
+int lj_gc_fin_queue_pop(global_State *g, FinQueueEntry *out)
+{
+  FinQueueEntry *q = mref(g->gc.fin_queue, FinQueueEntry);
+  MSize mask = g->gc.fin_qmask;
+  MSize head = g->gc.fin_qhead;
+  if (q == NULL || head == g->gc.fin_qtail) return 0;
+  *out = q[head & mask];
+  g->gc.fin_qhead = head + 1;
+  return 1;
+}
+
+int lj_gc_fin_queue_empty(global_State *g)
+{
+  return g->gc.fin_qhead == g->gc.fin_qtail;
 }
 
 /* F3: registry is authoritative. Postcondition after separate:
