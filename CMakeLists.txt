@@ -87,8 +87,12 @@ if (LUAJIT_ENABLE_FSANITIZE)
       # dlmalloc; apply it only to the default variant below. Arena GC has its
       # own ASan poison helpers in lj_asan.h (same contract as Makefile ASAN=1).
       # ASan flags applied per shared library target (not host tools).
+      # ASSERT/APICHECK stay on for correctness traps, but the O(live) fullgc
+      # shadow-mark verify and per-step checkheap walks are too expensive for
+      # ASAN game/CI runs — gate them off (re-enable pure -DLUA_USE_ASSERT
+      # without these for deep GC diagnosis).
       add_definitions(-DLUA_USE_APICHECK -DLUA_USE_ASSERT)
-      add_definitions(-DLJ_GC_NOSTEPVERIFY)
+      add_definitions(-DLJ_GC_NOSTEPVERIFY -DLJ_GC_NOFULLGCVERIFY)
 endif()
 
 CHECK_TYPE_SIZE("void*" SIZEOF_VOID_P)
