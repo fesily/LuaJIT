@@ -366,7 +366,8 @@ static void gc_mark(global_State *g, GCobj *o)
     gray2black(o);
 #if LJ_HASFFI
     /* Registry holds fin outside the mark graph (no FFI_FIN strong values).
-    ** Keep fin live for both live CDATA_FIN objects and mmudata re-mark. */
+    ** Keep fin live for live CDATA_FIN objects (dead ones get fin marked at
+    ** separate and via the fin_queue slot at resurrection). */
     if (gct == ~LJ_TCDATA && (o->gch.marked & LJ_GC_CDATA_FIN)) {
       int found = 0;
       FinEntry *e = fin_tab_find(g, o, &found);
@@ -435,35 +436,9 @@ static void gc_mark_start(global_State *g)
   g->gc.state = GCSpropagate;
 }
 
-/* Mark userdata in mmudata list. */
-static void gc_mark_mmudata(global_State *g)
-{
-  GCobj *root = gcref(g->gc.mmudata);
-  GCobj *u = root;
-  if (u) {
-    do {
-      u = gcnext(u);
-      gc_obj_makewhite(g, u);  /* Could be from previous GC. */
-      gc_mark(g, u);
-    } while (u != root);
-  }
-}
-
-/* Link o onto the circular mmudata ring (tail insert). */
-static void fin_mmudata_link(global_State *g, GCobj *o)
-{
-  if (gcref(g->gc.mmudata)) {
-    GCobj *root = gcref(g->gc.mmudata);
-    setgcrefr(o->gch.nextgc, root->gch.nextgc);
-    setgcref(root->gch.nextgc, o);
-    setgcref(g->gc.mmudata, o);
-  } else {
-    setgcref(o->gch.nextgc, o);
-    setgcref(g->gc.mmudata, o);
-  }
-}
-
-/* Udata: white (or all) + has __gc + !FINALIZED → mmudata. */
+/* Udata: white (or all) + has __gc + !FINALIZED → fin_queue (registration FIFO).
+** Unregister at death judgment; resurrect via makewhite+mark so the object and
+** its __gc graph survive the free window until mutator drain. */
 static size_t sepudata_one(global_State *g, GCobj *o, int all)
 {
   if (!(gc_obj_iswhite(g, o) || all) || isfinalized(gco2ud(o)))
@@ -476,20 +451,37 @@ static size_t sepudata_one(global_State *g, GCobj *o, int all)
   {
     size_t sz = sizeudata(gco2ud(o));
     markfinalized(o);
-    fin_mmudata_link(g, o);
+    lj_gc_fin_queue_push(g, o, FIN_KIND_UDATA, NULL, 0);
+    lj_gc_fin_unregister(g, o);
+    gc_obj_makewhite(g, o);  /* Could be from previous GC. */
+    gc_mark(g, o);
     return sz;
   }
 }
 
 #if LJ_HASFFI
-/* Cdata: registry entry is authority (F3); CDATA_FIN kept in sync for JIT. */
+/* Cdata: copy fin into queue entry, unregister registry, mark fin + object. */
 static size_t sepcdata_one(global_State *g, GCobj *o, int all)
 {
+  int found = 0;
+  FinEntry *e;
+  GCobj *fin = NULL;
+  uint32_t fin_it = 0;
   if (!(gc_obj_iswhite(g, o) || all) || (o->gch.marked & LJ_GC_FINALIZED))
     return 0;
+  e = fin_tab_find(g, o, &found);
+  if (found && e != NULL && e->kind == FIN_KIND_CDATA) {
+    fin = gcref(e->fin);
+    fin_it = e->fin_it;
+  }
   o->gch.marked |= LJ_GC_CDATA_FIN;
   markfinalized(o);
-  fin_mmudata_link(g, o);
+  lj_gc_fin_queue_push(g, o, FIN_KIND_CDATA, fin, fin_it);
+  if (fin != NULL)
+    gc_markobj(g, fin);  /* Keep fin live after registry drop. */
+  lj_gc_fin_unregister(g, o);
+  gc_obj_makewhite(g, o);
+  gc_mark(g, o);
   return 0;
 }
 #endif
@@ -506,16 +498,16 @@ static LJ_AINLINE MSize fin_hash(GCobj *o, MSize mask)
 }
 
 #if defined(LUA_USE_ASSERT)
-static int fin_on_mmudata(global_State *g, GCobj *o)
+/* True if o is pending on fin_queue (replaces mmudata ring membership). */
+static int fin_on_queue(global_State *g, GCobj *o)
 {
-  GCobj *root = gcref(g->gc.mmudata);
-  GCobj *u;
-  if (root == NULL) return 0;
-  u = root;
-  do {
-    u = gcnext(u);
-    if (u == o) return 1;
-  } while (u != root);
+  FinQueueEntry *q = mref(g->gc.fin_queue, FinQueueEntry);
+  MSize mask = g->gc.fin_qmask;
+  MSize head = g->gc.fin_qhead, tail = g->gc.fin_qtail, i;
+  if (q == NULL || head == tail) return 0;
+  for (i = head; i != tail; i++) {
+    if (gcref(q[i & mask].obj) == o) return 1;
+  }
   return 0;
 }
 #endif
@@ -829,7 +821,7 @@ void lj_gc_fin_free(global_State *g)
 ** indexing correct across wraparound. Drain pops head-first, so finalize call
 ** order == separateudata enqueue order == registration FIFO.
 **
-** T1: storage + helpers only, no consumer yet (mmudata ring still in use). */
+** Drain order == separateudata enqueue order == registration FIFO. */
 
 #define FIN_QUEUE_INIT	16	/* power of two; first allocation size. */
 
@@ -900,16 +892,26 @@ int lj_gc_fin_queue_empty(global_State *g)
   return g->gc.fin_qhead == g->gc.fin_qtail;
 }
 
-/* F3: registry is authoritative. Postcondition after separate:
-** - white udata with __gc / white cdata must be FINALIZED and on mmudata
-** - every registry CDATA entry keeps LJ_GC_CDATA_FIN (cache sync, not
-**   authority; O(1) presence cache for JIT/mark fast paths)
-** Reverse (bit without registry) is checked on free, not a full-heap scan. */
+/* F3 complete: after separate, dead finalizables leave the registry and sit
+** on fin_queue with FINALIZED. Registry survivors must not be white+needs-fin
+** (they would have been enqueued). Queue members must carry FINALIZED.
+** CDATA_FIN cache sync on remaining registry cdata entries still holds. */
 void lj_gc_fin_dual_assert_udata(global_State *g)
 {
 #if defined(LUA_USE_ASSERT)
   FinEntry *tab = mref(g->gc.fin_tab, FinEntry);
+  FinQueueEntry *q = mref(g->gc.fin_queue, FinQueueEntry);
   MSize i, mask = g->gc.fin_mask;
+  MSize qmask = g->gc.fin_qmask, head = g->gc.fin_qhead, tail = g->gc.fin_qtail;
+  /* Queue: every pending entry is FINALIZED. */
+  if (q != NULL) {
+    for (i = head; i != tail; i++) {
+      GCobj *o = gcref(q[i & qmask].obj);
+      lj_assertG(o != NULL && (o->gch.marked & LJ_GC_FINALIZED),
+		 "fin F3: fin_queue entry not FINALIZED: ptr=%p", (void *)o);
+      lj_assertG(fin_on_queue(g, o), "fin F3: queue walk inconsistency");
+    }
+  }
   if (tab == NULL || mask == 0) return;
   for (i = 0; i <= mask; i++) {
     GCobj *o;
@@ -919,21 +921,17 @@ void lj_gc_fin_dual_assert_udata(global_State *g)
     lj_assertG(o != NULL, "fin registry empty obj");
     if (tab[i].kind == FIN_KIND_UDATA) {
       cTValue *mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
-      if (gc_obj_iswhite(g, o) && mo != NULL)
-	lj_assertG(isfinalized(gco2ud(o)) && fin_on_mmudata(g, o),
-		   "fin F3: white __gc udata not on mmudata: ptr=%p", (void *)o);
+      /* White + __gc must already have been enqueued+unregistered. */
+      lj_assertG(!(gc_obj_iswhite(g, o) && mo != NULL),
+		 "fin F3: white __gc udata still on registry: ptr=%p", (void *)o);
     }
 #if LJ_HASFFI
     else {
-      /* Presence cache (registry ⇒ bit; cache sync, not authority).
-      ** Reverse direction (bit ⇒ registry) is checked on free. */
       lj_assertG((o->gch.marked & LJ_GC_CDATA_FIN),
 		 "fin F3: cdata cache sync — registry entry missing CDATA_FIN bit: ptr=%p marked=0x%02x",
 		 (void *)o, o->gch.marked);
-      if (gc_obj_iswhite(g, o)) {
-	lj_assertG((o->gch.marked & LJ_GC_FINALIZED) && fin_on_mmudata(g, o),
-		   "fin F3: white registry cdata not on mmudata: ptr=%p", (void *)o);
-      }
+      lj_assertG(!gc_obj_iswhite(g, o),
+		 "fin F3: white registry cdata still on registry: ptr=%p", (void *)o);
     }
 #endif
   }
@@ -942,9 +940,9 @@ void lj_gc_fin_dual_assert_udata(global_State *g)
 #endif
 }
 
-/* Separate finalizable objects onto mmudata.
-** Walk fin_order reverse (LIFO ≈ classic) via a snapshot so mid-scan
-** unregister (no __gc) cannot skip entries. all=1: include black objs. */
+/* Separate finalizable objects onto fin_queue (registration FIFO).
+** Forward walk of a fin_order snapshot so mid-scan unregister cannot skip
+** or reorder. all=1: include black objs (lua_close). */
 size_t lj_gc_separateudata(global_State *g, int all)
 {
   size_t m = 0;
@@ -956,8 +954,8 @@ size_t lj_gc_separateudata(global_State *g, int all)
   if (LJ_UNLIKELY(snap == NULL))
     lj_err_mem(mainthread(g));
   memcpy(snap, order, n * sizeof(GCRef));
-  for (i = n; i > 0; ) {
-    GCobj *o = gcref(snap[--i]);
+  for (i = 0; i < n; i++) {
+    GCobj *o = gcref(snap[i]);
     int found = 0;
     FinEntry *e;
     if (o == NULL) continue;
@@ -1742,7 +1740,8 @@ static size_t gc_bitmap_sweep(global_State *g)
     ** translation); cdatav_cell_assert validates it; gc_freefunc[cd->gct-...]
     ** frees via pure lj_cdata_free (F2). Bounded by GCSWEEP_BITMAP_MAX cells
     ** per slice. Survivor (mark=1) cells keep MARK until rebuild_clearmarks;
-    ** pending-finalizer cdata stay marked via mmudata from atomic.
+    ** pending-finalizer cdata stay marked (marked inline at separate, on
+    ** fin_queue) through atomic.
     **
     ** Nursery aend note: the old rebuild_prologue_cdatav scanned ALL arenas
     ** (arenastop); folding into the epoch-model sweep (current arenas skipped
@@ -1844,8 +1843,8 @@ static size_t gc_bitmap_sweep(global_State *g)
 	/* Strings reclaimed on NonTrav OPENADDR path above; skip here. */
 	if (o->gch.gct == ~LJ_TSTR)
 	  continue;
-	/* F2: pending-finalizer cdata are re-marked via mmudata at atomic, so
-	** they do not appear as dead here. lj_cdata_free is pure free. */
+	/* F2: pending-finalizer cdata are marked at separate (on fin_queue),
+	** so they do not appear as dead here. lj_cdata_free is pure free. */
 	/* The bitmap (block=1, mark=0) is the sole dead test under HASGCMARK;
 	** the header white bit is vestigial. Phase-independent isdead
 	** (!mark ∧ other) holds inside the free window (the arena is "other"
@@ -1892,19 +1891,15 @@ static size_t gc_bitmap_sweep(global_State *g)
 	      (unsigned)g->gc.hugenum, (size_t)g->gc.hugemem);
     g->gc.sweepphase = SweepPhase_Rebuild;
     g->gc.rebuildphase = Rebuild_Prologue;
-    /* P3b: CdataV-arena dead free is now folded into the bitmap sweep above
+    /* P3b: CdataV-arena dead free is folded into the bitmap sweep above
     ** (ArenaFlag_CdataVOnly branch), no longer a resumable scan in
     ** Rebuild_Prologue. The (sweepa, sweepw) cursor is armed for HugeScan's
-    ** first slice instead. rebuild_mmu_started is set to 1 for vestigial
-    ** readers: the field name predates T2 (it once gated the mmudata ring
-    ** mark-clear walk), then was repurposed as the CdataV-scan-in-progress
-    ** (0) vs done (1) marker within Rebuild_Prologue; with CdataV free moved
-    ** into the bitmap sweep there is no in-progress state to gate, so it is
-    ** unconditionally "done" (1). The T1 finalized-cdata MARK is preserved
-    ** (no mmudata mark-clear walk runs). */
+    ** first slice instead. Finalizer pending objects live on fin_queue
+    ** (marked inline at separate), so no mark-clear walk runs here; their
+    ** MARK is preserved through rebuild (a finalized cdata's MARK makes a
+    ** HugeScan restart skip it). */
     g->gc.sweepa = 0;
     g->gc.sweepw = UnusedBlockWords;
-    g->gc.rebuild_mmu_started = 1;
   }
   return freed;
 }
@@ -1934,20 +1929,14 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** Rebuild_Prologue no longer runs a CdataV scan slice -- it just resets the
 ** (sweepa, sweepw) cursor for HugeScan and advances the rebuild phase.
 **
-** The former mmudata ring mark-clear walk (rebuild_prologue_mmu) was vestigial
-** post the survivor-scan removal (the arena survivor scan it protected was
-** deleted): no remaining rebuild phase re-links mmudata members, and
-** gc_mark_mmudata re-marks + gc_finalize whitens at the next atomic. Keeping
-** mmudata members' marks SET through rebuild is also required by T1, which
-** sets the MARK on finalized cdata so a HugeScan restart skips it -- clearing
-** it here would undo that fix. */
+** No mark-clear walk runs here: finalizer pending objects live on fin_queue
+** (marked inline at separate, whitened at drain). Their MARK must stay SET
+** through rebuild -- a finalized cdata's MARK makes a HugeScan restart skip
+** it, and clearing it here would undo that. */
 
 static void rebuild_prologue(global_State *g)
 {
   lj_assertG(g->gc.state == GCSsweep, "rebuild prologue outside GCSsweep");
-  /* rebuild_mmu_started is left at 1 (set by gc_bitmap_sweep on transition);
-  ** it no longer gates a CdataV scan here -- vestigial field name, see the
-  ** transition comment in gc_bitmap_sweep. */
   g->gc.sweepa = 0;
   g->gc.sweepw = UnusedBlockWords;
   g->gc.rebuild_hugehi = 0;
@@ -2219,56 +2208,48 @@ static void gc_call_finalizer(global_State *g, lua_State *L,
   }
 }
 
-/* Finalize one userdata or cdata object from the mmudata list. */
+/* Finalize one userdata or cdata object from fin_queue (FIFO head).
+** Registry entry was dropped at enqueue; cdata fin is stored on the queue. */
 static void gc_finalize(lua_State *L)
 {
   global_State *g = G(L);
-  gcstat_inc(g, finalizers);
-  GCobj *o = gcnext(gcref(g->gc.mmudata));
+  FinQueueEntry e;
+  GCobj *o;
   cTValue *mo;
+  gcstat_inc(g, finalizers);
   lj_assertG(tvref(g->jit_base) == NULL, "finalizer called on trace");
-  if (o == gcref(g->gc.mmudata))
-    setgcrefnull(g->gc.mmudata);
-  else
-    setgcrefr(gcref(g->gc.mmudata)->gch.nextgc, o->gch.nextgc);
+  if (!lj_gc_fin_queue_pop(g, &e))
+    return;
+  o = gcref(e.obj);
+  lj_assertG(o != NULL, "fin_queue empty obj");
 #if LJ_HASFFI
-  if (o->gch.gct == ~LJ_TCDATA) {
+  if (e.kind == FIN_KIND_CDATA || o->gch.gct == ~LJ_TCDATA) {
     TValue tmp;
-    int found = 0;
-    FinEntry *e = fin_tab_find(g, o, &found);
-    GCobj *finobj = NULL;
-    uint32_t fin_it = 0;
-    if (found && e != NULL && e->kind == FIN_KIND_CDATA) {
-      finobj = gcref(e->fin);
-      fin_it = e->fin_it;
-    }
-    lj_gc_fin_unregister(g, o);
+    GCobj *finobj = gcref(e.fin);
     gc_obj_makewhite(g, o);
     o->gch.marked &= (uint8_t)~LJ_GC_CDATA_FIN;
     if (finobj != NULL) {
-      setgcV(L, &tmp, finobj, fin_it);
+      setgcV(L, &tmp, finobj, e.fin_it);
       gc_call_finalizer(g, L, &tmp, o);
     }
     return;
   }
 #endif
-  lj_gc_fin_unregister(g, o);
   gc_obj_makewhite(g, o);
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
   if (mo)
     gc_call_finalizer(g, L, mo, o);
 }
 
-/* Finalize all userdata objects from mmudata list. */
+/* Drain all pending finalizers from fin_queue. */
 void lj_gc_finalize_udata(lua_State *L)
 {
-  while (gcref(G(L)->gc.mmudata) != NULL)
+  while (!lj_gc_fin_queue_empty(G(L)))
     gc_finalize(L);
 }
 
 #if LJ_HASFFI
-/* Close: disable new cdata fin_register (classic: FFI_FIN metatable=NULL).
-** F3 cdata fin runs from mmudata via registry; gate lives next to fin_tab. */
+/* Close: disable new cdata fin_register (classic: FFI_FIN metatable=NULL). */
 void lj_gc_finalize_cdata(lua_State *L)
 {
   G(L)->gc.fin_closed = 1;
@@ -2486,14 +2467,14 @@ static void atomic(global_State *g, lua_State *L)
   ** rescan — they only enqueue more gray work which this single call drains. */
   gc_propagate_gray(g);
 
-  /* (6) F2 registry → mmudata (udata + cdata), mark, propagate.
+  /* (6) F3 registry scan → fin_queue + resurrect marks, then propagate.
   ** Backfill runs first so udata whose mt gained __gc (TF_HASGC) since the
-  ** last atomic are registered before separate sees them. */
+  ** last atomic are registered before separate sees them. Enqueue marks
+  ** each object (and cdata fin) inline; no mmudata re-mark pass. */
   lj_gc_fin_backfill_udata(g);
   udsize = lj_gc_separateudata(g, 0);
   lj_gc_fin_dual_assert_udata(g);
-  gc_mark_mmudata(g);  /* Mark them. */
-  udsize += gc_propagate_gray(g);  /* And propagate the marks. */
+  udsize += gc_propagate_gray(g);
 
   /* (7) All marking done, clear weak tables. */
   gc_clearweak_stacks(g);
@@ -2644,7 +2625,7 @@ static size_t gc_onestep_raw(lua_State *L)
 	if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
 	  lj_str_resize(L, g->str.mask >> 1);
 	lj_arena_shrink(g);
-	if (gcref(g->gc.mmudata)) {
+	if (!lj_gc_fin_queue_empty(g)) {
 	  g->gc.state = GCSfinalize;
 	  MARKALLOC_PROGRESS_LOG(
 		    "[markalloc-progress] cycle → finalize total=%zu "
@@ -2680,11 +2661,11 @@ static size_t gc_onestep_raw(lua_State *L)
     return GCSWEEPMAX*GCSWEEPCOST;
     }
   case GCSfinalize:
-    if (gcref(g->gc.mmudata) != NULL) {
+    if (!lj_gc_fin_queue_empty(g)) {
       GCSize old = g->gc.total;
       if (tvref(g->jit_base))  /* Don't call finalizers on trace. */
 	return LJ_MAX_MEM;
-      gc_finalize(L);  /* Finalize one userdata object. */
+      gc_finalize(L);  /* Finalize one object from fin_queue. */
       if (old >= g->gc.total && g->gc.estimate > old - g->gc.total)
 	g->gc.estimate -= old - g->gc.total;
       if (g->gc.estimate > GCFINALIZECOST)
@@ -2935,7 +2916,7 @@ int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps)
 ** shadow-marking every allocated cell then asserting dead==0 mostly checks
 ** setmark/visit_unmarked primitives. Real mark/sweep invariants live earlier:
 **   - gc_assert_atomic_end: residual GRAY + black→white edges + class routing
-**   - lj_gc_checkheap: freelist/POD + GCSpause stuck-mark / mmudata FINALIZED
+**   - lj_gc_checkheap: freelist/POD + GCSpause stuck-mark / fin_queue FINALIZED
 **
 ** Gate: LUA_USE_ASSERT && !LJ_GC_NOFULLGCVERIFY. FSANITIZE builds define
 ** LJ_GC_NOFULLGCVERIFY so ASAN/CI game runs do not pay O(live) every fullgc.
@@ -2987,18 +2968,17 @@ static void gc_arena_verify(global_State *g)
   GCobj *o;
   MSize i, dead = 0;
   lj_assertG(gc_hugegray_empty(g), "arena verify with pending huge gray objects");
-  /* Invariant 5 (T7): every mmudata member is FINALIZED (F2 registry separate).
-  ** Also checked in lj_gc_checkheap (any phase) for earlier detection. */
+  /* Invariant 5: every fin_queue member is FINALIZED (also in checkheap). */
   {
-    GCobj *mroot = gcref(g->gc.mmudata);
-    if (mroot != NULL) {
-      GCobj *mu = mroot;
-      do {
-	mu = gcnext(mu);
-	lj_assertG(mu->gch.marked & LJ_GC_FINALIZED,
-		   "mmudata ring member not finalized: ptr=%p gct=%d marked=0x%02x",
-		   (void *)mu, mu->gch.gct, mu->gch.marked);
-      } while (mu != mroot);
+    FinQueueEntry *q = mref(g->gc.fin_queue, FinQueueEntry);
+    MSize qmask = g->gc.fin_qmask, head = g->gc.fin_qhead, tail = g->gc.fin_qtail, qi;
+    if (q != NULL) {
+      for (qi = head; qi != tail; qi++) {
+	GCobj *mu = gcref(q[qi & qmask].obj);
+	lj_assertG(mu != NULL && (mu->gch.marked & LJ_GC_FINALIZED),
+		   "fin_queue member not finalized: ptr=%p gct=%d marked=0x%02x",
+		   (void *)mu, mu ? mu->gch.gct : 0, mu ? mu->gch.marked : 0);
+      }
     }
   }
   {
@@ -3238,7 +3218,7 @@ static void gc_arena_verify(global_State *g)
 ** Front-loaded GC invariants (formerly only at fullgc tail via
 ** gc_arena_verify — too late, and the O(live) shadow-mark was near-empty
 ** after rebuild re-whitening):
-**  - any phase: mmudata ring members must carry LJ_GC_FINALIZED
+**  - any phase: fin_queue members must carry LJ_GC_FINALIZED
 **  - any phase: class routing on marked-live cells (UdataOnly / NonTrav str)
 **  - GCSpause only: TravObjs mark bits all clear (post-rebuild stuck-black)
 **  - GCSpause only: huge slots MARK clear
@@ -3246,19 +3226,20 @@ static void gc_arena_verify(global_State *g)
 int lj_gc_checkheap(global_State *g)
 {
   MSize ai, bad = 0;
-  /* -- mmudata FINALIZED (any phase; set at separate, cleared after fin). -- */
+  /* -- fin_queue FINALIZED (any phase; set at separate). -- */
   {
-    GCobj *mroot = gcref(g->gc.mmudata);
-    if (mroot != NULL) {
-      GCobj *mu = mroot;
-      do {
-	mu = gcnext(mu);
-	if (!(mu->gch.marked & LJ_GC_FINALIZED)) {
-	  lj_assertG(0, "mmudata ring member not finalized: ptr=%p gct=%d "
-		     "marked=0x%02x", (void *)mu, mu->gch.gct, mu->gch.marked);
+    FinQueueEntry *q = mref(g->gc.fin_queue, FinQueueEntry);
+    MSize qmask = g->gc.fin_qmask, head = g->gc.fin_qhead, tail = g->gc.fin_qtail, qi;
+    if (q != NULL) {
+      for (qi = head; qi != tail; qi++) {
+	GCobj *mu = gcref(q[qi & qmask].obj);
+	if (mu == NULL || !(mu->gch.marked & LJ_GC_FINALIZED)) {
+	  lj_assertG(0, "fin_queue member not finalized: ptr=%p gct=%d "
+		     "marked=0x%02x", (void *)mu, mu ? mu->gch.gct : 0,
+		     mu ? mu->gch.marked : 0);
 	  bad++;
 	}
-      } while (mu != mroot);
+      }
     }
   }
   /* -- GCSpause: post-rebuild all marks cleared (Trav + huge). -- */

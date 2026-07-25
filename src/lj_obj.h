@@ -725,11 +725,9 @@ typedef struct GCState {
   uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */
   uint8_t sweepphase;	/* 0=bitmap sweep, 1=rebuild chain, 2=done. */
   uint8_t rebuildphase;	/* Resumable rebuild sub-phase (RebuildPhase). */
-  uint8_t rebuild_mmu_started;	/* mmudata ring walk has snapshotted its root. */
   MSize rebuild_hugehi;	/* HugeScan: current slot index cursor. */
   MSize rebuild_hugegen;	/* HugeScan: hugesetgen snapshot for rehash restart. */
   MSize hugesetgen;	/* Monotonic huge-set rehash generation. */
-  GCRef rebuild_mmu_cursor;	/* mmudata ring walk cursor. */
   MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
   MSize grayastop;	/* Gray arena stack: number of entries. */
   MSize grayasz;	/* Gray arena stack: allocated capacity. */
