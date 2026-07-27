@@ -422,6 +422,11 @@ LUA_API void lua_close(lua_State *L)
 #endif
     }
   }
+#if LJ_HASGCMARK && defined(LUA_USE_ASSERT)
+  /* Classic parity keeps the 10-iter bound; under assert builds demand the
+  ** queue is empty so runaway finalizer re-enqueue cannot silently leak. */
+  lj_assertG(lj_gc_fin_queue_empty(g), "lua_close: fin_queue not empty after drain");
+#endif
   close_state(L);
 }
 

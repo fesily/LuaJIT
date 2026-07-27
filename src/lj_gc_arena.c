@@ -405,6 +405,30 @@ static void gc_mark_gcroot(global_State *g)
       gc_markobj(g, gcref(g->gcroot[i]));
 }
 
+/* Re-root pending fin_queue (obj + cdata fin). Sole call site: gc_mark_start.
+** Enqueue already marks inline; ClearMarks demotes carry-over entries, so each
+** new cycle must re-mark the queue as roots (classic gc_mark_mmudata role). */
+static void gc_mark_fin_queue(global_State *g)
+{
+  FinQueueEntry *q = mref(g->gc.fin_queue, FinQueueEntry);
+  MSize mask = g->gc.fin_qmask;
+  MSize head = g->gc.fin_qhead, tail = g->gc.fin_qtail, i;
+  if (q == NULL || head == tail) return;
+  for (i = head; i != tail; i++) {
+    FinQueueEntry *e = &q[i & mask];
+    GCobj *o = gcref(e->obj);
+    if (o != NULL)
+      gc_markobj(g, o);
+#if LJ_HASFFI
+    if (e->kind == FIN_KIND_CDATA) {
+      GCobj *fin = gcref(e->fin);
+      if (fin != NULL)
+	gc_markobj(g, fin);
+    }
+#endif
+  }
+}
+
 /* Start a GC cycle and mark the root set. */
 static void gc_mark_start(global_State *g)
 {
@@ -432,6 +456,8 @@ static void gc_mark_start(global_State *g)
   gc_marktv(g, &g->registrytv);
   gc_mark_gcroot(g);
   gc_traverse_mainthread(g);
+  /* Pending finals are not in the registry; re-root before propagate. */
+  gc_mark_fin_queue(g);
   g->gc.gccycle++;
   g->gc.state = GCSpropagate;
 }
@@ -581,44 +607,6 @@ static FinEntry *fin_tab_insert_slot(global_State *g, GCobj *o)
   return tomb;
 }
 
-static void fin_order_grow(global_State *g)
-{
-  MSize osz = g->gc.fin_ordersz;
-  MSize nsz = osz ? osz * 2 : FIN_TAB_INIT;
-  GCRef *norder = (GCRef *)g->allocf(g->allocd, mref(g->gc.fin_order, GCRef),
-				     osz * sizeof(GCRef), nsz * sizeof(GCRef));
-  if (LJ_UNLIKELY(norder == NULL))
-    lj_err_mem(mainthread(g));
-  if (osz == 0)
-    memset(norder, 0, nsz * sizeof(GCRef));
-  setmref(g->gc.fin_order, norder);
-  g->gc.fin_ordersz = nsz;
-}
-
-static void fin_order_append(global_State *g, GCobj *o)
-{
-  GCRef *order;
-  if (g->gc.fin_num >= g->gc.fin_ordersz)
-    fin_order_grow(g);
-  order = mref(g->gc.fin_order, GCRef);
-  setgcref(order[g->gc.fin_num], o);
-}
-
-static void fin_order_remove(global_State *g, GCobj *o)
-{
-  GCRef *order = mref(g->gc.fin_order, GCRef);
-  MSize i, n = g->gc.fin_num;
-  if (order == NULL || n == 0) return;
-  for (i = 0; i < n; i++) {
-    if (gcref(order[i]) == o) {
-      if (i + 1 < n)
-	setgcrefr(order[i], order[n - 1]);
-      setgcrefnull(order[n - 1]);
-      return;
-    }
-  }
-}
-
 void lj_gc_fin_register(lua_State *L, GCobj *o, int kind, GCobj *fin, uint32_t it)
 {
   global_State *g = G(L);
@@ -635,7 +623,7 @@ void lj_gc_fin_register(lua_State *L, GCobj *o, int kind, GCobj *fin, uint32_t i
     lj_assertG(e != NULL, "fin_register: no free slot after rehash");
     if (e->kind == FIN_KIND_TOMB)
       g->gc.fin_tomb--;
-    fin_order_append(g, o);
+    e->seq = ++g->gc.fin_seq;  /* First registration stamps FIFO order. */
     g->gc.fin_num++;
   }
   setgcref(e->obj, o);
@@ -659,7 +647,7 @@ void lj_gc_fin_unregister(global_State *g, GCobj *o)
   setgcrefnull(e->fin);
   e->kind = FIN_KIND_TOMB;
   e->fin_it = 0;
-  fin_order_remove(g, o);
+  e->seq = 0;
   g->gc.fin_num--;
   g->gc.fin_tomb++;
   /* Do not free the table here: separateudata may unregister mid-scan. */
@@ -795,12 +783,6 @@ void lj_gc_fin_free(global_State *g)
     setmref(g->gc.fin_tab, NULL);
     g->gc.fin_mask = 0;
   }
-  if (g->gc.fin_ordersz != 0) {
-    g->allocf(g->allocd, mref(g->gc.fin_order, GCRef),
-	      g->gc.fin_ordersz * sizeof(GCRef), 0);
-    setmref(g->gc.fin_order, NULL);
-    g->gc.fin_ordersz = 0;
-  }
   if (g->gc.fin_qmask != 0) {
     g->allocf(g->allocd, mref(g->gc.fin_queue, FinQueueEntry),
 	      (g->gc.fin_qmask + 1) * sizeof(FinQueueEntry), 0);
@@ -809,6 +791,7 @@ void lj_gc_fin_free(global_State *g)
   }
   g->gc.fin_num = 0;
   g->gc.fin_tomb = 0;
+  g->gc.fin_seq = 0;
   g->gc.fin_qhead = 0;
   g->gc.fin_qtail = 0;
 }
@@ -940,39 +923,68 @@ void lj_gc_fin_dual_assert_udata(global_State *g)
 #endif
 }
 
-/* Separate finalizable objects onto fin_queue (registration FIFO).
-** Forward walk of a fin_order snapshot so mid-scan unregister cannot skip
-** or reorder. all=1: include black objs (lua_close). */
+typedef struct FinSepCand {
+  GCobj *o;
+  uint32_t seq;
+  uint8_t kind;
+} FinSepCand;
+
+static int fin_sep_cand_cmp(const void *a, const void *b)
+{
+  uint32_t sa = ((const FinSepCand *)a)->seq;
+  uint32_t sb = ((const FinSepCand *)b)->seq;
+  return (sa > sb) - (sa < sb);
+}
+
+/* Registry scan → fin_queue. Dead candidates sorted by FinEntry.seq (FIFO).
+** all=1 includes black objects (lua_close). */
 size_t lj_gc_separateudata(global_State *g, int all)
 {
   size_t m = 0;
-  MSize n = g->gc.fin_num, i;
-  GCRef *order = mref(g->gc.fin_order, GCRef);
-  GCRef *snap;
-  if (n == 0 || order == NULL) return 0;
-  snap = (GCRef *)g->allocf(g->allocd, NULL, 0, n * sizeof(GCRef));
-  if (LJ_UNLIKELY(snap == NULL))
+  FinEntry *tab = mref(g->gc.fin_tab, FinEntry);
+  MSize mask = g->gc.fin_mask, i, ncap, ndead = 0;
+  FinSepCand *cands;
+  if (g->gc.fin_num == 0 || tab == NULL || mask == 0) return 0;
+  ncap = g->gc.fin_num;
+  cands = (FinSepCand *)g->allocf(g->allocd, NULL, 0, ncap * sizeof(FinSepCand));
+  if (LJ_UNLIKELY(cands == NULL))
     lj_err_mem(mainthread(g));
-  memcpy(snap, order, n * sizeof(GCRef));
-  for (i = 0; i < n; i++) {
-    GCobj *o = gcref(snap[i]);
-    int found = 0;
-    FinEntry *e;
+  for (i = 0; i <= mask; i++) {
+    FinEntry *e = &tab[i];
+    GCobj *o;
+    if (e->kind != FIN_KIND_UDATA && e->kind != FIN_KIND_CDATA)
+      continue;
+    o = gcref(e->obj);
     if (o == NULL) continue;
-    e = fin_tab_find(g, o, &found);
-    if (!found || e == NULL) continue;
     if (e->kind == FIN_KIND_UDATA) {
+      if (!(gc_obj_iswhite(g, o) || all) || isfinalized(gco2ud(o)))
+	continue;
+    } else {
+      if (!(gc_obj_iswhite(g, o) || all) || (o->gch.marked & LJ_GC_FINALIZED))
+	continue;
+    }
+    lj_assertG(ndead < ncap, "fin separate cand overflow");
+    cands[ndead].o = o;
+    cands[ndead].seq = e->seq;
+    cands[ndead].kind = e->kind;
+    ndead++;
+  }
+  if (ndead > 1)
+    qsort(cands, (size_t)ndead, sizeof(FinSepCand), fin_sep_cand_cmp);
+  for (i = 0; i < ndead; i++) {
+    GCobj *o = cands[i].o;
+    if (cands[i].kind == FIN_KIND_UDATA) {
       lj_assertG(o->gch.gct == ~LJ_TUDATA, "fin reg udata kind mismatch");
       m += sepudata_one(g, o, all);
     }
 #if LJ_HASFFI
-    else if (e->kind == FIN_KIND_CDATA) {
+    else if (cands[i].kind == FIN_KIND_CDATA) {
       lj_assertG(o->gch.gct == ~LJ_TCDATA, "fin reg cdata kind mismatch");
       m += sepcdata_one(g, o, all);
     }
 #endif
   }
-  g->allocf(g->allocd, snap, n * sizeof(GCRef), 0);
+  g->allocf(g->allocd, cands, ncap * sizeof(FinSepCand), 0);
   return m;
 }
 
@@ -2468,9 +2480,9 @@ static void atomic(global_State *g, lua_State *L)
   gc_propagate_gray(g);
 
   /* (6) F3 registry scan → fin_queue + resurrect marks, then propagate.
-  ** Backfill runs first so udata whose mt gained __gc (TF_HASGC) since the
-  ** last atomic are registered before separate sees them. Enqueue marks
-  ** each object (and cdata fin) inline; no mmudata re-mark pass. */
+  ** Backfill first; enqueue marks each object (and cdata fin) inline.
+  ** Carry-over queue entries were re-rooted in gc_mark_start — no second
+  ** full-queue walk here. */
   lj_gc_fin_backfill_udata(g);
   udsize = lj_gc_separateudata(g, 0);
   lj_gc_fin_dual_assert_udata(g);

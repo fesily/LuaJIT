@@ -751,23 +751,16 @@ typedef struct GCState {
   MRef weakall;		/* GCobj **: tables with weak keys and values. */
   MSize weakalltop;	/* All-weak stack: number of entries. */
   MSize weakallsz;	/* All-weak stack: allocated capacity. */
-  /* Finalizer registry. */
+  /* Finalizer registry + pending queue (LJ_HASGCMARK / F3). */
   MRef fin_tab;		/* FinEntry *: open-addressing finalizer registry. */
-  MRef fin_order;	/* GCRef *: registration order (LIFO separate). */
   MSize fin_mask;	/* Capacity-1 (power of two); 0 when unallocated. */
-  MSize fin_num;	/* Live registry entries (= fin_order length). */
+  MSize fin_num;	/* Live registry entries. */
   MSize fin_tomb;	/* Tombstone entries (drive rehash). */
-  MSize fin_ordersz;	/* Capacity of fin_order array. */
+  uint32_t fin_seq;	/* Monotonic registration sequence for FinEntry.seq. */
   uint8_t fin_closed;	/* lua_close gate: reject new cdata fin_register. */
   uint8_t fin_backfill;	/* COMPAT: table gained __gc since last atomic. */
-  uint8_t fin_pad[3];
-  /* Pending-finalizer FIFO work queue (replaces the circular mmudata ring;
-  ** design Finalizers §3/§10). Lazily allocated on first push; freed in
-  ** lj_gc_fin_free. Power-of-two ring: head==tail ⇒ empty;
-  ** (tail-head)==mask+1 ⇒ full (grow). head/tail wrap mod 2^N; & mask keeps
-  ** indexing correct across wraparound. Drain pops head-first, so finalize
-  ** call order == separateudata enqueue order == registration FIFO. */
-  MRef fin_queue;	/* FinQueueEntry *: ring base (NULL when unallocated). */
+  uint8_t fin_pad[2];
+  MRef fin_queue;	/* FinQueueEntry *: pending-finalizer ring base. */
   MSize fin_qmask;	/* Capacity-1 (power of two); 0 when unallocated. */
   MSize fin_qhead;	/* Pop index (monotonic; & fin_qmask). */
   MSize fin_qtail;	/* Push index (monotonic; & fin_qmask). */
@@ -781,6 +774,7 @@ typedef struct FinEntry {
   GCRef obj;		/* Object with a finalizer (udata or cdata). */
   GCRef fin;		/* cdata: finalizer value; udata: unused (mt __gc). */
   uint32_t fin_it;	/* Full itype of fin (not uint8: LJ_T* are ~N). */
+  uint32_t seq;		/* Registration order (from GCState.fin_seq). */
   uint8_t kind;		/* FIN_KIND_* (see lj_gc.h). */
   uint8_t pad[3];
 } FinEntry;
