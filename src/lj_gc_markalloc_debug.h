@@ -341,12 +341,12 @@ static void gc_markalloc_catchup(global_State *g)
 ** (classic-aligned: see gc_mark UPVAL in lj_gc_arena.c) — their value
 ** aliases a stack slot re-marked by gc_atomic_rescan_threads, the UV
 ** header is re-closed by lj_gc_closeuv (gray2black on close during
-** prop/atomic; makewhite during sweep/nursery), and dead open UVs are
-** freed by gc_atomic_sweep_openupvals / per-thread fullsweep (bitmap
-** sweep skips !closed). Arena THREADs are deliberately left mark∧GRAY
+** prop/atomic; makewhite during sweep/nursery), and open UVs are owned
+** by Path L (lj_state_free → closeuv) / Path F (freeall_openuv) — bitmap
+** sweep skips !closed. Arena THREADs are deliberately left mark∧GRAY
 ** (permanent-gray: see propagatemark THREAD branch) — stack slots
 ** cannot pay write barriers, so a thread is never pure black; the
-** graythread list enumerates threads for atomic rescan + UV fullsweep.
+** graythread list enumerates threads for atomic stack rescan.
 ** The arena walk below skips the residual-GRAY assert for both open UV
 ** and THREAD; for THREAD it still edge-walks stack children (open UV
 ** skips the edge walk — its value is covered by the thread's rescan).
