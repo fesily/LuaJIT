@@ -722,11 +722,9 @@ typedef struct GCState {
   uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */
   uint8_t sweepphase;	/* 0=bitmap sweep, 1=rebuild chain, 2=done. */
   uint8_t rebuildphase;	/* Resumable rebuild sub-phase (RebuildPhase). */
-  uint8_t rebuild_mmu_started;	/* mmudata ring walk has snapshotted its root. */
   MSize rebuild_hugehi;	/* HugeScan: current slot index cursor. */
   MSize rebuild_hugegen;	/* HugeScan: hugesetgen snapshot for rehash restart. */
   MSize hugesetgen;	/* Monotonic huge-set rehash generation. */
-  GCRef rebuild_mmu_cursor;	/* mmudata ring walk cursor. */
   MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
   MSize grayastop;	/* Gray arena stack: number of entries. */
   MSize grayasz;	/* Gray arena stack: allocated capacity. */
@@ -750,16 +748,19 @@ typedef struct GCState {
   MRef weakall;		/* GCobj **: tables with weak keys and values. */
   MSize weakalltop;	/* All-weak stack: number of entries. */
   MSize weakallsz;	/* All-weak stack: allocated capacity. */
-  /* Finalizer registry. */
+  /* Finalizer registry + pending queue (LJ_HASGCMARK / F3). */
   MRef fin_tab;		/* FinEntry *: open-addressing finalizer registry. */
-  MRef fin_order;	/* GCRef *: registration order (LIFO separate). */
   MSize fin_mask;	/* Capacity-1 (power of two); 0 when unallocated. */
-  MSize fin_num;	/* Live registry entries (= fin_order length). */
+  MSize fin_num;	/* Live registry entries. */
   MSize fin_tomb;	/* Tombstone entries (drive rehash). */
-  MSize fin_ordersz;	/* Capacity of fin_order array. */
+  uint32_t fin_seq;	/* Monotonic registration sequence for FinEntry.seq. */
   uint8_t fin_closed;	/* lua_close gate: reject new cdata fin_register. */
   uint8_t fin_backfill;	/* COMPAT: table gained __gc since last atomic. */
-  uint8_t fin_pad[3];
+  uint8_t fin_pad[2];
+  MRef fin_queue;	/* FinQueueEntry *: pending-finalizer ring base. */
+  MSize fin_qmask;	/* Capacity-1 (power of two); 0 when unallocated. */
+  MSize fin_qhead;	/* Pop index (monotonic; & fin_qmask). */
+  MSize fin_qtail;	/* Push index (monotonic; & fin_qmask). */
   GCstats stats;	/* Instrumentation counters (LJ_HASGCMARK only). */
 #endif
 #endif
@@ -770,9 +771,22 @@ typedef struct FinEntry {
   GCRef obj;		/* Object with a finalizer (udata or cdata). */
   GCRef fin;		/* cdata: finalizer value; udata: unused (mt __gc). */
   uint32_t fin_it;	/* Full itype of fin (not uint8: LJ_T* are ~N). */
+  uint32_t seq;		/* Registration order (from GCState.fin_seq). */
   uint8_t kind;		/* FIN_KIND_* (see lj_gc.h). */
   uint8_t pad[3];
 } FinEntry;
+
+/* Pending-finalizer FIFO work-queue entry (fin_queue). Copied from a FinEntry
+** at separateudata enqueue time; the registry entry is then unregistered. The
+** object is resurrected (marked) so it survives the cycle; the queue slot is
+** the sole record of the pending finalizer until drain pops and runs it. */
+typedef struct FinQueueEntry {
+  GCRef obj;		/* Pending-finalizer object (resurrected). */
+  GCRef fin;		/* cdata: finalizer value; udata: NULL (mt __gc). */
+  uint32_t fin_it;	/* Full itype of fin (not uint8: LJ_T* are ~N). */
+  uint8_t kind;		/* FIN_KIND_UDATA / FIN_KIND_CDATA. */
+  uint8_t pad[3];
+} FinQueueEntry;
 #endif
 
 /* String interning state. */
