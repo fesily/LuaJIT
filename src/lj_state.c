@@ -385,10 +385,20 @@ LUA_API void lua_close(lua_State *L)
     if (lj_vm_cpcall(L, NULL, NULL, cpfinalize) == LUA_OK) {
       if (++i >= 10) break;
       lj_gc_separateudata(g, 1);  /* Separate udata again. */
+#if LJ_HASGCMARK
+      if (lj_gc_fin_queue_empty(g))  /* Until fin_queue is drained. */
+	break;
+#else
       if (gcref(g->gc.mmudata) == NULL)  /* Until nothing is left to do. */
 	break;
+#endif
     }
   }
+#if LJ_HASGCMARK && defined(LUA_USE_ASSERT)
+  /* Classic parity keeps the 10-iter bound; under assert builds demand the
+  ** queue is empty so runaway finalizer re-enqueue cannot silently leak. */
+  lj_assertG(lj_gc_fin_queue_empty(g), "lua_close: fin_queue not empty after drain");
+#endif
   close_state(L);
 }
 
