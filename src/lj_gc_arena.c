@@ -2772,16 +2772,19 @@ int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps)
 }
 #endif
 
-#ifdef LUA_USE_ASSERT
 /*
-** Phase M shadow-verify: with header colors still authoritative, rebuild
-** the arena mark bitmap from the live object set and assert it matches.
-** Called at the end of a full GC, when every surviving GC object is live,
-** so after shadow-marking all live arena objects there must be zero
-** allocated-but-unmarked (dead) objects left. This validates the Phase S
-** locate primitives (flushbins + setmark + block & ~mark) on the real
-** heap without changing any GC behavior.
+** Full-GC O(live) shadow-mark verify is a diagnostic allocator self-test,
+** not a GC liveness proof: after rebuild, marks are already cleared, so
+** shadow-marking every allocated cell then asserting dead==0 mostly checks
+** setmark/visit_unmarked primitives. Real mark/sweep invariants live earlier:
+**   - gc_assert_atomic_end: residual GRAY + black→white edges + class routing
+**   - lj_gc_checkheap: freelist/POD + GCSpause stuck-mark / mmudata FINALIZED
+**
+** Gate: LUA_USE_ASSERT && !LJ_GC_NOFULLGCVERIFY. FSANITIZE builds define
+** LJ_GC_NOFULLGCVERIFY so ASAN/CI game runs do not pay O(live) every fullgc.
+** Pure -DLUA_USE_ASSERT (no NOFULLGCVERIFY) keeps the deep self-test.
 */
+#if defined(LUA_USE_ASSERT) && !defined(LJ_GC_NOFULLGCVERIFY)
 static void gcverify_count_dead(void *o, int gct, void *ud)
 {
   UNUSED(o); UNUSED(gct);
@@ -2827,7 +2830,8 @@ static void gc_arena_verify(global_State *g)
   GCobj *o;
   MSize i, dead = 0;
   lj_assertG(gc_hugegray_empty(g), "arena verify with pending huge gray objects");
-  /* Invariant 5 (T7): every mmudata member is FINALIZED (F2 registry separate). */
+  /* Invariant 5 (T7): every mmudata member is FINALIZED (F2 registry separate).
+  ** Also checked in lj_gc_checkheap (any phase) for earlier detection. */
   {
     GCobj *mroot = gcref(g->gc.mmudata);
     if (mroot != NULL) {
@@ -2853,7 +2857,8 @@ static void gc_arena_verify(global_State *g)
   ** (MARK clear). T3 moved the huge MARK clear out of HugeScan (marks stay
   ** authoritative through the rebuild yield) into rebuild_clearmarks (one-shot,
   ** non-yielding, runs before this verify). A stuck slot mark means the
-  ** per-cycle reset regressed. HUGESET_SWEPT no longer exists (T3 removed it). */
+  ** per-cycle reset regressed. HUGESET_SWEPT no longer exists (T3 removed it).
+  ** Also checked in lj_gc_checkheap when state==GCSpause. */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -2897,10 +2902,8 @@ static void gc_arena_verify(global_State *g)
 	  GCobj *o2 = (GCobj *)arena_cellptr(a, c);
 	  alive &= alive - 1;
 	  /* Invariants 1a/1b (T7): a cell is udata iff its arena is
-	  ** ArenaFlag_UdataOnly. 1a locks the class invariant for udata arenas
-	  ** (every allocated cell is a GCudata, continuous from T4's one-shot
-	  ** assert inside separateudata). 1b catches a udata mis-routed into a
-	  ** Trav/POD arena (a T3 routing regression). */
+	  ** ArenaFlag_UdataOnly. Class routing is also checked on marked
+	  ** survivors in gc_assert_atomic_end (earlier, marks authoritative). */
 	  if (a->flags & ArenaFlag_UdataOnly) {
 	    lj_assertG(o2->gch.gct == ~LJ_TUDATA,
 		       "non-udata in Udata arena: gct=%d marked=0x%02x cell=%d flags=0x%x",
@@ -3048,7 +3051,7 @@ static void gc_arena_verify(global_State *g)
   ** start from a clean mark bitmap. */
   lj_arena_gcprepare(g);
 }
-#endif /* LUA_USE_ASSERT */
+#endif /* LUA_USE_ASSERT && !LJ_GC_NOFULLGCVERIFY */
 
 /*
 ** Read-only heap consistency checker for the arena allocator. Walks every
@@ -3074,10 +3077,51 @@ static void gc_arena_verify(global_State *g)
 ** right after a scavenge, because several free paths bump freecells without
 ** threading the block onto a list. Over-counting is the signature of a
 ** double free.
+**
+** Front-loaded GC invariants (formerly only at fullgc tail via
+** gc_arena_verify — too late, and the O(live) shadow-mark was near-empty
+** after rebuild re-whitening):
+**  - any phase: mmudata ring members must carry LJ_GC_FINALIZED
+**  - any phase: class routing on marked-live cells (UdataOnly / NonTrav str)
+**  - GCSpause only: TravObjs mark bits all clear (post-rebuild stuck-black)
+**  - GCSpause only: huge slots MARK clear
 */
 int lj_gc_checkheap(global_State *g)
 {
   MSize ai, bad = 0;
+  /* -- mmudata FINALIZED (any phase; set at separate, cleared after fin). -- */
+  {
+    GCobj *mroot = gcref(g->gc.mmudata);
+    if (mroot != NULL) {
+      GCobj *mu = mroot;
+      do {
+	mu = gcnext(mu);
+	if (!(mu->gch.marked & LJ_GC_FINALIZED)) {
+	  lj_assertG(0, "mmudata ring member not finalized: ptr=%p gct=%d "
+		     "marked=0x%02x", (void *)mu, mu->gch.gct, mu->gch.marked);
+	  bad++;
+	}
+      } while (mu != mroot);
+    }
+  }
+  /* -- GCSpause: post-rebuild all marks cleared (Trav + huge). -- */
+  if (g->gc.state == GCSpause) {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	if (!hugeset_slot_live(u)) continue;
+	if (u & HUGESET_MARK) {
+	  GCobj *o2 = hugeset_slot_obj(u);
+	  lj_assertG(0, "huge object still slot-marked at GCSpause: "
+		     "ptr=%p gct=%d marked=0x%02x", (void *)o2, o2->gch.gct,
+		     o2->gch.marked);
+	  bad++;
+	}
+      }
+    }
+  }
   for (ai = 0; ai < g->gc.arenastop; ai++) {
     GCArena *a = mref(g->gc.arenas, GCArena *)[ai];
     ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
@@ -3104,6 +3148,77 @@ int lj_gc_checkheap(global_State *g)
 		       (int)ai, o->gch.gct, (int)((w << 5) + bitidx));
 	    bad++;
 	  }
+	}
+      }
+    }
+    /* -- Class routing on marked-live cells (any phase). Free/binned cells
+    ** have mark=0 so they are excluded; no flushbins (read-only). -- */
+    if ((a->flags & ArenaFlag_UdataOnly) ||
+	!(a->flags & (ArenaFlag_TravObjs | ArenaFlag_CdataVOnly))) {
+      uint32_t w, wtop;
+      if ((GCCellID)a->celltop > MinCellId) {
+	wtop = arena_blockidx(celltop - 1);
+	for (w = UnusedBlockWords; w <= wtop; w++) {
+	  GCBlockword alive = a->block[w] & a->mark[w];
+	  while (alive) {
+	    uint32_t bitidx = lj_ffs(alive);
+	    GCCellID c = (w << 5) + bitidx;
+	    GCobj *o = (GCobj *)arena_cellptr(a, c);
+	    alive &= alive - 1;
+	    if (a->flags & ArenaFlag_UdataOnly) {
+	      if (o->gch.gct != ~LJ_TUDATA) {
+		lj_assertG(0, "non-udata in Udata arena %d: gct=%d cell=%d",
+			   (int)ai, (int)o->gch.gct, (int)c);
+		bad++;
+	      }
+	    } else {
+	      /* NonTrav (string) arena: openaddr reclaim target. */
+	      if (o->gch.gct != ~LJ_TSTR) {
+		lj_assertG(0, "non-string in NonTrav arena %d: gct=%d cell=%d",
+			   (int)ai, (int)o->gch.gct, (int)c);
+		bad++;
+	      }
+	    }
+	  }
+	}
+      }
+    } else if ((a->flags & ArenaFlag_TravObjs) &&
+	       !(a->flags & ArenaFlag_UdataOnly)) {
+      /* Trav non-Udata: no udata mis-route (1b). */
+      uint32_t w, wtop;
+      if ((GCCellID)a->celltop > MinCellId) {
+	wtop = arena_blockidx(celltop - 1);
+	for (w = UnusedBlockWords; w <= wtop; w++) {
+	  GCBlockword alive = a->block[w] & a->mark[w];
+	  while (alive) {
+	    uint32_t bitidx = lj_ffs(alive);
+	    GCCellID c = (w << 5) + bitidx;
+	    GCobj *o = (GCobj *)arena_cellptr(a, c);
+	    alive &= alive - 1;
+	    if (o->gch.gct == ~LJ_TUDATA) {
+	      lj_assertG(0, "udata in non-Udata Trav arena %d: cell=%d",
+			 (int)ai, (int)c);
+	      bad++;
+	    }
+	  }
+	}
+      }
+    }
+    /* -- GCSpause stuck-black: TravObjs mark bitmap must be empty. -- */
+    if (g->gc.state == GCSpause && (a->flags & ArenaFlag_TravObjs) &&
+	(GCCellID)a->celltop > MinCellId) {
+      uint32_t w, wtop = arena_blockidx(celltop - 1);
+      for (w = UnusedBlockWords; w <= wtop; w++) {
+	GCBlockword stuck = a->block[w] & a->mark[w];
+	if (stuck) {
+	  uint32_t bitidx = lj_ffs(stuck);
+	  GCCellID c = (w << 5) + bitidx;
+	  GCobj *o = (GCobj *)arena_cellptr(a, c);
+	  lj_assertG(0, "arena %d object still bitmap-black at GCSpause: "
+		     "ptr=%p gct=%d marked=0x%02x cell=%d",
+		     (int)ai, (void *)o, o->gch.gct, o->gch.marked, (int)c);
+	  bad++;
+	  break;  /* one report per arena is enough */
 	}
       }
     }
@@ -3236,8 +3351,10 @@ void lj_gc_fullgc(lua_State *L)
   do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
   g->vmstate = ostate;
-#ifdef LUA_USE_ASSERT
-  gc_arena_verify(g);  /* Phase M: cross-check the arena mark bitmap. */
+  /* O(live) shadow-mark self-test: only pure ASSERT builds without
+  ** LJ_GC_NOFULLGCVERIFY. GC invariants run earlier (atomic_end / checkheap). */
+#if defined(LUA_USE_ASSERT) && !defined(LJ_GC_NOFULLGCVERIFY)
+  gc_arena_verify(g);
 #endif
 }
 

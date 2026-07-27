@@ -406,12 +406,18 @@ static void gc_assert_atomic_end(global_State *g)
   for (ai = 0; ai < g->gc.arenastop; ai++) {
     GCArena *a = arenas[ai];
     uint32_t w, wtop;
+    int is_nontrav_str = !(a->flags & (ArenaFlag_TravObjs | ArenaFlag_PODOnly |
+				       ArenaFlag_UdataOnly
+#if LJ_HASFFI
+				       | ArenaFlag_CdataVOnly
+#endif
+			 ));
     if (!(a->flags & (ArenaFlag_TravObjs | ArenaFlag_PODOnly |
 		      ArenaFlag_UdataOnly
 #if LJ_HASFFI
 		      | ArenaFlag_CdataVOnly
 #endif
-	 )))
+	 )) && !is_nontrav_str)
       continue;
     if ((GCCellID)a->celltop <= MinCellId)
       continue;
@@ -432,6 +438,24 @@ static void gc_assert_atomic_end(global_State *g)
 	} else
 #endif
 	  o = (GCobj *)arena_cellptr(a, c);
+	/* Class routing (front-loaded from fullgc gc_arena_verify): at
+	** atomic→sweep marks are authoritative for survivors. */
+	if (a->flags & ArenaFlag_UdataOnly) {
+	  lj_assertG(o->gch.gct == ~LJ_TUDATA,
+		     "non-udata in Udata arena at atomic: gct=%d p=%p",
+		     (int)o->gch.gct, (void *)o);
+	} else if (is_nontrav_str) {
+	  lj_assertG(o->gch.gct == ~LJ_TSTR,
+		     "non-string in NonTrav arena at atomic: gct=%d p=%p",
+		     (int)o->gch.gct, (void *)o);
+	} else if (a->flags & ArenaFlag_TravObjs) {
+	  lj_assertG(o->gch.gct != ~LJ_TUDATA,
+		     "udata in non-Udata Trav arena at atomic: p=%p",
+		     (void *)o);
+	}
+	/* NonTrav strings: mark bits only — no residual-GRAY / edge walk. */
+	if (is_nontrav_str)
+	  continue;
 	if (o->gch.marked & LJ_GC_GRAY) {
 	  /* P3a (classic-aligned): open UV AND arena THREAD are the legit
 	  ** mark∧GRAY residuals. Open UV is left gray (value aliases a stack
