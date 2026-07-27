@@ -14,6 +14,11 @@ LJ_FUNC void LJ_FASTCALL lj_func_freeproto(global_State *g, GCproto *pt);
 /* Upvalues. */
 LJ_FUNCA void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level);
 LJ_FUNC void LJ_FASTCALL lj_func_freeuv(global_State *g, GCupval *uv);
+#if LJ_HASGCMARK
+LJ_FUNC void lj_func_free_openuv_buf(global_State *g, lua_State *L);
+/* Path F freeall/lua_close: unconditional freeuv, not closeuv/isdead. */
+LJ_FUNC void lj_func_freeall_openuv(global_State *g, lua_State *L);
+#endif
 
 /* Functions (closures). */
 LJ_FUNC GCfunc *lj_func_newC(lua_State *L, MSize nelems, GCtab *env);

@@ -96,7 +96,6 @@ static void gc_graythread_push(global_State *g, GCobj *o);
 static int gc_graythread_empty(global_State *g);
 static void gc_graythread_reset(global_State *g);
 static void gc_atomic_rescan_threads(global_State *g);
-static void gc_atomic_sweep_openupvals(global_State *g);
 static void gc_weak_push(global_State *g, GCobj *o, int weak);
 static void gc_weak_reset(global_State *g);
 static void gc_weak_redirect_all(global_State *g);
@@ -348,7 +347,7 @@ static void gc_mark(global_State *g, GCobj *o)
     ** mark∧GRAY residual exception: its value aliases a stack slot re-marked
     ** by gc_atomic_rescan_threads, the UV header is re-closed by lj_gc_closeuv
     ** (gray2black on close during prop/atomic), and dead open UVs are freed
-    ** by gc_atomic_sweep_openupvals / per-thread fullsweep (bitmap sweep skips
+    ** by Path L (closeuv) / Path F (freeall_openuv) (bitmap sweep skips
     ** !closed). GCMARK barriers prefilter !isgray, so a mark∧GRAY open UV
     ** correctly skips lj_gc_barrierf / barrierback — no path assumes open UV
     ** is pure-black. */
@@ -1143,6 +1142,13 @@ static void gc_traverse_thread(global_State *g, lua_State *th)
   }
   gc_markobj(g, tabref(th->env));
   lj_state_shrinkstack(th, gc_traverse_frames(g, th));
+  /* T1: after shrinkstack, mark every open UV mark∧GRAY (no atomic fullsweep). */
+  {
+    GCRef *vec = mref(th->openuv, GCRef);
+    MSize i, n = th->openuvtop;
+    for (i = 0; i < n; i++)
+      gc_mark(g, gcref(vec[i]));
+  }
 }
 
 /* Traverse the host-allocated main thread directly: it is SFIXED and cannot
@@ -1195,7 +1201,7 @@ static size_t propagatemark(global_State *g
     ** gray2black at entry cleared GRAY; restore it so the thread ends
     ** mark∧GRAY for the whole cycle — stack slots cannot pay write
     ** barriers, so a thread is never pure black. graythread is the
-    ** enumeration set for atomic stack rescan + openupval fullsweep,
+    ** enumeration set for atomic stack rescan,
     ** NOT a "pure black after first visit" scheme.
     **
     ** Re-visit safety: gc_mark only fires when gc_obj_iswhite is true
@@ -1205,7 +1211,7 @@ static size_t propagatemark(global_State *g
     ** permanent-gray thread — if one somehow appears on a gray stack
     ** twice, prop re-traverses it (idempotent) and graythread gains a
     ** duplicate. Rescan (gc_atomic_rescan_threads) and fullsweep
-    ** (gc_atomic_sweep_openupvals) tolerate duplicates; the bound is
+    ** (graythread walk) tolerate duplicates; the bound is
     ** N_threads not N_visits. Push-once membership is not cheap on the
     ** ptrstack, so duplicates are accepted rather than adding a
     ** per-thread dedup structure. */
@@ -1534,50 +1540,9 @@ static const GCFreeFunc gc_freefunc[] = {
   (GCFreeFunc)lj_udata_free
 };
 
-#define gc_fullsweep(g, p)	gc_sweep(g, (p), ~(uint32_t)0)
+/* T2: linked-list gc_sweep/gc_fullsweep removed under GCMARK.
+** Open UV free is Path F (lj_func_freeall_openuv) or Path L (closeuv). */
 
-static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
-{
-  GCobj *o;
-  while ((o = gcref(*p)) != NULL && lim-- > 0) {
-    if (o->gch.gct == ~LJ_TTHREAD)
-      gc_fullsweep(g, &gco2th(o)->openupval);
-    if ((g->gc.state == GCSatomic || g->gc.state == GCSsweep) &&
-	!lj_arena_ishuge(o) &&
-	o != obj2gco(mainthread(g))) {
-      if ((o->gch.marked & LJ_GC_FIXED) ||
-	  arena_obj_ismarked(ptr2arena(o), ptr2cell(o))) {
-	/* P3a (classic-aligned): open UV and arena THREAD are the legit
-	** mark∧GRAY residuals. Open UV is left gray (value aliases a stack
-	** slot — see gc_mark UPVAL). THREAD is permanent-gray (stack slots
-	** cannot pay write barriers — see propagatemark THREAD branch).
-	** Closed UV and every other survivor must still be pure black. This
-	** walk only sees openupval chains via the gc.state==GCSatomic|
-	** GCSsweep mark-authority branch (gc_fullsweep on per-thread/
-	** mainthread openupval; the incremental gc_sweep path is shutdown-
-	** only). mainthread is excluded by the o != mainthread(g) guard
-	** above, so it never reaches this assert. */
-	if (!(o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed) &&
-	    !(o->gch.gct == ~LJ_TTHREAD))
-	  lj_assert_check(g, !(o->gch.marked & LJ_GC_GRAY),
-			   "survivor GRAY in sweep: gct=%d marked=0x%02x p=%p",
-			   o->gch.gct, o->gch.marked, (void *)o);
-	p = &o->gch.nextgc;
-      } else {
-	setgcrefr(*p, o->gch.nextgc);
-	gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
-      }
-      continue;
-    }
-    if (o->gch.marked & LJ_GC_SFIXED) {
-      p = &o->gch.nextgc;
-    } else {
-      setgcrefr(*p, o->gch.nextgc);
-      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
-    }
-  }
-  return p;
-}
 
 /* Open-addressing string sweep: free every interned string. Called only from
 ** the shutdown/freeall path (P2 folds incremental string reclaim into the
@@ -1843,8 +1808,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 	** under the arena ASAN poison contract.) */
 	if (arena_cellstate(a, c) < CellState_White)
 	  continue;
-	/* Skip open upvalues: they're on per-thread openupval chains,
-	** freed by lj_state_free (dead thread) or gc_fullsweep in rebuild. */
+	/* Skip open upvalues: Path L closeuv / Path F freeall_openuv; not bitmap. */
 	if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
 	  continue;
 	/* Strings reclaimed on NonTrav OPENADDR path above; skip here. */
@@ -1964,7 +1928,7 @@ static void rebuild_hugescan(global_State *g)
   ** mark=0 slots. On a restart, a survivor slot still has MARK set → the
   ** dead-free branch skips it (no re-free). Dead objects tombstone their
   ** slots via lj_hugeblock_free → skipped by !hugeset_slot_live on restart.
-  ** Thread openupval fullsweep is idempotent across restarts (dead upvalues
+  ** Open UV Path L/F free is idempotent across restarts (dead upvalues
   ** freed on first pass). This makes the HUGESET_SWEPT restart-skip tag
   ** redundant — it was removed (def, set, check, markinit clear).
   **
@@ -2349,14 +2313,12 @@ void lj_gc_freeall(global_State *g)
 	  ** under the arena ASAN poison contract. */
 	  if (arena_cellstate(a, c) < CellState_White)
 	    continue;
-	  /* Open upvalues are freed through their owning thread's openupval
-	  ** chain (gc_fullsweep + lj_state_free -> closeuv below); skip them
-	  ** here. Cells already side-effect-freed by an earlier thread free in
-	  ** this word are caught by the bitmap re-check above. */
+	  /* Open UVs: Path F freeall_openuv on THREAD; Path L closeuv mid-cycle.
+	  ** Bitmap never frees open UVs (C4b skip). */
 	  if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
 	    continue;
 	  if (o->gch.gct == ~LJ_TTHREAD)
-	    gc_fullsweep(g, &gco2th(o)->openupval);
+	    lj_func_freeall_openuv(g, gco2th(o));
 	  {
 	    unsigned gct = o->gch.gct;
 	    gc_freefunc[gct - ~LJ_TSTR](g, o);
@@ -2409,28 +2371,6 @@ static void gc_atomic_rescan_threads(global_State *g)
     lj_assertG(gc_inarena(g, o), "non-arena thread in graythread");
     gc_traverse_thread(g, gco2th(o));
   }
-}
-
-/* Free dead open upvalues. Called at atomic end after epoch++ with gc.state
-** == GCSatomic, so gc_sweep takes its mark-authority branch (keeps marked UVs,
-** frees unmarked). Threads are permanent-gray (mark∧GRAY); closed UVs are
-** pure black; open UVs are left mark∧GRAY (P3a allowed residual — see
-** gc_mark UPVAL). gc_fullsweep frees unmarked UVs and keeps marked ones;
-** the survivor GRAY assert in gc_sweep excludes open UV and THREAD. */
-static void gc_atomic_sweep_openupvals(global_State *g)
-{
-  GCobj **thr = mref(g->gc.graythread, GCobj *);
-  MSize i, n = g->gc.graythreadtop;
-  gc_fullsweep(g, &mainthread(g)->openupval);
-  if (thr != NULL) {
-    for (i = 0; i < n; i++) {
-      GCobj *o = thr[i];
-      if (o == NULL || o == obj2gco(mainthread(g))) continue;
-      lj_assertG(o->gch.gct == ~LJ_TTHREAD, "graythread non-thread at UV sweep");
-      gc_fullsweep(g, &gco2th(o)->openupval);
-    }
-  }
-  gc_graythread_reset(g);
 }
 
 /* Atomic part of the GC cycle, transitioning from mark to sweep phase. */
@@ -2506,13 +2446,11 @@ static void atomic(global_State *g, lua_State *L)
 				   "arena/huge gray non-empty at atomic→sweep: "
 				   "grayastop=%u hugegraytop=%u",
 				   (unsigned)g->gc.grayastop, (unsigned)g->gc.hugegraytop);
-  /* (8) Open free window: epoch++ FIRST (D1 / I2). This is the single
-  ** otherwhite boundary; before it isdead is globally false, after it every
-  ** pre-existing arena is "other" and its unmarked objects are dead.
-  ** gc_atomic_sweep_openupvals runs mark-authority via gc_sweep's
-  ** gc.state==GCSatomic branch (no GCF flag). */
+  /* (8) Open free window: epoch++ FIRST (D1 / I2). Live-thread open UVs
+  ** marked in gc_traverse_thread (T1); dead-thread open UVs via Path L.
+  ** No atomic openupval fullsweep (T2). graythread_reset is hygiene/canary. */
   g->gc.epoch++;
-  gc_atomic_sweep_openupvals(g);
+  gc_graythread_reset(g);
   gc_assert_atomic_end(g);
 
   /* (9) Prepare for sweep phase. */

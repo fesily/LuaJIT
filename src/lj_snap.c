@@ -220,12 +220,25 @@ static BCReg snap_usedef(jit_State *J, uint8_t *udf,
 #endif
 
   /* Treat open upvalues as used. */
+#if LJ_HASGCMARK
+  {
+    GCRef *vec = mref(J->L->openuv, GCRef);
+    MSize i, n = J->L->openuvtop;
+    for (i = 0; i < n; i++) {
+      TValue *uvs = uvval(gco2uv(gcref(vec[i])));
+      if (uvs < J->L->base) break;
+      udf[uvs - J->L->base] = 0;
+    }
+    UNUSED(o);
+  }
+#else
   o = gcref(J->L->openupval);
   while (o) {
     if (uvval(gco2uv(o)) < J->L->base) break;
     udf[uvval(gco2uv(o)) - J->L->base] = 0;
     o = gcref(o->gch.nextgc);
   }
+#endif
 
 #define USE_SLOT(s)		udf[(s)] &= ~1
 #define DEF_SLOT(s)		udf[(s)] *= 3

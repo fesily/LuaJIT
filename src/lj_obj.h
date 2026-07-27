@@ -736,7 +736,7 @@ typedef struct GCState {
   MRef hugegray;	/* GCobj **: worklist of gray huge traversable objects. */
   MSize hugegraytop;	/* Huge gray stack: number of entries. */
   MSize hugegraysz;	/* Huge gray stack: allocated capacity. */
-  MRef graythread;	/* GCobj **: mark re-scan; live-thread list until atomic openupval sweep. */
+  MRef graythread;	/* GCobj **: permanent-gray threads for atomic stack rescan. */
   MSize graythreadtop;	/* Thread gray stack: number of entries. */
   MSize graythreadsz;	/* Thread gray stack: allocated capacity. */
   MRef weakkey;		/* GCobj **: tables with weak keys only. */
@@ -872,7 +872,14 @@ struct lua_State {
   TValue *top;		/* First free slot in the stack. */
   MRef maxstack;	/* Last free slot in the stack. */
   MRef stack;		/* Stack base. */
+#if LJ_HASGCMARK
+  /* T3a: open-UV vector (uvval descending). openuvtop==0 empty; no openupval. */
+  MRef openuv;		/* GCRef *: open UV vector base (allocf, not GC). */
+  MSize openuvtop;	/* Live entry count. */
+  MSize openuvsz;	/* Capacity in entries. */
+#else
   GCRef openupval;	/* List of open upvalues in the stack. */
+#endif
   GCRef env;		/* Thread environment (table of globals). */
   void *cframe;		/* End of C stack frame chain. */
   MSize stacksize;	/* True stack size (incl. LJ_STACK_EXTRA). */
@@ -924,6 +931,17 @@ LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(lua_State, gclist));
 LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(GCproto, gclist));
 LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(GCfuncL, gclist));
 LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(GCtab, gclist));
+
+#if LJ_HASGCMARK
+/* T3a: open-UV vector layout guards (R5). The 7 BC_UCLO backends read
+** L->openuvtop via buildvm-resolved offsets; assert the triple is
+** contiguous/ordered so a future field reorder is caught at compile time
+** (prevents the g->uvhead-style SIGSEGV from a stale dasc offset). */
+LJ_STATIC_ASSERT(offsetof(lua_State, openuv) + sizeof(MRef) ==
+		 offsetof(lua_State, openuvtop));
+LJ_STATIC_ASSERT(offsetof(lua_State, openuvtop) + sizeof(MSize) ==
+		 offsetof(lua_State, openuvsz));
+#endif
 
 typedef union GCobj {
   GChead gch;

@@ -11,9 +11,12 @@
 
 #include "lj_obj.h"
 #include "lj_gc.h"
+#include "lj_err.h"
 #include "lj_func.h"
 #include "lj_trace.h"
 #include "lj_vm.h"
+
+#include <string.h>
 
 /* -- Prototypes ---------------------------------------------------------- */
 
@@ -23,6 +26,130 @@ void LJ_FASTCALL lj_func_freeproto(global_State *g, GCproto *pt)
 }
 
 /* -- Upvalues ------------------------------------------------------------ */
+
+#if LJ_HASGCMARK
+/* T3a: open UV vector only (no openupval chain). Sorted by uvval descending. */
+#define OPENUV_VEC_INIT		8
+
+static void openuv_grow(lua_State *L)
+{
+  global_State *g = G(L);
+  GCRef *old = mref(L->openuv, GCRef);
+  MSize oldsz = L->openuvsz;
+  MSize newsz = oldsz ? oldsz * 2 : OPENUV_VEC_INIT;
+  GCRef *buf = (GCRef *)g->allocf(g->allocd, old,
+				  (size_t)oldsz * sizeof(GCRef),
+				  (size_t)newsz * sizeof(GCRef));
+  if (LJ_UNLIKELY(buf == NULL)) lj_err_mem(L);
+  setmref(L->openuv, buf);
+  L->openuvsz = newsz;
+}
+
+static void openuv_insert(lua_State *L, MSize idx, GCupval *uv)
+{
+  GCRef *vec;
+  if (L->openuvtop >= L->openuvsz)
+    openuv_grow(L);
+  vec = mref(L->openuv, GCRef);
+  if (idx < L->openuvtop)
+    memmove(vec + idx + 1, vec + idx,
+	    (size_t)(L->openuvtop - idx) * sizeof(GCRef));
+  setgcref(vec[idx], obj2gco(uv));
+  L->openuvtop++;
+}
+
+void lj_func_free_openuv_buf(global_State *g, lua_State *L)
+{
+  GCRef *vec = mref(L->openuv, GCRef);
+  if (vec != NULL) {
+    g->allocf(g->allocd, vec, (size_t)L->openuvsz * sizeof(GCRef), 0);
+    setmref(L->openuv, NULL);
+    L->openuvtop = 0;
+    L->openuvsz = 0;
+  }
+}
+
+/* Path F freeall/lua_close: unconditional freeuv (not closeuv/isdead). */
+void lj_func_freeall_openuv(global_State *g, lua_State *L)
+{
+  GCRef *vec = mref(L->openuv, GCRef);
+  MSize i, n = L->openuvtop;
+  for (i = 0; i < n; i++) {
+    GCupval *uv = gco2uv(gcref(vec[i]));
+    lj_assertG(!uv->closed, "closed upvalue in freeall openuv");
+    lj_func_freeuv(g, uv);
+  }
+  L->openuvtop = 0;
+}
+
+/* Find existing open upvalue for a stack slot or create a new one. */
+static GCupval *func_finduv(lua_State *L, TValue *slot)
+{
+  global_State *g = G(L);
+  GCRef *vec = mref(L->openuv, GCRef);
+  MSize i, top = L->openuvtop;
+  GCupval *p, *uv;
+  for (i = 0; i < top; i++) {
+    p = gco2uv(gcref(vec[i]));
+    lj_assertG(!p->closed && uvval(p) != &p->tv, "closed upvalue in openuv");
+    if (uvval(p) < slot)
+      break;
+    if (uvval(p) == slot) {
+      if (gc_obj_isdead(g, obj2gco(p)))
+	gc_obj_resurrect(g, obj2gco(p));
+      return p;
+    }
+  }
+  /* Capacity before UV alloc: grow OOM after newagco would leave open UV
+  ** off-vector (C4b skip + Path F only walks vector → leak past lua_close). */
+  if (L->openuvtop >= L->openuvsz)
+    openuv_grow(L);
+  uv = (GCupval *)lj_mem_newagco(L, sizeof(GCupval), 1);
+  newwhite(g, uv);
+  uv->gct = ~LJ_TUPVAL;
+  uv->closed = 0;
+  setmref(uv->v, slot);
+  /* NOBARRIER: The GCupval is new (marked white) and open. uv->nextgc unused. */
+  openuv_insert(L, i, uv);
+  return uv;
+}
+
+/* Close all open upvalues pointing to some stack level or above. */
+void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
+{
+  global_State *g = G(L);
+  GCRef *vec = mref(L->openuv, GCRef);
+  MSize i = 0, n = L->openuvtop, j;
+  while (i < n) {
+    GCupval *uv = gco2uv(gcref(vec[i]));
+    if (uvval(uv) < level)
+      break;
+    i++;
+  }
+  if (i == 0)
+    return;
+  for (j = 0; j < i; j++) {
+    GCupval *uv = gco2uv(gcref(vec[j]));
+    GCobj *o = obj2gco(uv);
+    lj_assertG(!uv->closed && uvval(uv) != &uv->tv, "closed upvalue in openuv");
+    if (gc_obj_isdead(g, o))
+      lj_func_freeuv(g, uv);
+    else
+      lj_gc_closeuv(g, uv);
+  }
+  if (i < n)
+    memmove(vec, vec + i, (size_t)(n - i) * sizeof(GCRef));
+  L->openuvtop = n - i;
+}
+
+void LJ_FASTCALL lj_func_freeuv(global_State *g, GCupval *uv)
+{
+  /* Open UVs live only on the per-thread openuv vector; caller unlinks first.
+  ** prev/next union and nextgc unused under HASGCMARK. */
+  lj_mem_freegco(g, uv, sizeof(GCupval));
+}
+
+#else  /* !LJ_HASGCMARK */
 
 /* Find existing open upvalue for a stack slot or create a new one. */
 static GCupval *func_finduv(lua_State *L, TValue *slot)
@@ -53,17 +180,6 @@ static GCupval *func_finduv(lua_State *L, TValue *slot)
   return uv;
 }
 
-/* Create an empty and closed upvalue. */
-static GCupval *func_emptyuv(lua_State *L)
-{
-  GCupval *uv = (GCupval *)lj_mem_newgcot(L, sizeof(GCupval));
-  uv->gct = ~LJ_TUPVAL;
-  uv->closed = 1;
-  setnilV(&uv->tv);
-  setmref(uv->v, &uv->tv);
-  return uv;
-}
-
 /* Close all open upvalues pointing to some stack level or above. */
 void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
 {
@@ -72,11 +188,8 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
   while (gcref(L->openupval) != NULL &&
 	 uvval((uv = gco2uv(gcref(L->openupval)))) >= level) {
     GCobj *o = obj2gco(uv);
-#if !LJ_HASGCMARK
-    /* Classic: open upvalues stay white/gray until closed. Bitmap GC
-    ** gray2black's surviving open UVs at atomic end, so black is normal. */
+    /* Classic: open upvalues stay white/gray until closed. */
     lj_assertG(!gc_obj_isblack(g, o), "bad black upvalue");
-#endif
     lj_assertG(!uv->closed && uvval(uv) != &uv->tv, "closed upvalue in chain");
     setgcrefr(L->openupval, uv->nextgc);  /* No longer in open list. */
     if (gc_obj_isdead(g, o)) {
@@ -89,11 +202,21 @@ void LJ_FASTCALL lj_func_closeuv(lua_State *L, TValue *level)
 
 void LJ_FASTCALL lj_func_freeuv(global_State *g, GCupval *uv)
 {
-  /* Open upvalues are no longer linked into a global DLL (g->uvhead retired);
-  ** they live only on the per-thread openupval chain, unlinked by the caller
-  ** (lj_func_closeuv or the sweep) before this free. The prev/next union
-  ** fields are dead and left as-is. */
+  /* Open upvalues live on the per-thread openupval chain, unlinked by caller. */
   lj_mem_freegco(g, uv, sizeof(GCupval));
+}
+
+#endif  /* LJ_HASGCMARK */
+
+/* Create an empty and closed upvalue. */
+static GCupval *func_emptyuv(lua_State *L)
+{
+  GCupval *uv = (GCupval *)lj_mem_newgcot(L, sizeof(GCupval));
+  uv->gct = ~LJ_TUPVAL;
+  uv->closed = 1;
+  setnilV(&uv->tv);
+  setmref(uv->v, &uv->tv);
+  return uv;
 }
 
 /* -- Functions (closures) ------------------------------------------------ */

@@ -69,7 +69,9 @@ static void resizestack(lua_State *L, MSize n)
   ptrdiff_t delta;
   MSize oldsize = L->stacksize;
   MSize realsize = n + 1 + LJ_STACK_EXTRA;
+#if !LJ_HASGCMARK
   GCobj *up;
+#endif
   lj_assertL((MSize)(tvref(L->maxstack)-oldst) == L->stacksize-LJ_STACK_EXTRA-1,
 	     "inconsistent stack size");
   st = (TValue *)lj_mem_realloc(L, tvref(L->stack),
@@ -85,8 +87,19 @@ static void resizestack(lua_State *L, MSize n)
     setmref(G(L)->jit_base, mref(G(L)->jit_base, char) + delta);
   L->base = (TValue *)((char *)L->base + delta);
   L->top = (TValue *)((char *)L->top + delta);
+#if LJ_HASGCMARK
+  {
+    GCRef *vec = mref(L->openuv, GCRef);
+    MSize i, nopen = L->openuvtop;
+    for (i = 0; i < nopen; i++) {
+      GCupval *uv = gco2uv(gcref(vec[i]));
+      setmref(uv->v, (TValue *)((char *)uvval(uv) + delta));
+    }
+  }
+#else
   for (up = gcref(L->openupval); up != NULL; up = gcnext(up))
     setmref(gco2uv(up)->v, (TValue *)((char *)uvval(gco2uv(up)) + delta));
+#endif
 }
 
 /* Relimit stack after error, in case the limit was overdrawn. */
@@ -228,6 +241,7 @@ static void close_state(lua_State *L)
   global_State *g = G(L);
   lj_func_closeuv(L, tvref(L->stack));
 #if LJ_HASGCMARK
+  lj_func_free_openuv_buf(g, L);
   lj_gc_graywork_free(g);  /* Discard stale gray worklists before freeall. */
 #endif
   lj_gc_freeall(g);
@@ -412,7 +426,13 @@ lua_State *lj_state_new(lua_State *L)
   setmref(L1->stack, NULL);
   L1->cframe = NULL;
   /* NOBARRIER: The lua_State is new (marked white). */
+#if LJ_HASGCMARK
+  setmref(L1->openuv, NULL);
+  L1->openuvtop = 0;
+  L1->openuvsz = 0;
+#else
   setgcrefnull(L1->openupval);
+#endif
   setmrefr(L1->glref, L->glref);
   setgcrefr(L1->env, L->env);
   stack_init(L1, L);  /* init stack */
@@ -442,11 +462,20 @@ void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
   if (ctype_ctsG(g) && ctype_ctsG(g)->L == L)  /* Avoid dangling cts->L. */
     ctype_ctsG(g)->L = mainthread(g);
 #endif
+#if LJ_HASGCMARK
+  if (L->openuvtop != 0) {
+    lj_func_closeuv(L, tvref(L->stack));
+    lj_trace_abort(g);  /* For aa_uref soundness. */
+    lj_assertG(L->openuvtop == 0, "stale openuv vector after closeuv");
+  }
+  lj_func_free_openuv_buf(g, L);
+#else
   if (gcref(L->openupval) != NULL) {
     lj_func_closeuv(L, tvref(L->stack));
     lj_trace_abort(g);  /* For aa_uref soundness. */
     lj_assertG(gcref(L->openupval) == NULL, "stale open upvalues");
   }
+#endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
   lj_mem_freegco(g, L, sizeof(lua_State));
 }
