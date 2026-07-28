@@ -512,6 +512,9 @@ void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
   }
 #endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
+#if LUA_COMPAT_TAILCALL_COUNT
+  lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
+#endif
   lj_mem_freegco(g, L, sizeof(lua_State));
 }
 

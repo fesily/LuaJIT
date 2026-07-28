@@ -2721,6 +2721,44 @@ int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
   clock_gettime(CLOCK_MONOTONIC, &start);
 #endif
 
+  uint64_t elapsed;
+  GCSize work = 0;
+  do {
+    size_t cost = gc_onestep(L);
+    if (cost >= LJ_MAX_MEM)
+      break;
+    work += (GCSize)cost;
+    if (g->gc.state == GCSpause) {
+      g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
+      g->vmstate = ostate;
+      return 1;
+    }
+#if defined(_WIN32)
+    QueryPerformanceCounter(&now);
+    elapsed = (uint64_t)((now.QuadPart - start.QuadPart) * 1e9 / freq.QuadPart);
+#elif defined(__APPLE__)
+    now = mach_absolute_time();
+    elapsed = (now - start) * tb.numer / tb.denom;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    elapsed = (uint64_t)((now.tv_sec - start.tv_sec) * 1e9 + (now.tv_nsec - start.tv_nsec));
+#endif
+  } while (elapsed < timelim);
+
+  if (g->gc.debt <= work) {
+    g->gc.debt = 0;
+    g->gc.threshold = g->gc.total + GCSTEPSIZE;
+    g->vmstate = ostate;
+    return -1;
+  } else {
+    g->gc.debt -= work;
+    g->gc.threshold = g->gc.total;
+    g->vmstate = ostate;
+    return 0;
+  }
+}
+#endif
+
 /* Ditto, but fix the stack top first. */
 void LJ_FASTCALL lj_gc_step_fixtop(lua_State *L)
 {
