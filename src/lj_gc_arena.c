@@ -54,6 +54,13 @@
 ** Hugeset is NOT chunked (rehash invalidates slot cursor; one-shot at end). */
 #define GCSWEEP_CLEARMARKS_ARENAS	16
 
+/* Batch gray pop granularity for arena mark propagation (P1-3a). Pop up to N
+** gray entries per iteration of the POD / mixed drain; the outer drain loop
+** still runs until the gray stack is empty (including same-arena re-pushes
+** from traversal). N=8 keeps the local-resolve array small for the hot path
+** while amortizing greytop updates across multiple worklist items. */
+#define GC_MARK_BATCH_N	8
+
 /* Macros to set GCobj colors and flags. */
 #define white2gray(x) \
   ((x)->gch.marked |= LJ_GC_GRAY)
@@ -1137,6 +1144,39 @@ static LJ_AINLINE size_t gc_prop_trace(global_State *g, GCobj *o)
 }
 #endif
 
+/* Batch gray pop (P1-3a). Pop up to GC_MARK_BATCH_N entries from the arena's
+** gray stack into a caller-provided local array, returning the count popped.
+**
+** HARD RULE (plan §5): every selected GCobj* is resolved into the local
+** array BEFORE greytop is lowered. arena_cellptr is independent of greytop,
+** so resolving here is safe. Once greytop is lowered, NEVER re-read batch
+** members from gray-stack storage — a same-arena re-push during subsequent
+** traversal may overwrite the now-freed stack slots, yielding a stale/aliased
+** cellid. The local array is the only authoritative copy for the batch.
+**
+** Stale ArenaFlag_InGrayHeap after a same-arena re-push (the arena was
+** already taken off grayastack; the re-push re-inserts InGrayHeap / a heap
+** entry that later looks empty) is EXPECTED. gc_grayarena_pop clears the
+** flag and skips stale/empty roots (see ~line 1271); do NOT add ad-hoc
+** InGrayHeap clearing inside the drain to "fix" this.
+**
+** No prefetch here (T5); no sort by cellid. */
+static LJ_AINLINE MSize gc_gray_batch_pop(GCArena *a, GCobj **objs)
+{
+  GCCellID1 *top = mref(a->greytop, GCCellID1);
+  GCCellID1 *base = mref(a->greybase, GCCellID1);
+  MSize depth = (MSize)(top - base);
+  if (depth == 0) return 0;
+  if (depth > GC_MARK_BATCH_N) depth = GC_MARK_BATCH_N;
+  /* LIFO: objs[0] = most-recently pushed (top-1), matching single-pop order
+  ** within the batch. Batch-internal order need not equal pure single-pop
+  ** LIFO once re-push lands on the live stack for the next iteration. */
+  for (MSize i = 0; i < depth; i++)
+    objs[i] = (GCobj *)arena_cellptr(a, top[-1 - (ptrdiff_t)i]);
+  setmref(a->greytop, top - depth);
+  return depth;
+}
+
 /* Propagate one gray object. Traverse it and turn it black. */
 static size_t propagatemark(global_State *g, GCobj *o)
 {
@@ -1181,38 +1221,46 @@ static size_t propagatemark(global_State *g, GCobj *o)
 **
 ** mark_calls accounting: the fast path inlines gcstat_inc(mark_calls) to
 ** match propagatemark's per-object accounting; the fallback lets
-** propagatemark own the inc. Single-object drain here; batch pop is T4.
-** Same gray-check / cost-accounting shape as the mixed drain below. */
+** propagatemark own the inc.
+**
+** Batch gray pop (T4): pop up to GC_MARK_BATCH_N entries per iteration into
+** a local array (gc_gray_batch_pop enforces the local-copy hard rule). The
+** outer loop drains until empty including same-arena re-pushes from
+** traversal. Same gray-check / cost-accounting shape as the mixed drain. */
 static size_t gc_propagate_arena_pod(global_State *g, GCArena *a)
 {
   size_t m = 0;
-  while (!arena_gray_empty(a)) {
-    GCCellID1 cellid = arena_gray_pop(a);
-    GCobj *o = (GCobj *)arena_cellptr(a, cellid);
-    /* Non-gray: duplicate worklist entry or already processed. */
-    if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
-      continue;
-    int gct = o->gch.gct;
-    size_t c;
-    if (LJ_LIKELY(gct == ~LJ_TFUNC)) {
-      gray2black(o);
-      c = gc_prop_func(g, o);
-      gcstat_inc(g, mark_calls);
-    } else if (LJ_LIKELY(gct == ~LJ_TPROTO)) {
-      gray2black(o);
-      c = gc_prop_proto(g, o);
-      gcstat_inc(g, mark_calls);
-    } else {
-      /* PODOnly gray stack must only hold FUNC/PROTO. Route the unexpected
-      ** through propagatemark (TAB weak keep-gray, THREAD permanent-gray,
-      ** TRACE) and assert so the misclassification is caught in debug. */
-      c = propagatemark(g, o);
-      lj_assertG(gct == ~LJ_TTAB || gct == ~LJ_TTHREAD ||
-                 (LJ_HASJIT && gct == ~LJ_TTRACE),
-                 "PODOnly arena gray stack held unexpected gct=%d", gct);
+  for (;;) {
+    GCobj *objs[GC_MARK_BATCH_N];
+    MSize n = gc_gray_batch_pop(a, objs);
+    if (n == 0) break;
+    for (MSize i = 0; i < n; i++) {
+      GCobj *o = objs[i];
+      /* Non-gray: duplicate worklist entry or already processed. */
+      if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
+	continue;
+      int gct = o->gch.gct;
+      size_t c;
+      if (LJ_LIKELY(gct == ~LJ_TFUNC)) {
+	gray2black(o);
+	c = gc_prop_func(g, o);
+	gcstat_inc(g, mark_calls);
+      } else if (LJ_LIKELY(gct == ~LJ_TPROTO)) {
+	gray2black(o);
+	c = gc_prop_proto(g, o);
+	gcstat_inc(g, mark_calls);
+      } else {
+	/* PODOnly gray stack must only hold FUNC/PROTO. Route the unexpected
+	** through propagatemark (TAB weak keep-gray, THREAD permanent-gray,
+	** TRACE) and assert so the misclassification is caught in debug. */
+	c = propagatemark(g, o);
+	lj_assertG(gct == ~LJ_TTAB || gct == ~LJ_TTHREAD ||
+	           (LJ_HASJIT && gct == ~LJ_TTRACE),
+	           "PODOnly arena gray stack held unexpected gct=%d", gct);
+      }
+      gcstat_add(g, mark_cost, c);
+      m += c;
     }
-    gcstat_add(g, mark_cost, c);
-    m += c;
   }
   return m;
 }
@@ -1294,21 +1342,26 @@ static GCArena *gc_grayarena_pop(global_State *g)
 **
 ** PODOnly arenas hold only FUNC/PROTO (T2 audit Finding 1); route them to
 ** the specialized drain to skip the propagatemark gct switch. Mixed Trav
-** arenas keep the general single-object loop here; batch pop (T4) and TAB
-** fast-path (T6) layer on later. */
+** arenas use the general loop below. Both paths use batch gray pop (T4):
+** gc_gray_batch_pop copies up to GC_MARK_BATCH_N entries into a local array
+** before lowering greytop, so same-arena re-push during traversal cannot
+** alias a batch member. The outer loop drains until empty (including
+** re-pushes). TAB fast-path is T6; prefetch is T5 (off by default). */
 static size_t gc_propagate_arena(global_State *g, GCArena *a)
 {
   if (a->flags & ArenaFlag_PODOnly)
     return gc_propagate_arena_pod(g, a);
   {
     size_t m = 0;
-    while (!arena_gray_empty(a)) {
-      GCCellID1 cellid = arena_gray_pop(a);
-      GCobj *o = (GCobj *)arena_cellptr(a, cellid);
-      /* Non-gray: duplicate worklist entry or already processed. */
-      if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
-	continue;
-      {
+    for (;;) {
+      GCobj *objs[GC_MARK_BATCH_N];
+      MSize n = gc_gray_batch_pop(a, objs);
+      if (n == 0) break;
+      for (MSize i = 0; i < n; i++) {
+	GCobj *o = objs[i];
+	/* Non-gray: duplicate worklist entry or already processed. */
+	if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
+	  continue;
 	size_t c = propagatemark(g, o);
 	gcstat_add(g, mark_cost, c);
 	m += c;
