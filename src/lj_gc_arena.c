@@ -54,6 +54,11 @@
  * sweep still uses GCSWEEPMAX. */
 #define GCSWEEP_BITMAP_MAX	256
 
+/* ClearMarks chunking: max arenas demoted per rebuild_clearmarks slice.
+** ~16 arenas/slice ≈ 256–512KB bitmap traffic, targeting sub-ms pause.
+** Hugeset is NOT chunked (rehash invalidates slot cursor; one-shot at end). */
+#define GCSWEEP_CLEARMARKS_ARENAS	16
+
 /* Macros to set GCobj colors and flags. */
 #define white2gray(x) \
   ((x)->gch.marked |= LJ_GC_GRAY)
@@ -1499,14 +1504,17 @@ enum {
 };
 
 /* Resumable rebuild sub-phases (g->gc.rebuildphase). Ordered: each phase runs
-** to completion (no chunking yet) and advances to the next; the GCSsweep
-** driver re-enters the dispatcher until Rebuild_Done. */
+** to completion and advances to the next; the GCSsweep driver re-enters the
+** dispatcher until Rebuild_Done. Prologue/HugeScan/ClearMarks are chunked
+** (yield to dispatcher mid-phase via persisted cursor); Epilogue is one-shot;
+** ClearMarks arena loop is chunked but its hugeset clear is one-shot at end. */
 enum {
   Rebuild_Prologue,	/* Arm HugeScan (CdataV dead free folded into bitmap
 			   sweep by P3b; no CdataV scan slice here). */
   Rebuild_HugeScan,	/* Huge-set: free dead; survivor MARK cleared in ClearMarks. */
-  Rebuild_Epilogue,	/* Anchor root on mainthread. */
-  Rebuild_ClearMarks,	/* Clear arena/huge MARK only. */
+  Rebuild_Epilogue,	/* Arm ClearMarks cursor (root re-anchor retired T3b). */
+  Rebuild_ClearMarks,	/* Clear arena/huge MARK. Arena loop chunked; hugeset
+			   one-shot on last slice. */
   Rebuild_Done
 };
 
@@ -1799,11 +1807,10 @@ static size_t gc_bitmap_sweep(global_State *g)
 ** g->gc.rebuildphase. gc_rebuild_rootchain is a dispatcher that runs one
 ** sub-phase per call and the GCSsweep driver re-enters it once per onestep.
 ** P3b folded the CdataV-arena dead free into gc_bitmap_sweep, so Prologue is
-** now one-shot (just arms HugeScan); only HugeScan is chunked and yields
-** mid-phase via its persisted cursor (rebuild_hugehi; (sweepa, sweepw) is
-** armed for the huge dead-free scan). Epilogue and ClearMarks are one-shot —
-** neither yields; they run to Done in the dispatcher's internal loop in the
-** same onestep.
+** now one-shot (just arms HugeScan). HugeScan and ClearMarks are chunked
+** (yield mid-phase via rebuild_hugehi / rebuild_clarena). Epilogue is
+** one-shot (arms ClearMarks cursor). ClearMarks clears hugeset MARK on the
+** last arena slice.
 */
 
 /* Prologue: arm HugeScan. P3b folded the CdataV-arena dead free into the
@@ -1843,10 +1850,10 @@ static void rebuild_hugescan(global_State *g)
   ** freed on first pass). This makes the HUGESET_SWEPT restart-skip tag
   ** redundant — it was removed (def, set, check, markinit clear).
   **
-  ** The slot MARK clear is deferred to rebuild_clearmarks (one-shot,
-  ** non-yielding, runs after HugeScan) and the next cycle's markinit, both
-  ** of which clear all live huge slot marks. This preserves the post-fullgc
-  ** mark0 invariant checked by gc_arena_verify.
+  ** The slot MARK clear is deferred to rebuild_clearmarks (arena loop
+  ** chunked; hugeset one-shot on its last slice, runs after HugeScan) and
+  ** the next cycle's markinit, both of which clear all live huge slot marks.
+  ** This preserves the post-fullgc mark0 invariant checked by gc_arena_verify.
   **
   ** Huge STRINGS freed in OPENADDR branch above; survivors keep MARK
   ** set through the yield (cleared by rebuild_clearmarks/markinit). Upvalues
@@ -1894,8 +1901,9 @@ static void rebuild_hugescan(global_State *g)
   }
   if (g->gc.rebuild_hugehi > hmask) {
     /* Main walk done. Survivor slot MARKs persist past this point and are
-    ** cleared by rebuild_clearmarks (one-shot, non-yielding, runs next in
-    ** the dispatcher) and the next cycle's lj_arena_gc_markinit.
+    ** cleared by rebuild_clearmarks (arena loop chunked; hugeset MARK is
+    ** cleared on the last slice, runs next in the dispatcher) and the next
+    ** cycle's lj_arena_gc_markinit.
     ** Phase 1 dual-track: the huge set is now fully scanned, so every live
     ** huge object is "current" for the new isdead formula. Mirror the per-
     ** arena swept_gen write with the global huge_swept_gen (per-slot
@@ -1908,40 +1916,53 @@ static void rebuild_hugescan(global_State *g)
 static void rebuild_epilogue(global_State *g)
 {
   /* T3b-1: no g->gc.root re-anchor (field retired under HASGCMARK). */
+  g->gc.rebuild_clarena = 0;  /* Arm ClearMarks arena cursor. */
   g->gc.rebuildphase = Rebuild_ClearMarks;
 }
 
 static void rebuild_clearmarks(global_State *g)
 {
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
-  MSize i;
-  GCSize total_before;
+  MSize i, n, stop;
+  /* ClearMarks performs no free; assert g->gc.total is invariant within
+  ** each call. Sampled per-call (not cross-slice): between slices the
+  ** mutator/sweep interleaves and may grow total, so a first-slice sample
+  ** would fire falsely. The per-call check still proves ClearMarks never
+  ** frees (arena demote + hugeset MARK clear are both non-freeing). */
+  GCSize total_before = g->gc.total;
   lj_assertG(g->gc.rebuildphase == Rebuild_ClearMarks,
 	     "ClearMarks entered with rebuildphase=%d (expected Rebuild_ClearMarks)",
 	     g->gc.rebuildphase);
   lj_assertG(g->gc.state == GCSsweep, "ClearMarks outside GCSsweep");
-  total_before = g->gc.total;
-  /* Phase 3 D3: the per-arena free-complete already demoted survivors
-  ** (mark &= ~block for TravObjs/CdataV/NonTrav; mark'=block^mark in POD).
-  ** The loop below is now idempotent (mark already 0 on survivors) but
-  ** kept to clear any residual (e.g. open-UV bitmap marks left by the
-  ** free-path skip, finalized-cdata marks) and as the demote point for
-  ** huge slots. Do NOT re-XOR: `mark &= ~block` is idempotent and avoids
-  ** the double-wrong-demote the goal #3 warns about. */
-  /* I1 assert: leaving free requires every live arena to be current
-  ** (swept_gen == epoch), otherwise !mark survivors read isdead next cycle. */
-  for (i = 0; i < g->gc.arenastop; i++) {
+  /* Chunked: up to GCSWEEP_CLEARMARKS_ARENAS arenas/slice then yield.
+  ** R1: re-read arenastop each slice — arenas appended mid-sweep have zeroed
+  ** bitmaps and swept_gen==epoch, so demote is idempotent and I1 holds.
+  ** Hugeset one-shot on last slice only (rehash invalidates slot cursor). */
+  stop = g->gc.arenastop;
+  n = 0;
+  for (i = g->gc.rebuild_clarena; i < stop && n < GCSWEEP_CLEARMARKS_ARENAS;
+       i++, n++) {
     GCArena *a = arenas[i];
     uint32_t w, wtop;
+    /* I1 assert: every visited arena must be current (swept_gen == epoch),
+    ** otherwise !mark survivors would read isdead next cycle. */
     lj_assertG(a->swept_gen == g->gc.epoch,
-	       "ClearMarks: arena %u not current (I1 broken): swept_gen=%u epoch=%u",
+	       "ClearMarks: arena %u not current (I1 broken): "
+	       "swept_gen=%u epoch=%u",
 	       (unsigned)i, (unsigned)a->swept_gen, (unsigned)g->gc.epoch);
     if ((GCCellID)a->celltop <= MinCellId) continue;
     wtop = arena_blockidx((GCCellID)a->celltop - 1);
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
-  /* Huge: clear slot MARK only. */
+  g->gc.rebuild_clarena = i;
+  /* Arena demote loop freed nothing. */
+  lj_assertG(g->gc.total == total_before,
+	     "ClearMarks arena slice freed memory (total %lu -> %lu)",
+	     (unsigned long)total_before, (unsigned long)g->gc.total);
+  if (i < stop)
+    return;  /* More arenas remain: yield in same phase (dispatcher returns). */
+  /* ---- last slice: hugeset one-shot (also non-freeing) + done ---- */
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -1953,10 +1974,6 @@ static void rebuild_clearmarks(global_State *g)
       }
     }
   }
-  lj_assertG(g->gc.total == total_before,
-		     "ClearMarks freed memory (total %lu -> %lu); no gc_freefunc expected",
-		     (unsigned long)total_before, (unsigned long)g->gc.total);
-
   MARKALLOC_PROGRESS_LOG(
 	    "[markalloc-progress] rebuild ClearMarks done total=%zu strnum=%u "
 	    "arenastop=%u\n",
@@ -1989,9 +2006,10 @@ static void gc_rebuild_rootchain(global_State *g)
       g->gc.sweepphase = SweepPhase_Done;
       return;
     }
-    if ((phase == Rebuild_Prologue || phase == Rebuild_HugeScan) &&
+    if ((phase == Rebuild_Prologue || phase == Rebuild_HugeScan ||
+	 phase == Rebuild_ClearMarks) &&
 	g->gc.rebuildphase == phase)
-      return;
+      return;  /* Still in same phase → yield one onestep (chunked). */
   }
 }
 
@@ -2459,9 +2477,10 @@ static size_t gc_onestep_raw(lua_State *L)
     GCSize old = g->gc.total;
     if (g->gc.sweepphase == SweepPhase_Rebuild) {
       /* Run one rebuild dispatch per onestep. The dispatcher yields after
-      ** each chunked sub-phase (Prologue/HugeScan). Phase 3 dropped the
-      ** GCF flags; rebuild_clearmarks no longer clears a flag, so this branch
-      ** is keyed on sweepphase (set by gc_bitmap_sweep at aend), not a flag. */
+      ** each chunked sub-phase (Prologue/HugeScan/ClearMarks). Phase 3 dropped
+      ** the GCF flags; rebuild_clearmarks no longer clears a flag, so this
+      ** branch is keyed on sweepphase (set by gc_bitmap_sweep at aend), not a
+      ** flag. */
       gc_rebuild_rootchain(g);
       lj_assertG(old >= g->gc.total, "sweep increased memory");
       g->gc.estimate -= old - g->gc.total;
