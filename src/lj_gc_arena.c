@@ -1179,6 +1179,28 @@ static LJ_AINLINE MSize gc_gray_batch_pop(GCArena *a, GCobj **objs)
   for (MSize i = 0; i < depth; i++)
     objs[i] = (GCobj *)arena_cellptr(a, top[-1 - (ptrdiff_t)i]);
   setmref(a->greytop, top - depth);
+  /* T5 worklist-MLP header prefetch (OFF by default; compile with
+  ** -DLUAJIT_GC_MARK_HEADER_PREFETCH to enable). This prefetches the
+  ** GCobj *header* of each batch work item — the object the gray stack
+  ** entry points at — so the header (gch.marked / gch.gct) is in cache by
+  ** the time the drain loop reads it for the GRAY check and dispatch.
+  **
+  ** This is NOT the rejected edge prefetch from
+  ** doc/gc-mark-sweep-adaptation-plan.md (~L299, L352) and
+  ** doc/arenagc-p1-mark-monomorph.md §5.1. That rejected scheme inserted
+  ** __builtin_prefetch(o) on *child edges* inside gc_traverse_tab /
+  ** gc_traverse_func etc. and measured no gain (child tables are
+  ** sequentially allocated → covered by the hardware prefetcher; deep
+  ** chains are serial pointer-chasing → prefetch can't overlap). T5 is
+  ** *worklist MLP*: the gray stack is contiguous GCCellID1 storage,
+  ** batch pop is a sequential read, and the resolved GCobj* headers are
+  ** independent work items the drain is about to visit. Prefetching them
+  ** overlaps the header read with the greytop update and loop overhead.
+  ** Never insert __builtin_prefetch into gc_traverse_* (see §5.1). */
+#ifdef LUAJIT_GC_MARK_HEADER_PREFETCH
+  for (MSize i = 0; i < depth; i++)
+    __builtin_prefetch(objs[i], 0, 3);  /* read, high locality */
+#endif
   return depth;
 }
 
@@ -1367,7 +1389,23 @@ static size_t gc_propagate_arena(global_State *g, GCArena *a)
 	/* Non-gray: duplicate worklist entry or already processed. */
 	if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
 	  continue;
-	size_t c = propagatemark(g, o);
+	int gct = o->gch.gct;
+	size_t c;
+	/* TAB fast-path (T6): tables are the dominant non-POD gray work in
+	** mixed Trav arenas. Dispatch directly to gc_prop_tab (shared with
+	** propagatemark) to skip the gct switch and gray2black re-check.
+	** gc_prop_tab owns the weak keep-gray restore (header WEAK bits
+	** only); non-TAB types fall through to propagatemark, which covers
+	** THREAD permanent-gray, FUNC, PROTO, and TRACE. mark_calls is
+	** inlined on the fast path to match propagatemark's accounting; the
+	** fallback lets propagatemark own the inc. */
+	if (LJ_LIKELY(gct == ~LJ_TTAB)) {
+	  gray2black(o);
+	  c = gc_prop_tab(g, o);
+	  gcstat_inc(g, mark_calls);
+	} else {
+	  c = propagatemark(g, o);
+	}
 	gcstat_add(g, mark_cost, c);
 	m += c;
       }
