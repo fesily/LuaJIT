@@ -182,104 +182,10 @@ static LJ_AINLINE void cdatav_cell_assert(global_State *g, void *p_)
 #define cdatav_cell_assert(g, p)	((void)0)
 #endif
 
-/* LUA_USE_ASSERT: root-chain probe + anchor-only assertion for the arena
-** collector (T0 of the deprecate-arena-gc-root-chain plan). The root chain
-** (g->gc.root -> gch.nextgc -> ...) is being deprecated in favor of arena
-** bitmaps + the hugeset; these helpers measure the current writers so later
-** phases (T1-T6) can verify removal, and T5 can assert the final anchor-only
-** state globally.
-**
-** GC_ROOT_CHAIN_MAX bounds the walk so a corrupted chain cannot loop forever;
-** hitting the cap is itself an assertion failure.
-**
-** gc_root_chain_count(g)       -> bounded total length of g->gc.root chain.
-** gc_root_chain_probe_print(g) -> per-gct breakdown to stderr, gated by
-**   getenv("LUAJIT_GC_ROOT_CHAIN_PROBE") so normal assert runs are not spammed.
-**   Used by the baseline harness test/gc/root_chain_probe_assert.lua.
-** gc_assert_root_anchor_only(g)-> asserts the steady state reached after
-**   rebuild/freeall/init: g->gc.root == mainthread && mainthread->nextgc == NULL.
-**   T0 only DEFINES this helper; T5 wires the global call sites.
-**
-** Entirely gated by LUA_USE_ASSERT (and LJ_HASGCMARK via the file guard);
-** release builds pay nothing. */
-#define GC_ROOT_CHAIN_MAX	100000u
+/* T3b-1: root-chain probe/anchor helpers retired under HASGCMARK.
+** Enumeration is arena bitmaps + hugeset + strtab; g->gc.root is gone.
+*/
 
-#ifdef LUA_USE_ASSERT
-#include <stdio.h>
-#include <stdlib.h>
-
-static uint32_t gc_root_chain_count(global_State *g)
-{
-  GCobj *o = gcref(g->gc.root);
-  uint32_t n = 0;
-  while (o != NULL) {
-    n++;
-    if (n >= GC_ROOT_CHAIN_MAX) {
-      lj_assertG(0,
-		 "gc_root_chain_count: hit safety cap %u (corrupted chain?)",
-		 GC_ROOT_CHAIN_MAX);
-      return n;
-    }
-    o = gcref(o->gch.nextgc);
-  }
-  return n;
-}
-
-/* Per-gct breakdown printed to stderr when LUAJIT_GC_ROOT_CHAIN_PROBE is set.
-** Walks the same chain as gc_root_chain_count; the per-type counters reflect
-** which writers currently link to g->gc.root (strings/udata/VLA-cdata are
-** expected to be absent -- negative controls). */
-static void gc_root_chain_probe_print(global_State *g, const char *tag)
-{
-  if (LJ_UNLIKELY(getenv("LUAJIT_GC_ROOT_CHAIN_PROBE") != NULL)) {
-    GCobj *o = gcref(g->gc.root);
-    uint32_t total = 0;
-    uint32_t cstr = 0, cupval = 0, cthread = 0, cproto = 0, cfunc = 0;
-    uint32_t ctrace = 0, ccdata = 0, ctab = 0, cudata = 0, cother = 0;
-    while (o != NULL) {
-      if (total >= GC_ROOT_CHAIN_MAX) {
-	lj_assertG(0,
-		   "gc_root_chain_probe_print: hit safety cap %u (corrupted chain?)",
-		   GC_ROOT_CHAIN_MAX);
-	break;
-      }
-      total++;
-      if (o->gch.gct == ~LJ_TSTR) cstr++;
-      else if (o->gch.gct == ~LJ_TUPVAL) cupval++;
-      else if (o->gch.gct == ~LJ_TTHREAD) cthread++;
-      else if (o->gch.gct == ~LJ_TPROTO) cproto++;
-      else if (o->gch.gct == ~LJ_TFUNC) cfunc++;
-      else if (o->gch.gct == ~LJ_TTRACE) ctrace++;
-      else if (o->gch.gct == ~LJ_TCDATA) ccdata++;
-      else if (o->gch.gct == ~LJ_TTAB) ctab++;
-      else if (o->gch.gct == ~LJ_TUDATA) cudata++;
-      else cother++;
-      o = gcref(o->gch.nextgc);
-    }
-    fprintf(stderr,
-      "[gc_root_chain_probe] %s: total=%u str=%u upval=%u th=%u proto=%u "
-      "func=%u trace=%u cdata=%u tab=%u ud=%u other=%u\n",
-      tag ? tag : "?", total, cstr, cupval, cthread, cproto, cfunc, ctrace,
-      ccdata, ctab, cudata, cother);
-  }
-}
-
-static LJ_AINLINE void gc_assert_root_anchor_only(global_State *g)
-{
-  GCobj *root = gcref(g->gc.root);
-  GCobj *mt = obj2gco(mainthread(g));
-  lj_assertG(root == mt,
-	     "root chain not anchored on mainthread alone (root=%p mt=%p)",
-	     (void *)root, (void *)mt);
-  lj_assertG(gcref(mt->gch.nextgc) == NULL,
-	     "mainthread has a nextgc link (anchor-only invariant): nextgc=%p",
-	     (void *)gcref(mt->gch.nextgc));
-}
-#else
-#define gc_root_chain_count(g)			((uint32_t)0)
-#define gc_root_chain_probe_print(g, tag)	((void)0)
-#define gc_assert_root_anchor_only(g)		((void)0)
-#endif
 
 #if LJ_HASGCMARK
 static FinEntry *fin_tab_find(global_State *g, GCobj *o, int *found);
@@ -352,7 +258,7 @@ static void gc_mark(global_State *g, GCobj *o)
     ** mark∧GRAY residual exception: its value aliases a stack slot re-marked
     ** by gc_atomic_rescan_threads, the UV header is re-closed by lj_gc_closeuv
     ** (gray2black on close during prop/atomic), and dead open UVs are freed
-    ** by gc_atomic_sweep_openupvals / per-thread fullsweep (bitmap sweep skips
+    ** by Path L (closeuv) / Path F (freeall_openuv) (bitmap sweep skips
     ** !closed). GCMARK barriers prefilter !isgray, so a mark∧GRAY open UV
     ** correctly skips lj_gc_barrierf / barrierback — no path assumes open UV
     ** is pure-black. */
@@ -1206,7 +1112,7 @@ static size_t propagatemark(global_State *g
     ** gray2black at entry cleared GRAY; restore it so the thread ends
     ** mark∧GRAY for the whole cycle — stack slots cannot pay write
     ** barriers, so a thread is never pure black. graythread is the
-    ** enumeration set for atomic stack rescan + openupval fullsweep,
+    ** enumeration set for atomic stack rescan,
     ** NOT a "pure black after first visit" scheme.
     **
     ** Re-visit safety: gc_mark only fires when gc_obj_iswhite is true
@@ -1216,7 +1122,7 @@ static size_t propagatemark(global_State *g
     ** permanent-gray thread — if one somehow appears on a gray stack
     ** twice, prop re-traverses it (idempotent) and graythread gains a
     ** duplicate. Rescan (gc_atomic_rescan_threads) and fullsweep
-    ** (gc_atomic_sweep_openupvals) tolerate duplicates; the bound is
+    ** (graythread walk) tolerate duplicates; the bound is
     ** N_threads not N_visits. Push-once membership is not cheap on the
     ** ptrstack, so duplicates are accepted rather than adding a
     ** per-thread dedup structure. */
@@ -1548,6 +1454,7 @@ static const GCFreeFunc gc_freefunc[] = {
 /* T2: linked-list gc_sweep/gc_fullsweep removed under GCMARK.
 ** Open UV free is Path F (lj_func_freeall_openuv) or Path L (closeuv). */
 
+
 /* Open-addressing string sweep: free every interned string. Called only from
 ** the shutdown/freeall path (P2 folds incremental string reclaim into the
 ** GCSsweep bitmap pass; the GCSsweepstring case is a defensive no-op under
@@ -1623,7 +1530,7 @@ static LJ_AINLINE void gc_arena_demote_survivors(GCArena *a)
 /*
 ** Incremental bitmap sweep. Scans trav arenas for dead objects
 ** (block=1, mark=0) and frees them. Returns a cost estimate.
-** The root chain (g->gc.root) is NOT rebuilt here: it stays anchored on
+** T3b-1: g->gc.root retired; no root chain rebuild. (was: anchored on
 ** the (super-fixed) main thread. SweepPhase_Rebuild does CdataV/huge
 ** dead-free, re-anchors the root on mainthread, and clears huge marks.
 **
@@ -1812,8 +1719,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 	** under the arena ASAN poison contract.) */
 	if (arena_cellstate(a, c) < CellState_White)
 	  continue;
-	/* Skip open upvalues: they're on per-thread openupval chains,
-	** freed by lj_state_free (dead thread) or gc_fullsweep in rebuild. */
+	/* Skip open upvalues: Path L closeuv / Path F freeall_openuv; not bitmap. */
 	if (o->gch.gct == ~LJ_TUPVAL && !gco2uv(o)->closed)
 	  continue;
 	/* Strings reclaimed on NonTrav OPENADDR path above; skip here. */
@@ -1885,7 +1791,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 	 ** objects, and clear arena mark bits. Header GRAY is already zero at free
 	 ** entry (atomic blacken + empty worklists); ClearMarks clears MARK only.
 **
-** The root chain (g->gc.root) is NOT rebuilt: all former consumers now
+** T3b-1: g->gc.root retired; all former consumers now
 ** enumerate arena objects via the block bitmaps directly. The root reference
 ** is simply anchored on the (super-fixed) main thread.
 **
@@ -1933,7 +1839,7 @@ static void rebuild_hugescan(global_State *g)
   ** mark=0 slots. On a restart, a survivor slot still has MARK set → the
   ** dead-free branch skips it (no re-free). Dead objects tombstone their
   ** slots via lj_hugeblock_free → skipped by !hugeset_slot_live on restart.
-  ** Thread openupval fullsweep is idempotent across restarts (dead upvalues
+  ** Open UV Path L/F free is idempotent across restarts (dead upvalues
   ** freed on first pass). This makes the HUGESET_SWEPT restart-skip tag
   ** redundant — it was removed (def, set, check, markinit clear).
   **
@@ -2001,8 +1907,7 @@ static void rebuild_hugescan(global_State *g)
 
 static void rebuild_epilogue(global_State *g)
 {
-  setgcref(g->gc.root, obj2gco(mainthread(g)));
-  gc_assert_root_anchor_only(g);
+  /* T3b-1: no g->gc.root re-anchor (field retired under HASGCMARK). */
   g->gc.rebuildphase = Rebuild_ClearMarks;
 }
 
@@ -2245,7 +2150,7 @@ void lj_gc_freeall(global_State *g)
   ** afterwards would be a use-after-free. */
   g->gc.gcmarkflags = 0;
   /*
-  ** Arena mode: the 根 chain (g->gc.root) is redundant with the arena block
+  ** T3b-1: g->gc.root retired; enumeration is the arena block
   ** bitmaps -- it is rebuilt from them after every bitmap sweep. Rather than
   ** walk that chain, enumerate the live arena cells directly (the same scan
   ** gc_rebuild_rootchain uses to relink survivors) and free each object. This
@@ -2350,11 +2255,7 @@ void lj_gc_freeall(global_State *g)
 	}
       }
     }
-    /* Re-anchor the 根 reference on the (super-fixed) main thread: every other
-    ** object is gone, and the stale chain must never be walked again. */
-    setgcrefnull(mainthread(g)->nextgc);
-    setgcref(g->gc.root, obj2gco(mainthread(g)));
-    gc_assert_root_anchor_only(g);
+    /* T3b-1: no root-chain re-anchor; mainthread is SFIXED via mainthref. */
   }
   gc_sweepstr_oa(g, 0, g->str.mask + 1);  /* Free all open-addr string slots. */
 }
@@ -2801,44 +2702,6 @@ int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
   clock_gettime(CLOCK_MONOTONIC, &start);
 #endif
 
-  uint64_t elapsed;
-  GCSize work = 0;
-  do {
-    size_t cost = gc_onestep(L);
-    if (cost >= LJ_MAX_MEM)
-      break;
-    work += (GCSize)cost;
-    if (g->gc.state == GCSpause) {
-      g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
-      g->vmstate = ostate;
-      return 1;
-    }
-#if defined(_WIN32)
-    QueryPerformanceCounter(&now);
-    elapsed = (uint64_t)((now.QuadPart - start.QuadPart) * 1e9 / freq.QuadPart);
-#elif defined(__APPLE__)
-    now = mach_absolute_time();
-    elapsed = (now - start) * tb.numer / tb.denom;
-#else
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    elapsed = (uint64_t)((now.tv_sec - start.tv_sec) * 1e9 + (now.tv_nsec - start.tv_nsec));
-#endif
-  } while (elapsed < timelim);
-
-  if (g->gc.debt <= work) {
-    g->gc.debt = 0;
-    g->gc.threshold = g->gc.total + GCSTEPSIZE;
-    g->vmstate = ostate;
-    return -1;
-  } else {
-    g->gc.debt -= work;
-    g->gc.threshold = g->gc.total;
-    g->vmstate = ostate;
-    return 0;
-  }
-}
-#endif
-
 /* Ditto, but fix the stack top first. */
 void LJ_FASTCALL lj_gc_step_fixtop(lua_State *L)
 {
@@ -3102,30 +2965,8 @@ static void gc_arena_verify(global_State *g)
     if (!lj_arena_ishuge(o))
       arena_obj_shadowmark(o);
   }
-  /* P3 (§3.4): openaddr strings are allocated unlinked
-  ** from g->gc.root (lj_str_alloc -> lj_mem_newagco link=0) and resurrection
-  ** only sets the mark bit (gc_obj_resurrect never touches nextgc). So no
-  ** ~LJ_TSTR may ever be reachable via the g->gc.root nextgc chain. This
-  ** bounded walk locks that invariant; a fire is a genuine design-premise
-  ** regression -- report it, do not paper over. Cheap: at verify time
-  ** (after rebuild_epilogue) the root chain is mainthread alone. */
-  {
-    GCobj *ro = gcref(g->gc.root);
-    uint32_t rn = 0;
-    while (ro != NULL) {
-      if (rn >= GC_ROOT_CHAIN_MAX) {
-	lj_assertG(0, "gc_arena_verify: root chain hit safety cap %u (corrupted?)",
-		   GC_ROOT_CHAIN_MAX);
-	break;
-      }
-      rn++;
-      lj_assertG(ro->gch.gct != ~LJ_TSTR,
-		 "string on g->gc.root chain (openaddr design §3.4 violation): "
-		 "ptr=%p gct=%d marked=0x%02x",
-		 (void *)ro, ro->gch.gct, ro->gch.marked);
-      ro = gcref(ro->gch.nextgc);
-    }
-  }
+  /* T3b-1: openaddr strings are unlinked (link=0); root chain retired.
+  ** String liveness is strtab + hugeset/arena only — no nextgc walk. */
   /* After a full GC nothing dead remains, so no allocated arena object may
   ** be left unmarked. */
   for (i = 0; i < g->gc.arenastop; i++)
@@ -3392,10 +3233,6 @@ void lj_gc_fullgc(lua_State *L)
   global_State *g = G(L);
   int32_t ostate = g->vmstate;
   setvmstate(g, GC);
-  /* T0 root-chain baseline: snapshot the pre-collect chain so the harness can
-  ** observe which writers currently link to g->gc.root. No-op unless
-  ** LUAJIT_GC_ROOT_CHAIN_PROBE is set; release builds compile it out. */
-  gc_root_chain_probe_print(g, "fullgc-entry");
   if (g->gc.state <= GCSatomic) {  /* Caught somewhere in the middle. */
     gc_hugegray_reset(g);  /* Reset worklists from partial propagation. */
     gc_graythread_reset(g);

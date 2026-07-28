@@ -112,7 +112,7 @@ local function calibrate_openuvtop_offset()
 
   local bp0 = ffi.cast("uint8_t*", p0)
   local bp1 = ffi.cast("uint8_t*", p1)
-  if bp0[9] ~= GCT_THREAD or bp1[9] ~= GCT_THREAD then return nil end
+  if bp0[1] ~= GCT_THREAD or bp1[1] ~= GCT_THREAD then return nil end
 
   for off = 0, 120, 4 do
     local v0 = ffi.cast("uint32_t*", bp0 + off)[0]

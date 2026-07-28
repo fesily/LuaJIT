@@ -111,7 +111,7 @@ local function calibrate_openupval_offset()
   if not p0 or not p1 then return nil end
   local bp0 = ffi.cast("uint8_t*", p0)
   local bp1 = ffi.cast("uint8_t*", p1)
-  if bp0[9] ~= GCT_THREAD or bp1[9] ~= GCT_THREAD then return nil end
+  if bp0[1] ~= GCT_THREAD or bp1[1] ~= GCT_THREAD then return nil end
   for off = 0, 120, 8 do
     local v0 = ffi.cast("uint64_t*", bp0 + off)[0]
     local v1 = ffi.cast("uint64_t*", bp1 + off)[0]
@@ -137,7 +137,7 @@ local function count_open_upvalues(co, openupval_off)
   local count = 0
   while uv_ptr ~= 0 do
     local uv = ffi.cast("uint8_t*", uv_ptr)
-    if uv[9] ~= GCT_UPVAL then break end
+    if uv[1] ~= GCT_UPVAL then break end
     count = count + 1
     uv_ptr = ffi.cast("uint64_t*", uv)[0]
     if count > 1000 then break end

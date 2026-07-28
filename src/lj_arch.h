@@ -687,6 +687,11 @@
 ** no "arena allocator + classic tri-color GC" configuration. Hence
 ** LJ_HASGCARENA and LJ_HASGCMARK are kept equivalent (see below).
 */
+/* T3b-2 strategy (b): GCARENA is x64-only. Fail loudly if enabled elsewhere. */
+#if defined(LUAJIT_ENABLE_GCARENA) && !LJ_TARGET_X64
+#error "LUAJIT_ENABLE_GCARENA is only supported on x64"
+#endif
+
 #if defined(LUAJIT_ENABLE_GCARENA) && !defined(LUAJIT_USE_SYSMALLOC) && \
     LJ_TARGET_X64
 #if LJ_64 && !LJ_GC64

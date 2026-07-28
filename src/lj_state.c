@@ -270,8 +270,10 @@ static void close_state(lua_State *L)
   lj_gc_graywork_free(g);  /* Discard stale gray worklists before freeall. */
 #endif
   lj_gc_freeall(g);
+#if !LJ_HASGCMARK
   lj_assertG(gcref(g->gc.root) == obj2gco(L),
 	     "main thread is not first GC object");
+#endif
   lj_assertG(g->str.num == 0, "leaked %d strings", g->str.num);
   lj_trace_freestate(g);
 #if LJ_HASFFI
@@ -371,8 +373,10 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
 #endif
   lj_buf_init(NULL, &g->tmpbuf);
   g->gc.state = GCSpause;
+#if !LJ_HASGCMARK
   setgcref(g->gc.root, obj2gco(L));
   setmref(g->gc.sweep, &g->gc.root);
+#endif
   g->gc.total = sizeof(GG_State);
 #if LJ_HASGCMARK
   /* GenGC: lower pause (1.3×estimate) to cap free-window heap growth. */
@@ -508,11 +512,6 @@ void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
   }
 #endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
-#if LUA_COMPAT_TAILCALL_COUNT
-  lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
-#endif
   lj_mem_freegco(g, L, sizeof(lua_State));
 }
-
-
 
