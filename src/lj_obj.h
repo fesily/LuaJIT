@@ -753,6 +753,7 @@ typedef struct GCState {
   uint8_t rebuildphase;	/* Resumable rebuild sub-phase (RebuildPhase). */
   MSize rebuild_hugehi;	/* HugeScan: current slot index cursor. */
   MSize rebuild_hugegen;	/* HugeScan: hugesetgen snapshot for rehash restart. */
+  MSize rebuild_clarena;	/* ClearMarks: next arena index to demote (chunked). */
   MSize hugesetgen;	/* Monotonic huge-set rehash generation. */
   MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
   MSize grayastop;	/* Gray arena stack: number of entries. */
