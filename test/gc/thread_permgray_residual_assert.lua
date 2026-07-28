@@ -71,9 +71,9 @@ local GCT_THREAD = 6
 local GCT_TAB    = 11
 
 -- LJ_GC_GRAY = 0x01 under arena GC (reuses WHITE0 slot; see lj_gc.h:32).
--- The header `marked` byte lives at offset 8 (GCHeader = nextgc:8, marked:1, gct:1).
-local MARKED_OFF = 8
-local GCT_OFF    = 9
+-- HASGCMARK GCHeader = marked:1, gct:1 at offsets 0,1 (no nextgc).
+local MARKED_OFF = 0
+local GCT_OFF    = 1
 local LJ_GC_GRAY = 0x01
 
 local SENTINEL_MARKER = 0xDEAD0A11

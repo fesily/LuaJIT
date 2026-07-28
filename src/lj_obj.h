@@ -59,9 +59,16 @@ typedef struct GCRef {
 #endif
 } GCRef;
 
-/* Common GC header for all collectable objects. */
+/* Common GC header for all collectable objects.
+** Classic: nextgc threads the global/root + open-UV + mmudata chains.
+** HASGCMARK: nextgc is dead (arena bitmaps + hugeset + strtab openaddr
+** enumerate everything); the header is just marked+gct, so every type that
+** starts with GCHeader is 8 bytes smaller than classic. */
+#if LJ_HASGCMARK
+#define GCHeader	uint8_t marked; uint8_t gct
+#else
 #define GCHeader	GCRef nextgc; uint8_t marked; uint8_t gct
-/* This occupies 6 bytes, so use the next 2 bytes for non-32 bit fields. */
+#endif
 
 #if LJ_GC64
 #define gcref(r)	((GCobj *)(r).gcptr64)
@@ -87,7 +94,11 @@ typedef struct GCRef {
 #define setgcrefr(r, v)	((r).gcptr32 = (v).gcptr32)
 #endif
 
+/* Classic-only: step the root/gray/mmudata nextgc chains. HASGCMARK has no
+** nextgc field (see GCHeader) and no chain readers. */
+#if !LJ_HASGCMARK
 #define gcnext(gc)	(gcref((gc)->gch.nextgc))
+#endif
 
 /* IMPORTANT NOTE:
 **
@@ -377,7 +388,9 @@ typedef struct GCproto {
 #if LJ_GC64
   uint32_t unused_gc64;
 #endif
+#if !LJ_HASGCMARK
   GCRef gclist;
+#endif
   MRef k;		/* Split constant array (points to the middle). */
   MRef uv;		/* Upvalue list. local slot|0x8000 or parent uv idx. */
   MSize sizekgc;	/* Number of collectable constants. */
@@ -437,8 +450,9 @@ typedef struct GCupval {
   union {
     TValue tv;		/* If closed: the value itself. */
     struct {		/* If open: dead DLL fields (g->uvhead retired).
-		** Retained as a union to keep sizeof(GCupval) stable; do NOT
-		** collapse -- arena cell accounting depends on the struct size. */
+		** Harmless dead space; collapsing is optional T3b-2b (lead-gated).
+		** arena_roundcells(sizeof(GCupval)) asserts the cell count stays
+		** bounded as this struct and GCHeader evolve. */
       GCRef prev;
       GCRef next;
     };
@@ -451,10 +465,17 @@ typedef struct GCupval {
 
 /* -- Function object (closures) ------------------------------------------ */
 
-/* Common header for functions. env should be at same offset in GCudata. */
+/* Common header for functions. env should be at same offset in GCudata.
+** Classic keeps gclist for gray-chain barriers; HASGCMARK has no gclist. */
+#if LJ_HASGCMARK
+#define GCfuncHeader \
+  GCHeader; uint8_t ffid; uint8_t nupvalues; \
+  GCRef env; MRef pc
+#else
 #define GCfuncHeader \
   GCHeader; uint8_t ffid; uint8_t nupvalues; \
   GCRef env; GCRef gclist; MRef pc
+#endif
 
 typedef struct GCfuncC {
   GCfuncHeader;
@@ -501,7 +522,13 @@ typedef struct GCtab {
   uint8_t nomm;		/* Negative cache for fast metamethods. */
   int8_t colo;		/* Array colocation. */
   MRef array;		/* Array part. */
+  /* 8B before metatable: classic gclist; HASGCMARK dead pad so
+  ** offsetof(GCtab, metatable) == offsetof(GCudata, metatable) (vm_x64.dasc). */
+#if LJ_HASGCMARK
+  GCRef unused_mt_pad;
+#else
   GCRef gclist;
+#endif
   GCRef metatable;	/* Must be at same offset in GCudata. */
   MRef node;		/* Hash part. */
   uint32_t asize;	/* Size of array part (keys [0, asize-1]). */
@@ -674,8 +701,10 @@ typedef struct GCState {
   uint8_t unused1;
 #endif
   MSize sweepstr;	/* Sweep position in string table. */
+#if !LJ_HASGCMARK
   GCRef root;		/* List of all collectable objects. */
   MRef sweep;		/* Sweep position in root list. */
+#endif
   GCRef gray;		/* List of gray objects. */
   GCRef grayagain;	/* List of objects for atomic traversal. */
 #if LJ_HASGCMARK
@@ -867,7 +896,9 @@ struct lua_State {
   uint8_t dummy_ffid;	/* Fake FF_C for curr_funcisL() on dummy frames. */
   uint8_t status;	/* Thread status. */
   MRef glref;		/* Link to global state. */
+#if !LJ_HASGCMARK
   GCRef gclist;		/* GC chain. */
+#endif
   TValue *base;		/* Base of currently executing function. */
   TValue *top;		/* First free slot in the stack. */
   MRef maxstack;	/* Last free slot in the stack. */
@@ -914,7 +945,11 @@ typedef struct GChead {
   uint8_t unused1;
   uint8_t unused2;
   GCRef env;
+#if LJ_HASGCMARK
+  GCRef unused_mt_pad;	/* layout pad: match GCtab/GCudata metatable offset */
+#else
   GCRef gclist;
+#endif
   GCRef metatable;
 } GChead;
 
@@ -922,15 +957,19 @@ typedef struct GChead {
 LJ_STATIC_ASSERT(offsetof(GChead, env) == offsetof(GCfuncL, env));
 LJ_STATIC_ASSERT(offsetof(GChead, env) == offsetof(GCudata, env));
 
-/* The metatable field MUST be at the same offset for all GC objects. */
+/* Metatable must be same offset on GCtab/GCudata/GChead (vm getmetatable).
+** HASGCMARK: unused_mt_pad replaces gclist as the 8B spacer (len on GCudata). */
 LJ_STATIC_ASSERT(offsetof(GChead, metatable) == offsetof(GCtab, metatable));
 LJ_STATIC_ASSERT(offsetof(GChead, metatable) == offsetof(GCudata, metatable));
 
-/* The gclist field MUST be at the same offset for all GC objects. */
+/* The gclist field MUST be at the same offset for all GC objects (classic
+** only: HASGCMARK has no gclist field on any type). */
+#if !LJ_HASGCMARK
 LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(lua_State, gclist));
 LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(GCproto, gclist));
 LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(GCfuncL, gclist));
 LJ_STATIC_ASSERT(offsetof(GChead, gclist) == offsetof(GCtab, gclist));
+#endif
 
 #if LJ_HASGCMARK
 /* T3a: open-UV vector layout guards (R5). The 7 BC_UCLO backends read
