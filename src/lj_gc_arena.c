@@ -1074,10 +1074,76 @@ static void gc_traverse_mainthread(global_State *g)
   gc_traverse_thread(g, mainthread(g));
 }
 
+/* Shared type-specific propagate helpers. The caller has already verified
+** the object is gray and applied gray2black; these own only the
+** type-specific traverse and the weak/THREAD keep-gray semantics, so the
+** specialized arena drains (gc_propagate_arena_pod) and propagatemark stay
+** in sync without copy-paste drift. Cost is returned for mark_cost
+** accounting by the caller. */
+
+/* TAB: traverse, then keep gray only when header WEAK bits are set. Do NOT
+** use the traverse return value alone: FFI_FIN sets a synthetic non-zero
+** weak without LJ_GC_WEAK, which would leave non-weak mark∧GRAY residuals. */
+static LJ_AINLINE size_t gc_prop_tab(global_State *g, GCobj *o)
+{
+  GCtab *t = gco2tab(o);
+  gc_traverse_tab(g, t);
+  if (t->marked & LJ_GC_WEAK)
+    black2gray(o);  /* Keep weak tables gray until clearweak. */
+  return sizeof(GCtab) + sizeof(TValue) * t->asize +
+         (t->hmask ? sizeof(Node) * (t->hmask + 1) : 0);
+}
+
+static LJ_AINLINE size_t gc_prop_func(global_State *g, GCobj *o)
+{
+  GCfunc *fn = gco2func(o);
+  gc_traverse_func(g, fn);
+  return isluafunc(fn) ? sizeLfunc((MSize)fn->l.nupvalues) :
+                         sizeCfunc((MSize)fn->c.nupvalues);
+}
+
+static LJ_AINLINE size_t gc_prop_proto(global_State *g, GCobj *o)
+{
+  GCproto *pt = gco2pt(o);
+  gc_traverse_proto(g, pt);
+  return pt->sizept;
+}
+
+/* THREAD: permanent-gray. The caller's gray2black cleared GRAY; restore it so
+** the thread ends mark∧GRAY for the whole cycle — stack slots cannot pay
+** write barriers, so a thread is never pure black. graythread is the
+** enumeration set for atomic stack rescan, NOT a "pure black after first
+** visit" scheme.
+**
+** Re-visit safety: gc_mark only fires when gc_obj_iswhite is true (mark
+** bitmap clear), so a marked thread is never re-enqueued to arena gray/SSB
+** by barriers (none exist for stacks). If one somehow appears on a gray
+** stack twice, prop re-traverses it (idempotent) and graythread gains a
+** duplicate. Rescan (gc_atomic_rescan_threads) and fullsweep (graythread
+** walk) tolerate duplicates; the bound is N_threads not N_visits. Push-once
+** membership is not cheap on the ptrstack, so duplicates are accepted rather
+** than adding a per-thread dedup structure. */
+static LJ_AINLINE size_t gc_prop_thread(global_State *g, GCobj *o)
+{
+  lua_State *th = gco2th(o);
+  black2gray(o);
+  gc_graythread_push(g, o);
+  gc_traverse_thread(g, th);
+  return sizeof(lua_State) + sizeof(TValue) * th->stacksize;
+}
+
+#if LJ_HASJIT
+static LJ_AINLINE size_t gc_prop_trace(global_State *g, GCobj *o)
+{
+  GCtrace *T = gco2trace(o);
+  gc_traverse_trace(g, T);
+  return ((sizeof(GCtrace)+7)&~7) + (T->nins-T->nk)*sizeof(IRIns) +
+         T->nsnap*sizeof(SnapShot) + T->nsnapmap*sizeof(SnapEntry);
+}
+#endif
+
 /* Propagate one gray object. Traverse it and turn it black. */
-static size_t propagatemark(global_State *g
-  , GCobj *o
-)
+static size_t propagatemark(global_State *g, GCobj *o)
 {
   int gct = o->gch.gct;
   gcstat_inc(g, mark_calls);
@@ -1090,62 +1156,70 @@ static size_t propagatemark(global_State *g
   /* Header bit 0x04 is a free slot under bitmap GC (no writer remains),
   ** so there is nothing to assert here. */
   gray2black(o);
-  if (LJ_LIKELY(gct == ~LJ_TTAB)) {
-    GCtab *t = gco2tab(o);
-    /* Keep gray only when header WEAK bits are set. Do not use the traverse
-    ** return value alone: FFI_FIN sets a synthetic non-zero weak without
-    ** LJ_GC_WEAK, which would leave non-weak mark∧GRAY residuals. */
-    gc_traverse_tab(g, t);
-    if (t->marked & LJ_GC_WEAK) {
-      black2gray(o);  /* Keep weak tables gray until clearweak. */
-    }
-    return sizeof(GCtab) + sizeof(TValue) * t->asize +
-			   (t->hmask ? sizeof(Node) * (t->hmask + 1) : 0);
-  } else if (LJ_LIKELY(gct == ~LJ_TFUNC)) {
-    GCfunc *fn = gco2func(o);
-    gc_traverse_func(g, fn);
-    return isluafunc(fn) ? sizeLfunc((MSize)fn->l.nupvalues) :
-			   sizeCfunc((MSize)fn->c.nupvalues);
-  } else if (LJ_LIKELY(gct == ~LJ_TPROTO)) {
-    GCproto *pt = gco2pt(o);
-    gc_traverse_proto(g, pt);
-    return pt->sizept;
-  } else if (LJ_LIKELY(gct == ~LJ_TTHREAD)) {
-    lua_State *th = gco2th(o);
-    /* Permanent-gray THREAD (classic-aligned, mirrors weak-table keep-gray
-    ** above and classic lj_gc.c "threads are never black"). The shared
-    ** gray2black at entry cleared GRAY; restore it so the thread ends
-    ** mark∧GRAY for the whole cycle — stack slots cannot pay write
-    ** barriers, so a thread is never pure black. graythread is the
-    ** enumeration set for atomic stack rescan,
-    ** NOT a "pure black after first visit" scheme.
-    **
-    ** Re-visit safety: gc_mark only fires when gc_obj_iswhite is true
-    ** (mark bitmap clear), so a marked thread is never re-enqueued to
-    ** arena gray/SSB by barriers (none exist for stacks). The early-out
-    ** `if (!(marked & GRAY)) return 0` above does NOT early-out for a
-    ** permanent-gray thread — if one somehow appears on a gray stack
-    ** twice, prop re-traverses it (idempotent) and graythread gains a
-    ** duplicate. Rescan (gc_atomic_rescan_threads) and fullsweep
-    ** (graythread walk) tolerate duplicates; the bound is
-    ** N_threads not N_visits. Push-once membership is not cheap on the
-    ** ptrstack, so duplicates are accepted rather than adding a
-    ** per-thread dedup structure. */
-    black2gray(o);
-    gc_graythread_push(g, o);
-    gc_traverse_thread(g, th);
-    return sizeof(lua_State) + sizeof(TValue) * th->stacksize;
-  } else {
+  if (LJ_LIKELY(gct == ~LJ_TTAB))
+    return gc_prop_tab(g, o);
+  if (LJ_LIKELY(gct == ~LJ_TFUNC))
+    return gc_prop_func(g, o);
+  if (LJ_LIKELY(gct == ~LJ_TPROTO))
+    return gc_prop_proto(g, o);
+  if (LJ_LIKELY(gct == ~LJ_TTHREAD))
+    return gc_prop_thread(g, o);
 #if LJ_HASJIT
-    GCtrace *T = gco2trace(o);
-    gc_traverse_trace(g, T);
-    return ((sizeof(GCtrace)+7)&~7) + (T->nins-T->nk)*sizeof(IRIns) +
-	   T->nsnap*sizeof(SnapShot) + T->nsnapmap*sizeof(SnapEntry);
+  return gc_prop_trace(g, o);
 #else
-    lj_assertG(0, "bad GC type %d", gct);
-    return 0;
+  lj_assertG(0, "bad GC type %d", gct);
+  return 0;
 #endif
+}
+
+/* Drain the gray stack of a PODOnly arena. Allocation routing
+** (lj_mem_newgcot_pod -> ArenaClass_POD, T2 audit Finding 1) restricts POD
+** arena contents to FUNC and PROTO, so the gray stack only ever holds those
+** two gct values. Dispatch directly to gc_prop_func / gc_prop_proto to skip
+** the propagatemark gct switch on the hot path.
+**
+** An unexpected gct is an allocator-class invariant violation: fall back to
+** the full propagatemark, which re-checks GRAY (passes), re-applies
+** gray2black, accounts mark_calls at entry, and dispatches TAB (weak
+** keep-gray), THREAD (permanent-gray), TRACE via the shared helpers. Assert
+** in LUA_USE_ASSERT builds so the misclassification is caught.
+**
+** mark_calls accounting: the fast path inlines gcstat_inc(mark_calls) to
+** match propagatemark's per-object accounting; the fallback lets
+** propagatemark own the inc. Single-object drain here; batch pop is T4.
+** Same gray-check / cost-accounting shape as the mixed drain below. */
+static size_t gc_propagate_arena_pod(global_State *g, GCArena *a)
+{
+  size_t m = 0;
+  while (!arena_gray_empty(a)) {
+    GCCellID1 cellid = arena_gray_pop(a);
+    GCobj *o = (GCobj *)arena_cellptr(a, cellid);
+    /* Non-gray: duplicate worklist entry or already processed. */
+    if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
+      continue;
+    int gct = o->gch.gct;
+    size_t c;
+    if (LJ_LIKELY(gct == ~LJ_TFUNC)) {
+      gray2black(o);
+      c = gc_prop_func(g, o);
+      gcstat_inc(g, mark_calls);
+    } else if (LJ_LIKELY(gct == ~LJ_TPROTO)) {
+      gray2black(o);
+      c = gc_prop_proto(g, o);
+      gcstat_inc(g, mark_calls);
+    } else {
+      /* PODOnly gray stack must only hold FUNC/PROTO. Route the unexpected
+      ** through propagatemark (TAB weak keep-gray, THREAD permanent-gray,
+      ** TRACE) and assert so the misclassification is caught in debug. */
+      c = propagatemark(g, o);
+      lj_assertG(gct == ~LJ_TTAB || gct == ~LJ_TTHREAD ||
+                 (LJ_HASJIT && gct == ~LJ_TTRACE),
+                 "PODOnly arena gray stack held unexpected gct=%d", gct);
+    }
+    gcstat_add(g, mark_cost, c);
+    m += c;
   }
+  return m;
 }
 
 /* Gray arena priority: number of entries on the arena's gray stack. */
@@ -1221,23 +1295,32 @@ static GCArena *gc_grayarena_pop(global_State *g)
 ** Same-arena children pushed during the drain are included (locality).
 ** Cross-arena / huge work is left for later GCSpropagate steps.
 ** One GCSpropagate step = one arena (not one object) so large heaps finish
-** mark before mutator allocation doubles the live set again. */
+** mark before mutator allocation doubles the live set again.
+**
+** PODOnly arenas hold only FUNC/PROTO (T2 audit Finding 1); route them to
+** the specialized drain to skip the propagatemark gct switch. Mixed Trav
+** arenas keep the general single-object loop here; batch pop (T4) and TAB
+** fast-path (T6) layer on later. */
 static size_t gc_propagate_arena(global_State *g, GCArena *a)
 {
-  size_t m = 0;
-  while (!arena_gray_empty(a)) {
-    GCCellID1 cellid = arena_gray_pop(a);
-    GCobj *o = (GCobj *)arena_cellptr(a, cellid);
-    /* Non-gray: duplicate worklist entry or already processed. */
-    if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
-      continue;
-    {
-      size_t c = propagatemark(g, o);
-      gcstat_add(g, mark_cost, c);
-      m += c;
+  if (a->flags & ArenaFlag_PODOnly)
+    return gc_propagate_arena_pod(g, a);
+  {
+    size_t m = 0;
+    while (!arena_gray_empty(a)) {
+      GCCellID1 cellid = arena_gray_pop(a);
+      GCobj *o = (GCobj *)arena_cellptr(a, cellid);
+      /* Non-gray: duplicate worklist entry or already processed. */
+      if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
+	continue;
+      {
+	size_t c = propagatemark(g, o);
+	gcstat_add(g, mark_cost, c);
+	m += c;
+      }
     }
+    return m;
   }
-  return m;
 }
 
 /* -- Non-arena gray worklists (huge objects + threads) ------------------- */
