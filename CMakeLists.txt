@@ -317,13 +317,28 @@ else()
   set(BUILDVM_HOST_ENV)
 endif()
 
-# Avoid src/lj_*def.h shadowing variant-local buildvm outputs.
-foreach(_lj_gen_h lj_bcdef.h lj_ffdef.h lj_folddef.h lj_libdef.h lj_recdef.h)
+# Avoid in-tree generated headers shadowing variant-local buildvm outputs.
+# Quoted #include "buildvm_arch.h" in host/buildvm.c searches host/ FIRST, so a
+# stale file left by plain `make -C luajit/src` (often with GCARENA/GCMARK) wins
+# over variants/<name>/buildvm_arch.h and breaks classic buildvm-default with
+# undeclared LJ_GC_GRAY / missing openuvtop.
+foreach(_lj_gen_h
+    lj_bcdef.h lj_ffdef.h lj_folddef.h lj_libdef.h lj_recdef.h
+    host/buildvm_arch.h)
   if(EXISTS "${LUAJIT_DIR}/src/${_lj_gen_h}")
     message(STATUS "Removing stale ${LUAJIT_DIR}/src/${_lj_gen_h}")
     file(REMOVE "${LUAJIT_DIR}/src/${_lj_gen_h}")
   endif()
 endforeach()
+
+# Build-time guard: `make` in luajit/src can recreate host/buildvm_arch.h after
+# configure. Every buildvm-* compile must see the variant-local header only.
+set(LUAJIT_STALE_HOST_BUILDVM_ARCH "${LUAJIT_DIR}/src/host/buildvm_arch.h")
+add_custom_target(luajit-clear-stale-host-buildvm-arch
+  COMMAND ${CMAKE_COMMAND} -E rm -f "${LUAJIT_STALE_HOST_BUILDVM_ARCH}"
+  COMMENT "Clear stale luajit/src/host/buildvm_arch.h (shadows variant-local)"
+  VERBATIM
+)
 
 function(add_buildvm_target_for_variant buildvm_target variant_binary_dir output_name mode)
   add_custom_command(OUTPUT "${variant_binary_dir}/${output_name}"
@@ -377,6 +392,9 @@ function(add_luajit_variant)
 
   set(variant_buildvm_arch_h "${variant_binary_dir}/buildvm_arch.h")
   add_custom_command(OUTPUT "${variant_buildvm_arch_h}"
+    # Drop make-tree host/buildvm_arch.h so #include "buildvm_arch.h" cannot
+    # pick the wrong (GCMARK) artifact when compiling this variant's buildvm.
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${LUAJIT_STALE_HOST_BUILDVM_ARCH}"
     COMMAND ${minilua_target} ${LUAJIT_DIR}/dynasm/dynasm.lua ${variant_dasm_flags} -o "${variant_buildvm_arch_h}" ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
     DEPENDS
       ${LUAJIT_DIR}/dynasm/dynasm.lua
@@ -402,6 +420,9 @@ function(add_luajit_variant)
   set(variant_src_buildvm ${SRC_BUILDVM_BASE} "${variant_buildvm_arch_h}" "${variant_luajit_h}")
   set(buildvm_target "buildvm-${LJVAR_NAME}")
   add_executable(${buildvm_target} ${variant_src_buildvm})
+  # Re-clear before every buildvm compile: suite `make` may recreate the file
+  # between ninja steps without re-running the arch generation rule.
+  add_dependencies(${buildvm_target} luajit-clear-stale-host-buildvm-arch)
   target_compile_definitions(${buildvm_target} PRIVATE ${TARGET_ARCH} ${LJVAR_COMPILE_DEFINITIONS})
   target_include_directories(${buildvm_target} PRIVATE
     "${variant_binary_dir}"

@@ -376,9 +376,8 @@ typedef void (*ArenaObjVisitor)(void *cellptr, int gct, void *ud);
 LJ_FUNC void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud);
 
 /*
-** Phase M shadow-verify support. lj_arena_gcprepare() flushes bins and
-** clears all GC mark bits across every arena, ready for a fresh mark
-** cycle.
+** lj_arena_gcprepare: abandon partial marks (fullgc mid-mark abort / verify).
+** lj_arena_gc_markinit: flush bins + assert demote complete (no mark write).
 */
 LJ_FUNC void lj_arena_gcprepare(global_State *g);
 LJ_FUNC void lj_arena_gc_markinit(global_State *g);

@@ -874,13 +874,11 @@ void lj_arena_gray_free(global_State *g, GCArena *a)
 }
 
 /*
-** Prepare every arena for a fresh GC mark cycle: flush bins so the block
-** map is authoritative, then clear GC mark bits for allocated cells only.
-** Allocated objects become White=(block=1,mark=0); free blocks preserve their
-** Free=(block=0,mark=1) head encoding so the allocator's bitmap free state
-** stays stable across the reset (the POD word-sweep relies on this to recount
-** free cells across GC cycles). Using mark[w]&=~block[w] (not mark[w]=0) is
-** what preserves the free heads.
+** Abandon partial marks / force White for a fresh mark cycle: flush bins so
+** the block map is authoritative, then mark[w]&=~block[w] (keeps Free heads)
+** and clear live HUGESET_MARK. Used by fullgc mid-mark abort (free demote did
+** not run) and post-cycle verify prep. Normal cycle boundaries rely on free
+** demote + hugescan; markinit only asserts.
 */
 void lj_arena_gcprepare(global_State *g)
 {
@@ -898,15 +896,25 @@ void lj_arena_gcprepare(global_State *g)
     for (w = UnusedBlockWords; w <= wtop; w++)
       a->mark[w] &= ~a->block[w];
   }
+  {
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	if (hugeset_slot_live(u) && (u & HUGESET_MARK))
+	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
+      }
+    }
+  }
 }
 
 /*
-** Initialize arenas for a mark-driven GC cycle. Flush bins so (block,mark)
-** is authoritative, then clear mark bits only for allocated cells:
-**   mark[w] &= ~block[w]
-** Allocated objects become White=(1,0), ready for the mark phase to set
-** their mark bits. Free blocks preserve Free=(0,1) state, so the allocator
-** can continue servicing mutator allocations during incremental marking.
+** Prepare for a mark-driven GC cycle: flush bins so (block,mark) is
+** authoritative. Allocated cells must already be White=(1,0) — free demotes
+** arena survivors; rebuild_hugescan demotes huge survivors. Under
+** LUA_USE_ASSERT verify mark&block==0 and no live HUGESET_MARK (no write).
+** Free blocks keep Free=(0,1); free heads are not asserted as residual marks.
 */
 void lj_arena_gc_markinit(global_State *g)
 {
@@ -914,19 +922,24 @@ void lj_arena_gc_markinit(global_State *g)
   for (i = 0; i < g->gc.arenastop; i++) {
     GCArena *a = mref(g->gc.arenas, GCArena *)[i];
     ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
-    uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
     if (fl != NULL) {
       arena_flushbins(a, fl);
       freelist_reset(fl);
       fl->scavgen = a->freegen - 1;
     }
-    for (w = UnusedBlockWords; w <= wtop; w++)
-      a->mark[w] &= ~a->block[w];
+#if LUA_USE_ASSERT
+    if ((GCCellID)a->celltop > MinCellId) {
+      uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+      for (w = UnusedBlockWords; w <= wtop; w++)
+	lj_assertG_(g, (a->mark[w] & a->block[w]) == 0,
+		    "markinit residual arena mark: arena %u word %u "
+		    "mark&block=0x%x (demote incomplete?)",
+		    (unsigned)i, (unsigned)w,
+		    (unsigned)(a->mark[w] & a->block[w]));
+    }
+#endif
   }
-  /* Clear huge-set slot marks from the previous sweep window so gc_mark does
-  ** not skip tracing objects with a stale slot mark. Symmetric with arena
-  ** mark clearing above; rebuild_clearmarks also clears huge marks at rebuild
-  ** end for the post-fullgc mark0 invariant. */
+#if LUA_USE_ASSERT
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -934,10 +947,14 @@ void lj_arena_gc_markinit(global_State *g)
       for (hi = 0; hi <= hmask; hi++) {
 	uintptr_t u = gcrefu(slots[hi]);
 	if (hugeset_slot_live(u))
-	  setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
+	  lj_assertG_(g, !(u & HUGESET_MARK),
+		      "markinit residual huge MARK: slot=%u ptr=%p",
+		      (unsigned)hi,
+		      (void *)hugeset_slot_obj(u));
       }
     }
   }
+#endif
 }
 #endif
 
@@ -1011,7 +1028,7 @@ static int hugeset_resize(global_State *g, MSize newmask)
   MSize oldmask = g->gc.hugesetmask;
   size_t bytes = (size_t)(newmask + 1) * sizeof(GCRef);
   GCRef *neu;
-  g->gc.hugesetgen++;  /* Monotonic rehash generation (HugeScan restart key). */
+  g->gc.hugesetgen++;  /* Monotonic rehash generation (stats counter). */
   neu = (GCRef *)g->allocf(g->allocd, NULL, 0, bytes);
   if (neu == NULL)
     return 0;
@@ -1096,11 +1113,6 @@ void huge_obj_clearmark(global_State *g, void *p)
   setgcrefp(slots[i], (void *)(gcrefu(slots[i]) & ~HUGESET_MARK));
 }
 
-/* -- Huge object rebuild-swept tag (lives in the hugeset slot, bit 3) ------- */
-/* Mirrors the mark trio; rebuild_hugescan sets this on survivors so a restart
-** re-scan skips them (a cleared slot MARK would otherwise look dead). Keyed on
-** the base address. The inline slots[hi] writes in rebuild_hugescan are O(1)
-** and preferred there; these helpers exist for any base-keyed caller. */
 /* Set the CDATAV flag on a registered huge block base: the block holds a VLA
 ** cdata whose GCobj is at base + GCcdataVar.offset, not at base. The flag
 ** survives rehash (hugeset_put carries the raw slot value) and is stripped by

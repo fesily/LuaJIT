@@ -638,7 +638,7 @@ typedef struct GCstats {
   uint64_t rebuild_threadscan;
   uint64_t rebuild_hugescan;
   uint64_t rebuild_epilogue;
-  uint64_t rebuild_clearmarks;
+  uint64_t rebuild_assert_demote;
   uint64_t barrierback;		/* lj_gc_barrierback_arena calls. */
   uint64_t gray_notify;		/* lj_gc_grayarena_notify calls. */
   uint64_t ssb_overflow;	/* SSB flush triggered by overflow. */
@@ -754,10 +754,8 @@ typedef struct GCState {
   uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */
   uint8_t sweepphase;	/* 0=bitmap sweep, 1=rebuild chain, 2=done. */
   uint8_t rebuildphase;	/* Resumable rebuild sub-phase (RebuildPhase). */
-  MSize rebuild_hugehi;	/* HugeScan: current slot index cursor. */
-  MSize rebuild_hugegen;	/* HugeScan: hugesetgen snapshot for rehash restart. */
-  MSize rebuild_clarena;	/* ClearMarks: next arena index to demote (chunked). */
-  MSize hugesetgen;	/* Monotonic huge-set rehash generation. */
+  MSize rebuild_asserta;	/* AssertDemote: next arena index (chunked). */
+  MSize hugesetgen;	/* Monotonic huge-set rehash generation (stats). */
   MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
   MSize grayastop;	/* Gray arena stack: number of entries. */
   MSize grayasz;	/* Gray arena stack: allocated capacity. */
