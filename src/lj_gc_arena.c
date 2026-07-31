@@ -49,9 +49,9 @@
  * sweep still uses GCSWEEPMAX. */
 #define GCSWEEP_BITMAP_MAX	256
 
-/* AssertDemote chunking: max arenas verified per rebuild_assert_demote slice.
+/* Post-sweep assert chunking: max arenas verified per SweepHuge_Assert slice.
 ** ~16 arenas/slice ≈ 256–512KB bitmap traffic, targeting sub-ms pause.
-** Hugeset free+demote is one-shot in Rebuild_HugeScan. */
+** Hugeset free+demote is one-shot in SweepHuge_Scan. */
 #define GCSWEEP_ASSERT_DEMOTE_ARENAS	16
 
 /* Batch gray pop granularity for arena mark propagation (P1-3a). Pop up to N
@@ -1668,21 +1668,16 @@ static MSize gc_sweepstr_oa(global_State *g, MSize start, MSize count)
 /* Sweep phase constants. */
 enum {
   SweepPhase_Bitmap,	/* Scanning arena bitmaps, freeing dead objects. */
-  SweepPhase_Rebuild,	/* Post-sweep: CdataV/huge free, anchor root, clear marks. */
-  SweepPhase_Done	/* Bitmap sweep complete. */
+  SweepPhase_Huge,	/* Post-bitmap: hugeset free+demote (+ optional assert). */
+  SweepPhase_Done	/* Sweep complete; cycle may end / finalize. */
 };
 
-/* Resumable rebuild sub-phases (g->gc.rebuildphase). Ordered: each phase runs
-** to completion and advances to the next; the GCSsweep driver re-enters the
-** dispatcher until Rebuild_Done. Prologue/Epilogue/HugeScan are one-shot;
-** AssertDemote arena checks are chunked (yield via rebuild_asserta). */
+/* Sub-phases within SweepPhase_Huge (g->gc.sweep_hugep).
+** Scan is one-shot; Assert is chunked under LUA_USE_ASSERT (release skips it). */
 enum {
-  Rebuild_Prologue,	/* Arm HugeScan (CdataV dead free folded into bitmap
-			   sweep by P3b; no CdataV scan slice here). */
-  Rebuild_HugeScan,	/* Huge-set one-shot: free dead + clear survivor MARK. */
-  Rebuild_Epilogue,	/* Arm AssertDemote cursor (root re-anchor retired T3b). */
-  Rebuild_AssertDemote,	/* Assert arena demote complete (chunked). No hugeset. */
-  Rebuild_Done
+  SweepHuge_Scan,	/* Free dead hugeset slots + demote survivor MARK. */
+  SweepHuge_Assert,	/* Chunked arena demote check (debug only). */
+  SweepHuge_Done
 };
 
 #include "lj_gc_markalloc_debug.h"
@@ -1705,9 +1700,8 @@ static LJ_AINLINE void gc_arena_demote_survivors(GCArena *a)
 /*
 ** Incremental bitmap sweep. Scans trav arenas for dead objects
 ** (block=1, mark=0) and frees them. Returns a cost estimate.
-** T3b-1: g->gc.root retired; no root chain rebuild. (was: anchored on
-** the (super-fixed) main thread. SweepPhase_Rebuild does CdataV/huge
-** dead-free, re-anchors the root on mainthread, and clears huge marks.
+** T3b-1: g->gc.root retired; enumeration is arena bitmaps + hugeset.
+** After aend, SweepPhase_Huge runs hugeset free/demote (not root rebuild).
 **
 ** Epoch model (D4): aend = sweep_aend (snapshot of arenastop at atomic end).
 ** Current arenas (swept_gen == epoch) are skipped — they are nursery (born or
@@ -1790,7 +1784,7 @@ static size_t gc_bitmap_sweep(global_State *g)
     }
 #if LJ_HASFFI
     /* P3b: CdataV-arena dead free folded into the main bitmap sweep (was a
-    ** separate resumable scan in Rebuild_Prologue). ArenaFlag_CdataVOnly
+    ** separate resumable scan in old rebuild prologue). ArenaFlag_CdataVOnly
     ** arenas lack ArenaFlag_TravObjs and would otherwise be skipped at the
     ** `!(TravObjs)` continue below, leaking every dead VLA cdata. Word-parallel
     ** scan: dead = block & ~mark (liveness authority is the BASE cell's mark).
@@ -1801,7 +1795,7 @@ static size_t gc_bitmap_sweep(global_State *g)
     ** pending-finalizer cdata stay marked (marked inline at separate, on
     ** fin_queue) through atomic.
     **
-    ** Nursery aend note: the old rebuild_prologue_cdatav scanned ALL arenas
+    ** Nursery aend note: the old CdataV rebuild prologue scanned ALL arenas
     ** (arenastop); folding into the epoch-model sweep (current arenas skipped
     ** per-arena via arena_is_current) matches the TravObjs nursery isolation --
     ** dead nursery CdataV free next cycle when other. Consistent with the rest
@@ -1942,137 +1936,113 @@ static size_t gc_bitmap_sweep(global_State *g)
   if (ai >= aend) {
     /* All other arenas swept (current arenas were skipped per-arena). */
     MARKALLOC_PROGRESS_LOG(
-	      "[markalloc-progress] free done → Rebuild aend=%u total=%zu "
+	      "[markalloc-progress] free done → Huge aend=%u total=%zu "
 	      "strnum=%u hugenum=%u hugemem=%zu\n",
 	      (unsigned)aend, (size_t)g->gc.total, (unsigned)g->str.num,
 	      (unsigned)g->gc.hugenum, (size_t)g->gc.hugemem);
-    g->gc.sweepphase = SweepPhase_Rebuild;
-    g->gc.rebuildphase = Rebuild_Prologue;
+    g->gc.sweepphase = SweepPhase_Huge;
+    g->gc.sweep_hugep = SweepHuge_Scan;
     /* P3b: CdataV-arena dead free is folded into the bitmap sweep above
-	    ** (ArenaFlag_CdataVOnly branch). Finalizer pending objects live on
-	    ** fin_queue (marked inline at separate); their MARK is demoted with
-	    ** other survivors in one-shot HugeScan. */
-	    g->gc.sweepa = 0;
-	    g->gc.sweepw = UnusedBlockWords;
+    ** (ArenaFlag_CdataVOnly branch). Finalizer pending objects live on
+    ** fin_queue (marked inline at separate); their MARK is demoted with
+    ** other survivors in one-shot SweepHuge_Scan. */
+    g->gc.sweepa = 0;
+    g->gc.sweepw = UnusedBlockWords;
   }
   return freed;
 }
 
 	/*
-	** Post-sweep pass: free dead huge objects and demote survivors;
-	** AssertDemote only verifies arena demote (free already demotes arena
-	** survivors). Header GRAY is already zero at free entry (atomic blacken
-	** + empty worklists).
-	**
-	** T3b-1: g->gc.root retired; all former consumers now
-	** enumerate arena objects via the block bitmaps directly. The root reference
-	** is simply anchored on the (super-fixed) main thread.
-	**
-	** The work is split into ordered sub-phases (RebuildPhase) driven by
-	** g->gc.rebuildphase. gc_rebuild_rootchain is a dispatcher that runs one
-	** sub-phase per call and the GCSsweep driver re-enters it once per onestep.
-	** P3b folded the CdataV-arena dead free into gc_bitmap_sweep, so Prologue is
-	** one-shot (arms HugeScan). HugeScan is one-shot (free dead + clear survivor
-	** HUGESET_MARK in a single full-table walk — no mid-scan yield). Epilogue
-	** arms AssertDemote. AssertDemote only chunk-asserts arena demote.
-	*/
-	
-	/* Prologue: arm HugeScan. P3b folded the CdataV-arena dead free into the
-	** main bitmap sweep (gc_bitmap_sweep's ArenaFlag_CdataVOnly branch), so
-	** Rebuild_Prologue no longer runs a CdataV scan slice -- it just advances
-	** the rebuild phase.
-	**
-	** Finalizer pending objects live on fin_queue (marked inline at separate,
-	** whitened at drain). Their MARK stays SET until HugeScan sees them as
-	** survivors and demotes in the same one-shot walk. */
-	
-	static void rebuild_prologue(global_State *g)
-	{
-	  lj_assertG(g->gc.state == GCSsweep, "rebuild prologue outside GCSsweep");
-	  g->gc.sweepa = 0;
-	  g->gc.sweepw = UnusedBlockWords;
-	  g->gc.rebuildphase = Rebuild_HugeScan;
-	}
-	
-	static void rebuild_hugescan(global_State *g)
-	{
-	  /* One-shot huge-set sweep: free dead (MARK=0) and demote survivors
-	  ** (clear HUGESET_MARK) in a single full-table walk. No mid-scan yield —
-	  ** the previous chunked design forced a second full hugeset walk to
-	  ** demote survivors (T3 forbade demote across yield), which made
-	  ** chunking net-worse. Free only tombs slots (no rehash); mutator
-	  ** cannot run mid-walk, so no restart/gen cursor is needed.
-	  ** Next-cycle lj_arena_gc_assert_demote checks no residual huge MARK.
-	  ** Upvalues are never huge. */
-	  GCRef *slots;
-	  MSize hi, hmask;
-	
-	  slots = mref(g->gc.hugeset, GCRef);
-	  hmask = g->gc.hugesetmask;
-	  if (slots == NULL) {
-	    g->gc.huge_swept_gen = g->gc.epoch;  /* Empty huge set: trivially current. */
-	    g->gc.rebuildphase = Rebuild_Epilogue;
-	    return;
-	  }
-	  for (hi = 0; hi <= hmask; hi++) {
-	    uintptr_t u = gcrefu(slots[hi]);
-	    GCobj *o;
-	    if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
-	    hugeset_slot_assert(g, u);
-	    /* o = GCobj (cd for CDATAV slots); mark authority is the slot itself. */
-	    o = hugeset_slot_obj(u);
-	    if (o->gch.gct == ~LJ_TSTR) {
-	      /* Huge strings: openaddr reclaim (symmetric to arena NonTrav). */
-	      if (!(u & HUGESET_MARK)) {
-		lj_strtab_remove(g, gco2str(o));
-		gcstat_inc(g, strings_dead_freed);
-		lj_str_free(g, gco2str(o));
-	      } else {
-		setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
-	      }
-	      continue;  /* not generic gc_freefunc */
-	    }
-	    lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
-	    if (!(u & HUGESET_MARK)) {
-	      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
-	    } else {
-	      lj_assertG(o->gch.gct != ~LJ_TTHREAD, "unexpected huge thread");
-	      setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
-	    }
-	  }
-	  /* Phase 1 dual-track: huge set fully scanned → every live huge object is
-	  ** "current". Mirror per-arena swept_gen with global huge_swept_gen. */
-	  g->gc.huge_swept_gen = g->gc.epoch;
-	  g->gc.rebuildphase = Rebuild_Epilogue;
-	}
+** Post-bitmap hugeset pass (SweepPhase_Huge).
+**
+** Arena free already demotes survivors (gc_arena_demote_survivors / podsweep).
+** Huge objects have no cell bitmap, so dead free + survivor demote
+** (clear HUGESET_MARK) and huge_swept_gen=epoch happen here in one shot.
+** Optional SweepHuge_Assert chunk-checks arena demote under LUA_USE_ASSERT
+** (release: Scan → Done). Header GRAY is already zero at free entry
+** (atomic blacken + empty worklists). T3b-1: no root chain work.
+**
+** CdataV dead free is folded into gc_bitmap_sweep (P3b). Fin-queue objects
+** keep MARK until this hugescan demotes survivors.
+*/
 
-static void rebuild_epilogue(global_State *g)
+/* One-shot hugeset sweep: free dead (MARK=0) and demote survivors
+** (clear HUGESET_MARK). No mid-scan yield — mutator cannot run mid-walk.
+** Next-cycle lj_arena_gc_assert_demote also checks no residual huge MARK.
+** Upvalues are never huge. */
+static void gc_sweep_hugeset(global_State *g)
 {
-  /* T3b-1: no g->gc.root re-anchor (field retired under HASGCMARK). */
-  g->gc.rebuild_asserta = 0;  /* Arm AssertDemote arena cursor. */
-  g->gc.rebuildphase = Rebuild_AssertDemote;
+  GCRef *slots;
+  MSize hi, hmask;
+
+  slots = mref(g->gc.hugeset, GCRef);
+  hmask = g->gc.hugesetmask;
+  if (slots == NULL) {
+    g->gc.huge_swept_gen = g->gc.epoch;  /* Empty huge set: trivially current. */
+#if LUA_USE_ASSERT
+    g->gc.sweep_asserta = 0;
+    g->gc.sweep_hugep = SweepHuge_Assert;
+#else
+    g->gc.sweep_hugep = SweepHuge_Done;
+#endif
+    return;
+  }
+  for (hi = 0; hi <= hmask; hi++) {
+    uintptr_t u = gcrefu(slots[hi]);
+    GCobj *o;
+    if (!hugeset_slot_live(u)) continue;  /* EMPTY / TOMB. */
+    hugeset_slot_assert(g, u);
+    /* o = GCobj (cd for CDATAV slots); mark authority is the slot itself. */
+    o = hugeset_slot_obj(u);
+    if (o->gch.gct == ~LJ_TSTR) {
+      /* Huge strings: openaddr reclaim (symmetric to arena NonTrav). */
+      if (!(u & HUGESET_MARK)) {
+	lj_strtab_remove(g, gco2str(o));
+	gcstat_inc(g, strings_dead_freed);
+	lj_str_free(g, gco2str(o));
+      } else {
+	setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
+      }
+      continue;  /* not generic gc_freefunc */
+    }
+    lj_assertG(o->gch.gct != ~LJ_TUPVAL, "huge upvalue is impossible");
+    if (!(u & HUGESET_MARK)) {
+      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+    } else {
+      lj_assertG(o->gch.gct != ~LJ_TTHREAD, "unexpected huge thread");
+      setgcrefp(slots[hi], (void *)(u & ~(uintptr_t)HUGESET_MARK));
+    }
+  }
+  /* Every live huge object is "current". Mirror per-arena swept_gen. */
+  g->gc.huge_swept_gen = g->gc.epoch;
+#if LUA_USE_ASSERT
+  g->gc.sweep_asserta = 0;
+  g->gc.sweep_hugep = SweepHuge_Assert;
+#else
+  g->gc.sweep_hugep = SweepHuge_Done;
+#endif
 }
 
 /* Free already demotes arena survivors; hugescan demotes huge. This phase
-** only verifies (chunked). Without LUA_USE_ASSERT it is a no-op Done. */
-static void rebuild_assert_demote(global_State *g)
+** only verifies (chunked). Without LUA_USE_ASSERT it is never entered. */
+static void gc_sweep_assert_demote(global_State *g)
 {
 #if !LUA_USE_ASSERT
-  g->gc.rebuildphase = Rebuild_Done;
+  g->gc.sweep_hugep = SweepHuge_Done;
 #else
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
   MSize i, n, stop;
   GCSize total_before = g->gc.total;
-  lj_assertG(g->gc.rebuildphase == Rebuild_AssertDemote,
-	     "AssertDemote entered with rebuildphase=%d",
-	     g->gc.rebuildphase);
+  lj_assertG(g->gc.sweep_hugep == SweepHuge_Assert,
+	     "AssertDemote entered with sweep_hugep=%d",
+	     g->gc.sweep_hugep);
   lj_assertG(g->gc.state == GCSsweep, "AssertDemote outside GCSsweep");
   /* Chunked: up to GCSWEEP_ASSERT_DEMOTE_ARENAS arenas/slice then yield.
   ** R1: re-read arenastop each slice — arenas appended mid-sweep have zeroed
   ** bitmaps and swept_gen==epoch, so I1 holds. */
   stop = g->gc.arenastop;
   n = 0;
-  for (i = g->gc.rebuild_asserta; i < stop && n < GCSWEEP_ASSERT_DEMOTE_ARENAS;
+  for (i = g->gc.sweep_asserta; i < stop && n < GCSWEEP_ASSERT_DEMOTE_ARENAS;
        i++, n++) {
     GCArena *a = arenas[i];
     uint32_t w, wtop;
@@ -2090,47 +2060,49 @@ static void rebuild_assert_demote(global_State *g)
 		 (unsigned)i, (unsigned)w,
 		 (unsigned)(a->mark[w] & a->block[w]));
   }
-  g->gc.rebuild_asserta = i;
+  g->gc.sweep_asserta = i;
   lj_assertG(g->gc.total == total_before,
 	     "AssertDemote arena slice freed memory (total %lu -> %lu)",
 	     (unsigned long)total_before, (unsigned long)g->gc.total);
   if (i < stop)
     return;  /* More arenas remain: yield in same phase. */
   MARKALLOC_PROGRESS_LOG(
-	    "[markalloc-progress] rebuild AssertDemote done total=%zu strnum=%u "
+	    "[markalloc-progress] sweep AssertDemote done total=%zu strnum=%u "
 	    "arenastop=%u\n",
 	    (size_t)g->gc.total, (unsigned)g->str.num, (unsigned)g->gc.arenastop);
-  g->gc.rebuildphase = Rebuild_Done;
+  g->gc.sweep_hugep = SweepHuge_Done;
 #endif
 }
 
-static void gc_rebuild_rootchain(global_State *g)
+/* Dispatcher for SweepPhase_Huge: one sub-phase per call; yields only while
+** chunked Assert is in progress. */
+static void gc_sweep_huge(global_State *g)
 {
-  /* Rebuild runs inside GCSsweep; marks are authoritative through the yield
-  ** (T3). Phase 3 dropped the GCF flags, so the entry asserts only the GC
-  ** state (scheduling authority), not a free-window predicate. */
-  lj_assertG(g->gc.state == GCSsweep,
-	     "rebuild entered outside GCSsweep");
+  lj_assertG(g->gc.state == GCSsweep, "sweep_huge entered outside GCSsweep");
   for (;;) {
-    uint8_t phase = g->gc.rebuildphase;
+    uint8_t phase = g->gc.sweep_hugep;
     switch (phase) {
-    case Rebuild_Prologue:   gcstat_inc(g, rebuild_prologue);   rebuild_prologue(g);   break;
-    case Rebuild_HugeScan:   gcstat_inc(g, rebuild_hugescan);   rebuild_hugescan(g);   break;
-    case Rebuild_Epilogue:   gcstat_inc(g, rebuild_epilogue);   rebuild_epilogue(g);   break;
-    case Rebuild_AssertDemote: gcstat_inc(g, rebuild_assert_demote); rebuild_assert_demote(g); break;
+    case SweepHuge_Scan:
+      gcstat_inc(g, sweep_hugescan);
+      gc_sweep_hugeset(g);
+      break;
+    case SweepHuge_Assert:
+      gcstat_inc(g, sweep_assert_demote);
+      gc_sweep_assert_demote(g);
+      break;
     default:
-      lj_assertG(0, "bad rebuild phase %d", g->gc.rebuildphase);
+      lj_assertG(0, "bad sweep_huge phase %d", g->gc.sweep_hugep);
       return;
     }
-    lj_assertG(g->gc.rebuildphase >= phase,
-	       "rebuild phase went backward: %d -> %d",
-	       (int)phase, (int)g->gc.rebuildphase);
-    if (g->gc.rebuildphase == Rebuild_Done) {
+    lj_assertG(g->gc.sweep_hugep >= phase,
+	       "sweep_huge phase went backward: %d -> %d",
+	       (int)phase, (int)g->gc.sweep_hugep);
+    if (g->gc.sweep_hugep == SweepHuge_Done) {
       g->gc.sweepphase = SweepPhase_Done;
       return;
     }
-    if (phase == Rebuild_AssertDemote && g->gc.rebuildphase == phase)
-      return;  /* Still in same phase → yield one onestep (chunked asserts). */
+    if (phase == SweepHuge_Assert && g->gc.sweep_hugep == phase)
+      return;  /* Still in same phase → yield one onestep. */
   }
 }
 
@@ -2289,11 +2261,9 @@ void lj_gc_freeall(global_State *g)
   ** afterwards would be a use-after-free. */
   g->gc.gcmarkflags = 0;
   /*
-  ** T3b-1: g->gc.root retired; enumeration is the arena block
-  ** bitmaps -- it is rebuilt from them after every bitmap sweep. Rather than
-  ** walk that chain, enumerate the live arena cells directly (the same scan
-  ** gc_rebuild_rootchain uses to relink survivors) and free each object. This
-  ** removes the last shutdown reader of the 根 chain.
+  ** T3b-1: g->gc.root retired; enumeration is the arena block bitmaps +
+  ** hugeset. Shutdown frees by walking live arena cells and the hugeset
+  ** directly (no root chain).
   **
   ** Coverage:
   **  - Traversable arenas: tables, funcs, protos, threads, upvalues, regular
@@ -2596,12 +2566,11 @@ static size_t gc_onestep_raw(lua_State *L)
     return GCSWEEPCOST;
   case GCSsweep: {
     GCSize old = g->gc.total;
-    if (g->gc.sweepphase == SweepPhase_Rebuild) {
-      /* Run one rebuild dispatch per onestep. The dispatcher yields after
-      ** each chunked sub-phase (AssertDemote). Phase 3 dropped the GCF
-      ** flags; rebuild_assert_demote is assert-only, so this branch is keyed
-      ** on sweepphase (set by gc_bitmap_sweep at aend), not a flag. */
-      gc_rebuild_rootchain(g);
+    if (g->gc.sweepphase == SweepPhase_Huge) {
+      /* Run one hugesweep dispatch per onestep. Yields only for chunked
+      ** Assert under LUA_USE_ASSERT. Keyed on sweepphase (set by
+      ** gc_bitmap_sweep at aend). */
+      gc_sweep_huge(g);
       lj_assertG(old >= g->gc.total, "sweep increased memory");
       g->gc.estimate -= old - g->gc.total;
       if (g->gc.sweepphase == SweepPhase_Done) {
@@ -2638,16 +2607,14 @@ static size_t gc_onestep_raw(lua_State *L)
       }
       return GCSWEEPMAX*GCSWEEPCOST;
     }
-    /* SweepPhase_Bitmap (normal GCMARK cycle). Phase 3 dropped the GCF
-    ** gate: sweepphase alone drives bitmap-vs-rebuild. The classic
+    /* SweepPhase_Bitmap. sweepphase alone drives bitmap vs huge. The classic
     ** linked-list incremental gc_sweep path is shutdown-only (lj_gc_freeall)
     ** and never reached from the state machine under GCMARK. */
     gc_bitmap_sweep(g);
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
-    /* SweepPhase_Done is unreachable here: Done is only reached via the
-    ** rebuild branch above (AssertDemote completes the rebuild window).
-    ** gc_bitmap_sweep transitions Bitmap → Rebuild, never directly to Done. */
+    /* SweepPhase_Done is only reached via SweepPhase_Huge above.
+    ** gc_bitmap_sweep transitions Bitmap → Huge, never directly to Done. */
     return GCSWEEPMAX*GCSWEEPCOST;
     }
   case GCSfinalize:
@@ -2681,9 +2648,9 @@ static void gcstat_timing_record(global_State *g, uint8_t state,
 {
   uint64_t *t, *m;
   if (state == GCSsweep) {
-    if (sweepphase == 1) {  /* SweepPhase_Rebuild */
-      t = &g->gc.stats.time_sweep_rebuild_ns;
-      m = &g->gc.stats.maxpause_sweep_rebuild_ns;
+    if (sweepphase == 1) {  /* SweepPhase_Huge */
+      t = &g->gc.stats.time_sweep_huge_ns;
+      m = &g->gc.stats.maxpause_sweep_huge_ns;
     } else {  /* SweepPhase_Bitmap (0) or Done (2, shouldn't happen) */
       t = &g->gc.stats.time_sweep_bitmap_ns;
       m = &g->gc.stats.maxpause_sweep_bitmap_ns;
@@ -2725,8 +2692,8 @@ static size_t gc_onestep(lua_State *L)
   cost = gc_onestep_raw(L);
 #endif
   if (pre_state == GCSsweep) {
-    if (pre_sweepphase == 1)  /* SweepPhase_Rebuild */
-      gcstat_inc(g, sweep_rebuild_steps);
+    if (pre_sweepphase == 1)  /* SweepPhase_Huge */
+      gcstat_inc(g, sweep_huge_steps);
     else
       gcstat_inc(g, sweep_bitmap_steps);
   } else {
@@ -2837,7 +2804,7 @@ int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps)
 
 /*
 ** Full-GC O(live) shadow-mark verify is a diagnostic allocator self-test,
-** not a GC liveness proof: after rebuild, marks are already cleared, so
+** not a GC liveness proof: after sweep demote, marks are already cleared, so
 ** shadow-marking every allocated cell then asserting dead==0 mostly checks
 ** setmark/visit_unmarked primitives. Real mark/sweep invariants live earlier:
 **   - gc_assert_atomic_end: residual GRAY + black→white edges + class routing
@@ -2866,11 +2833,11 @@ static void gc_arena_verify_color(global_State *g, GCArena *a)
       GCobj *o = (GCobj *)arena_cellptr(a, c);
       heads &= heads - 1;
       /* Called at the tail of lj_gc_fullgc (state == GCSpause), after the mark
-      ** phase blackened every survivor and gc_rebuild_rootchain re-whitened the
-      ** bitmap. With the bitmap authoritative for arena color, every allocated
+      ** phase blackened every survivor and free/hugescan demoted the bitmap.
+      ** With the bitmap authoritative for arena color, every allocated
       ** object must read back as bitmap-white here. A surviving mark bit means
-      ** the cycle ended with a stuck-black object -- a rebuild re-whitening
-      ** regression (the next cycle's white-reset would then be wrong).
+      ** the cycle ended with a stuck-black object -- a demote regression
+      ** (the next cycle's white-reset would then be wrong).
       **
       ** A header cross-check is deliberately NOT done: gc_mark writes
       ** white2gray(header) and arena_obj_setmark(bitmap) in lockstep, and
@@ -2878,10 +2845,10 @@ static void gc_arena_verify_color(global_State *g, GCArena *a)
       ** header WHITES bit can never diverge from the bitmap at a mutation site.
       ** Asserting their agreement would be vacuous; the live invariant is the
       ** bitmap reaching the clean all-white state the next cycle depends on.
-      ** Verified reachable: defeating the rebuild whitening leaves objects
+      ** Verified reachable: defeating demote leaves objects
       ** bitmap-black here and this assert fires. */
       lj_assertG(!arena_obj_ismarked(a, c),
-		 "arena object still bitmap-black after full GC rebuild: "
+		 "arena object still bitmap-black after full GC demote: "
 		 "ptr=%p gct=%d marked=0x%02x cell=%d",
 		 (void *)o, o->gch.gct, o->gch.marked, (int)c);
     }
@@ -2915,8 +2882,8 @@ static void gc_arena_verify(global_State *g)
     }
   }
   /* Huge color cross-check, mirroring gc_arena_verify_color: at GCSpause after
-  ** rebuild, every live huge object (string and non-string) must be slot-white
-  ** (MARK clear). One-shot rebuild_hugescan demotes survivors (free dead +
+  ** demote, every live huge object (string and non-string) must be slot-white
+  ** (MARK clear). One-shot gc_sweep_hugeset demotes survivors (free dead +
   ** clear MARK) before this verify. A stuck slot mark means the per-cycle
   ** reset regressed. Also checked in lj_gc_checkheap when state==GCSpause. */
   {
@@ -2930,7 +2897,7 @@ static void gc_arena_verify(global_State *g)
 	hugeset_slot_assert(g, u);
 	o2 = hugeset_slot_obj(u);
 	lj_assertG(!(u & HUGESET_MARK),
-		   "huge object still slot-marked after full GC rebuild: "
+		   "huge object still slot-marked after full GC demote: "
 		   "ptr=%p gct=%d marked=0x%02x", (void *)o2, o2->gch.gct,
 		   o2->gch.marked);
       }
@@ -3023,7 +2990,7 @@ static void gc_arena_verify(global_State *g)
 	  if (!hugeset_slot_live(u)) continue;
 	  hugeset_slot_assert(g, u);
 	  { /* base is huge (no arena bitmap): shadowmark is a no-op; the slot mark
-	    ** set by rebuild is the authority. o = cd for CDATAV slots, to read gct. */
+	    ** set by hugescan demote is the authority. o = cd for CDATAV slots, to read gct. */
 	    GCobj *base = hugeset_slot_addr(u);
 	    o = hugeset_slot_obj(u);
 	    if (o->gch.gct == ~LJ_TSTR) continue;
@@ -3118,10 +3085,10 @@ static void gc_arena_verify(global_State *g)
 **
 ** Front-loaded GC invariants (formerly only at fullgc tail via
 ** gc_arena_verify — too late, and the O(live) shadow-mark was near-empty
-** after rebuild re-whitening):
+** after sweep demote):
 **  - any phase: fin_queue members must carry LJ_GC_FINALIZED
 **  - any phase: class routing on marked-live cells (UdataOnly / NonTrav str)
-**  - GCSpause only: TravObjs mark bits all clear (post-rebuild stuck-black)
+**  - GCSpause only: TravObjs mark bits all clear (post-demote stuck-black)
 **  - GCSpause only: huge slots MARK clear
 */
 int lj_gc_checkheap(global_State *g)
@@ -3143,7 +3110,7 @@ int lj_gc_checkheap(global_State *g)
       }
     }
   }
-  /* -- GCSpause: post-rebuild all marks cleared (Trav + huge). -- */
+  /* -- GCSpause: post-demote all marks cleared (Trav + huge). -- */
   if (g->gc.state == GCSpause) {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -3720,7 +3687,7 @@ void lj_gc_stats_push(lua_State *L)
   SETNUM("steps_atomic", s->nsteps[GCSatomic]);
   SETNUM("steps_sweepstring", s->nsteps[GCSsweepstring]);
   SETNUM("steps_sweep_bitmap", s->sweep_bitmap_steps);
-  SETNUM("steps_sweep_rebuild", s->sweep_rebuild_steps);
+  SETNUM("steps_sweep_huge", s->sweep_huge_steps);
   SETNUM("steps_finalize", s->nsteps[GCSfinalize]);
   SETNUM("cycles", s->cycles);
   SETNUM("mark_calls", s->mark_calls);
@@ -3729,11 +3696,8 @@ void lj_gc_stats_push(lua_State *L)
   SETNUM("grayarena_pops", s->grayarena_pops);
   SETNUM("sweep_cells", s->sweep_cells);
   SETNUM("pod_sweeps", s->pod_sweeps);
-  SETNUM("rebuild_prologue", s->rebuild_prologue);
-  SETNUM("rebuild_threadscan", s->rebuild_threadscan);
-  SETNUM("rebuild_hugescan", s->rebuild_hugescan);
-  SETNUM("rebuild_epilogue", s->rebuild_epilogue);
-  SETNUM("rebuild_assert_demote", s->rebuild_assert_demote);
+  SETNUM("sweep_hugescan", s->sweep_hugescan);
+  SETNUM("sweep_assert_demote", s->sweep_assert_demote);
   SETNUM("barrierback", s->barrierback);
   SETNUM("gray_notify", s->gray_notify);
   SETNUM("ssb_overflow", s->ssb_overflow);
@@ -3760,14 +3724,14 @@ void lj_gc_stats_push(lua_State *L)
   SETNUM("time_atomic_ns", s->time_atomic_ns);
   SETNUM("time_sweepstring_ns", s->time_sweepstring_ns);
   SETNUM("time_sweep_bitmap_ns", s->time_sweep_bitmap_ns);
-  SETNUM("time_sweep_rebuild_ns", s->time_sweep_rebuild_ns);
+  SETNUM("time_sweep_huge_ns", s->time_sweep_huge_ns);
   SETNUM("time_finalize_ns", s->time_finalize_ns);
   SETNUM("maxpause_pause_ns", s->maxpause_pause_ns);
   SETNUM("maxpause_propagate_ns", s->maxpause_propagate_ns);
   SETNUM("maxpause_atomic_ns", s->maxpause_atomic_ns);
   SETNUM("maxpause_sweepstring_ns", s->maxpause_sweepstring_ns);
   SETNUM("maxpause_sweep_bitmap_ns", s->maxpause_sweep_bitmap_ns);
-  SETNUM("maxpause_sweep_rebuild_ns", s->maxpause_sweep_rebuild_ns);
+  SETNUM("maxpause_sweep_huge_ns", s->maxpause_sweep_huge_ns);
   SETNUM("maxpause_finalize_ns", s->maxpause_finalize_ns);
   SETBOOL("timing", 1);
 #else

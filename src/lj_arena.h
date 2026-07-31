@@ -403,9 +403,9 @@ LJ_FUNC void lj_hugeset_free(global_State *g);
 ** translate base->cd at every consumer; mark/color authority stays keyed on
 ** the base address (the slot). */
 #define HUGESET_CDATAV	((uintptr_t)4)
-/* T3 removed HUGESET_SWEPT (bit 3): marks are now authoritative through the
-** rebuild window, so a restart sees survivor MARK set and skips the dead-free
-** branch without a separate processed-skip tag. Bit 3 is free. */
+/* T3 removed HUGESET_SWEPT (bit 3): marks are authoritative through free;
+** one-shot gc_sweep_hugeset frees dead and demotes survivors without a
+** separate processed-skip tag. Bit 3 is free. */
 #define HUGESET_PTRMASK	(~(uintptr_t)15)	/* Strip TOMB|MARK|CDATAV to recover addr. */
 #define hugeset_slot_addr(u)	((GCobj *)((u) & HUGESET_PTRMASK))
 #define hugeset_slot_live(u)	(((u) & HUGESET_PTRMASK) != 0)

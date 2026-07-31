@@ -927,7 +927,7 @@ void lj_arena_gcprepare(global_State *g)
 ** - Mutator freelist stays warm across the cycle boundary.
 **
 ** fullgc mid-mark abort still uses lj_arena_gcprepare (flush+clear).
-** Pairs with rebuild-phase Rebuild_AssertDemote (post-sweep check).
+** Pairs with SweepHuge_Assert (post-sweep chunked check under LUA_USE_ASSERT).
 */
 void lj_arena_gc_assert_demote(global_State *g)
 {
@@ -978,11 +978,11 @@ void lj_arena_gc_assert_demote(global_State *g)
 ** Huge objects have no cell bitmap, so they are invisible to the bitmap
 ** sweep. To keep them enumerable (and thus sweepable), every live huge
 ** object is registered in an address-keyed open-addressing hash set
-** (design doc: "Huge Blocks"). gc_rebuild_rootchain scans this set to free
-** dead huge objects and re-link survivors onto the GC chains -- the set is
+** (design doc: "Huge Blocks"). gc_sweep_hugeset scans this set to free dead
+** huge objects and demote survivors (clear HUGESET_MARK) -- the set is
 ** effectively "the bitmap for huge objects". The set is backed by the raw
-** allocator, never GC memory, and stores addresses only: each huge object's
-** mark lives in its own GCobj header and its size is reconstructed on free.
+** allocator, never GC memory, and stores addresses only. Mark authority is
+** the slot MARK bit; size is reconstructed on free.
 */
 
 #define HUGESET_EMPTY	((uintptr_t)0)	/* Never a valid arena-aligned addr. */
