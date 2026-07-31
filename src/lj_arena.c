@@ -328,7 +328,7 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
     arena_flushbins(a, fl);
   /* Freed cells = (free heads after the transform) - (free heads before).
   ** Both counts use the same Free (block=0, mark=1) head encoding, so any free
-  ** space that the cross-cycle mark-bit resets (gcprepare/markinit) collapsed
+  ** space that the cross-cycle mark-bit resets (gcprepare) collapsed
   ** to Extent (0,0) is invisible to BOTH and cancels out -- making the delta
   ** exactly the cells newly freed by this sweep, independent of the unstable
   ** old-free encoding. The trusted, allocator-maintained freecells counter is
@@ -344,7 +344,7 @@ GCCellID lj_arena_podsweep(global_State *g, GCArena *a)
   lj_assertX(free_post >= free_pre, "podsweep freed negative cells");
   freed = free_post - free_pre;
   /* Set freecells to the absolute post-transform count. Now that the free-head
-  ** encoding is stable across cycles (gcprepare/markinit preserve it), the
+  ** encoding is stable across cycles (gcprepare preserves it), the
   ** bitmap recount is authoritative and matches the freed delta. */
   a->freecells = free_post;
   a->freegen++;
@@ -792,9 +792,11 @@ void lj_arena_freeall(global_State *g)
 
 /*
 ** Public bin flush: make (block,mark) the single source of truth before a
-** GC mark phase reads mark bits. After this, allocated objects are White
-** (1,0) and free blocks are Free (0,1). The free list is reset; the next
-** allocation rebuilds it via scavenge.
+** path that treats (block&~mark) as dead or recounts free heads from the
+** bitmaps (sweep free, podsweep, fin backfill, visit_unmarked). After this,
+** allocated objects are White (1,0) and free blocks are Free (0,1). The free
+** list is reset; the next allocation rebuilds it via scavenge.
+** Not required at mark start: mark is root-driven and freelist stays warm.
 */
 void lj_arena_flushbins(GCArena *a)
 {
@@ -878,7 +880,7 @@ void lj_arena_gray_free(global_State *g, GCArena *a)
 ** the block map is authoritative, then mark[w]&=~block[w] (keeps Free heads)
 ** and clear live HUGESET_MARK. Used by fullgc mid-mark abort (free demote did
 ** not run) and post-cycle verify prep. Normal cycle boundaries rely on free
-** demote + hugescan; markinit only asserts.
+** demote + hugescan; lj_arena_gc_assert_demote only checks that contract.
 */
 void lj_arena_gcprepare(global_State *g)
 {
@@ -910,36 +912,43 @@ void lj_arena_gcprepare(global_State *g)
 }
 
 /*
-** Prepare for a mark-driven GC cycle: flush bins so (block,mark) is
-** authoritative. Allocated cells must already be White=(1,0) — free demotes
-** arena survivors; rebuild_hugescan demotes huge survivors. Under
-** LUA_USE_ASSERT verify mark&block==0 and no live HUGESET_MARK (no write).
-** Free blocks keep Free=(0,1); free heads are not asserted as residual marks.
+** Pure debug assert at the start of a mark-driven GC cycle.
+**
+** Release: no-op (no freelist flush, no mark write).
+** LUA_USE_ASSERT: verify free demote left no Black residual
+** (mark&block==0) and hugescan left no HUGESET_MARK — O(bitmap) only.
+**
+** Rationale (normal path needs no write here):
+** - Mark is root-driven; binned free cells look White=(1,0) but are
+**   unreachable, so they are never marked. isdead requires other(meta),
+**   so current-arena freelist cells are not corpses.
+** - Every free/sweep path that treats (block&~mark) as dead already
+**   calls lj_arena_flushbins first (bitmap free, podsweep, etc.).
+** - Mutator freelist stays warm across the cycle boundary.
+**
+** fullgc mid-mark abort still uses lj_arena_gcprepare (flush+clear).
+** Pairs with rebuild-phase Rebuild_AssertDemote (post-sweep check).
 */
-void lj_arena_gc_markinit(global_State *g)
+void lj_arena_gc_assert_demote(global_State *g)
 {
-  MSize i;
-  for (i = 0; i < g->gc.arenastop; i++) {
-    GCArena *a = mref(g->gc.arenas, GCArena *)[i];
-    ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
-    if (fl != NULL) {
-      arena_flushbins(a, fl);
-      freelist_reset(fl);
-      fl->scavgen = a->freegen - 1;
+#if !LUA_USE_ASSERT
+  UNUSED(g);
+#else
+  {
+    MSize i;
+    for (i = 0; i < g->gc.arenastop; i++) {
+      GCArena *a = mref(g->gc.arenas, GCArena *)[i];
+      if ((GCCellID)a->celltop > MinCellId) {
+	uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
+	for (w = UnusedBlockWords; w <= wtop; w++)
+	  lj_assertG_(g, (a->mark[w] & a->block[w]) == 0,
+		      "assert_demote residual arena mark: arena %u word %u "
+		      "mark&block=0x%x (demote incomplete?)",
+		      (unsigned)i, (unsigned)w,
+		      (unsigned)(a->mark[w] & a->block[w]));
+      }
     }
-#if LUA_USE_ASSERT
-    if ((GCCellID)a->celltop > MinCellId) {
-      uint32_t w, wtop = arena_blockidx((GCCellID)a->celltop - 1);
-      for (w = UnusedBlockWords; w <= wtop; w++)
-	lj_assertG_(g, (a->mark[w] & a->block[w]) == 0,
-		    "markinit residual arena mark: arena %u word %u "
-		    "mark&block=0x%x (demote incomplete?)",
-		    (unsigned)i, (unsigned)w,
-		    (unsigned)(a->mark[w] & a->block[w]));
-    }
-#endif
   }
-#if LUA_USE_ASSERT
   {
     GCRef *slots = mref(g->gc.hugeset, GCRef);
     if (slots != NULL) {
@@ -948,7 +957,7 @@ void lj_arena_gc_markinit(global_State *g)
 	uintptr_t u = gcrefu(slots[hi]);
 	if (hugeset_slot_live(u))
 	  lj_assertG_(g, !(u & HUGESET_MARK),
-		      "markinit residual huge MARK: slot=%u ptr=%p",
+		      "assert_demote residual huge MARK: slot=%u ptr=%p",
 		      (unsigned)hi,
 		      (void *)hugeset_slot_obj(u));
       }

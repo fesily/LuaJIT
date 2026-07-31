@@ -377,10 +377,12 @@ LJ_FUNC void lj_arena_visit_unmarked(GCArena *a, ArenaObjVisitor cb, void *ud);
 
 /*
 ** lj_arena_gcprepare: abandon partial marks (fullgc mid-mark abort / verify).
-** lj_arena_gc_markinit: flush bins + assert demote complete (no mark write).
+** lj_arena_gc_assert_demote: pure debug assert at mark-cycle start (release
+** no-op). Verifies free demote + hugescan left no residual Black/HUGESET_MARK.
+** Freelist flush lives on free/sweep paths, not mark start.
 */
 LJ_FUNC void lj_arena_gcprepare(global_State *g);
-LJ_FUNC void lj_arena_gc_markinit(global_State *g);
+LJ_FUNC void lj_arena_gc_assert_demote(global_State *g);
 LJ_FUNC void lj_arena_gray_free(global_State *g, GCArena *a);
 /* Word-parallel sweep of one POD-only arena. Returns cells freed. */
 LJ_FUNC GCCellID lj_arena_podsweep(global_State *g, GCArena *a);

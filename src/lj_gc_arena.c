@@ -365,7 +365,7 @@ static void gc_mark_start(global_State *g)
 	arena_gray_reset(a);
     }
   }
-  lj_arena_gc_markinit(g);
+  lj_arena_gc_assert_demote(g);
   /* mainthread is SFIXED: gc_mark early-returns at the non-arena/non-huge
   ** assert branch. gc_traverse_mainthread below walks its stack frames. */
   gc_markobj(g, tabref(mainthread(g)->env));
@@ -2007,7 +2007,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 	  ** demote survivors (T3 forbade demote across yield), which made
 	  ** chunking net-worse. Free only tombs slots (no rehash); mutator
 	  ** cannot run mid-walk, so no restart/gen cursor is needed.
-	  ** Next-cycle markinit asserts no residual huge MARK.
+	  ** Next-cycle lj_arena_gc_assert_demote checks no residual huge MARK.
 	  ** Upvalues are never huge. */
 	  GCRef *slots;
 	  MSize hi, hmask;
@@ -3445,7 +3445,7 @@ void lj_gc_fullgc(lua_State *L)
 	  arena_gray_reset(aa);
       }
     }
-    /* Free demote never ran; markinit is assert-only. Drop partial marks. */
+    /* Free demote never ran; mark-start assert is pure check. Drop partial marks. */
     lj_arena_gcprepare(g);
     g->gc.state = GCSpause;
   }
