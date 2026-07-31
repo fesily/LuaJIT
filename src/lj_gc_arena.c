@@ -1934,7 +1934,9 @@ static size_t gc_bitmap_sweep(global_State *g)
 	    "[markalloc-progress] free step ai=%u/%u w=%u freed=%u\n",
 	    (unsigned)ai, (unsigned)aend, (unsigned)w, (unsigned)freed);
   if (ai >= aend) {
-    /* All other arenas swept (current arenas were skipped per-arena). */
+    /* All other arenas swept (current arenas were skipped per-arena).
+    ** Empty aend (no arenas at atomic end) is not expected in a live VM. */
+    lj_assertG(aend > 0, "bitmap sweep aend==0 (no arenas at atomic?)");
     MARKALLOC_PROGRESS_LOG(
 	      "[markalloc-progress] free done → Huge aend=%u total=%zu "
 	      "strnum=%u hugenum=%u hugemem=%zu\n",
@@ -2565,56 +2567,51 @@ static size_t gc_onestep_raw(lua_State *L)
     g->gc.state = GCSsweep;
     return GCSWEEPCOST;
   case GCSsweep: {
+    /* Bitmap first, then Huge (fall-through after aend). */
     GCSize old = g->gc.total;
-    if (g->gc.sweepphase == SweepPhase_Huge) {
-      /* Run one hugesweep dispatch per onestep. Yields only for chunked
-      ** Assert under LUA_USE_ASSERT. Keyed on sweepphase (set by
-      ** gc_bitmap_sweep at aend). */
-      gc_sweep_huge(g);
+    if (g->gc.sweepphase == SweepPhase_Bitmap) {
+      gc_bitmap_sweep(g);
       lj_assertG(old >= g->gc.total, "sweep increased memory");
       g->gc.estimate -= old - g->gc.total;
-      if (g->gc.sweepphase == SweepPhase_Done) {
-	/* Phase 3: no free-window flags to clear (gcmarkflags now holds only
-	** MEMPROF); preserve MEMPROF, drop any residual bits. */
-#if defined(LUAJIT_ENABLE_MEMPROF)
-	g->gc.gcmarkflags &= GCF_MEMPROF;
-#else
-	g->gc.gcmarkflags = 0;
-#endif
-	if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
-	  lj_str_resize(L, g->str.mask >> 1);
-	lj_arena_shrink(g);
-	if (!lj_gc_fin_queue_empty(g)) {
-	  g->gc.state = GCSfinalize;
-	  MARKALLOC_PROGRESS_LOG(
-		    "[markalloc-progress] cycle → finalize total=%zu "
-		    "arenastop=%u strnum=%u\n",
-		    (size_t)g->gc.total, (unsigned)g->gc.arenastop,
-		    (unsigned)g->str.num);
-	} else {
-	  gcstat_inc(g, cycles);
-	  g->gc.stats.last_arenastop = g->gc.arenastop;
-	  g->gc.stats.last_hugenum = g->gc.hugenum;
-	  g->gc.stats.last_hugemem = g->gc.hugemem;
-	  g->gc.state = GCSpause;
-	  g->gc.debt = 0;
-	  MARKALLOC_PROGRESS_LOG(
-		    "[markalloc-progress] cycle → pause total=%zu "
-		    "estimate=%zu arenastop=%u strnum=%u\n",
-		    (size_t)g->gc.total, (size_t)g->gc.estimate,
-		    (unsigned)g->gc.arenastop, (unsigned)g->str.num);
-	}
-      }
-      return GCSWEEPMAX*GCSWEEPCOST;
+      if (g->gc.sweepphase == SweepPhase_Bitmap)
+	return GCSWEEPMAX*GCSWEEPCOST;
+      old = g->gc.total;
     }
-    /* SweepPhase_Bitmap. sweepphase alone drives bitmap vs huge. The classic
-    ** linked-list incremental gc_sweep path is shutdown-only (lj_gc_freeall)
-    ** and never reached from the state machine under GCMARK. */
-    gc_bitmap_sweep(g);
+    lj_assertG(g->gc.sweepphase == SweepPhase_Huge,
+	       "sweep expected Huge after Bitmap, got %d", g->gc.sweepphase);
+    gc_sweep_huge(g);
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
-    /* SweepPhase_Done is only reached via SweepPhase_Huge above.
-    ** gc_bitmap_sweep transitions Bitmap → Huge, never directly to Done. */
+    if (g->gc.sweepphase == SweepPhase_Done) {
+#if defined(LUAJIT_ENABLE_MEMPROF)
+      g->gc.gcmarkflags &= GCF_MEMPROF;
+#else
+      g->gc.gcmarkflags = 0;
+#endif
+      if (g->str.num <= (g->str.mask >> 2) && g->str.mask > LJ_MIN_STRTAB*2-1)
+	lj_str_resize(L, g->str.mask >> 1);
+      lj_arena_shrink(g);
+      if (!lj_gc_fin_queue_empty(g)) {
+	g->gc.state = GCSfinalize;
+	MARKALLOC_PROGRESS_LOG(
+		  "[markalloc-progress] cycle → finalize total=%zu "
+		  "arenastop=%u strnum=%u\n",
+		  (size_t)g->gc.total, (unsigned)g->gc.arenastop,
+		  (unsigned)g->str.num);
+      } else {
+	gcstat_inc(g, cycles);
+	g->gc.stats.last_arenastop = g->gc.arenastop;
+	g->gc.stats.last_hugenum = g->gc.hugenum;
+	g->gc.stats.last_hugemem = g->gc.hugemem;
+	g->gc.state = GCSpause;
+	g->gc.debt = 0;
+	MARKALLOC_PROGRESS_LOG(
+		  "[markalloc-progress] cycle → pause total=%zu "
+		  "estimate=%zu arenastop=%u strnum=%u\n",
+		  (size_t)g->gc.total, (size_t)g->gc.estimate,
+		  (unsigned)g->gc.arenastop, (unsigned)g->str.num);
+      }
+    }
     return GCSWEEPMAX*GCSWEEPCOST;
     }
   case GCSfinalize:
