@@ -576,12 +576,12 @@ static LJ_AINLINE void lj_mem_freegco_(global_State *g, void *p, size_t osize)
 ** hugeset, not the root nextgc chain). link=0 keeps nextgc untouched. */
 #define lj_mem_newgcou(L, s) \
   lj_mem_newgco_arena(L, (GCSize)(s), ArenaClass_Udata, 0)
-/* VLA/over-aligned cdata: dedicated ArenaClass_CdataV arena, NOT linked
-** to any nextgc chain (VLA cdata are enumerated by the rebuild prologue
-** CdataV-arena bitmap scan + hugeset, not a chain). link=0 keeps nextgc
-** untouched. lj_mem_newgco_arena routes size >= ArenaHugeThreshold
-** to the hugeblock path, so a single call handles both small (CdataV arena)
-** and huge (hugeset + lj_huge_set_cdatav) VLA cdata. */
+  /* VLA/over-aligned cdata: dedicated ArenaClass_CdataV arena, NOT linked
+  ** to any nextgc chain (VLA cdata are enumerated by the CdataV-arena bitmap
+  ** sweep + hugeset, not a chain). link=0 keeps nextgc untouched.
+  ** lj_mem_newgco_arena routes size >= ArenaHugeThreshold to the hugeblock
+  ** path, so a single call handles both small (CdataV arena) and huge
+  ** (hugeset + lj_huge_set_cdatav) VLA cdata. */
 #define lj_mem_newgcocv(L, s) \
   lj_mem_newgco_arena(L, (GCSize)(s), ArenaClass_CdataV, 0)
 /* POD-only traversable allocation (closures, protos): routed to the POD

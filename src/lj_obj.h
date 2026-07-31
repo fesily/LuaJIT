@@ -626,7 +626,7 @@ typedef enum {
 typedef struct GCstats {
   uint64_t nsteps[6];		/* Per-phase step counts (GCSpause..GCSfinalize). */
   uint64_t sweep_bitmap_steps;	/* GCSsweep steps in bitmap sub-phase. */
-  uint64_t sweep_rebuild_steps; /* GCSsweep steps in rebuild sub-phase. */
+  uint64_t sweep_huge_steps;	/* GCSsweep steps in hugeset sub-phase. */
   uint64_t cycles;		/* Full GC cycles completed. */
   uint64_t mark_calls;		/* propagatemark invocations. */
   uint64_t mark_cost;		/* Total traverse cost returned by propagatemark. */
@@ -634,11 +634,8 @@ typedef struct GCstats {
   uint64_t grayarena_pops;	/* gc_grayarena_pop calls (non-NULL return). */
   uint64_t sweep_cells;		/* Dead objects freed by bitmap sweep. */
   uint64_t pod_sweeps;		/* lj_arena_podsweep calls. */
-  uint64_t rebuild_prologue;	/* Rebuild sub-phase dispatch counts. */
-  uint64_t rebuild_threadscan;
-  uint64_t rebuild_hugescan;
-  uint64_t rebuild_epilogue;
-  uint64_t rebuild_assert_demote;
+  uint64_t sweep_hugescan;	/* SweepPhase_Huge: hugeset free+demote dispatches. */
+  uint64_t sweep_assert_demote;	/* SweepHuge_Assert chunk dispatches (debug). */
   uint64_t barrierback;		/* lj_gc_barrierback_arena calls. */
   uint64_t gray_notify;		/* lj_gc_grayarena_notify calls. */
   uint64_t ssb_overflow;	/* SSB flush triggered by overflow. */
@@ -661,14 +658,14 @@ typedef struct GCstats {
   uint64_t time_atomic_ns;
   uint64_t time_sweepstring_ns;
   uint64_t time_sweep_bitmap_ns;
-  uint64_t time_sweep_rebuild_ns;
+  uint64_t time_sweep_huge_ns;
   uint64_t time_finalize_ns;
   uint64_t maxpause_pause_ns;	/* Per-phase max single-step ns (pause proxy). */
   uint64_t maxpause_propagate_ns;
   uint64_t maxpause_atomic_ns;
   uint64_t maxpause_sweepstring_ns;
   uint64_t maxpause_sweep_bitmap_ns;
-  uint64_t maxpause_sweep_rebuild_ns;
+  uint64_t maxpause_sweep_huge_ns;
   uint64_t maxpause_finalize_ns;
 #endif
 } GCstats;
@@ -752,9 +749,9 @@ typedef struct GCState {
   uint32_t epoch;	/* Current free-generation; ++ at atomic end. */
   uint32_t huge_swept_gen;	/* epoch at last hugescan completion. */
   uint16_t sweepw;	/* Bitmap sweep: current word offset in arena. */
-  uint8_t sweepphase;	/* 0=bitmap sweep, 1=rebuild chain, 2=done. */
-  uint8_t rebuildphase;	/* Resumable rebuild sub-phase (RebuildPhase). */
-  MSize rebuild_asserta;	/* AssertDemote: next arena index (chunked). */
+  uint8_t sweepphase;	/* 0=bitmap, 1=hugeset free+demote, 2=done. */
+  uint8_t sweep_hugep;	/* SweepPhase_Huge sub-phase (SweepHuge_*). */
+  MSize sweep_asserta;	/* SweepHuge_Assert: next arena index (chunked). */
   MSize hugesetgen;	/* Monotonic huge-set rehash generation (stats). */
   MRef grayastack;	/* MSize *: stack of arena indices with gray objects. */
   MSize grayastop;	/* Gray arena stack: number of entries. */
