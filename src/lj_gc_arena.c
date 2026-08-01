@@ -54,6 +54,14 @@
  * sweep still uses GCSWEEPMAX. */
 #define GCSWEEP_BITMAP_MAX	256
 
+/* Mark drain quantum (P4-mark). Checked only at GC_MARK_BATCH_N boundaries.
+** Final after T3 calibration: 128 objs / 4KB (B10 1.56× classic PASS;
+** B1 +11% vs pre-quantum T0 accepted — arena still ~2.7× faster than classic).
+** See doc/arenagc-p4-mark-budget.md §7. Both conditions first-to-stop;
+** done counts every popped batch member including non-gray continues. */
+#define GCMARK_STEP_OBJS	128
+#define GCMARK_STEP_COST	(4*1024)	/* bytes of mark_cost; T3-calibrated */
+
 /* Post-sweep assert chunking: max arenas verified per SweepHuge_Assert slice.
 ** ~16 arenas/slice ≈ 256–512KB bitmap traffic, targeting sub-ms pause.
 ** Hugeset free+demote is one-shot in SweepHuge_Scan. */
@@ -1253,16 +1261,23 @@ static size_t propagatemark(global_State *g, GCobj *o)
 ** Batch gray pop (T4): pop up to GC_MARK_BATCH_N entries per iteration into
 ** a local array (gc_gray_batch_pop enforces the local-copy hard rule). The
 ** outer loop drains until empty including same-arena re-pushes from
-** traversal. Same gray-check / cost-accounting shape as the mixed drain. */
+** traversal. Same gray-check / cost-accounting shape as the mixed drain.
+**
+** P4-mark: each call drains at most one quantum (GCMARK_STEP_OBJS /
+** GCMARK_STEP_COST), checked only at batch boundaries. May return with a
+** non-empty gray stack; the caller (onestep = single call + notify, or
+** gc_propagate_gray outer loop) decides whether to continue. */
 static size_t gc_propagate_arena_pod(global_State *g, GCArena *a)
 {
   size_t m = 0;
+  MSize done = 0;
   for (;;) {
     GCobj *objs[GC_MARK_BATCH_N];
     MSize n = gc_gray_batch_pop(a, objs);
     if (n == 0) break;
     for (MSize i = 0; i < n; i++) {
       GCobj *o = objs[i];
+      done++;  /* every popped member, incl. non-gray continues */
       /* Non-gray: duplicate worklist entry or already processed. */
       if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
 	continue;
@@ -1288,6 +1303,7 @@ static size_t gc_propagate_arena_pod(global_State *g, GCArena *a)
       gcstat_add(g, mark_cost, c);
       m += c;
     }
+    if (done >= GCMARK_STEP_OBJS || m >= GCMARK_STEP_COST) break;
   }
   return m;
 }
@@ -1336,8 +1352,9 @@ static void grayheap_siftdown(global_State *g, MSize *heap, MSize n, MSize pos)
 
 /* Take the arena with the largest gray stack from the heap.
 ** Removes it immediately so priorities stay consistent while the caller
-** drains the whole stack (GCSpropagate step = one arena). Same-arena
-** re-push during the drain re-inserts via lj_gc_grayarena_notify. */
+** drains one quantum (P4-mark). Residual gray after a partial drain is
+** re-notified by onestep via lj_gc_grayarena_notify; gc_propagate_gray
+** loops via its outer while (!arena_gray_empty) until empty (atomic). */
 static GCArena *gc_grayarena_pop(global_State *g)
 {
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
@@ -1361,31 +1378,36 @@ static GCArena *gc_grayarena_pop(global_State *g)
   return NULL;
 }
 
-/* Drain every gray cell currently on this arena's gray stack.
-** Same-arena children pushed during the drain are included (locality).
-** Cross-arena / huge work is left for later GCSpropagate steps.
-** One GCSpropagate step = one arena (not one object) so large heaps finish
-** mark before mutator allocation doubles the live set again.
+/* Drain the gray stack of one arena. Same-arena children pushed during the
+** drain are included (locality). Cross-arena / huge work is left for later
+** GCSpropagate steps.
+**
+** P4-mark: each call drains at most one quantum (GCMARK_STEP_OBJS /
+** GCMARK_STEP_COST), checked only at batch boundaries. May return with a
+** non-empty gray stack. onestep calls this once then re-notifies the arena
+** via lj_gc_grayarena_notify; gc_propagate_gray loops via its outer
+** while (!arena_gray_empty) until empty (atomic fixed-point).
 **
 ** PODOnly arenas hold only FUNC/PROTO (T2 audit Finding 1); route them to
 ** the specialized drain to skip the propagatemark gct switch. Mixed Trav
 ** arenas use the general loop below. Both paths use batch gray pop (T4):
 ** gc_gray_batch_pop copies up to GC_MARK_BATCH_N entries into a local array
 ** before lowering greytop, so same-arena re-push during traversal cannot
-** alias a batch member. The outer loop drains until empty (including
-** re-pushes). TAB fast-path is T6; prefetch is T5 (off by default). */
+** alias a batch member. TAB fast-path is T6; prefetch is T5 (off by default). */
 static size_t gc_propagate_arena(global_State *g, GCArena *a)
 {
   if (a->flags & ArenaFlag_PODOnly)
     return gc_propagate_arena_pod(g, a);
   {
     size_t m = 0;
+    MSize done = 0;
     for (;;) {
       GCobj *objs[GC_MARK_BATCH_N];
       MSize n = gc_gray_batch_pop(a, objs);
       if (n == 0) break;
       for (MSize i = 0; i < n; i++) {
 	GCobj *o = objs[i];
+	done++;  /* every popped member, incl. non-gray continues */
 	/* Non-gray: duplicate worklist entry or already processed. */
 	if (LJ_UNLIKELY(!(o->gch.marked & LJ_GC_GRAY)))
 	  continue;
@@ -1409,6 +1431,7 @@ static size_t gc_propagate_arena(global_State *g, GCArena *a)
 	gcstat_add(g, mark_cost, c);
 	m += c;
       }
+      if (done >= GCMARK_STEP_OBJS || m >= GCMARK_STEP_COST) break;
     }
     return m;
   }
@@ -1579,7 +1602,9 @@ static size_t gc_propagate_gray(global_State *g)
       gcstat_add(g, mark_cost, c);
       m += c;
     }
-    /* Drain all arena gray stacks (one take = whole stack). */
+    /* Drain all arena gray stacks. Each gc_propagate_arena call drains at
+    ** most one quantum (P4-mark); the outer while (!arena_gray_empty)
+    ** loop completes the drain to empty — required for atomic correctness. */
     while ((a = gc_grayarena_pop(g)) != NULL) {
       m += gc_propagate_arena(g, a);
       /* Same-arena re-push during drain re-inserts; finish if still gray. */
@@ -2514,34 +2539,41 @@ static size_t gc_onestep_raw(lua_State *L)
   case GCSpropagate:
     {
       size_t c;
+      MSize done;
       GCobj **ssb, **ssbtop;
       GCArena *a;
       /* SSB is part of gray work: flush before each slice / empty check. */
       lj_gc_ssb_flush(g);
-      /* One step drains a whole worklist unit: all hugegray, or one arena's
-      ** full gray stack (gc_propagate_arena). Not one object per step. */
+      /* P4-mark: one onestep = one quantum, not a full drain. Huge and arena
+      ** work are each capped by GCMARK_STEP_OBJS / GCMARK_STEP_COST; residual
+      ** gray stays for the next onestep. gc_propagate_gray (atomic) owns the
+      ** outer drain-to-empty loops. */
       if (!gc_hugegray_empty(g)) {
-	c = 0;
-	while (!gc_hugegray_empty(g)) {
+	c = 0; done = 0;
+	while (!gc_hugegray_empty(g) &&
+	       done < GCMARK_STEP_OBJS && c < GCMARK_STEP_COST) {
 	  size_t n = propagatemark(g, gc_hugegray_pop(g));
 	  gcstat_add(g, mark_cost, n);
 	  c += n;
+	  done++;
 	}
 	lj_gc_ssb_flush(g);
-	return c ? c : 1;
+	return c ? c : 1;  /* residual huge stays for next onestep */
       }
       a = gc_grayarena_pop(g);
       if (a != NULL) {
-	/* mark_cost counted inside gc_propagate_arena. */
+	/* Exactly one quantum — do NOT while-drain (P4-mark). */
 	c = gc_propagate_arena(g, a);
-	/* Same-arena re-push (notify) during drain — finish this arena. */
-	while (!arena_gray_empty(a))
-	  c += gc_propagate_arena(g, a);
-	/* Huge objects marked from this arena. */
-	while (!gc_hugegray_empty(g)) {
+	if (!arena_gray_empty(a))
+	  lj_gc_grayarena_notify(g, (MSize)a->id);
+	/* Huge spawned mid-drain: spend remaining quantum, still capped. */
+	done = 0;
+	while (!gc_hugegray_empty(g) &&
+	       done < GCMARK_STEP_OBJS && c < GCMARK_STEP_COST) {
 	  size_t n = propagatemark(g, gc_hugegray_pop(g));
 	  gcstat_add(g, mark_cost, n);
 	  c += n;
+	  done++;
 	}
 	lj_gc_ssb_flush(g);
 	return c ? c : 1;
