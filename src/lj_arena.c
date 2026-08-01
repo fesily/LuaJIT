@@ -801,7 +801,8 @@ void lj_arena_freeall(global_State *g)
 void lj_arena_flushbins(GCArena *a)
 {
   ArenaFreeList *fl = mref(a->freelist, ArenaFreeList);
-  if (fl != NULL) {
+  /* Skip when bins empty: avoid scavgen invalidation under multi-slice free. */
+  if (fl != NULL && fl->binmask != 0) {
     arena_flushbins(a, fl);
     freelist_reset(fl);
     /* Force the next allocslow to rescan: bins no longer cache anything. */

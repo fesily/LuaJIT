@@ -46,13 +46,15 @@
 #define GCSWEEPMAX	40
 #define GCSWEEPCOST	10
 #define GCFINALIZECOST	100
-/* D: GenGC bitmap free budget per onestep. Cost return is intentionally NOT
- * scaled (stays GCSWEEPMAX*GCSWEEPCOST) so the pacer runs ~5 onesteps per
- * lj_gc_step, each freeing up to 256 cells (was 40) — ~6.4x free throughput.
- * Shrinks the free window during which nursery alloc promotes survivors to
- * Old. ~4KB/onestep (256*CellSize) keeps each call in microseconds. Classic
- * sweep still uses GCSWEEPMAX. */
+/* Bitmap free slice budget (legacy cell/event units for sweep_cells stats).
+** P4-sweep: dual budget — see GCSWEEP_SLICE_BILL_MAX. Classic uses GCSWEEPMAX. */
 #define GCSWEEP_BITMAP_MAX	256
+
+/* Sweep billing (P4-sweep), dual budget:
+**   bill  — live-only words scanned (no freefunc in word); stop at SLICE_BILL_MAX
+**   freed — freefunc/events (death throughput); stop at GCSWEEP_BITMAP_MAX
+** Slice stops when EITHER hits. Declared cost stays GCSWEEPMAX*GCSWEEPCOST. */
+#define GCSWEEP_SLICE_BILL_MAX	1024
 
 /* Mark drain quantum (P4-mark). Checked only at GC_MARK_BATCH_N boundaries.
 ** Final after T3 calibration: 128 objs / 4KB (B10 1.56× classic PASS;
@@ -1736,14 +1738,16 @@ static LJ_AINLINE void gc_arena_demote_survivors(GCArena *a)
 ** Epoch model (D4): aend = sweep_aend (snapshot of arenastop at atomic end).
 ** Current arenas (swept_gen == epoch) are skipped — they are nursery (born or
 ** already swept this cycle); only other arenas have freeable dead objects.
-** Free is incremental (GCSWEEP_BITMAP_MAX / word / POD-arena budget).
+** Free is incremental (dual: GCSWEEP_BITMAP_MAX freefuncs AND
+** GCSWEEP_SLICE_BILL_MAX live-only words / POD one-shot). Cost return legacy fixed.
 */
 static size_t gc_bitmap_sweep(global_State *g)
 {
   GCArena **arenas = mref(g->gc.arenas, GCArena *);
   MSize ai = g->gc.sweepa;
   uint32_t w = g->gc.sweepw;
-  uint32_t freed = 0;
+  uint32_t freed = 0;  /* death freefunc/events; stop at GCSWEEP_BITMAP_MAX */
+  size_t bill = 0;     /* live-only words; stop at GCSWEEP_SLICE_BILL_MAX */
   MSize aend = g->gc.sweep_aend;
 
   if (ai == 0 && w == UnusedBlockWords) {
@@ -1757,7 +1761,7 @@ static size_t gc_bitmap_sweep(global_State *g)
 	      (unsigned)g->gc.state);
   }
 
-  while (ai < aend && freed < GCSWEEP_BITMAP_MAX) {
+  while (ai < aend && freed < GCSWEEP_BITMAP_MAX && bill < GCSWEEP_SLICE_BILL_MAX) {
     GCArena *a = arenas[ai];
     uint32_t wtop;
     /* Nursery: current arenas (swept_gen == epoch) have no dead objects —
@@ -1781,8 +1785,9 @@ static size_t gc_bitmap_sweep(global_State *g)
 		      ArenaFlag_UdataOnly | ArenaFlag_CdataVOnly))) {
       lj_arena_flushbins(a);
       wtop = arena_blockidx((GCCellID)a->celltop - 1);
-      while (w <= wtop && freed < GCSWEEP_BITMAP_MAX) {
+      while (w <= wtop && freed < GCSWEEP_BITMAP_MAX && bill < GCSWEEP_SLICE_BILL_MAX) {
 	GCBlockword dead = a->block[w] & ~a->mark[w];
+	uint32_t nfree = 0;
 	while (dead) {
 	  uint32_t bitidx = lj_ffs(dead);
 	  GCCellID c = (w << 5) + bitidx;
@@ -1800,9 +1805,11 @@ static size_t gc_bitmap_sweep(global_State *g)
 	  probes = lj_strtab_remove(g, s);  /* backward-shift; num-- by lj_str_free */
 	  gcstat_inc(g, strings_dead_freed);
 	  lj_str_free(g, s);  /* free cell (may overwrite head / unmap) */
-	  freed += 1 + (probes >> 2);  /* bill object + probe/shift cost */
+	  freed += 1 + (probes >> 2);  /* death budget + stats */
+	  nfree++;
 	}
 	w++;
+	if (!nfree) bill++;  /* live-only word */
       }
       if (w > wtop) {
 	a->swept_gen = g->gc.epoch;
@@ -1833,8 +1840,9 @@ static size_t gc_bitmap_sweep(global_State *g)
     if (a->flags & ArenaFlag_CdataVOnly) {
       lj_arena_flushbins(a);
       wtop = arena_blockidx((GCCellID)a->celltop - 1);
-      while (w <= wtop && freed < GCSWEEP_BITMAP_MAX) {
+      while (w <= wtop && freed < GCSWEEP_BITMAP_MAX && bill < GCSWEEP_SLICE_BILL_MAX) {
 	GCBlockword dead = a->block[w] & ~a->mark[w];
+	uint32_t nfree = 0;
 	while (dead) {
 	  uint32_t bitidx = lj_ffs(dead);
 	  GCCellID c = (w << 5) + bitidx;
@@ -1850,8 +1858,10 @@ static size_t gc_bitmap_sweep(global_State *g)
 	  cd = (GCcdata *)(p + ((GCcdataVar *)p)->offset);
 	  gc_freefunc[cd->gct - ~LJ_TSTR](g, obj2gco(cd));
 	  freed++;
+	  nfree++;
 	}
 	w++;
+	if (!nfree) bill++;  /* live-only word */
       }
       if (w > wtop) {
 	a->swept_gen = g->gc.epoch;
@@ -1886,6 +1896,7 @@ static size_t gc_bitmap_sweep(global_State *g)
       if (LJ_UNLIKELY(g->gc.gcmarkflags & GCF_MEMPROF))
 	lj_memprof_emit_podfree(g, (uint32_t)fcells, (size_t)fcells << CellSizeLog2);
 #endif
+      /* POD whole-arena atomic: charge freed only (pre-P4). */
       freed += GCSWEEP_BITMAP_MAX/2;
       ai++;
       w = UnusedBlockWords;
@@ -1899,8 +1910,9 @@ static size_t gc_bitmap_sweep(global_State *g)
     ** sweep itself pushes to bins. */
     lj_arena_flushbins(a);
     wtop = arena_blockidx((GCCellID)a->celltop - 1);
-    while (w <= wtop && freed < GCSWEEP_BITMAP_MAX) {
+    while (w <= wtop && freed < GCSWEEP_BITMAP_MAX && bill < GCSWEEP_SLICE_BILL_MAX) {
       GCBlockword dead = a->block[w] & ~a->mark[w];
+      uint32_t nfree = 0;
       while (dead) {
 	uint32_t bitidx = lj_ffs(dead);
 	GCCellID c = (w << 5) + bitidx;
@@ -1946,8 +1958,10 @@ static size_t gc_bitmap_sweep(global_State *g)
 	    lj_arena_flushbins(a);
 	}
 	freed++;
+	nfree++;
       }
       w++;
+      if (!nfree) bill++;  /* live-only word */
     }
     if (w > wtop) {
       a->swept_gen = g->gc.epoch;
@@ -1961,8 +1975,8 @@ static size_t gc_bitmap_sweep(global_State *g)
   g->gc.sweepw = (uint16_t)w;
   gcstat_add(g, sweep_cells, freed);
   MARKALLOC_PROGRESS_LOG(
-	    "[markalloc-progress] free step ai=%u/%u w=%u freed=%u\n",
-	    (unsigned)ai, (unsigned)aend, (unsigned)w, (unsigned)freed);
+	    "[markalloc-progress] free step ai=%u/%u w=%u freed=%u bill=%zu\n",
+	    (unsigned)ai, (unsigned)aend, (unsigned)w, (unsigned)freed, bill);
   if (ai >= aend) {
     /* All other arenas swept (current arenas were skipped per-arena).
     ** Empty aend (no arenas at atomic end) is not expected in a live VM. */
@@ -1981,7 +1995,8 @@ static size_t gc_bitmap_sweep(global_State *g)
     g->gc.sweepa = 0;
     g->gc.sweepw = UnusedBlockWords;
   }
-  return freed;
+  /* bill bounds the slice; declared cost stays legacy fixed. */
+  return (size_t)GCSWEEPMAX * GCSWEEPCOST;
 }
 
 /*
