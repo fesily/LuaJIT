@@ -494,7 +494,10 @@ function(add_luajit_variant)
       target_link_options(${LJVAR_LIB_TARGET} PRIVATE /fsanitize=address)
     endif()
   endif()
-  install(TARGETS ${LJVAR_LIB_TARGET} RUNTIME DESTINATION .)
+  # Package VMs under Mod/deps (CMAKE_INSTALL_PREFIX = Mod/)
+  install(TARGETS ${LJVAR_LIB_TARGET}
+    RUNTIME DESTINATION deps COMPONENT plugins
+    LIBRARY DESTINATION deps COMPONENT plugins)
 
   if(WIN32)
     add_executable(${LJVAR_EXE_TARGET} ${LUAJIT_DIR}/src/luajit.c)
