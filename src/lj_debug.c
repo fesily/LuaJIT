@@ -214,6 +214,12 @@ static const char *debug_varname(const GCproto *pt, BCPos pc, BCReg slot)
 static TValue *debug_localname(lua_State *L, const lua_Debug *ar,
 			       const char **name, BCReg slot1)
 {
+#if LUA_COMPAT_TAILCALL_COUNT
+  if (ar->i_ci == 0) {  /* Virtual tail level (Lua 5.1). No locals. */
+    *name = NULL;
+    return NULL;
+  }
+#endif
   uint32_t offset = (uint32_t)ar->i_ci & 0xffff;
   uint32_t size = (uint32_t)ar->i_ci >> 16;
   TValue *frame = tvref(L->stack) + offset;

@@ -4,6 +4,10 @@
        test/compat51/run_compare.sh
 ]]
 
+
+io.stdout:setvbuf("no")
+io.stderr:setvbuf("no")
+
 local MAX_FRAMES = 64
 
 local function engine_tag()
@@ -157,6 +161,45 @@ local function case_getinfo_on_tail()
   expect("getinfo_tail: source sentinel", okSrc, detail)
 end
 
+-- DST stacktrace.lua:35: getdebuglocals calls debug.getlocal on every
+-- frame, including Lua 5.1 virtual tail frames (i_ci==0). lua_getlocal
+-- must not treat i_ci=0 as stack offset 0 (AV in debug_framepc).
+local function case_getlocal_on_tail()
+  local tlevel, tname, walked, nframes
+  local function leaf()
+    for i = 0, MAX_FRAMES - 1 do
+      local ar = debug.getinfo(i, "S")
+      if not ar then break end
+      if ar.what == "tail" then
+        tlevel = i
+        tname = debug.getlocal(i, 1)
+        break
+      end
+    end
+    nframes = 0
+    for i = 0, MAX_FRAMES - 1 do
+      if not debug.getinfo(i, "S") then break end
+      nframes = nframes + 1
+      local idx = 1
+      while idx < 256 do
+        local name = debug.getlocal(i, idx)
+        if not name then break end
+        idx = idx + 1
+      end
+    end
+    walked = true
+  end
+  local function b() return leaf() end
+  local function a() return b() end
+  a()
+  expect("getlocal_tail: found tail", tlevel ~= nil, "tlevel=" .. tostring(tlevel))
+  expect("getlocal_tail: walk finished", walked == true, "nframes=" .. tostring(nframes))
+  expect("getlocal_tail: no real local",
+    tname == nil or tostring(tname):sub(1, 1) == "(",
+    "name=" .. tostring(tname))
+end
+
+
 local function case_traceback()
   local tb
   local function leaf() tb = debug.traceback("ERR", 1) end
@@ -292,6 +335,7 @@ local function run_all()
   case_three_tails()
   case_no_tail()
   case_getinfo_on_tail()
+  case_getlocal_on_tail()
   case_traceback()
   case_vararg()
   case_deep()
