@@ -934,6 +934,31 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_NEW_PROXY_PATCH LJ_DS
 #endif
 
+/* Engine-parity debug.traceback/luaL_traceback text: the db_errorfb shape of
+** the win/mac/linux engine-embedded Lua ("LUA ERROR stack traceback:" header,
+** "\n" + 8 spaces indent, "%s" short_src + "(line,1)", and no "<%s:%d>"
+** fallback for nameless frames).
+** Default: on with LJ_DS; override -DLJ_DS_TRACEBACK_PATCH=0 for stock LuaJIT
+** formatting. */
+#ifndef LJ_DS_TRACEBACK_PATCH
+#define LJ_DS_TRACEBACK_PATCH	LJ_DS
+#endif
+
+/* DST/Klei compat API (declarations in lua.h, implementations in lj_api.c):
+** process-wide execution-error sink and protected-call status override.
+** Mirrors the Android client's LuaJIT (lua_setexecutionerror @0x00c324bc,
+** lua_pcall override @0x00c3e510); the client exports no lua_settimeslice.
+** Default: on with LJ_DS; override -DLJ_DS_EXECERROR=0 -DLJ_DS_PCALL_ERRSTATUS=0
+** to drop the entry points entirely.
+** LJ_DS_PCALL_ERRSTATUS additionally requires LJ_DS_EXECERROR. */
+#ifndef LJ_DS_EXECERROR
+#define LJ_DS_EXECERROR		LJ_DS
+#endif
+
+#ifndef LJ_DS_PCALL_ERRSTATUS
+#define LJ_DS_PCALL_ERRSTATUS	LJ_DS
+#endif
+
 #if LJ_DS
 #undef LUAJIT_ENABLE_FIN_UDATA_COMPAT
 #define LUAJIT_ENABLE_FIN_UDATA_COMPAT	1

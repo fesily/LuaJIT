@@ -798,6 +798,83 @@ LUA_API void *lua_getuserdata(lua_State *L)
 #endif
 }
 
+#if LJ_DS_EXECERROR
+/* DST: process-wide execution-error sink, backed by the ENGINE'S OWN storage.
+**
+** The engine owns the error state (macOS 32-bit client: 0x1000-byte message
+** buffer 0x00468000 reached through the pointer variable 0x00450dbc, and the
+** flag 0x00467d68 which stores that pointer, so a non-NULL flag doubles as the
+** message).  A swapped-in VM must not keep a private copy -- the engine's own
+** error display reads its block, not ours -- so the host (Injector) patches the
+** two exported pointers below with the addresses it resolves in the game image:
+**
+**   extern_error_message_buffer   -> engine's 0x1000-byte message block
+**   extern_had_execution_error    -> engine's flag slot (receives the block
+**                                    pointer; non-NULL == armed)
+**
+** While either one is NULL the storage is not wired yet: the entry points
+** degrade to no-ops (get returns NULL) instead of touching unrelated memory.
+**
+** Behaviour copied from lua_setexecutionerror (Android client 0x00c324bc /
+** macOS client 0x0032e348): first error wins, strncpy of the whole 0x1000 block
+** (no extra terminator, exactly like the engine), the flag receives the block
+** pointer.
+**
+** The original private-storage implementation is kept here for reference:
+**
+**   static char error_message_buffer[0x1000];
+**   static char *errormessage = error_message_buffer;
+**   static const char *g_had_execution_error = NULL;
+**
+**   LUA_API void lua_setexecutionerror(const char *msg)
+**   {
+**     if (g_had_execution_error != NULL)
+**       return;  // keep the first error reported
+**     strncpy(errormessage, msg, sizeof(error_message_buffer));
+**     g_had_execution_error = errormessage;
+**   }
+**
+**   LUA_API const char *lua_getexecutionerror(void)
+**   {
+**     return g_had_execution_error;
+**   }
+**
+**   LUA_API void lua_clearexecutionerror(void)
+**   {
+**     g_had_execution_error = NULL;
+**   }
+*/
+#define LJ_DS_EXECERROR_MESSAGE_SIZE	0x1000
+
+/* Host-provided engine addresses (see the comment above). */
+LUA_API char       *extern_error_message_buffer = NULL;
+LUA_API const char **extern_had_execution_error = NULL;
+
+LUA_API void lua_setexecutionerror(const char *msg)
+{
+  if (extern_error_message_buffer == NULL || extern_had_execution_error == NULL)
+    return;  /* engine storage not wired up */
+  if (*extern_had_execution_error != NULL)
+    return;  /* keep the first error reported */
+  if (msg == NULL)
+    return;  /* nothing to record (the client would strncpy from NULL) */
+  strncpy(extern_error_message_buffer, msg, LJ_DS_EXECERROR_MESSAGE_SIZE);
+  *extern_had_execution_error = extern_error_message_buffer;
+}
+
+LUA_API const char *lua_getexecutionerror(void)
+{
+  return (extern_had_execution_error != NULL) ? *extern_had_execution_error
+                                              : NULL;
+}
+
+LUA_API void lua_clearexecutionerror(void)
+{
+  if (extern_had_execution_error != NULL)
+    *extern_had_execution_error = NULL;
+}
+#endif
+
 LUA_API void lua_concat(lua_State *L, int n)
 {
   lj_checkapi_slot(n);
@@ -1178,6 +1255,14 @@ LUA_API int lua_pcall(lua_State *L, int nargs, int nresults, int errfunc)
   }
   status = lj_vm_pcall(L, api_call_base(L, nargs), nresults+1, ef);
   if (status) hook_restore(g, oldh);
+#if LJ_DS_EXECERROR && LJ_DS_PCALL_ERRSTATUS
+  /* DST: once an execution error is recorded, every protected call reports
+  ** LUA_YIELD (the client stores the literal 1) until the host clears the error
+  ** (Android client lua_pcall @0x00c3e510).  The flag lives in the engine's
+  ** storage, hence the double indirection. */
+  if (extern_had_execution_error != NULL && *extern_had_execution_error != NULL)
+    status = LUA_YIELD;
+#endif
   return status;
 }
 

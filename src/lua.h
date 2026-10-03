@@ -184,6 +184,24 @@ LUA_API void *(lua_newuserdata) (lua_State *L, size_t sz);
 /* DST: bind engine object (cSimulation*) on lua_State @ L+0xC0. */
 LUA_API void  (lua_setuserdata) (lua_State *L, void *p);
 LUA_API void *(lua_getuserdata) (lua_State *L);
+/* DST/Klei compat API: process-wide execution-error sink + protected-call status
+** override.  The switches (LJ_DS_EXECERROR / LJ_DS_PCALL_ERRSTATUS, default =
+** LJ_DS) live in lj_arch.h, which the library always includes; a stand-alone
+** consumer that includes only lua.h defines them itself.  LJ_DS_PCALL_ERRSTATUS
+** additionally requires LJ_DS_EXECERROR.
+** Provenance: Android client lua_setexecutionerror @0x00c324bc / get 0x00c3249c /
+** clear 0x00c324ac, lua_pcall status override @0x00c3e510.  The client's LuaJIT
+** exports no lua_settimeslice (only the 5.1 game Lua does). */
+#if LJ_DS_EXECERROR
+LUA_API void        (lua_setexecutionerror) (const char *msg);
+LUA_API const char *(lua_getexecutionerror) (void);
+LUA_API void        (lua_clearexecutionerror) (void);
+/* Engine-side execution-error storage, patched by the host at VM-swap time
+** (see lj_api.c); NULL until wired, then the entry points above act on the
+** engine's own message block / flag and keep its error display in sync. */
+LUA_API char       *extern_error_message_buffer;
+LUA_API const char **extern_had_execution_error;
+#endif
 LUA_API int   (lua_getmetatable) (lua_State *L, int objindex);
 LUA_API void  (lua_getfenv) (lua_State *L, int idx);
 

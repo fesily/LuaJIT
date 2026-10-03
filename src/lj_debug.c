@@ -19,6 +19,14 @@
 #include "lj_jit.h"
 #endif
 
+#if LJ_DS_EXECERROR
+/* lua.h guards the *executionerror declarations with LJ_DS_EXECERROR, but
+** lj_obj.h reads lua.h before lj_arch.h defines that switch, so the guard is
+** false by the time this TU sees lua.h; repeat the prototype verbatim here
+** (definition lives in lj_api.c). */
+LUA_API void (lua_setexecutionerror) (const char *msg);
+#endif
+
 /* -- Frames -------------------------------------------------------------- */
 
 /* Get frame corresponding to a level. */
@@ -793,7 +801,11 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
   int lim = TRACEBACK_LEVELS1;
   lj_Debug ar;
   if (msg) lua_pushfstring(L, "%s\n", msg);
+#if LJ_DS_TRACEBACK_PATCH
+  lua_pushliteral(L, "LUA ERROR stack traceback:");
+#else
   lua_pushliteral(L, "stack traceback:");
+#endif
   while (lua_getstack(L1, level++, (lua_Debug*)&ar)) {
     GCfunc *fn;
     if (level > lim) {
@@ -824,9 +836,23 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
       lua_pushfstring(L, "\n\t[builtin#%d]:", fn->c.ffid);
     else
 #endif
+#if LJ_DS_TRACEBACK_PATCH
+      /* DST: 8-space indent, ar.source with only a leading '@' dropped -- the
+      ** engine's db_errorfb formats lua_Debug+0x10 = source, not short_src
+      ** (verify: _db_getinfo @0x0032b6a6 maps local_6c->"source", local_58->
+      ** "short_src") -- and "(line,1)" instead of "%d:". */
+      lua_pushfstring(L, "\n        %s", *ar.source == '@' ? ar.source + 1
+                                                          : ar.source);
+#else
       lua_pushfstring(L, "\n\t%s:", ar.short_src);
+#endif
+#if LJ_DS_TRACEBACK_PATCH
+    if (ar.currentline > 0)
+      lua_pushfstring(L, "(%d,1)", ar.currentline);
+#else
     if (ar.currentline > 0)
       lua_pushfstring(L, "%d:", ar.currentline);
+#endif
     if (*ar.namewhat) {
       lua_pushfstring(L, " in function " LUA_QS, ar.name);
     } else {
@@ -838,14 +864,34 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
 #else
 	lua_pushliteral(L, " ?");
 #endif
-      } else {
+      }
+#if LJ_DS_TRACEBACK_PATCH
+      /* DST engine parity: the engine's db_errorfb has no "<%s:%d>" fallback
+      ** (no such literal in any win/mac/linux engine binary), so a nameless
+      ** Lua frame ends right after the source/line part. */
+#else
+      else {
 	lua_pushfstring(L, " in function <%s:%d>",
 			ar.short_src, ar.linedefined);
       }
+#endif
     }
     if ((int)(L->top - L->base) - top >= 15)
       lua_concat(L, (int)(L->top - L->base) - top);
   }
   lua_concat(L, (int)(L->top - L->base) - top);
+#if LJ_DS_EXECERROR
+  /* DST fork addition: arm the process-wide execution-error sink with the
+  ** finished traceback text.  Only the Android client's LuaJIT and the macOS
+  ** client engine carry the sink in the official builds (win/linux engines and
+  ** lua51DS.dll have no *executionerror entry points); like the 5.1 flavor, we
+  ** arm it here so a VM swap keeps one error path. */
+  {
+    const char *msg = NULL;
+    if (lua_type(L, -1) == LUA_TSTRING)
+      msg = lua_tolstring(L, -1, NULL);
+    lua_setexecutionerror(msg);
+  }
+#endif
 }
 
