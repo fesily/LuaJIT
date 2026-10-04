@@ -197,8 +197,10 @@ LUA_API void        (lua_setexecutionerror) (const char *msg);
 LUA_API const char *(lua_getexecutionerror) (void);
 LUA_API void        (lua_clearexecutionerror) (void);
 /* Engine-side execution-error storage, patched by the host at VM-swap time
-** (see lj_api.c); NULL until wired, then the entry points above act on the
-** engine's own message block / flag and keep its error display in sync. */
+** (see lj_api.c).  Both are required (the engine's own behaviour is flag +
+** buffer): extern_error_message_buffer is the 0x1000-byte message block, and
+** extern_had_execution_error is the engine flag slot that stores the block
+** pointer.  NULL means "not wired": the entry points degrade to no-ops. */
 LUA_API char       *extern_error_message_buffer;
 LUA_API const char **extern_had_execution_error;
 #endif
