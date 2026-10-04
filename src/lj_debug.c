@@ -363,8 +363,10 @@ const char *lj_debug_funcname(lua_State *L, cTValue *frame, const char **name)
       if (bc_op(*ip) == BC_ITERC) slot -= 3;
       return lj_debug_slotname(pt, ip, slot, name);
     } else if (mm != MM__MAX) {
+#if !LJ_DS_DEBUG_FUNCNAME_PATCH
       *name = strdata(mmname_str(G(L), mm));
       return "metamethod";
+#endif
     }
   }
   return NULL;
@@ -809,6 +811,21 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
   while (lua_getstack(L1, level++, (lua_Debug*)&ar)) {
     GCfunc *fn;
     if (level > lim) {
+#if LJ_DS_TRACEBACK_PATCH
+      /* DST engine parity: 5.1 db_errorfb advances the *numeric* level
+      ** (`while (lua_getstack(L1, level+LEVELS2, &ar)) level++;`).  Upstream
+      ** LuaJIT's `level = ar.i_ci - TRACEBACK_LEVELS2` is wrong as soon as the
+      ** LUA_COMPAT_TAILCALL_COUNT layer materializes virtual tail levels: every
+      ** virtual level reports i_ci == 0, so the walk restarts at a negative
+      ** level and re-prints frames (duplicates + phantom C frames). */
+      if (!lua_getstack(L1, level + TRACEBACK_LEVELS2, (lua_Debug*)&ar)) {
+	level--;
+      } else {
+	lua_pushliteral(L, "\n\t...");
+	while (lua_getstack(L1, level + TRACEBACK_LEVELS2, (lua_Debug*)&ar))
+	  level++;
+      }
+#else
       if (!lua_getstack(L1, level + TRACEBACK_LEVELS2, (lua_Debug*)&ar)) {
 	level--;
       } else {
@@ -816,11 +833,17 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
 	lua_getstack(L1, -10, (lua_Debug*)&ar);
 	level = ar.i_ci - TRACEBACK_LEVELS2;
       }
+#endif
       lim = 2147483647;
       continue;
     }
 #if LUA_COMPAT_TAILCALL_COUNT
-    if (ar.i_ci == 0) {
+    /* DST engine parity: the engine prints one "\n        =(tail call) ?" line
+    ** per elided tail call (5.1 info_tailcall + db_errorfb), while the upstream
+    ** LuaJIT marker collapses them into "\n\t(...tail calls...)".  Under
+    ** LJ_DS_TRACEBACK_PATCH the virtual level falls through to the normal
+    ** rendering below, which reproduces the engine's line exactly. */
+    if (ar.i_ci == 0 && !LJ_DS_TRACEBACK_PATCH) {
       lj_debug_getinfo(L1, "S", &ar, 0);
       lua_pushliteral(L, "\n\t(...tail calls...)");
       if ((int)(L->top - L->base) - top >= 15)
@@ -858,11 +881,19 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
     } else {
       if (*ar.what == 'm') {
 	lua_pushliteral(L, " in main chunk");
+#if LJ_DS_TRACEBACK_PATCH
+      } else if (*ar.what == 'C' || *ar.what == 't') {
+	/* DST engine parity: the engine prints " ?" for both C frames and the
+	** "=(tail call)" virtual frame; a tail frame has no C function, so the
+	** stock " at %p" branch must not be taken. */
+	lua_pushliteral(L, " ?");
+#else
       } else if (*ar.what == 'C') {
 #if !LUA_COMPAT_DEBUG_TRACE_C_DISABLE_ADDRESS
 	lua_pushfstring(L, " at %p", fn->c.f);
 #else
 	lua_pushliteral(L, " ?");
+#endif
 #endif
       }
 #if LJ_DS_TRACEBACK_PATCH

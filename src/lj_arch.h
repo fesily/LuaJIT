@@ -944,6 +944,20 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_TRACEBACK_PATCH	LJ_DS
 #endif
 
+/* Engine-parity frame naming for debug.getinfo/traceback.  The engine-embedded
+** Lua 5.1 getfuncname() (macOS _db_errorfb path: ldebug.c:544-555) names only
+** frames pushed by OP_CALL/OP_TAILCALL/OP_TFORLOOP; a frame entered through a
+** metamethod (VM-called __index/__newindex/...) keeps namewhat == "" and the
+** engine prints no " in function '...'" suffix.  LuaJIT's lj_debug_funcname()
+** reports "metamethod" + the metamethod event name for exactly those frames, so
+** the printed traceback (and the name fields mods read via debug.getinfo) would
+** otherwise differ from the engine's Lua.  Suppressing it restores parity.
+** Default: on with LJ_DS_TRACEBACK_PATCH; override
+** -DLJ_DS_DEBUG_FUNCNAME_PATCH=0 for stock LuaJIT naming. */
+#ifndef LJ_DS_DEBUG_FUNCNAME_PATCH
+#define LJ_DS_DEBUG_FUNCNAME_PATCH LJ_DS_TRACEBACK_PATCH
+#endif
+
 /* DST/Klei compat API (declarations in lua.h, implementations in lj_api.c):
 ** process-wide execution-error sink and protected-call status override.
 ** Mirrors the Android client's LuaJIT (lua_setexecutionerror @0x00c324bc,
