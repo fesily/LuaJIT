@@ -828,7 +828,12 @@ static TRef rec_call_specialize(jit_State *J, GCfunc *fn, TRef tr)
 }
 
 /* Record call setup. */
+#if LUA_COMPAT_TAILCALL_CFRAME
+static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs,
+			   TValue *calleep)
+#else
 static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs)
+#endif
 {
   RecordIndex ix;
   TValue *functv = &J->L->base[func];
@@ -850,6 +855,10 @@ static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs)
     fbase[0] = ix.mobj;  /* Replace function. */
     functv = &ix.mobjv;
   }
+#if LUA_COMPAT_TAILCALL_CFRAME
+  if (calleep)  /* Return the resolved callee (BC_CALLT dispatch needs it). */
+    copyTV(J->L, calleep, functv);
+#endif
   kfunc = rec_call_specialize(J, funcV(functv), fbase[0]);
 #if LJ_FR2
   fbase[0] = kfunc;
@@ -863,7 +872,11 @@ static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs)
 /* Record call. */
 void lj_record_call(jit_State *J, BCReg func, ptrdiff_t nargs)
 {
+#if LUA_COMPAT_TAILCALL_CFRAME
+  rec_call_setup(J, func, nargs, NULL);
+#else
   rec_call_setup(J, func, nargs);
+#endif
   /* Bump frame. */
   J->framedepth++;
   J->base += func+1+LJ_FR2;
@@ -872,6 +885,73 @@ void lj_record_call(jit_State *J, BCReg func, ptrdiff_t nargs)
     lj_trace_err(J, LJ_TRERR_STACKOV);
 }
 
+#if LUA_COMPAT_TAILCALL_CFRAME
+/* Record the frame replacement of a tail call. Also used for the
+** FFH_TAILCALL path (recff_metacall), which replaces the fast function frame.
+*/
+static void rec_tailcall(jit_State *J, BCReg func)
+{
+  if (frame_isvarg(J->L->base - 1)) {
+    BCReg cbase = (BCReg)frame_delta(J->L->base - 1);
+    if (--J->framedepth < 0)
+      lj_trace_err(J, LJ_TRERR_NYIRETL);
+    J->baseslot -= (BCReg)cbase;
+    J->base -= cbase;
+    func += cbase;
+  }
+  /* Move func + args down. */
+  if (LJ_FR2 && J->baseslot == 2)
+    J->base[func+1] = TREF_FRAME;
+  memmove(&J->base[-1-LJ_FR2], &J->base[func], sizeof(TRef)*(J->maxslot+1+LJ_FR2));
+  /* Note: the new TREF_FRAME is now at J->base[-1] (even for slot #0). */
+#if LUA_COMPAT_TAILCALL_COUNT && LJ_TARGET_X64
+  /* Inline: L->tailcalls[((BASE-1)-stack)/sizeof(TValue)]++ */
+  {
+    TRef trL, trstack, trtc, trbs, tridx, trofs, traddr, trv, trn;
+    trL = emitir(IRT(IR_LREF, IRT_THREAD), 0, 0);
+    trstack = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_STACK);
+    trtc = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_TAILCALLS);
+    trbs = emitir(IRT(IR_SUB, IRT_INTP), REF_BASE, trstack);
+    tridx = emitir(IRTI(IR_BSHR), trbs, lj_ir_kint(J, 3));
+    tridx = emitir(IRTI(IR_ADD), tridx, lj_ir_kint(J, -1));
+    trofs = emitir(IRTI(IR_BSHL), tridx, lj_ir_kint(J, 2));
+    traddr = emitir(IRT(IR_ADD, IRT_PGC), trtc, trofs);
+    trv = emitir(IRT(IR_XLOAD, IRT_INT), traddr, 0);
+    trn = emitir(IRTI(IR_ADD), trv, lj_ir_kint(J, 1));
+    emitir(IRT(IR_XSTORE, IRT_INT), traddr, trn);
+  }
+#endif
+  /* Tailcalls can form a loop, so count towards the loop unroll limit. */
+  if (++J->tailcalled > J->loopunroll)
+    lj_trace_err(J, LJ_TRERR_LUNROLL);
+}
+
+/* Record tail call. */
+void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
+{
+  rec_call_setup(J, func, nargs, NULL);
+  rec_tailcall(J, func);
+}
+
+/* Record BC_CALLT with dispatch on the callee type (ditto the interpreter): a
+** Lua callee replaces the frame (stock tail call), a C/FF callee is recorded
+** like a normal call (5.1 PCRC) and the trailing BC_RETM emitted by the parser
+** records the return. */
+static void rec_callt(jit_State *J, BCReg func, ptrdiff_t nargs)
+{
+  TValue callee;
+  rec_call_setup(J, func, nargs, &callee);
+  if (!isluafunc(funcV(&callee))) {  /* C/FF callee: normal call. */
+    J->framedepth++;
+    J->base += func+1+LJ_FR2;
+    J->baseslot += func+1+LJ_FR2;
+    if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
+      lj_trace_err(J, LJ_TRERR_STACKOV);
+  } else {
+    rec_tailcall(J, func);
+  }
+}
+#else
 /* Record tail call. */
 void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
 {
@@ -910,6 +990,7 @@ void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
   if (++J->tailcalled > J->loopunroll)
     lj_trace_err(J, LJ_TRERR_LUNROLL);
 }
+#endif
 
 /* Check unroll limits for down-recursion. */
 static int check_downrec_unroll(jit_State *J, GCproto *pt)
@@ -2682,7 +2763,11 @@ void lj_record_ins(jit_State *J)
     rc = (BCReg)(J->L->top - J->L->base) - ra - LJ_FR2;
     /* fallthrough */
   case BC_CALLT:
+#if LUA_COMPAT_TAILCALL_CFRAME
+    rec_callt(J, ra, (ptrdiff_t)rc-1);
+#else
     lj_record_tailcall(J, ra, (ptrdiff_t)rc-1);
+#endif
     break;
 
   case BC_VARG:

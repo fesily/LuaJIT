@@ -4331,6 +4331,13 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov LFUNC:RB, [RA-16]
     |  checktp_nc LFUNC:RB, LJ_TFUNC, ->vmeta_call
     |->BC_CALLT_Z:
+#if LUA_COMPAT_TAILCALL_CFRAME
+    |  // 5.1 PCRC parity: a C/FF callee keeps the caller frame (normal call).
+    |  mov TMPR, RB
+    |  cleartp TMPR
+    |  cmp byte LFUNC:TMPR->ffid, 0	// FF_LUA == 0 (lj_obj.h:496)
+    |  jne ->BC_CALLT_CFRAME
+#endif
     |  mov PC, [BASE-8]
     |  test PCd, FRAME_TYPE
     |  jnz >7
@@ -4363,6 +4370,10 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |3:
     |  cleartp LFUNC:RB
     |  mov NARGS:RDd, MULTRES
+#if LUA_COMPAT_TAILCALL_CFRAME
+    |  // Only Lua callees reach this point (C/FF took ->BC_CALLT_CFRAME).
+    |  ins_callt
+#else
     |  cmp byte LFUNC:RB->ffid, 1	// (> FF_C) Calling a fast function?
     |  ja >5
     |4:
@@ -4379,6 +4390,20 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov KBASE, [KBASE+PC2PROTO(k)]
     |  jmp <4
     |
+#endif
+    |->BC_CALLT_CFRAME:			// C/FF callee: normal call, caller frame kept.
+#if LUA_COMPAT_TAILCALL_CFRAME
+    |  cleartp LFUNC:RB
+    |  // The CALLT prologue clobbered KBASE (= old BASE). Restore it from the
+    |  // calling frame: fff_res resumes that frame's bytecode with it, and
+    |  // vmeta_call's KBASE/BASE flag test must not see the CALLT encoding.
+    |  mov LFUNC:KBASE, [BASE-16]
+    |  cleartp LFUNC:KBASE
+    |  mov KBASE, LFUNC:KBASE->pc
+    |  mov KBASE, [KBASE+PC2PROTO(k)]
+    |  mov BASE, RA
+    |  ins_call
+#endif
     |7:  // Tailcall from a vararg function.
     |  sub PC, FRAME_VARG
     |  test PCd, FRAME_TYPEP

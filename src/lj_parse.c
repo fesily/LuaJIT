@@ -2704,6 +2704,10 @@ static void parse_return(LexState *ls, int eflags)
 {
   BCIns ins;
   FuncState *fs = ls->fs;
+#if LUA_COMPAT_TAILCALL_CFRAME
+  BCIns ins_ret = 0;
+  int emit_ret = 0;
+#endif
   fs->flags |= PROTO_HAS_RETURN;
   if (!(eflags & EXPR_F_RET1) && (parse_isend(ls->tok) || ls->tok == ';')) {
     ins = BCINS_AD(BC_RET0, 0, 1);  /* Bare return. */
@@ -2731,6 +2735,11 @@ static void parse_return(LexState *ls, int eflags)
 #endif
 	fs->pc--;
 	ins = BCINS_AD(bc_op(*ip)-BC_CALL+BC_CALLT, bc_a(*ip), bc_c(*ip));
+#if LUA_COMPAT_TAILCALL_CFRAME
+	/* A C/FF callee runs as a normal call; this RET forwards its results. */
+	ins_ret = BCINS_AD(BC_RETM, bc_a(*ip), 0);
+	emit_ret = 1;
+#endif
 #endif
       } else {  /* Can return the result from any register. */
 	ins = BCINS_AD(BC_RET1, expr_toanyreg(fs, &e), 2);
@@ -2750,6 +2759,10 @@ static void parse_return(LexState *ls, int eflags)
   if (fs->flags & PROTO_CHILD)
     bcemit_AJ(fs, BC_UCLO, 0, 0);  /* May need to close upvalues first. */
   bcemit_INS(fs, ins);
+#if LUA_COMPAT_TAILCALL_CFRAME
+  if (emit_ret)
+    bcemit_INS(fs, ins_ret);
+#endif
 }
 
 /* Parse 'break' statement. */

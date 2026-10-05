@@ -1013,6 +1013,26 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LUA_COMPAT_TAILCALL_DEBUG LUA_COMPAT_TAILCALL_COUNT
 #endif
 
+/* 5.1 PCRC parity: a tail call to a C/fast function must not elide the caller
+** frame.  5.1's OP_TAILCALL only replaces the frame for Lua callees (PCRLUA);
+** for C callees it calls them normally and keeps the caller frame
+** (src/lua51/src/lvm.c:611-636).  With this switch on, BC_CALLT tests the
+** callee's ffid: Lua callees keep the stock eliding path, C/FF callees run as
+** a normal call and the function's trailing BC_RETM (emitted by the parser)
+** returns their results to the caller's caller.
+** Implemented by the x64+GC64 interpreter backend only (vm_x64.dasc, LJ_FR2);
+** all other backends (x86, x64 without GC64, arm, ...) keep stock semantics and
+** never emit the trailing BC_RETM.
+** Default: on with LJ_DS.  Override -DLUA_COMPAT_TAILCALL_CFRAME=0 for stock
+** LuaJIT behavior (caller frame elided, C frame unnamed). */
+#ifndef LUA_COMPAT_TAILCALL_CFRAME
+#if LJ_DS && LJ_TARGET_X64 && LJ_FR2
+#define LUA_COMPAT_TAILCALL_CFRAME 1
+#else
+#define LUA_COMPAT_TAILCALL_CFRAME 0
+#endif
+#endif
+
 #ifndef LUA_COMPAT_DEBUG_TRACE_C_DISABLE_ADDRESS
 #define LUA_COMPAT_DEBUG_TRACE_C_DISABLE_ADDRESS LUAJIT_ENABLE_LUA51COMPAT
 #endif
