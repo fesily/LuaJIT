@@ -91,7 +91,7 @@ local function addr_of(obj)
   local s = tostring(obj)
   local hex = s:match("0x(%x+)")
   if not hex then return nil end
-  return tonumber(hex, 16)
+  return tonumber("0x" .. hex)  -- Windows: strtoul is 32-bit; base-16 tonumber saturates 64-bit addresses
 end
 
 local function marked_byte(obj)

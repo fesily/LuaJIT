@@ -78,7 +78,7 @@ local function addr_of(co)
   local s = tostring(co)
   local hex = s:match("thread: 0x(%x+)")
   if not hex then return nil end
-  return tonumber(hex, 16)
+  return tonumber("0x" .. hex)  -- Windows: strtoul is 32-bit; base-16 tonumber saturates 64-bit addresses
 end
 
 ----------------------------------------------------------------

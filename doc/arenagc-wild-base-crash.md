@@ -287,7 +287,7 @@ EXP-VEH-HIST[3] val=stack+0x0B0 rip=…(RVA 0x1CE7) op=0x33 prevop=0x42
 
 **gc 全量扫描（仓库 `builds/ninja-multi-vcpkg` 重建 `luajit-arenagc` 后）**：`luajit/test/gc/*.lua` 30 个 → 12 通过；其余 18 个与本次缺陷无关：
 - 15 个脚本前提不满足：`cannot resolve symbol 'clock_gettime'`（deep_pause / inc_pause / inc_pause_bench）、`module 'memprof' not found`（memprof_* 共 13 个）——属环境/可选模块；
-- 3 个 `openuv_vector_v31_assert` / `thread_openupval_sweep_assert` / `thread_permgray_residual_assert` 在 **`lj_cconv_ct_ct+0x35f`**（`movzx eax,[r14]`，`r14=0x100000000`）AV，**修复前/后构建各 3/3 次同样复现**（把 `barrierback` 临时换回 push 版重编做 A/B）⇒ **既有独立缺陷**，与 shadow space/`barrierback` 无关（用例自述 “FFI white-box (best-effort)”，自行按地址读内部结构）。
+- 3 个 `openuv_vector_v31_assert` / `thread_openupval_sweep_assert` / `thread_permgray_residual_assert` 在 **`lj_cconv_ct_ct+0x35f`**（`movzx eax,[r14]`）AV —— **已定位并修复（测试侧，与 VM 无关）**：三个白盒用例用 `addr_of()`（从 `tostring(obj)` 正则取十六进制地址）后 `tonumber(hex, 16)` 解析，而 **Windows 的 `strtoul`/`unsigned long` 是 32 位**，64 位 GC 地址被饱和成 `4294967295`（实测：`tonumber("01b0d29056c0",16)` = 4294967295，`tonumber("0x01b0d29056c0")` = 1858958546624；诊断插桩实测 `addr_of(thread: 0x01b0d29056c0)` 返回 `p=ffffffff`），随后把该值当指针解引用 ⇒ AV（现场 fault 地址即这类值，例如 `0x1_00000000`）。修复：`tonumber(hex, 16)` → `tonumber("0x" .. hex)`（每文件一行），三用例复测 **11 / 12 / 51 断言全过、0 失败**。A/B（`barrierback` 临时换回 push 版重编）证明其与该修复无关；arena 与默认变体同样复现，Linux 上 `unsigned long` 为 64 位故作者环境不触发。
 
 **对齐副产物（实测）**：原 push 版在 `lj_BC_TSETV` 的 barrier `call` 处实测 `rsp & 0xf == 8`（不符 Win64「call 时 16 字节对齐」）；本修复后为 `0`，顺带修掉这个既有 ABI 瑕疵。
 
