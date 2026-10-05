@@ -389,19 +389,38 @@
 |// light-gray and on-stack/weak gray skip). C still does gc_obj_ismarked.
 |.macro barrierback, tab, reg
 |.if LJ_HASGCMARK
-|  push RC				// rax (caller-save, return value)
-|  push TMPR				// r10 (caller-save)
-|  push ITYPE				// r11 (caller-save)
-|  push RA				// rcx (caller-save / WIN64 CARG1)
-|  push BASE				// rdx (caller-save / WIN64 CARG2)
+|  // WIN64 ABI: the callee owns the 32-byte shadow space above its return
+|  // address.  The old push/pop version kept its saves inside that space, so
+|  // lj_gc_barrierback_arena's prologue ("mov [rsp+10h],rbx") overwrote the
+|  // saved RA (rcx): after the pops RA held rbx (DISPATCH) and the next
+|  // "mov RB, [BASE+RA*8]" read a wild address -> AV in BC_TSETV/BC_TSETS/
+|  // BC_GGET (the "wild base" family).  Under ASan the callee also spills the
+|  // incoming args, which additionally clobbered the saved BASE with CARG1
+|  // (= G(L)), i.e. the observed "L->base = G(L)" event.
+|  // Reserve the shadow space first and keep the saves above it; this also
+|  // restores the 16-byte stack alignment the push-only version broke.
+|  //
+|  // Details: doc/arenagc-wild-base-crash.md §追记 14.
+|  // Original (buggy) sequence, kept for reference:
+|  //   push RC; push TMPR; push ITYPE; push RA; push BASE
+|  //   lea CARG1, [DISPATCH+GG_DISP2G]; mov CARG2, tab
+|  //   call extern lj_gc_barrierback_arena
+|  //   pop BASE; pop RA; pop ITYPE; pop TMPR; pop RC
+|  sub rsp, 0x50
+|  mov [rsp+0x20], RC			// rax (caller-save, return value)
+|  mov [rsp+0x28], TMPR			// r10 (caller-save)
+|  mov [rsp+0x30], ITYPE		// r11 (caller-save)
+|  mov [rsp+0x38], RA			// rcx (caller-save / WIN64 CARG1)
+|  mov [rsp+0x40], BASE			// rdx (caller-save / WIN64 CARG2)
 |  lea CARG1, [DISPATCH+GG_DISP2G]
 |  mov CARG2, tab
 |  call extern lj_gc_barrierback_arena
-|  pop BASE
-|  pop RA
-|  pop ITYPE
-|  pop TMPR
-|  pop RC
+|  mov BASE, [rsp+0x40]
+|  mov RA, [rsp+0x38]
+|  mov ITYPE, [rsp+0x30]
+|  mov TMPR, [rsp+0x28]
+|  mov RC, [rsp+0x20]
+|  add rsp, 0x50
 |.else
 |  and byte tab->marked, (uint8_t)~LJ_GC_BLACK	// black2gray(tab)
 |  mov reg, [DISPATCH+DISPATCH_GL(gc.grayagain)]
