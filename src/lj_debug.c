@@ -29,6 +29,25 @@ LUA_API void (lua_setexecutionerror) (const char *msg);
 
 /* -- Frames -------------------------------------------------------------- */
 
+#if LUA_COMPAT_TAILCALL_COUNT
+/* Is this slot a Lua function frame in the debug walk?  Besides plain Lua
+** frames this covers a frame that an in-place tail call reused while its
+** caller was C: the ftuz keeps the C caller's delta marker (FRAME_C/FRAME_CP/
+** FRAME_PCALL) instead of a PC, while the function slot holds a Lua function.
+** Such a frame owns a tail-call count exactly like a plain Lua frame; without
+** the extra check its tail levels are lost (main chunk top-level tail calls). */
+static int debug_isluaframe(cTValue *frame)
+{
+  if (frame_islua(frame))
+    return 1;
+  if (frame_isc(frame) || frame_ispcall(frame)) {
+    GCfunc *fn = frame_func(frame);
+    return fn->c.gct == ~LJ_TFUNC && isluafunc(fn);
+  }
+  return 0;
+}
+#endif
+
 /* Get frame corresponding to a level. */
 cTValue *lj_debug_frame(lua_State *L, int level, int *size)
 {
@@ -40,7 +59,7 @@ cTValue *lj_debug_frame(lua_State *L, int level, int *size)
 #if LUA_COMPAT_TAILCALL_COUNT
     {
       int tc = 0;
-      if (frame_islua(frame)) {
+      if (debug_isluaframe(frame)) {
 	tc = frame_tailcalls(L, frame);
 	if (tc < 0) tc = 0;
 	if (tc > LJ_TAILCALL_COUNT_MAX) tc = LJ_TAILCALL_COUNT_MAX;
