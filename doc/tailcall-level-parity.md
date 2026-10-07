@@ -51,7 +51,7 @@ static int debug_isluaframe(cTValue *frame)
 
 - `test/compat51/mainchunk_tailcall.lua`：PUC ✓ / 修复后 fork ✓（`luajit.exe` 与 `lua51DS.dll` 两条宿主）。
 - `builds/hang_repro/fp_tail7.lua` A1/A2/A3/A4 与 PUC **逐项全等**（同宿主下 `end/tails` = 4/2、4/2、4/1、5/3；A3 对照不变）。
-- `ctest -C Debug -R "harness_unit|game_mod_throw_abort|luajit_parity"` **7/7**（外层 `tests/CMakeLists.txt` 登记 `luajit_parity_mainchunk_tailcall`，直接跑本仓测试文件）。
+- `ctest -C Debug -R "harness_unit|game_mod_throw_abort|luajit_parity"` **7/7**（外层 `tests/CMakeLists.txt` 登记 `luajit_parity_mainchunk_tailcall`，跑 `tests/lua_vm_parity/mainchunk_tailcall.lua` 副本）。
 - 引擎（DST 专用服，history：见 `docs/mac-lua51-parity-audit.md` §5.2）：`hide` + `DS_NOJITWINDOW=1` 下受保护 mod 全链 `modmain_ → config → main` ✓（修复前仅 `modmain_.lua`，静默空桩）；日志 `builds/hang_repro/fix_hide_nofix.log`。
 
 ## 发布侧注意（实测，未改插件）
