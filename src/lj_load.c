@@ -65,11 +65,52 @@ static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
   return NULL;
 }
 
+#if LJ_DS_LOADLOG
+/* Forward declarations (the definitions live further down). */
+static int ds_loadlog_on(void);
+static int ds_loadlog_want(const char *name);
+static void ds_loadlog_dump_write(const char *name, const char *buf, size_t size);
+
+typedef struct {
+  lua_Reader r; void *d; const char *cn;
+  char *acc; size_t accn, acccap;      /* accumulated chunk body */
+} DSLogCtx;
+static const char *ds_logreader(lua_State *L, void *ud, size_t *size) {
+  DSLogCtx *c = (DSLogCtx *)ud;
+  const char *chunk = c->r(L, c->d, size);
+  int eoi = (!chunk || !size || *size == 0);
+  if (!eoi && ds_loadlog_on() && ds_loadlog_want(c->cn)) {
+    if (c->accn + *size > c->acccap) {
+      size_t cap = c->acccap ? c->acccap * 2 : 65536;
+      char *p;
+      while (cap < c->accn + *size) cap *= 2;
+      p = (char *)realloc(c->acc, cap);
+      if (p) { c->acc = p; c->acccap = cap; }
+    }
+    if (c->acc && c->accn + *size <= c->acccap) {
+      memcpy(c->acc + c->accn, chunk, *size);
+      c->accn += *size;
+    }
+  } else if (eoi && ds_loadlog_on() && c->acc) {
+    ds_loadlog_dump_write(c->cn, c->acc, c->accn);
+    free(c->acc);
+    c->acc = NULL; c->accn = c->acccap = 0;
+  }
+  return chunk;
+}
+#endif
+
 LUA_API int lua_loadx(lua_State *L, lua_Reader reader, void *data,
 		      const char *chunkname, const char *mode)
 {
   LexState ls;
   int status;
+#if LJ_DS_LOADLOG
+  DSLogCtx dsctx;
+  if (ds_loadlog_on()) { dsctx.r = reader; dsctx.d = data; dsctx.cn = chunkname;
+    dsctx.acc = NULL; dsctx.accn = 0; dsctx.acccap = 0;
+    reader = ds_logreader; data = &dsctx; }
+#endif
   ls.rfunc = reader;
   ls.rdata = data;
   ls.chunkarg = chunkname ? chunkname : "?";
@@ -167,6 +208,73 @@ static const char *custom_strstr(const char *haystack, int haystack_length, cons
     
     return NULL;
 }
+
+#if LJ_DS_LOADLOG
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#define DS_LOADLOG_MKDIR(p) _mkdir(p)
+#else
+#include <sys/stat.h>
+#define DS_LOADLOG_MKDIR(p) mkdir(p, 0755)
+#endif
+/* DS_LOADLOG=1: write every loaded chunk body into ds_loaddump/ (cwd-relative, i.e.
+** <game>/data/ds_loaddump/ in-game); DS_LOADLOG_FILTER=<substr> restricts it to
+** chunk names containing <substr>.  Used to read engine-decrypted mod sources. */
+static int ds_loadlog_on(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("DS_LOADLOG");
+    cached = (v && *v && *v != '0') ? 1 : 0;
+  }
+  return cached;
+}
+static const char *ds_loadlog_filter(void) {
+  static const char *cached = NULL;
+  static int inited = 0;
+  if (!inited) {
+    inited = 1;
+    cached = getenv("DS_LOADLOG_FILTER");
+    if (cached && !*cached) cached = NULL;
+  }
+  return cached;
+}
+static int ds_loadlog_want(const char *name) {
+  const char *filter = ds_loadlog_filter();
+  if (!filter) return 1;
+  return name && strstr(name, filter) != NULL;
+}
+static void ds_loadlog_dump_write(const char *name, const char *buf, size_t size) {
+  static unsigned counter = 0;
+  char path[512];
+  char safe[384];
+  size_t i, j = 0;
+  const char *sub;
+  if (!name) name = "?";
+  sub = strstr(name, "../mods/");
+  if (sub) {
+    for (i = 0; sub[i] && j < sizeof(safe) - 1; i++) {
+      char c = sub[i];
+      safe[j++] = (c == '/' || c == '\\' || c == ':') ? '_' : c;
+    }
+  } else {
+    for (i = 0; name[i] && j < sizeof(safe) - 1; i++) {
+      char c = name[i];
+      safe[j++] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_') ? c : '_';
+    }
+  }
+  safe[j] = 0;
+  DS_LOADLOG_MKDIR("ds_loaddump");
+  snprintf(path, sizeof(path), "ds_loaddump/%u_%s.lua", counter++, safe[0] ? safe : "chunk");
+  {
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(buf, 1, size, f); fclose(f); }
+  }
+}
+#endif
 
 LUALIB_API int luaL_loadbufferx(lua_State *L, const char *buf, size_t size,
 				const char *name, const char *mode)

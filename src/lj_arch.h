@@ -930,6 +930,12 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_PATCH_READLINE 0
 #endif
 
+/* LJ_DS_LOADLOG: dump loaded chunk bodies (env DS_LOADLOG=1, optional
+** DS_LOADLOG_FILTER=<substr>) into <game>/data/ds_loaddump/. */
+#ifndef LJ_DS_LOADLOG
+#define LJ_DS_LOADLOG 0
+#endif
+
 #ifndef LJ_DS_NEW_PROXY_PATCH
 #define LJ_DS_NEW_PROXY_PATCH LJ_DS
 #endif
