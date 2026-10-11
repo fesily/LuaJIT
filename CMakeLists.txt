@@ -569,9 +569,13 @@ add_luajit_variant(
 # function_args_alloc pins that an unreferenced 'arg' is never built.
 # str_order51 pins Lua 5.1 pairs() order for string keys (expected output from
 # a stock Lua 5.1); str_intern_collide pins the intern-chain collision fallback.
+# getlocal_tail_frame and tailcall_debug pin the debug API over virtual tail
+# levels: tailcall_debug raises the traceback that luaL_traceback() renders, so
+# it also trips the assertion VM when the walk touches a tail level's nil
+# function (hot-path review item C).
 foreach(_lj_compat51_case arg_bug function_args function_args_alloc
         function_args_closure function_args_debug function_args_main_chunk
-        str_order51 str_intern_collide)
+        getlocal_tail_frame str_order51 str_intern_collide tailcall_debug)
   add_test(NAME luajit_compat51_${_lj_compat51_case}
     COMMAND luajit ${LUAJIT_DIR}/test/compat51/${_lj_compat51_case}.lua)
   set_tests_properties(luajit_compat51_${_lj_compat51_case} PROPERTIES
