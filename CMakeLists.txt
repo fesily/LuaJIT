@@ -579,6 +579,17 @@ foreach(_lj_compat51_case arg_bug function_args function_args_alloc
     LABELS luajit_compat51)
 endforeach()
 
+# Frame counts must survive compiled calls and exits in both GC variants.
+if(LUA_COMPAT_TAILCALL_COUNT_ON)
+  foreach(_lj_tailcall_vm luajit luajit-arenagc)
+    add_test(NAME ${_lj_tailcall_vm}_compat51_tailcall_count_jit
+      COMMAND ${_lj_tailcall_vm} ${LUAJIT_DIR}/test/compat51/tailcall_count_jit.lua)
+    set_tests_properties(${_lj_tailcall_vm}_compat51_tailcall_count_jit PROPERTIES
+      WORKING_DIRECTORY ${LUAJIT_DIR}
+      LABELS luajit_compat51)
+  endforeach()
+endif()
+
 # DS engine API scripts (test/ds): lua_gc LUA_GCSTEPTIME/LUA_GCSTEP2
 # time-sliced GC cycles complete, collect and run finalizers.
 foreach(_lj_ds_case gc_steptime)

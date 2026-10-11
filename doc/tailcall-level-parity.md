@@ -8,7 +8,7 @@ Lua 5.1 `OP_TAILCALL`（PCRLUA 路径）把被调者帧放进调用者帧的位�
 
 本 VM 用 `L->tailcalls` 平行数组 + `LUA_COMPAT_TAILCALL_COUNT` 复刻该语义：
 
-- **写入侧（本来就正确，无需改动）**：`vm_x64.dasc` `BC_CALLT` 对 vararg 帧先把 `BASE` 重定位回真实帧槽再写 `(BASE-1)`，普通帧走 `>8` 旁路写当前帧槽；JIT recorder（`lj_record.c` 的 `((BASE-1)-stack)` 内联）与 `lj_state.c` 的扩容/清零一致。
+- **解释器写入侧**：`vm_x64.dasc` `BC_CALLT` 对 vararg 帧先把 `BASE` 重定位回真实帧槽再写 `(BASE-1)`，普通帧走 `>8` 旁路写当前帧槽，与 `lj_state.c` 的扩容/清零一致。此前“JIT recorder 写入侧也正确”的结论只经过冷代码验证；2026-10-11 的热循环调查复现了入口帧错位、普通调用不清零，以及退出重计和 FF 元方法虚拟层问题，修复和验证见 [tailcall-count-jit.md](tailcall-count-jit.md)。
 - **缺口（读取侧）**：**由 C 调入**的 Lua 函数（主 chunk / `kleiloadlua` 载入的 chunk / 任何 C→Lua 调用）其帧槽 ftuz 是 C 调用者 delta 标记（`FRAME_C`/`FRAME_CP`/`FRAME_PCALL`）而不是 PC。顶层 `return f(...)` 原位复用该槽后，计数确实写在 `(BASE-1)`（即该槽），但 `lj_debug_frame()` 只在 `frame_islua(frame)` 时读它 ⇒ **该链上每消一帧少一层**，其后所有**绝对层号**整体前移。
 
 影响面：DST 受保护 mod 的外壳按绝对层号走查自己的加载器帧（`i = debug.getinfo(level); if i.func == load then …`，见 `builds/hang_repro/shell_analysis/host_program_blocks.txt`）⇒ 走查命中错帧 ⇒ 走 `useGlobalEnv → setfenv → shouldExecute` 分支 ⇒ 静默返回空桩（无报错、mod 不加载）。

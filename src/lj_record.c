@@ -869,6 +869,35 @@ static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs)
   J->maxslot = (BCReg)nargs;
 }
 
+#if LUA_COMPAT_TAILCALL_COUNT && LJ_TARGET_X64
+/* REF_BASE is the trace entry base, not the base of an inlined call. */
+static void rec_tailcall_count(jit_State *J, int tailcall)
+{
+  TRef trL, trstack, trtc, trbs, tridx, trofs, traddr, trn;
+  /* FFH_TAILCALL replaces a fast function with its metamethod. The
+  ** interpreter preserves the count there, without eliding a Lua caller. */
+  if (tailcall && !isluafunc(J->fn)) return;
+  trL = emitir(IRT(IR_LREF, IRT_THREAD), 0, 0);
+  trstack = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_STACK);
+  trtc = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_TAILCALLS);
+  trbs = emitir(IRT(IR_SUB, IRT_INTP), REF_BASE, trstack);
+  tridx = emitir(IRTI(IR_BSHR), trbs, lj_ir_kint(J, 3));
+  tridx = emitir(IRTI(IR_ADD), tridx,
+		lj_ir_kint(J, (int32_t)J->baseslot - 2 - LJ_FR2));
+  trofs = emitir(IRTI(IR_BSHL), tridx, lj_ir_kint(J, 2));
+  traddr = emitir(IRT(IR_ADD, IRT_PGC), trtc, trofs);
+  trn = lj_ir_kint(J, 0);
+  if (tailcall) {
+    TRef trv = emitir(IRT(IR_XLOAD, IRT_INT), traddr, 0);
+    trn = emitir(IRTI(IR_ADD), trv, lj_ir_kint(J, 1));
+  }
+  emitir(IRT(IR_XSTORE, IRT_INT), traddr, trn);
+  J->needsnap = 1;  /* A trace exit must not replay the counter update. */
+}
+#else
+#define rec_tailcall_count(J, tailcall)	((void)0)
+#endif
+
 /* Record call. */
 void lj_record_call(jit_State *J, BCReg func, ptrdiff_t nargs)
 {
@@ -883,6 +912,7 @@ void lj_record_call(jit_State *J, BCReg func, ptrdiff_t nargs)
   J->baseslot += func+1+LJ_FR2;
   if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
     lj_trace_err(J, LJ_TRERR_STACKOV);
+  rec_tailcall_count(J, 0);
 }
 
 #if LUA_COMPAT_TAILCALL_CFRAME
@@ -904,23 +934,7 @@ static void rec_tailcall(jit_State *J, BCReg func)
     J->base[func+1] = TREF_FRAME;
   memmove(&J->base[-1-LJ_FR2], &J->base[func], sizeof(TRef)*(J->maxslot+1+LJ_FR2));
   /* Note: the new TREF_FRAME is now at J->base[-1] (even for slot #0). */
-#if LUA_COMPAT_TAILCALL_COUNT && LJ_TARGET_X64
-  /* Inline: L->tailcalls[((BASE-1)-stack)/sizeof(TValue)]++ */
-  {
-    TRef trL, trstack, trtc, trbs, tridx, trofs, traddr, trv, trn;
-    trL = emitir(IRT(IR_LREF, IRT_THREAD), 0, 0);
-    trstack = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_STACK);
-    trtc = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_TAILCALLS);
-    trbs = emitir(IRT(IR_SUB, IRT_INTP), REF_BASE, trstack);
-    tridx = emitir(IRTI(IR_BSHR), trbs, lj_ir_kint(J, 3));
-    tridx = emitir(IRTI(IR_ADD), tridx, lj_ir_kint(J, -1));
-    trofs = emitir(IRTI(IR_BSHL), tridx, lj_ir_kint(J, 2));
-    traddr = emitir(IRT(IR_ADD, IRT_PGC), trtc, trofs);
-    trv = emitir(IRT(IR_XLOAD, IRT_INT), traddr, 0);
-    trn = emitir(IRTI(IR_ADD), trv, lj_ir_kint(J, 1));
-    emitir(IRT(IR_XSTORE, IRT_INT), traddr, trn);
-  }
-#endif
+  rec_tailcall_count(J, 1);
   /* Tailcalls can form a loop, so count towards the loop unroll limit. */
   if (++J->tailcalled > J->loopunroll)
     lj_trace_err(J, LJ_TRERR_LUNROLL);
@@ -947,6 +961,7 @@ static void rec_callt(jit_State *J, BCReg func, ptrdiff_t nargs)
     J->baseslot += func+1+LJ_FR2;
     if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
       lj_trace_err(J, LJ_TRERR_STACKOV);
+    rec_tailcall_count(J, 0);
   } else {
     rec_tailcall(J, func);
   }
@@ -969,23 +984,7 @@ void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
     J->base[func+1] = TREF_FRAME;
   memmove(&J->base[-1-LJ_FR2], &J->base[func], sizeof(TRef)*(J->maxslot+1+LJ_FR2));
   /* Note: the new TREF_FRAME is now at J->base[-1] (even for slot #0). */
-#if LUA_COMPAT_TAILCALL_COUNT && LJ_TARGET_X64
-  /* Inline: L->tailcalls[((BASE-1)-stack)/sizeof(TValue)]++ */
-  {
-    TRef trL, trstack, trtc, trbs, tridx, trofs, traddr, trv, trn;
-    trL = emitir(IRT(IR_LREF, IRT_THREAD), 0, 0);
-    trstack = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_STACK);
-    trtc = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_TAILCALLS);
-    trbs = emitir(IRT(IR_SUB, IRT_INTP), REF_BASE, trstack);
-    tridx = emitir(IRTI(IR_BSHR), trbs, lj_ir_kint(J, 3));
-    tridx = emitir(IRTI(IR_ADD), tridx, lj_ir_kint(J, -1));
-    trofs = emitir(IRTI(IR_BSHL), tridx, lj_ir_kint(J, 2));
-    traddr = emitir(IRT(IR_ADD, IRT_PGC), trtc, trofs);
-    trv = emitir(IRT(IR_XLOAD, IRT_INT), traddr, 0);
-    trn = emitir(IRTI(IR_ADD), trv, lj_ir_kint(J, 1));
-    emitir(IRT(IR_XSTORE, IRT_INT), traddr, trn);
-  }
-#endif
+  rec_tailcall_count(J, 1);
   /* Tailcalls can form a loop, so count towards the loop unroll limit. */
   if (++J->tailcalled > J->loopunroll)
     lj_trace_err(J, LJ_TRERR_LUNROLL);
