@@ -2000,7 +2000,9 @@ static void expr_table(LexState *ls, ExpDesc *e)
 
     lj_gc_check(fs->L);
   }
-  fs->L->top--;
+#if LJ_DS_PARSER_TABLE_PATCH
+  fs->L->top--;  /* Pop the key-order table tmp_t. */
+#endif
 }
 
 /* Parse function parameters. */

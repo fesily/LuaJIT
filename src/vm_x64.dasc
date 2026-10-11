@@ -247,10 +247,22 @@
 |  jmp aword [DISPATCH+OP*8]
 |.endmacro
 |
+|// LUA_COMPAT_TAILCALL_COUNT is a DynASM define, too (the build passes
+|// -D LUA_COMPAT_TAILCALL_COUNT iff lj_arch.h enables it): a C #if does not
+|// work inside a .macro body. Refuse to build if the two disagree.
+|.if LUA_COMPAT_TAILCALL_COUNT
+||#define LJ_VM_TAILCALL_COUNT	1
+|.else
+||#define LJ_VM_TAILCALL_COUNT	0
+|.endif
+#if LJ_VM_TAILCALL_COUNT != LUA_COMPAT_TAILCALL_COUNT
+#error "DynASM -D LUA_COMPAT_TAILCALL_COUNT does not match lj_arch.h"
+#endif
+|
 |.macro ins_call
 |  // BASE = new base, RB = LFUNC, RD = nargs+1
 |  mov [BASE-8], PC
-#if LUA_COMPAT_TAILCALL_COUNT
+|.if LUA_COMPAT_TAILCALL_COUNT
 |  // Clear tailcount for the new frame. RA is free here (BC_CALL already used it).
 |  mov RA, SAVE_L
 |  mov TMPR, L:RA->stack
@@ -259,7 +271,7 @@
 |  mov TMPR, L:RA->tailcalls
 |  shr ITYPE, 3
 |  mov dword [TMPR+ITYPE*4], 0
-#endif
+|.endif
 |  ins_callt
 |.endmacro
 |

@@ -69,6 +69,13 @@ if exist minilua.exe.manifest^
 @shift
 @set LJCOMPILE=%LJCOMPILE% /DLUAJIT_ENABLE_LUA52COMPAT
 :NOLUA52COMPAT
+@rem Pass LUA_COMPAT_TAILCALL_COUNT on to DynASM iff lj_arch.h enables it.
+@rem The preprocessor also sees /D overrides in LJCOMPILE and in CL.
+@echo #include "lj_arch.h"> host\dasm_tccount.c
+@echo LJ_DASM_TCCOUNT=LUA_COMPAT_TAILCALL_COUNT>> host\dasm_tccount.c
+@%LJCOMPILE% /I "." %DASMTARGET% /EP host\dasm_tccount.c 2>nul | findstr /b /c:"LJ_DASM_TCCOUNT=1" >nul
+@if not errorlevel 1 set DASMFLAGS=%DASMFLAGS% -D LUA_COMPAT_TAILCALL_COUNT
+@del host\dasm_tccount.c
 minilua %DASM% -LN %DASMFLAGS% -o host\buildvm_arch.h %DASC%
 @if errorlevel 1 goto :BAD
 

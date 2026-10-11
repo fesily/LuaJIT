@@ -921,21 +921,22 @@ struct lua_State {
 #endif
 #if LJ_DS_LUA_STATE_LAYOUT
   /* Pad to game lua_State layout (lj_arch.h: LJ_DS_LUA_STATE_LAYOUT).
-  ** Core ends (LJ_GC64 x64):
-  **   classic: @0x60 / @0x68(+tailcalls)
+  ** Core ends (LJ_GC64 x64; stacksize is a 4-byte MSize, tailcalls an 8-byte
+  ** aligned MRef after it):
+  **   classic: @0x5c / @0x68(+tailcalls)
   **   HASGCMARK T3b: no nextgc(-8) no gclist(-8) + openuv triple(+8 vs openupval)
-  **     → @0x58 / @0x60(+tailcalls) */
+  **     → @0x54 / @0x60(+tailcalls) */
 #if LJ_HASGCMARK
 # if LUA_COMPAT_TAILCALL_COUNT
   char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x60];
 # else
-  char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x58];
+  char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x54];
 # endif
 #else
 # if LUA_COMPAT_TAILCALL_COUNT
   char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x68];
 # else
-  char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x60];
+  char _dst_pad[LJ_DST_LUA_STATE_RESERVED - 0x5c];
 # endif
 #endif
   char reserved[8];	/* Game lua51 reserved[8] @ 0xb8. */

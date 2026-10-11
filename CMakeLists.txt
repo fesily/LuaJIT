@@ -220,6 +220,19 @@ IF(LJ_NO_UNWIND_1)
   SET(DASM_FLAGS ${DASM_FLAGS} -D NO_UNWIND)
   LIST(APPEND TARGET_ARCH "LUAJIT_NO_UNWIND=1")
 ENDIF()
+# Lua 5.1 tail-call counts (vm_x64.dasc .if). No #undef here, unlike
+# LJ_TEST_ARCH_VALUE: a -DLUA_COMPAT_TAILCALL_COUNT=0 override must count.
+CHECK_C_SOURCE_COMPILES("
+#include \"lj_arch.h\"
+#if LUA_COMPAT_TAILCALL_COUNT
+int main() { return 0; }
+#else
+#error \"not enabled\"
+#endif
+" LUA_COMPAT_TAILCALL_COUNT_ON)
+IF(LUA_COMPAT_TAILCALL_COUNT_ON)
+  SET(DASM_FLAGS ${DASM_FLAGS} -D LUA_COMPAT_TAILCALL_COUNT)
+ENDIF()
 IF(WIN32)
   SET(DASM_FLAGS ${DASM_FLAGS} -LN -D WIN)
 ENDIF()

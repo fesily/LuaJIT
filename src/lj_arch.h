@@ -1007,9 +1007,11 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
+/* Also a DynASM define for vm_x64.dasc; the build systems read it back from
+** this header (Makefile: -dM text), so keep the value a literal 1 or 0. */
 #ifndef LUA_COMPAT_TAILCALL_COUNT
-#if LJ_TARGET_X64
-#define LUA_COMPAT_TAILCALL_COUNT LUAJIT_ENABLE_LUA51COMPAT
+#if LJ_TARGET_X64 && LUAJIT_ENABLE_LUA51COMPAT
+#define LUA_COMPAT_TAILCALL_COUNT 1
 #else
 #define LUA_COMPAT_TAILCALL_COUNT 0
 #endif
