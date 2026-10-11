@@ -551,6 +551,18 @@ add_luajit_variant(
   COMPILE_DEFINITIONS LUAJIT_ENABLE_GCARENA
 )
 
+# Self-checking Lua 5.1 compat scripts (test/compat51): each asserts and exits
+# non-zero on failure. The implicit vararg 'arg' (LUA_COMPAT_VARARG) cases;
+# function_args_alloc pins that an unreferenced 'arg' is never built.
+foreach(_lj_compat51_case arg_bug function_args function_args_alloc
+        function_args_closure function_args_debug function_args_main_chunk)
+  add_test(NAME luajit_compat51_${_lj_compat51_case}
+    COMMAND luajit ${LUAJIT_DIR}/test/compat51/${_lj_compat51_case}.lua)
+  set_tests_properties(luajit_compat51_${_lj_compat51_case} PROPERTIES
+    WORKING_DIRECTORY ${LUAJIT_DIR}
+    LABELS luajit_compat51)
+endforeach()
+
 MACRO(LUAJIT_add_custom_commands luajit_target)
   SET(target_srcs "")
   FOREACH(file ${ARGN})

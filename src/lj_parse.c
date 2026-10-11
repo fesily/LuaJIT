@@ -162,8 +162,10 @@ typedef struct FuncState {
   VarIndex uvmap[LJ_MAX_UPVAL];	/* Map from upvalue to variable idx. */
   VarIndex uvtmp[LJ_MAX_UPVAL];	/* Temporary upvalue map. */
 #if LUA_COMPAT_VARARG
-  uint8_t need_vararg;
-  uint8_t has_compat_arg;
+  uint8_t need_vararg;		/* Implicit 'arg' is referenced (or captured). */
+  uint8_t has_compat_arg;	/* Function has the implicit 5.1 'arg' local. */
+  VarIndex argvidx;		/* Variable index of the implicit 'arg'. */
+  BCPos argpc, argpcend;	/* Bytecode range that builds the 'arg' table. */
 #endif
 } FuncState;
 
@@ -1220,11 +1222,8 @@ static MSize var_lookup(LexState *ls, ExpDesc *e, GCstr *name)
 	expr_init(e, VLOCAL, v->slot);
 	e->u.s.aux = vidx;
 #if LUA_COMPAT_VARARG
-	if (fs->has_compat_arg &&
-	    name->len == (sizeof("arg") - 1) &&
-	    strncmp(strdata(name), "arg", name->len) == 0) {
+	if (fs->has_compat_arg && vidx == fs->argvidx)
 	  fs->need_vararg = 1;
-	}
 #endif
       } else {
 	MSize uvidx, nuv = fs->nuv;
@@ -1248,6 +1247,10 @@ static MSize var_lookup(LexState *ls, ExpDesc *e, GCstr *name)
 	  if (vidx >= fs->vbase) {  /* Local in that function. */
 	    *puvtmp = vidx;
 	    fscope_uvmark(fs, v->slot);
+#if LUA_COMPAT_VARARG
+	    if (fs->has_compat_arg && vidx == fs->argvidx)
+	      fs->need_vararg = 1;  /* Implicit 'arg' captured by a closure. */
+#endif
 	    return vidx;
 	  }
 	  /* Not a local in that function. Find or create upvalue. */
@@ -1718,6 +1721,19 @@ static GCproto *fs_finish(LexState *ls, BCLine line)
   /* Apply final fixups. */
   fs_fixup_ret(fs);
 
+#if LUA_COMPAT_VARARG
+  if (fs->argpcend != fs->argpc && !fs->need_vararg) {
+    /* Nothing names the implicit 'arg', so don't build its table on every
+    ** call. The local keeps its slot and debug name, but stays nil.
+    */
+    BCReg argslot = fs->numparams;
+    lj_assertFS(fs->argpcend - fs->argpc >= 2, "bad arg prologue");
+    fs->bcbase[fs->argpc].ins = BCINS_AD(BC_KPRI, argslot, VKNIL);
+    fs->bcbase[fs->argpc+1].ins = BCINS_AJ(BC_JMP, argslot+1,
+					   fs->argpcend - (fs->argpc+2));
+  }
+#endif
+
   /* Calculate total size of prototype including all colocated arrays. */
   sizept = sizeof(GCproto) + fs->pc*sizeof(BCIns) + fs->nkgc*sizeof(GCRef);
   sizept = (sizept + sizeof(TValue)-1) & ~(sizeof(TValue)-1);
@@ -1777,6 +1793,8 @@ static void fs_init(LexState *ls, FuncState *fs)
 #if LUA_COMPAT_VARARG
   fs->need_vararg = 0;
   fs->has_compat_arg = 0;
+  fs->argvidx = 0;
+  fs->argpc = fs->argpcend = 0;
 #endif
   /* Anchor table of constants in stack to avoid being collected. */
   settabV(L, L->top, fs->kt);
@@ -2001,10 +2019,10 @@ static BCReg parse_params(LexState *ls, int needself,
 	var_new(ls, nparams++, lex_str(ls));
       } else if (ls->tok == TK_dots) {
 	lj_lex_next(ls);
-  #if LUA_COMPAT_VARARG
-  fs->has_compat_arg = 1;
-  var_new_lit(ls, nparams, "arg");
-  #endif
+#if LUA_COMPAT_VARARG
+	fs->has_compat_arg = 1;
+	fs->argvidx = (VarIndex)var_new_lit(ls, nparams, "arg");
+#endif
 	fs->flags |= PROTO_VARARG;
 	break;
       } else {
@@ -2027,6 +2045,9 @@ static BCReg parse_params(LexState *ls, int needself,
 /* Forward declarations. */
 static void parse_chunk(LexState *ls);
 static void parse_return(LexState *ls, int eflags);
+#if LUA_COMPAT_VARARG
+static void add_argstmt(LexState *ls);
+#endif
 
 /* Begin a new function prototype. */
 static void proto_begin(FuncState *fs, BCLine line, BCReg nparams)
@@ -2037,6 +2058,12 @@ static void proto_begin(FuncState *fs, BCLine line, BCReg nparams)
   fs->bcbase = pfs->bcbase + pfs->pc;
   fs->bclim = pfs->bclim - pfs->pc;
   bcemit_AD(fs, BC_FUNCF, 0, 0);  /* Placeholder. */
+#if LUA_COMPAT_VARARG
+  /* Here and not in parse_chunk: short functions with an expression body
+  ** ('|...| -> arg') have no chunk, but still declare 'arg'. */
+  if (fs->has_compat_arg)
+    add_argstmt(fs->ls);
+#endif
 }
 
 /* Finish a function prototype. */
@@ -3128,14 +3155,11 @@ static int parse_stmt(LexState *ls)
 
 #if LUA_COMPAT_VARARG
 
+/* Emit the prologue that builds the implicit 5.1 'arg' table. Called from
+** proto_begin; fs_finish turns it into a skip if 'arg' is never referenced.
+*/
 static void add_argstmt(LexState* ls)
 {
-  //skip if/while/do-end body
-  if (ls->fs->bl->prev)
-    return;
-  if (!ls->fs->has_compat_arg)
-    return;
-
   ExpDesc argtab, key, val, en;
 #if LUA_COMPAT_VARARG_N
   ExpDesc selectfn, hasharg, nfield;
@@ -3156,11 +3180,12 @@ static void add_argstmt(LexState* ls)
   BCPos pc;
 #endif
 
+  lj_assertFS(fs->has_compat_arg, "arg prologue without implicit arg");
   synlevel_begin(ls);
 
   argslot = fs->numparams;
 
-  pc = bcemit_AD(fs, BC_TNEW, argslot, 0);
+  fs->argpc = pc = bcemit_AD(fs, BC_TNEW, argslot, 0);
 
   expr_init(&argtab, VLOCAL, argslot);
   argtab.u.s.aux = fs->varmap[argslot];
@@ -3207,6 +3232,7 @@ static void add_argstmt(LexState* ls)
   fs->bcbase[fs->pc - 1].line = line;
   bcemit_ABC(fs, BC_TSETS, callbase, argslot, const_str(fs, &nfield));
 #endif
+  fs->argpcend = fs->pc;
   fs->freereg = fs->nactvar;
 
   synlevel_end(ls);
@@ -3218,9 +3244,6 @@ static void parse_chunk(LexState *ls)
 {
   int islast = 0;
   synlevel_begin(ls);
-#if LUA_COMPAT_VARARG
-  add_argstmt(ls);
-#endif
   while (!islast && !parse_isend(ls->tok)) {
     islast = parse_stmt(ls);
     lex_opt(ls, ';');
