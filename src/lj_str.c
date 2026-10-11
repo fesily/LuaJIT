@@ -310,7 +310,12 @@ static GCstr *lj_str_alloc(lua_State *L, const char *str, MSize len,
   s->len = len;
   s->hash = hash;
 #if LJ_DS_STR_HASH_PATCH
-  s->sid = hash;
+  /* sid must stay the Lua 5.1 hash (pairs() order). A string born in a
+  ** chain that switched to the secondary hash gets the dense hash here,
+  ** so recompute the primary one; it ignores the seed. Rechaining only
+  ** ever rewrites s->hash, never sid.
+  */
+  s->sid = hashalg ? hash_sparse(g->str.seed, str, len) : hash;
 #else
 #ifndef STRID_RESEED_INTERVAL
   s->sid = g->str.id++;

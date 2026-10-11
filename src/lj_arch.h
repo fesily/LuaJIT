@@ -904,9 +904,12 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #endif
 
 #if LJ_DS
-#undef LUAJIT_SECURITY_STRHASH
+/* With LJ_DS_STR_HASH_PATCH the string ID is the Lua 5.1 hash, so string ID
+** randomization does not apply. The intern table keeps its collision
+** fallback (LUAJIT_SECURITY_STRHASH, upstream default): lj_str_alloc
+** recomputes the 5.1 sid for strings in secondary-hash chains.
+*/
 #undef LUAJIT_SECURITY_STRID
-#define LUAJIT_SECURITY_STRHASH 0
 #define LUAJIT_SECURITY_STRID 0
 #endif
 

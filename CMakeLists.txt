@@ -567,8 +567,11 @@ add_luajit_variant(
 # Self-checking Lua 5.1 compat scripts (test/compat51): each asserts and exits
 # non-zero on failure. The implicit vararg 'arg' (LUA_COMPAT_VARARG) cases;
 # function_args_alloc pins that an unreferenced 'arg' is never built.
+# str_order51 pins Lua 5.1 pairs() order for string keys (expected output from
+# a stock Lua 5.1); str_intern_collide pins the intern-chain collision fallback.
 foreach(_lj_compat51_case arg_bug function_args function_args_alloc
-        function_args_closure function_args_debug function_args_main_chunk)
+        function_args_closure function_args_debug function_args_main_chunk
+        str_order51 str_intern_collide)
   add_test(NAME luajit_compat51_${_lj_compat51_case}
     COMMAND luajit ${LUAJIT_DIR}/test/compat51/${_lj_compat51_case}.lua)
   set_tests_properties(luajit_compat51_${_lj_compat51_case} PROPERTIES

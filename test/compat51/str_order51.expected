@@ -1,0 +1,17 @@
+rpc_ctor n=10 sum=3805212910 head=EquipActionItem,ActionButton,AttackButton,RightClick,DropItemFromInvT,InspectButton
+rpc_assign n=10 sum=3805212910 head=EquipActionItem,ActionButton,AttackButton,RightClick,DropItemFromInvT,InspectButton
+mixed_ctor n=12 sum=351576656 head=1,2,3,theta,beta,alpha
+rand3 n=3 sum=882023542 head=igqogsiecqskiigc,ukcgaygeeqogququ,ksssmigkyyqcmkuc
+rand7 n=6 sum=1991345556 head=eowcukuusyagkssm,iggoqiageqwcguim,u,uywgimssuqqccomc,g,umuswciouucqmyqu
+rand17 n=16 sum=4031081682 head=a,gsqyyyucwummuewg,gskyqwuogcyqeqkj,ewgemkeaossacoem,u,kysiaaewkuuuuayo
+rand64 n=57 sum=2440111194 head=emsssgmwwcskyaau,isyqaoiqisucygwc,gcwsaewyewcgsaiu,secgsucegkigiwgc,ayamuiygasekyuqu,qckeemumskogeguu
+rand100 n=92 sum=2207859105 head=ckoqchukmqeyimao,sucooogiiisgeasy,c,gaycwaewggccqkie,e,aoezkokgqkigoook
+rand513 n=352 sum=2625516957 head=okocmeouwsgwwcug,iuqemegymmisqiss,osgoouesqekuiqgg,sekwqwqqqqsysmec,cgquaiweocqwqqso,gcgoamkotmaycggk
+rand2000 n=252 sum=2839973523 head=mqymyacqyqqeisus,uoowuwuukgyaqkai,wyymigsamkiiuwqi,iuqemegymmisqiss,gwougekcsoqmqguo,mccamywqkuwsiaca
+churn n=249 sum=67159100 head=ouikiiakcku,gynsccw,eomcggicemacmamu,kmkwkguwcec,iigseeegywwgigy,ascgswc
+runtime n=800 sum=3929505281 head=componentna179,prefab_145,prefab_120,componentna101,prefab_80,inst_195
+next20 sum=3662451706
+grow1500 n=1500 sum=1075968226 head=k59_as,k154_sa,k114_cs,k320_mg,k48_ee,k947_mk
+collide51_long n=4429 sum=719953327 head=w366,w2023,w3408,w3928,w388,w3206
+collide51_short n=48 sum=61869557 head=^ONa_prefab_tag,iBqj_prefab_tag,HAqj_prefab_tag,oqAj_prefab_tag,apAj_prefab_tag,iSdi_prefab_tag
+collide51_short_mixed n=48 sum=1437577403 head=x24,x48,x28,x20,iBqj_prefab_tag,x44
