@@ -870,11 +870,25 @@ LUALIB_API void luaL_traceback (lua_State *L, lua_State *L1, const char *msg,
       continue;
     }
 #endif
-    lj_debug_getinfo(L1, "Snlf", &ar, 0);
-    fn = funcV(L1->top-1); L1->top--;
+#if LUA_COMPAT_TAILCALL_COUNT
+    /* A virtual elided-tail-call level has no frame and no function.
+    ** lj_debug_getinfo() mirrors 5.1's lua_getinfo(): for a lost tail call
+    ** (i_ci == 0) the 'f' option pushes nil, exactly as ldebug.c does when its
+    ** closure stays NULL (`if (f == NULL) setnilvalue(L->top);`).  Ask for the
+    ** name/line options only here -- funcV() and the isffunc() probe below
+    ** cannot be applied to that nil. */
+    if (ar.i_ci == 0) {
+      lj_debug_getinfo(L1, "Snl", &ar, 0);
+      fn = NULL;
+    } else
+#endif
+    {
+      lj_debug_getinfo(L1, "Snlf", &ar, 0);
+      fn = funcV(L1->top-1); L1->top--;
+    }
     UNUSED(fn);
 #if !LUA_COMPAT_DISABLE_FUNCTION_BUILTIN_INFO
-    if (isffunc(fn) && !*ar.namewhat)
+    if (fn && isffunc(fn) && !*ar.namewhat)
       lua_pushfstring(L, "\n\t[builtin#%d]:", fn->c.ffid);
     else
 #endif
