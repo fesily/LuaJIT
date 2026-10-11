@@ -198,8 +198,10 @@ GCtab * LJ_FASTCALL lj_tab_dup(lua_State *L, const GCtab *kt)
       setmref(n->next, next == NULL? next : (Node *)((char *)next + d));
     }
   }
+#if LJ_HASGCMARK
   if (kt->marked & LJ_GC_HASGC)
     t->marked |= LJ_GC_HASGC;
+#endif
   return t;
 }
 
@@ -532,15 +534,13 @@ TValue *lj_tab_newkey(lua_State *L, GCtab *t, cTValue *key)
   if (LJ_UNLIKELY(tvismzero(&n->key)))
     n->key.u64 = 0;
   lj_gc_anybarriert(L, t);
-  if (LJ_UNLIKELY(tvisstr(key))) {
-    global_State *g = G(L);
-    if (strV(key) == mmname_str(g, MM_gc)) {
-      t->marked |= LJ_GC_HASGC;
 #if LJ_HASGCMARK
-      g->gc.fin_backfill = 1;
-#endif
-    }
+  /* Only the arena GC reads the sticky __gc bit (finalizer backfill). */
+  if (tvisstr(key) && LJ_UNLIKELY(strV(key) == mmname_str(G(L), MM_gc))) {
+    t->marked |= LJ_GC_HASGC;
+    G(L)->gc.fin_backfill = 1;
   }
+#endif
   lj_assertL(tvisnil(&n->val), "new hash slot is not empty");
   return &n->val;
 }
