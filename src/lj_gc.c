@@ -661,7 +661,7 @@ static void atomic(global_State *g, lua_State *L)
 }
 
 /* GC state machine. Returns a cost estimate for each step performed. */
-static size_t gc_onestep_raw(lua_State *L, uint32_t sweeplim)
+static size_t gc_onestep(lua_State *L)
 {
   global_State *g = G(L);
   switch (g->gc.state) {
@@ -691,7 +691,7 @@ static size_t gc_onestep_raw(lua_State *L, uint32_t sweeplim)
     }
   case GCSsweep: {
     GCSize old = g->gc.total;
-    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), sweeplim));
+    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));
     lj_assertG(old >= g->gc.total, "sweep increased memory");
     g->gc.estimate -= old - g->gc.total;
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
@@ -704,7 +704,7 @@ static size_t gc_onestep_raw(lua_State *L, uint32_t sweeplim)
 	g->gc.debt = 0;
       }
     }
-    return sweeplim*GCSWEEPCOST;
+    return GCSWEEPMAX*GCSWEEPCOST;
     }
   case GCSfinalize:
     if (gcref(g->gc.mmudata) != NULL) {
@@ -725,11 +725,6 @@ static size_t gc_onestep_raw(lua_State *L, uint32_t sweeplim)
     lj_assertG(0, "bad GC state");
     return 0;
   }
-}
-
-static size_t gc_onestep(lua_State *L)
-{
-  return gc_onestep_raw(L, GCSWEEPMAX);
 }
 
 /* Perform a limited amount of incremental GC steps. */
@@ -801,12 +796,12 @@ void lj_gc_fullgc(lua_State *L)
     g->gc.sweepstr = 0;
   }
   while (g->gc.state == GCSsweepstring || g->gc.state == GCSsweep)
-    gc_onestep_raw(L, GCSWEEPMAX);  /* Finish sweep. */
+    gc_onestep(L);  /* Finish sweep. */
   lj_assertG(g->gc.state == GCSfinalize || g->gc.state == GCSpause,
 	     "bad GC state");
   /* Now perform a full GC. */
   g->gc.state = GCSpause;
-  do { gc_onestep_raw(L, GCSWEEPMAX); } while (g->gc.state != GCSpause);
+  do { gc_onestep(L); } while (g->gc.state != GCSpause);
   g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
   g->vmstate = ostate;
 }
@@ -932,36 +927,67 @@ void *lj_mem_grow(lua_State *L, void *p, MSize *szp, MSize lim, MSize esz)
 #include <time.h>
 #endif
 
+/* Monotonic clock in native ticks, and a nanosecond budget in those ticks. */
+#if defined(_WIN32)
+static uint64_t gc_ticks(void)
+{
+  LARGE_INTEGER t;
+  QueryPerformanceCounter(&t);
+  return (uint64_t)t.QuadPart;
+}
+
+static uint64_t gc_ns2ticks(uint64_t ns)
+{
+  LARGE_INTEGER f;
+  QueryPerformanceFrequency(&f);
+  return ns * (uint64_t)f.QuadPart / 1000000000u;
+}
+#elif defined(__APPLE__)
+static uint64_t gc_ticks(void)
+{
+  return mach_absolute_time();
+}
+
+static uint64_t gc_ns2ticks(uint64_t ns)
+{
+  mach_timebase_info_data_t tb;
+  mach_timebase_info(&tb);
+  return ns * tb.denom / tb.numer;
+}
+#else
+static uint64_t gc_ticks(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t gc_ns2ticks(uint64_t ns)
+{
+  return ns;
+}
+#endif
+
+/* GC work between two clock reads. Reading the clock after every single
+** step costs more than the step itself; GCSTEPSIZE of work is a few us.
+*/
+#define GCTIMECHECKWORK	GCSTEPSIZE
+
 int LJ_FASTCALL lj_gc_step_timelimit(lua_State *L)
 {
   global_State *g = G(L);
   uint64_t timelim = (uint64_t)g->gc.stepmultime;  /* ns */
+  uint64_t deadline;
+  GCSize work = 0, checked = 0;
   int32_t ostate = g->vmstate;
   if (g->gc.total > g->gc.threshold)
     g->gc.debt += g->gc.total - g->gc.threshold;
   setvmstate(g, GC);
   if (timelim == 0)
     timelim = (uint64_t)1e5;  /* large limit, e.g., 100 us (1e5 ns) */
-
-#if defined(_WIN32)
-  LJ_STATIC_ASSERT(sizeof(LARGE_INTEGER) == sizeof(uint64_t));
-  LARGE_INTEGER freq, start, now;
-  QueryPerformanceFrequency(&freq);
-  QueryPerformanceCounter(&start);
-#elif defined(__APPLE__)
-  uint64_t start, now;
-  mach_timebase_info_data_t tb;
-  mach_timebase_info(&tb);
-  start = mach_absolute_time();
-#else
-  struct timespec start, now;
-  clock_gettime(CLOCK_MONOTONIC, &start);
-#endif
-
-uint64_t elapsed;
-  GCSize work = 0;
-  do {
-    size_t cost = gc_onestep_raw(L, 1);
+  deadline = gc_ticks() + gc_ns2ticks(timelim);
+  for (;;) {
+    size_t cost = gc_onestep(L);
     if (cost >= LJ_MAX_MEM) {
       /* On-trace defer sentinel: the atomic/finalize phase cannot run while
       ** a trace is active and gc_onestep makes no progress. Stop instead of
@@ -974,17 +1000,13 @@ uint64_t elapsed;
       g->vmstate = ostate;
       return 1;  /* Finished a GC cycle. */
     }
-#if defined(_WIN32)
-    QueryPerformanceCounter(&now);
-    elapsed = (uint64_t)((now.QuadPart - start.QuadPart) * 1e9 / freq.QuadPart);
-#elif defined(__APPLE__)
-    now = mach_absolute_time();
-    elapsed = (now - start) * tb.numer / tb.denom;
-#else
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    elapsed = (uint64_t)((now.tv_sec - start.tv_sec) * 1e9 + (now.tv_nsec - start.tv_nsec));
-#endif
-  } while (elapsed < timelim);
+    /* Finalizers run arbitrary Lua code, so check before each of them. */
+    if (work - checked >= GCTIMECHECKWORK || g->gc.state == GCSfinalize) {
+      if (gc_ticks() >= deadline)
+	break;
+      checked = work;
+    }
+  }
 
   /* Pay down debt by the work actually performed this slice instead of a
   ** fixed GCSTEPSIZE. A time-driven step runs many gc_onestep iterations

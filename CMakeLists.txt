@@ -563,6 +563,16 @@ foreach(_lj_compat51_case arg_bug function_args function_args_alloc
     LABELS luajit_compat51)
 endforeach()
 
+# DS engine API scripts (test/ds): lua_gc LUA_GCSTEPTIME/LUA_GCSTEP2
+# time-sliced GC cycles complete, collect and run finalizers.
+foreach(_lj_ds_case gc_steptime)
+  add_test(NAME luajit_ds_${_lj_ds_case}
+    COMMAND luajit ${LUAJIT_DIR}/test/ds/${_lj_ds_case}.lua)
+  set_tests_properties(luajit_ds_${_lj_ds_case} PROPERTIES
+    WORKING_DIRECTORY ${LUAJIT_DIR}
+    LABELS luajit_ds)
+endforeach()
+
 MACRO(LUAJIT_add_custom_commands luajit_target)
   SET(target_srcs "")
   FOREACH(file ${ARGN})
