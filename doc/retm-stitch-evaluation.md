@@ -5,6 +5,12 @@
 尾调用仍解释执行，普通 RETM 缝合回归通过。详见
 [关闭时机修复与验证](tailcall-upvalue-close.md)。
 
+2026-10-14 hook 补充：Lua 尾调用的 call hook 现在先观察保留的 caller，
+随后才关闭 upvalue 并复用帧；普通 return 后按虚拟尾层发 tail return。
+Windows/Linux x64 的完整矩阵与原生扩栈、多结果探针通过。
+已有编译 trace 的 hook 限制及验证记录见
+[尾调用 hook 修复](tailcall-hook-parity.md)。
+
 日期：2026-10-11。
 补充评估：2026-10-12，目标调整为保留 PUC 5.1 行为并对齐上游 C 函数缝合覆盖。
 历史实验与性能评估基线：`cbaddf73f94eab95c5e697b21fec179a69670093`。

@@ -623,6 +623,21 @@ foreach(_lj_upvalue_vm luajit luajit-arenagc)
     WORKING_DIRECTORY ${LUAJIT_DIR} LABELS luajit_compat51 TIMEOUT 30)
 endforeach()
 
+foreach(_lj_hook_vm luajit luajit-arenagc)
+  set(_lj_hook_modes)
+  if(NOT LUA_COMPAT_TAILCALL_COUNT_ON)
+    list(APPEND _lj_hook_modes nocount)
+  endif()
+  if(NOT LUA_COMPAT_TAILCALL_CFRAME_ON)
+    list(APPEND _lj_hook_modes nocframe)
+  endif()
+  add_test(NAME ${_lj_hook_vm}_compat51_tailcall_hooks
+    COMMAND ${_lj_hook_vm} ${LUAJIT_DIR}/test/compat51/tailcall_hooks.lua
+      ${_lj_hook_modes})
+  set_tests_properties(${_lj_hook_vm}_compat51_tailcall_hooks PROPERTIES
+    WORKING_DIRECTORY ${LUAJIT_DIR} LABELS luajit_compat51 TIMEOUT 30)
+endforeach()
+
 # DS engine API scripts (test/ds): lua_gc LUA_GCSTEPTIME/LUA_GCSTEP2
 # time-sliced GC cycles complete, collect and run finalizers.
 foreach(_lj_ds_case gc_steptime)
@@ -635,6 +650,7 @@ endforeach()
 
 if(LUAJIT_TEST_RETM)
   add_subdirectory(test/retm)
+  add_subdirectory(test/hooks)
 endif()
 
 MACRO(LUAJIT_add_custom_commands luajit_target)

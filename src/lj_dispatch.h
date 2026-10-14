@@ -138,6 +138,10 @@ LJ_FUNC void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock);
 /* Instruction dispatch callback for hooks or when recording. */
 LJ_FUNCA void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc);
 LJ_FUNCA ASMFunction LJ_FASTCALL lj_dispatch_call(lua_State *L, const BCIns*pc);
+#if LJ_TARGET_X64 && LJ_GC64
+LJ_FUNCA BCReg LJ_FASTCALL lj_dispatch_tailcall(lua_State *L, const BCIns *pc,
+					     BCReg nargs);
+#endif
 #if LJ_HASJIT
 LJ_FUNCA void LJ_FASTCALL lj_dispatch_stitch(jit_State *J, const BCIns *pc);
 #endif

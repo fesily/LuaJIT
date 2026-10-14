@@ -369,11 +369,15 @@ static void callhook(lua_State *L, int event, BCLine line)
   lua_Hook hookf = g->hookf;
   if (hookf && !hook_active(g)) {
     lua_Debug ar;
+    ptrdiff_t top = savestack(L, L->top);
     lj_trace_abort(g);  /* Abort recording on any hook call. */
     ar.event = event;
     ar.currentline = line;
     /* Top frame, nextframe = NULL. */
     ar.i_ci = (int)((L->base-1) - tvref(L->stack));
+#if LUA_COMPAT_TAILCALL_COUNT
+    if (event == LUA_HOOKTAILRET) ar.i_ci = 0;
+#endif
     lj_state_checkstack(L, 1+LUA_MINSTACK);
 #if LJ_HASPROFILE && !LJ_PROFILE_SIGPROF
     lj_profile_hook_enter(g);
@@ -388,6 +392,7 @@ static void callhook(lua_State *L, int event, BCLine line)
 #else
     hook_leave(g);
 #endif
+    L->top = restorestack(L, top);
   }
 }
 
@@ -448,8 +453,25 @@ void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc)
       L->top = L->base + slots;  /* Fix top again. */
     }
   }
-  if ((g->hookmask & LUA_MASKRET) && bc_isret(bc_op(pc[-1])))
+  if ((g->hookmask & LUA_MASKRET) && !hook_active(g) &&
+      bc_isret(bc_op(pc[-1]))) {
+#if LUA_COMPAT_TAILCALL_COUNT
+    TValue *frame = L->base-1;
+    ptrdiff_t frameofs;
+    if (frame_isvarg(frame)) frame = frame_prevd(frame);
+    frameofs = savestack(L, frame);
+#endif
     callhook(L, LUA_HOOKRET, -1);
+#if LUA_COMPAT_TAILCALL_COUNT
+    while ((g->hookmask & LUA_MASKRET)) {
+      frame = restorestack(L, frameofs);
+      if (frame_tailcalls(L, frame) <= 0) break;
+      frame_tailcalls_raw(L, frame)--;
+      callhook(L, LUA_HOOKTAILRET, -1);
+    }
+#endif
+    L->top = L->base + slots;
+  }
   ERRNO_RESTORE
 }
 
@@ -470,6 +492,50 @@ static int call_init(lua_State *L, GCfunc *fn)
     return 0;
   }
 }
+
+#if LJ_TARGET_X64 && LJ_GC64
+/* Show the new callee and its intact caller before replacing a tail frame. */
+BCReg LJ_FASTCALL lj_dispatch_tailcall(lua_State *L, const BCIns *pc,
+				      BCReg nargs)
+{
+  ERRNO_SAVE
+  ptrdiff_t callerofs = savestack(L, L->base);
+  TValue *base = L->base + bc_a(pc[-1]) + 1+LJ_FR2;
+  GCfunc *fn = funcV(base-1-LJ_FR2);
+  TValue *caller, *dest;
+  int missing;
+  lj_assertL(isluafunc(fn), "non-Lua tailcall hook");
+  setframe_pc(base-1, pc);
+#if LUA_COMPAT_TAILCALL_COUNT
+  frame_tailcalls_clear(L, base-1);
+#endif
+  L->base = base;
+  L->top = base + nargs-1;
+  missing = call_init(L, fn);
+  {
+    int i;
+    for (i = 0; i < missing; i++) setnilV(L->top++);
+  }
+  setcframe_pc(cframe_raw(L->cframe), proto_bc(funcproto(fn))+1);
+  callhook(L, LUA_HOOKCALL, -1);
+  while (missing-- > 0 && tvisnil(L->top-1)) L->top--;
+  base = L->base;
+  nargs = (BCReg)(L->top - base) + 1;
+  caller = restorestack(L, callerofs);
+  L->base = caller;
+  lj_func_closeuv(L, caller);
+  dest = frame_isvarg(caller-1) ? frame_prevd(caller-1)+1 : caller;
+#if LUA_COMPAT_TAILCALL_COUNT
+  frame_tailcalls_inc(L, dest-1);
+#endif
+  copyTV(L, dest-1-LJ_FR2, base-1-LJ_FR2);
+  memmove(dest, base, (nargs-1)*sizeof(TValue));
+  L->base = dest;
+  L->top = dest + nargs-1;
+  ERRNO_RESTORE
+  return nargs;
+}
+#endif
 
 /* Call dispatch. Used by call hooks, hot calls or when recording. */
 ASMFunction LJ_FASTCALL lj_dispatch_call(lua_State *L, const BCIns *pc)
