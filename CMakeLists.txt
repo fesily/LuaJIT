@@ -18,6 +18,10 @@ SET(CMAKE_REQUIRED_INCLUDES
 
 OPTION(WITH_AMALG "Build eveything in one shot (needs memory)" ON)
 option(WITH_SHARED_LUA "build shared lua" ON)
+option(LUAJIT_TEST_RETM "Build RETM stitch diagnostics and native tests." OFF)
+if(LUAJIT_TEST_RETM)
+  add_compile_definitions(LUAJIT_TEST_RETM)
+endif()
 
 # Ugly warnings
 IF(MSVC)
@@ -576,6 +580,10 @@ add_luajit_variant(
 foreach(_lj_compat51_case arg_bug function_args function_args_alloc
         function_args_closure function_args_debug function_args_main_chunk
         getlocal_tail_frame str_order51 str_intern_collide tailcall_debug)
+  if(NOT LUA_COMPAT_TAILCALL_COUNT_ON AND
+      _lj_compat51_case MATCHES "^(getlocal_tail_frame|tailcall_debug)$")
+    continue() # These cases explicitly require virtual tail frames.
+  endif()
   add_test(NAME luajit_compat51_${_lj_compat51_case}
     COMMAND luajit ${LUAJIT_DIR}/test/compat51/${_lj_compat51_case}.lua)
   set_tests_properties(luajit_compat51_${_lj_compat51_case} PROPERTIES
@@ -603,6 +611,10 @@ foreach(_lj_ds_case gc_steptime)
     WORKING_DIRECTORY ${LUAJIT_DIR}
     LABELS luajit_ds)
 endforeach()
+
+if(LUAJIT_TEST_RETM)
+  add_subdirectory(test/retm)
+endif()
 
 MACRO(LUAJIT_add_custom_commands luajit_target)
   SET(target_srcs "")

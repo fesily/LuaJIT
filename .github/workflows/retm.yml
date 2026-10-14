@@ -1,0 +1,38 @@
+name: RETM Stitch
+on: [push, pull_request]
+jobs:
+  retm:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-24.04]
+        flavor: [release, assert, nocframe, nocount, noboth]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: amd64
+      - name: Configure
+        shell: bash
+        run: |
+          flags=""
+          case "${{ matrix.flavor }}" in
+            assert) flags="-DLUA_USE_ASSERT -DLUA_USE_APICHECK";;
+            nocframe) flags="-DLUA_COMPAT_TAILCALL_CFRAME=0";;
+            nocount) flags="-DLUA_COMPAT_TAILCALL_COUNT=0";;
+            noboth) flags="-DLUA_COMPAT_TAILCALL_CFRAME=0 -DLUA_COMPAT_TAILCALL_COUNT=0";;
+          esac
+          cmake -S test/retm/runner -B build-retm -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLUAJIT_NUMMODE=OFF \
+            -DLUAJIT_TEST_RETM=ON "-DCMAKE_C_FLAGS=$flags"
+      - name: Build Both VMs and Probes
+        run: cmake --build build-retm --target luajit luajit-arenagc retmprobe-default retmprobe-arenagc --parallel 4
+      - name: Test
+        run: ctest --test-dir build-retm --output-on-failure
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: retm-${{ matrix.os }}-${{ matrix.flavor }}
+          path: build-retm/Testing/Temporary/

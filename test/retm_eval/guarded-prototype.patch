@@ -1,0 +1,118 @@
+diff --git a/src/lj_ffrecord.c b/src/lj_ffrecord.c
+index 41dee1ca..12002717 100644
+--- a/src/lj_ffrecord.c
++++ b/src/lj_ffrecord.c
+@@ -167,9 +167,15 @@ static void LJ_FASTCALL recff_nyi(jit_State *J, RecordFFData *rd)
+     /* Can only stitch from Lua call. */
+     if (J->framedepth && frame_islua(J->L->base-1)) {
+       BCOp op = bc_op(*frame_pc(J->L->base-1));
++      int retm_stitch = 0;
++#if LUA_COMPAT_TAILCALL_CFRAME && LJ_TARGET_X64
++      retm_stitch = op == BC_RETM &&
++        (bc_op(frame_pc(J->L->base-1)[-1]) == BC_CALLT ||
++         bc_op(frame_pc(J->L->base-1)[-1]) == BC_CALLMT);
++#endif
+       /* Stitched trace cannot start with *M op with variable # of args. */
+       if (!(op == BC_CALLM || op == BC_CALLMT ||
+-	    op == BC_RETM || op == BC_TSETM)) {
++	    (op == BC_RETM && !retm_stitch) || op == BC_TSETM)) {
+ 	switch (J->fn->c.ffid) {
+ 	case FF_error:
+ 	case FF_debug_sethook:
+diff --git a/src/lj_dispatch.c b/src/lj_dispatch.c
+index 9879a95b..7573c717 100644
+--- a/src/lj_dispatch.c
++++ b/src/lj_dispatch.c
+@@ -539,7 +539,7 @@ void LJ_FASTCALL lj_dispatch_stitch(jit_State *J, const BCIns *pc)
+     setcframe_pc(cf, pc);
+     /* Before dispatch, have to bias PC by 1. */
+     L->top = L->base + cur_topslot(curr_proto(L), pc+1, cframe_multres_n(cf));
+-    lj_trace_stitch(J, pc-1);  /* Point to the CALL instruction. */
++    lj_trace_stitch(J, bc_op(*pc) == BC_RETM ? pc : pc-1);
+     setcframe_pc(cf, oldpc);
+     ERRNO_RESTORE
+   }
+diff --git a/src/lj_record.c b/src/lj_record.c
+index 8096d1c2..1b1f522f 100644
+--- a/src/lj_record.c
++++ b/src/lj_record.c
+@@ -2950,6 +2950,12 @@ static const BCIns *rec_setup_root(jit_State *J)
+     /* No bytecode range check for down-recursive root traces. */
+     J->maxslot = ra + bc_d(ins) - 1;
+     break;
++  case BC_RETM:
++    J->maxslot = (BCReg)(J->L->top - J->L->base);
++    if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
++      lj_trace_err(J, LJ_TRERR_STACKOV);
++    J->cur.stitch_multres = J->maxslot - ra - bc_d(ins) + 1;
++    break;
+   case BC_FUNCF:
+     /* No bytecode range check for root traces started by a hot call. */
+     J->maxslot = J->pt->numparams;
+diff --git a/src/lj_trace.c b/src/lj_trace.c
+index e3709226..6a18c7c9 100644
+--- a/src/lj_trace.c
++++ b/src/lj_trace.c
+@@ -483,7 +483,8 @@ static void trace_start(jit_State *J)
+       setintV(V->top++, J->exitno);
+     } else {
+       BCOp op = bc_op(*J->pc);
+-      if (op == BC_CALLM || op == BC_CALL || op == BC_ITERC) {
++      if (op == BC_CALLM || op == BC_CALL || op == BC_ITERC ||
++          (op == BC_RETM && J->exitno != 0)) {
+ 	setintV(V->top++, J->exitno);  /* Parent of stitched trace. */
+ 	setintV(V->top++, -1);
+       }
+@@ -548,6 +549,7 @@ static void trace_stop(jit_State *J)
+   case BC_CALLM:
+   case BC_CALL:
+   case BC_ITERC:
++  case BC_RETM:
+     /* Trace stitching: patch link of previous trace. */
+     traceref(J, J->exitno)->link = traceno;
+     break;
+@@ -604,7 +606,8 @@ static int trace_abort(jit_State *J)
+     return 1;  /* Retry ASM with new MCode area. */
+   }
+   /* Penalize or blacklist starting bytecode instruction. */
+-  if (J->parent == 0 && !bc_isret(bc_op(J->cur.startins))) {
++  if (J->parent == 0 &&
++      (!bc_isret(bc_op(J->cur.startins)) || J->exitno != 0)) {
+     if (J->exitno == 0) {
+       BCIns *startpc = mref(J->cur.startpc, BCIns);
+       if (e == LJ_TRERR_RETRY)
+diff --git a/src/lj_jit.h b/src/lj_jit.h
+index 4597018c..3418e7c0 100644
+--- a/src/lj_jit.h
++++ b/src/lj_jit.h
+@@ -265,6 +265,7 @@ typedef struct GCtrace {
+   GCRef startpt;	/* Starting prototype. */
+   MRef startpc;		/* Bytecode PC of starting instruction. */
+   BCIns startins;	/* Original bytecode of starting instruction. */
++  uint32_t stitch_multres; /* Evaluation: RETM entry result count + 1. */
+   MSize szmcode;	/* Size of machine code. */
+   MCode *mcode;		/* Start of machine code. */
+ #if LJ_ABI_PAUTH
+diff --git a/src/vm_x64.dasc b/src/vm_x64.dasc
+index 37939b72..776fa958 100644
+--- a/src/vm_x64.dasc
++++ b/src/vm_x64.dasc
+@@ -2474,7 +2474,17 @@ static void build_subroutines(BuildCtx *ctx)
+   |  cmp RDd, RBd
+   |  je ->cont_nop			// Blacklisted.
+   |  test RDd, RDd
+-  |  jne =>BC_JLOOP			// Jump to stitched trace.
++  |  jz >4
++  |  // Evaluation: check variable results before snapshot #0 becomes active.
++  |  mov RB, [DISPATCH+DISPATCH_J(trace)]
++  |  mov TRACE:RB, [RB+RD*8]
++  |  cmp dword TRACE:RB->stitch_multres, 0
++  |  je =>BC_JLOOP
++  |  mov TMPRd, MULTRES
++  |  cmp TMPRd, TRACE:RB->stitch_multres
++  |  jne ->cont_nop
++  |  jmp =>BC_JLOOP
++  |4:
+   |
+   |  // Stitch a new trace to the previous trace.
+   |  mov [DISPATCH+DISPATCH_J(exitno)], RB
