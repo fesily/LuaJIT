@@ -10,7 +10,9 @@
 结束，并在真实 Lua 尾调用复用帧之前关闭。旧 dump 仍按该修复拒绝，
 CFRAME dump 版本为 `0x81`；本次 hook 修复未再改变编码或 dump 版本。
 依赖的细节与回归记录见 [upvalue 关闭时机](tailcall-upvalue-close.md)。
-两个分配失败修复仍在独立的 `codex/tailcall-stack-oom` 工作树中。
+以上描述为独立验证时的工作树状态。2026-10-14 已将这些修复与两个
+分配失败修复整理到整合分支；提交和组合验证见
+[主干整合记录](tailcall-fixes-integration.md)。
 
 ## 原因与改动
 

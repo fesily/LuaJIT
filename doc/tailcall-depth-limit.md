@@ -10,7 +10,9 @@ upvalue 修复，便于验证新的 call hook 路径在百万次尾调用后仍�
 正确计数。原 worktree 未修改。依赖的说明见
 [hook 修复](tailcall-hook-parity.md) 和
 [upvalue 关闭时机](tailcall-upvalue-close.md)。
-两个 OOM 修复仍在独立的 `codex/tailcall-stack-oom` 工作树中。
+以上描述为独立验证时的工作树状态。2026-10-14 已将这些修复与两个
+OOM 修复整理到整合分支；提交和组合验证见
+[主干整合记录](tailcall-fixes-integration.md)。
 
 ## 复现与原因
 
