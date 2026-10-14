@@ -2440,6 +2440,10 @@ static void build_subroutines(BuildCtx *ctx)
   |  add NARGS:RDd, 1
   |  jmp RB
   |
+  /* Keep this hot ELF entry aligned independently of subroutine layout. */
+  if (ctx->mode == BUILD_elfasm) {
+    |.align 64
+  }
   |->cont_stitch:			// Trace stitching.
   |.if JIT
   |  // BASE = base, RC = result, RB = mbase
@@ -2926,6 +2930,80 @@ static void build_subroutines(BuildCtx *ctx)
   |  mov rax, CTSTATE->cb.gpr[0]
   |  movsd xmm0, qword CTSTATE->cb.fpr[0]
   |  jmp ->vm_leave_unw
+  |.endif
+  |
+  |// Place the RETM handler after ordinary stitch and exit code; FFI stays last.
+  |->cont_stitch_retm:
+  |.if JIT
+  |  endbr
+  |  mov TRACE:ITYPE, [RB-40]
+  |  cleartp TRACE:ITYPE
+  |  mov TMPRd, MULTRES
+  |  movzx RAd, PC_RA
+  |  lea RA, [BASE+RA*8]
+  |  sub TMPRd, 1
+  |  jz >2
+  |1:
+  |  mov RB, [RC]
+  |  mov [RA], RB
+  |  add RC, 8
+  |  add RA, 8
+  |  sub TMPRd, 1
+  |  jnz <1
+  |2:
+  |  test TRACE:ITYPE, TRACE:ITYPE
+  |  jz ->cont_nop
+  |  movzx RBd, word TRACE:ITYPE->traceno
+  |  movzx RDd, word TRACE:ITYPE->link
+  |  cmp RDd, RBd
+  |  je ->cont_nop
+  |  test RDd, RDd
+  |  jz >4
+  |  mov RB, [DISPATCH+DISPATCH_J(trace)]
+  |  mov TRACE:RB, [RB+RD*8]
+  |  mov TMPRd, MULTRES
+  |  cmp byte TRACE:RB->stitch_entry, LJ_STITCH_RETM_FIXED
+  |  je >5
+  |  cmp TMPRd, TRACE:RB->stitch_multres
+  |  jne >8
+  |  jmp >7
+  |5:
+  |  movzx RBd, byte TRACE:RB->retm_wanted
+  |  movzx ITYPEd, PC_RA
+  |  add RBd, ITYPEd
+  |  lea RB, [BASE+RB*8]
+  |  cmp RA, RB
+  |  jae >7
+  |  mov L:ITYPE, SAVE_L
+  |  cmp RB, L:ITYPE->maxstack
+  |  ja >8
+  |6:
+  |  mov aword [RA], LJ_TNIL
+  |  add RA, 8
+  |  cmp RA, RB
+  |  jb <6
+  |7:
+#ifdef LUAJIT_TEST_RETM
+  |  inc dword [DISPATCH+DISPATCH_J(retm_entries)]
+#endif
+  |  jmp =>BC_JLOOP
+  |8:
+#ifdef LUAJIT_TEST_RETM
+  |  inc dword [DISPATCH+DISPATCH_J(retm_fallbacks)]
+#endif
+  |  jmp ->cont_nop
+  |4:
+  |
+  |  // Stitch a new trace to the previous trace.
+  |  mov [DISPATCH+DISPATCH_J(exitno)], RB
+  |  mov L:RB, SAVE_L
+  |  mov L:RB->base, BASE
+  |  mov CARG2, PC
+  |  lea CARG1, [DISPATCH+GG_DISP2J]
+  |  mov aword [DISPATCH+DISPATCH_J(L)], L:RB
+  |  call extern lj_dispatch_stitch	// (jit_State *J, const BCIns *pc)
+  |  mov BASE, L:RB->base
+  |  jmp ->cont_nop
   |.endif
   |
   |->vm_ffi_call:			// Call C function via FFI.

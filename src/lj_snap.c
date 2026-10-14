@@ -62,7 +62,8 @@ void lj_snap_grow_map_(jit_State *J, MSize need)
 /* Add all modified slots to the snapshot. */
 static MSize snapshot_slots(jit_State *J, SnapEntry *map, BCReg nslots)
 {
-  IRRef retf = J->chain[IR_RETF];  /* Limits SLOAD restore elimination. */
+  IRRef retf = J->chain[IR_RETF] > J->chain[IR_RETFV] ?
+    J->chain[IR_RETF] : J->chain[IR_RETFV];
   BCReg s;
   MSize n = 0;
   for (s = 0; s < nslots; s++) {
@@ -974,6 +975,13 @@ const BCIns *lj_snap_restore(jit_State *J, void *exptr)
   */
   setcframe_pc(L->cframe, bc_isret_or_tail(bc_op(*pc)) ? pc : pc+1);
   setcframe_pc(cframe_raw(cframe_prev(L->cframe)), pc);
+
+  if (trace_retm_pending(T, snap) && pc == trace_retm_pc(T)) {
+    /* Entry guards have not changed BASE or the raw C result slots. */
+    uint32_t multres = (uint32_t)ex->spill[T->retm_spill];
+    L->top = L->base + bc_a(*pc) + bc_d(*pc) + multres-1;
+    return pc;
+  }
 
   /* Make sure the stack is big enough for the slots from the snapshot. */
   if (LJ_UNLIKELY(L->base + snap->topslot >= tvref(L->maxstack))) {

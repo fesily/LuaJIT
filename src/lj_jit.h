@@ -8,6 +8,7 @@
 
 #include "lj_obj.h"
 #if LJ_HASJIT
+#include "lj_bc.h"
 #include "lj_ir.h"
 
 /* -- JIT engine flags ---------------------------------------------------- */
@@ -246,13 +247,23 @@ typedef enum {
   LJ_TRLINK_STITCH		/* Trace stitching. */
 } TraceLink;
 
+typedef enum {
+  LJ_STITCH_NONE,
+  LJ_STITCH_RETM_EXACT,
+  LJ_STITCH_RETM_FIXED
+} StitchEntry;
+
 /* Trace object. */
 typedef struct GCtrace {
   GCHeader;
   uint16_t nsnap;	/* Number of snapshots. */
   IRRef nins;		/* Next IR instruction. Biased with REF_BIAS. */
 #if LJ_GC64
-  uint32_t unused_gc64;
+  /* Fill the former unused_gc64 plus its alignment gap without growing traces. */
+  uint8_t retm_wanted;	/* BC B-1 is at most 254; this is not the raw count. */
+  uint8_t retm_spill;	/* Reserved per-activation MULTRES spill slot. */
+  IRRef1 retm_retref;	/* First committed return; earlier guards keep raw results. */
+  uint32_t stitch_multres; /* Full-width actual result count + 1. */
 #endif
 #if !LJ_HASGCMARK
   GCRef gclist;
@@ -281,11 +292,45 @@ typedef struct GCtrace {
   uint8_t sinktags;	/* Trace has SINK tags. */
   uint8_t topslot;	/* Top stack slot already checked to be allocated. */
   uint8_t linktype;	/* Type of link. */
-  uint8_t unused1;
+  uint8_t stitch_entry;	/* StitchEntry. Reuses the former padding byte. */
+#if !LJ_GC64
+  uint8_t retm_wanted;
+  uint8_t retm_spill;
+  IRRef1 retm_retref;
+  uint32_t stitch_multres;
+#endif
 #ifdef LUAJIT_USE_GDBJIT
   void *gdbjit_entry;	/* GDB JIT entry. */
 #endif
 } GCtrace;
+
+#if LJ_GC64
+LJ_STATIC_ASSERT(offsetof(GCtrace, ir) == (LJ_HASGCMARK ? 16 : 32));
+#endif
+
+static LJ_AINLINE int trace_retm_pending(GCtrace *T, SnapShot *snap)
+{
+  return T->stitch_entry != LJ_STITCH_NONE &&
+    (!T->retm_retref || snap->ref <= T->retm_retref);
+}
+
+static LJ_AINLINE const BCIns *trace_retm_pc(GCtrace *T)
+{
+  /* Pending RETM roots and their entry sides start at the unexecuted RETM. */
+  return mref(T->startpc, const BCIns);
+}
+
+static LJ_AINLINE int is_tailcall_retm(const BCIns *pc)
+{
+#if LUA_COMPAT_TAILCALL_CFRAME && LJ_TARGET_X64 && LJ_FR2
+  return bc_op(*pc) == BC_RETM && bc_d(*pc) == 0 &&
+    (bc_op(pc[-1]) == BC_CALLT || bc_op(pc[-1]) == BC_CALLMT) &&
+    bc_a(*pc) == bc_a(pc[-1]);
+#else
+  UNUSED(pc);
+  return 0;
+#endif
+}
 
 #define gco2trace(o)	check_exp((o)->gch.gct == ~LJ_TTRACE, (GCtrace *)(o))
 #define traceref(J, n) \
@@ -449,6 +494,13 @@ typedef struct jit_State {
   int32_t tailcalled;	/* Number of successive tailcalls. */
   int32_t framedepth;	/* Current frame depth. */
   int32_t retdepth;	/* Return frame depth (count of RETF). */
+#ifdef LUAJIT_TEST_RETM
+  uint32_t retm_entries;
+  uint32_t retm_returns;
+  uint32_t retm_fallbacks;
+  uint32_t retm_preexits;
+  uint32_t retm_postexits;
+#endif
 
 #if LJ_K32__USED
   uint32_t k32[LJ_K32__MAX];  /* Common 4 byte constants used by backends. */
@@ -473,12 +525,11 @@ typedef struct jit_State {
   uint8_t needsplit;	/* Need SPLIT pass. */
 #endif
   uint8_t retryrec;	/* Retry recording. */
+  IRRef1 ktrace;		/* KGC trace ref; fills the trace-pointer alignment gap. */
 
   GCRef *trace;		/* Array of traces. */
   TraceNo freetrace;	/* Start of scan for next free trace. */
   MSize sizetrace;	/* Size of trace array. */
-  IRRef1 ktrace;	/* Reference to KGC with GCtrace. */
-
   IRRef1 chain[IR__MAX];  /* IR instruction skip-list chain anchors. */
   TRef slot[LJ_MAX_JSLOTS+LJ_STACK_EXTRA];  /* Stack slot map. */
 

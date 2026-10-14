@@ -2393,7 +2393,9 @@ LJFOLDF(fwd_sload)
 {
   if ((fins->op2 & IRSLOAD_FRAME)) {
     TRef tr = lj_opt_cse(J);
-    return tref_ref(tr) < J->chain[IR_RETF] ? EMITFOLD : tr;
+    return tref_ref(tr) < (J->chain[IR_RETF] > J->chain[IR_RETFV] ?
+			  J->chain[IR_RETF] : J->chain[IR_RETFV]) ?
+      EMITFOLD : tr;
   } else {
     lj_assertJ(J->slot[fins->op1] != 0, "uninitialized slot accessed");
     return J->slot[fins->op1];
@@ -2419,7 +2421,8 @@ LJFOLD(SUB BASE any)
 LJFOLD(EQ any BASE)
 LJFOLDF(fold_base)
 {
-  return lj_opt_cselim(J, J->chain[IR_RETF]);
+  return lj_opt_cselim(J, J->chain[IR_RETF] > J->chain[IR_RETFV] ?
+		      J->chain[IR_RETF] : J->chain[IR_RETFV]);
 }
 
 /* -- Write barriers ------------------------------------------------------ */
@@ -2487,6 +2490,7 @@ LJFOLD(CALLS any any)
 LJFOLD(CALLXS any any)
 LJFOLD(XBAR)
 LJFOLD(RETF any any)  /* Modifies BASE. */
+LJFOLD(RETFV any any)
 LJFOLD(TNEW any any)
 LJFOLD(TDUP any)
 LJFOLD(CNEW any any)

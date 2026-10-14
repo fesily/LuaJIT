@@ -1807,6 +1807,9 @@ static void asm_ir(ASMState *as, IRIns *ir)
   case IR_EQ: case IR_NE: asm_fuseequal(as, ir); break;
 
   case IR_RETF: asm_retf(as, ir); break;
+#if LJ_TARGET_X64
+  case IR_RETFV: asm_retfv(as, ir); break;
+#endif
 
   /* Bit ops. */
   case IR_BNOT: asm_bnot(as, ir); break;
@@ -1925,6 +1928,11 @@ static void asm_head_root(ASMState *as)
   emit_setvmstate(as, (int32_t)as->T->traceno);
   spadj = asm_stack_adjust(as);
   as->T->spadjust = (uint16_t)spadj;
+#if LJ_TARGET_X64
+  if (as->T->stitch_entry)
+    emit_rmro(as, XO_MOVto, RID_R10D, RID_ESP,
+	      sps_scale(as->T->retm_spill));
+#endif
   emit_spsub(as, spadj);
   /* Root traces assume a checked stack for the starting proto. */
   as->T->topslot = gcref(as->T->startpt)->pt.framesize;
@@ -1999,6 +2007,17 @@ static void asm_head_side(ASMState *as)
     spadj = (int32_t)as->parent->spadjust;
     spdelta = 0;
   }
+#if LJ_TARGET_X64
+  if (as->T->stitch_entry) {
+    /* The early raw-count copy must not overwrite live parent spill slots. */
+    int32_t min_delta = (sps_scale(as->T->retm_spill)+8+15) & ~15;
+    if (spdelta < min_delta) {
+      spdelta = min_delta;
+      spadj = (int32_t)as->parent->spadjust + spdelta;
+    }
+    if (spadj > 65535) lj_trace_err(as->J, LJ_TRERR_SPILLOV);
+  }
+#endif
   as->T->spadjust = (uint16_t)spadj;
 
   /* Reload spilled target registers. */
@@ -2108,6 +2127,19 @@ static void asm_head_side(ASMState *as)
     as->T->topslot = (uint8_t)as->topslot;  /* Remember for child traces. */
     asm_stack_check(as, as->topslot, irp, pallow, exitno);
   }
+#if LJ_TARGET_X64
+  if (as->T->stitch_entry) {
+    Reg tmp;
+    if (pallow == RSET_EMPTY) lj_trace_err(as->J, LJ_TRERR_NYICOAL);
+    tmp = rset_pickbot(pallow);
+    /* Initialize before the first child guard without disturbing parent RSP. */
+    emit_spsub(as, -spdelta);
+    emit_rmro(as, XO_MOVto, tmp, RID_ESP, sps_scale(as->T->retm_spill));
+    emit_rmro(as, XO_MOV, tmp, RID_ESP,
+	      sps_scale(as->parent->retm_spill)+spdelta);
+    emit_spsub(as, spdelta);
+  }
+#endif
 }
 
 /* -- Tail of trace ------------------------------------------------------- */
@@ -2162,7 +2194,15 @@ static void asm_tail_link(ASMState *as)
     case BC_TSETM: mres -= (int32_t)bc_a(*pc); break;
     default: if (bc_op(*pc) < BC_FUNCF) mres = 0; break;
     }
-    ra_allockreg(as, mres, RID_RET);  /* Return MULTRES or 0. */
+    if (trace_retm_pending(as->T, snap)) {
+#if LJ_TARGET_X64
+      emit_rmro(as, XO_MOV, RID_RET, RID_ESP,
+		sps_scale(as->T->retm_spill));
+      ra_allockreg(as, 0, RID_RET);
+#endif
+    } else {
+      ra_allockreg(as, mres, RID_RET);  /* Return MULTRES or 0. */
+    }
   } else if (baseslot) {
     /* Save modified BASE for linking to trace with higher start frame. */
     emit_setgl(as, RID_BASE, jit_base);
@@ -2463,6 +2503,11 @@ static void asm_setup_regsp(ASMState *as)
     as->oddspill = as->evenspill++;
   else
     as->oddspill = 0;
+  if (T->stitch_entry) {
+    if (as->evenspill > 254) lj_trace_err(as->J, LJ_TRERR_SPILLOV);
+    T->retm_spill = (uint8_t)as->evenspill;
+    as->evenspill += 2;
+  }
 }
 
 /* -- Assembler core ------------------------------------------------------ */

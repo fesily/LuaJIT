@@ -29,6 +29,7 @@
   \
   _(ABC,	N , ref, ref) \
   _(RETF,	S , ref, ref) \
+  _(RETFV,	S , ref, ref) \
   \
   /* Miscellaneous ops. */ \
   _(NOP,	N , ___, ___) \

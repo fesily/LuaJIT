@@ -999,9 +999,11 @@ static int check_downrec_unroll(jit_State *J, GCproto *pt)
     if (ir_kgc(IR(ptref)) == obj2gco(pt)) {
       int count = 0;
       IRRef ref;
-      for (ref = J->chain[IR_RETF]; ref; ref = IR(ref)->prev)
-	if (IR(ref)->op1 == ptref)
-	  count++;
+      IROp op;
+      for (op = IR_RETF; op <= IR_RETFV; op++)
+	for (ref = J->chain[op]; ref; ref = IR(ref)->prev)
+	  if (IR(ref)->op1 == ptref)
+	    count++;
       if (count) {
 	if (J->pc == J->startpc) {
 	  if (count + J->tailcalled > J->param[JIT_P_recunroll])
@@ -1022,6 +1024,9 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
   TValue *frame = J->L->base - 1;
   ptrdiff_t i;
   BCReg baseadj = 0;
+  int entry_varg = J->cur.stitch_entry && !J->retdepth &&
+    J->framedepth == 0 && J->pc == trace_retm_pc(&J->cur) &&
+    frame_isvarg(frame);
   for (i = 0; i < gotresults; i++)
     (void)getslot(J, rbase+i);  /* Ensure all results have a reference. */
   while (frame_ispcall(frame)) {  /* Immediately resolve pcall() returns. */
@@ -1040,7 +1045,7 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
   }
   /* Return to lower frame via interpreter for unhandled cases. */
   if (J->framedepth == 0 && J->pt && bc_isret(bc_op(*J->pc)) &&
-       (!frame_islua(frame) ||
+       ((!frame_islua(frame) && !entry_varg) ||
 	(J->parent == 0 && J->exitno == 0 &&
 	 !bc_isret(bc_op(J->cur.startins))))) {
     /* NYI: specialize to frame type and return directly, not via RET*. */
@@ -1050,7 +1055,9 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
     lj_record_stop(J, LJ_TRLINK_RETURN, 0);  /* Return to interpreter. */
     return;
   }
-  if (frame_isvarg(frame)) {
+  if (entry_varg) {
+    frame = frame_prevd(frame);
+  } else if (frame_isvarg(frame)) {
     BCReg cbase = (BCReg)frame_delta(frame);
     if (--J->framedepth < 0)  /* NYI: return of vararg func to lower frame. */
       lj_trace_err(J, LJ_TRERR_NYIRETL);
@@ -1097,7 +1104,10 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
     } else {  /* Return to lower frame. Guard for the target we return to. */
       TRef trpt = lj_ir_kgc(J, obj2gco(pt), IRT_PROTO);
       TRef trpc = lj_ir_kptr(J, (void *)frame_pc(frame));
-      emitir(IRTG(IR_RETF, IRT_PGC), trpt, trpc);
+      TRef ret = emitir(IRTG(entry_varg ? IR_RETFV : IR_RETF, IRT_PGC),
+			trpt, trpc);
+      if (J->cur.stitch_entry && !J->cur.retm_retref)
+	J->cur.retm_retref = tref_ref(ret);
       J->retdepth++;
       J->needsnap = 1;
       J->scev.idx = REF_NIL;
@@ -2779,7 +2789,11 @@ void lj_record_ins(jit_State *J)
 
   case BC_RETM:
     /* L->top is set to L->base+ra+rc+NRESULTS-1, see lj_dispatch_ins(). */
-    rc = (BCReg)(J->L->top - J->L->base) - ra + 1;
+    if (J->cur.stitch_entry == LJ_STITCH_RETM_FIXED &&
+	J->pc == trace_retm_pc(&J->cur) && !J->retdepth)
+      rc = J->cur.retm_wanted + 1;
+    else
+      rc = (BCReg)(J->L->top - J->L->base) - ra + 1;
     /* fallthrough */
   case BC_RET: case BC_RET0: case BC_RET1:
 #if LJ_HASPROFILE
@@ -2950,6 +2964,32 @@ static const BCIns *rec_setup_root(jit_State *J)
     /* No bytecode range check for down-recursive root traces. */
     J->maxslot = ra + bc_d(ins) - 1;
     break;
+  case BC_RETM:
+  {
+    TValue *frame = J->L->base-1;
+    BCReg wanted = 0;
+    lj_assertJ(J->exitno && is_tailcall_retm(pc), "invalid RETM entry");
+    J->maxslot = (BCReg)(J->L->top - J->L->base);
+    J->cur.stitch_multres = J->maxslot - ra - bc_d(ins) + 1;
+    J->cur.stitch_entry = LJ_STITCH_RETM_EXACT;
+    if (frame_isvarg(frame)) frame = frame_prevd(frame);
+    if (frame_islua(frame)) wanted = bc_b(frame_pc(frame)[-1]);
+    if (wanted) {
+      BCReg actual = J->maxslot;
+      J->cur.stitch_entry = LJ_STITCH_RETM_FIXED;
+      J->cur.retm_wanted = (uint8_t)(wanted-1);
+      J->maxslot = ra + wanted-1;
+      /* Padding is outside the logical raw result range kept in L->top. */
+      if (J->maxslot > actual) {
+	BCReg i;
+	lj_state_checkstack(J->L, J->maxslot-actual);
+	for (i = actual; i < J->maxslot; i++) setnilV(J->L->base+i);
+      }
+    }
+    if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
+      lj_trace_err(J, LJ_TRERR_STACKOV);
+    break;
+  }
   case BC_FUNCF:
     /* No bytecode range check for root traces started by a hot call. */
     J->maxslot = J->pt->numparams;
@@ -3015,6 +3055,19 @@ void lj_record_setup(jit_State *J)
     TraceNo root = T->root ? T->root : J->parent;
     J->cur.root = (uint16_t)root;
     J->cur.startins = BCINS_AD(BC_JMP, 0, 0);
+    if (trace_retm_pending(T, &T->snap[J->exitno]) &&
+	J->pc == trace_retm_pc(T)) {
+      TValue *frame = J->L->base-1;
+      if (frame_isvarg(frame)) frame = frame_prevd(frame);
+      /* A different receiver needs its own normalized root entry. */
+      if (T->stitch_entry == LJ_STITCH_RETM_FIXED &&
+	  (!frame_islua(frame) ||
+	   bc_b(frame_pc(frame)[-1]) != T->retm_wanted+1))
+	lj_trace_err(J, LJ_TRERR_NYIRETL);
+      J->cur.stitch_entry = T->stitch_entry;
+      J->cur.stitch_multres = T->stitch_multres;
+      J->cur.retm_wanted = T->retm_wanted;
+    }
     /* Check whether we could at least potentially form an extra loop. */
     if (J->exitno == 0 && T->snap[0].nent == 0) {
       /* We can narrow a FORL for some side traces, too. */
