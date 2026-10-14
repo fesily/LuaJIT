@@ -37,14 +37,13 @@
 ** or to the dump format, you *must* set BCDUMP_VERSION to 0x80 or higher.
 **
 ** LUA_COMPAT_TAILCALL_CFRAME modifies the bytecode: a tail call to a C/FF
-** callee is followed by the BC_RETM it returns through (vm_x64.dasc,
-** lj_parse.c), so a pre-change dump (stock CALLT, nothing behind it) would
-** make the C return resume past the end of the prototype.  Bump the version
-** (per the rule above) so those chunks are rejected at load time.  With the
-** switch off the bytecode format and the version stay stock.
+** callee is followed by BC_RETM, with BC_UCLO after the call when needed.
+** Version 0x80 closed before CALLT and lost retained local/upvalue aliases;
+** stock dumps have no trailing return at all. Reject both older layouts.
+** With the switch off the bytecode format and the version stay stock.
 */
 #if LUA_COMPAT_TAILCALL_CFRAME
-#define BCDUMP_VERSION		0x80
+#define BCDUMP_VERSION		0x81
 #else
 #define BCDUMP_VERSION		2
 #endif

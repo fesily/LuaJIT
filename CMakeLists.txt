@@ -237,6 +237,14 @@ int main() { return 0; }
 IF(LUA_COMPAT_TAILCALL_COUNT_ON)
   SET(DASM_FLAGS ${DASM_FLAGS} -D LUA_COMPAT_TAILCALL_COUNT)
 ENDIF()
+CHECK_C_SOURCE_COMPILES("
+#include \"lj_arch.h\"
+#if LUA_COMPAT_TAILCALL_CFRAME
+int main() { return 0; }
+#else
+#error \"not enabled\"
+#endif
+" LUA_COMPAT_TAILCALL_CFRAME_ON)
 IF(WIN32)
   SET(DASM_FLAGS ${DASM_FLAGS} -LN -D WIN)
 ENDIF()
@@ -601,6 +609,19 @@ if(LUA_COMPAT_TAILCALL_COUNT_ON)
       LABELS luajit_compat51)
   endforeach()
 endif()
+
+# Retained C-tail frames must keep local/upvalue aliases in both GC variants.
+foreach(_lj_upvalue_vm luajit luajit-arenagc)
+  set(_lj_upvalue_mode)
+  if(NOT LUA_COMPAT_TAILCALL_CFRAME_ON)
+    set(_lj_upvalue_mode stock)
+  endif()
+  add_test(NAME ${_lj_upvalue_vm}_compat51_tailcall_upvalue
+    COMMAND ${_lj_upvalue_vm} ${LUAJIT_DIR}/test/compat51/tailcall_upvalue.lua
+      ${_lj_upvalue_mode})
+  set_tests_properties(${_lj_upvalue_vm}_compat51_tailcall_upvalue PROPERTIES
+    WORKING_DIRECTORY ${LUAJIT_DIR} LABELS luajit_compat51 TIMEOUT 30)
+endforeach()
 
 # DS engine API scripts (test/ds): lua_gc LUA_GCSTEPTIME/LUA_GCSTEP2
 # time-sliced GC cycles complete, collect and run finalizers.

@@ -954,6 +954,11 @@ void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
 static void rec_callt(jit_State *J, BCReg func, ptrdiff_t nargs)
 {
   TValue callee;
+  /* A tail frame with children may need to close upvalues before Lua reuse. */
+  if ((J->pt->flags & PROTO_CHILD)) {
+    setintV(&J->errinfo, (int32_t)BC_UCLO);
+    lj_trace_err_info(J, LJ_TRERR_NYIBC);
+  }
   rec_call_setup(J, func, nargs, &callee);
   if (!isluafunc(funcV(&callee))) {  /* C/FF callee: normal call. */
     J->framedepth++;

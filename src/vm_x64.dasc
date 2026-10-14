@@ -4446,7 +4446,15 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cleartp TMPR
     |  cmp byte LFUNC:TMPR->ffid, 0	// FF_LUA == 0 (lj_obj.h:496)
     |  jne ->BC_CALLT_CFRAME
+    |  mov L:TMPR, SAVE_L
+    |.if LJ_HASGCMARK
+    |  cmp dword L:TMPR->openuvtop, 0
+    |.else
+    |  cmp aword L:TMPR->openupval, 0
+    |.endif
+    |  jne ->BC_CALLT_CLOSEUV
 #endif
+    |->BC_CALLT_LUA:
     |  mov PC, [BASE-8]
     |  test PCd, FRAME_TYPE
     |  jnz >7
@@ -4524,6 +4532,23 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |8:
     |  add PCd, FRAME_VARG
     |  jmp <1
+    |->BC_CALLT_CLOSEUV:
+#if LUA_COMPAT_TAILCALL_CFRAME
+    |  // Close before the Lua branch overwrites this frame, including varargs.
+    |  mov L:TMPR->base, BASE
+    |  mov TMP1d, NARGS:RDd
+    |  mov SAVE_PC, PC
+    |  mov CARG2, BASE
+    |  mov L:CARG1, L:TMPR
+    |  call extern lj_func_closeuv
+    |  mov L:TMPR, SAVE_L
+    |  mov BASE, L:TMPR->base
+    |  mov NARGS:RDd, TMP1d
+    |  movzx RAd, PC_RA
+    |  lea RA, [BASE+RA*8+16]
+    |  mov KBASE, BASE
+    |  jmp ->BC_CALLT_LUA
+#endif
     break;
 
   case BC_ITERC:

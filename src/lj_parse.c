@@ -1691,6 +1691,10 @@ static void fs_fixup_ret(FuncState *fs)
       BCPos offset;
       switch (bc_op(ins)) {
       case BC_CALLMT: case BC_CALLT:
+#if LUA_COMPAT_TAILCALL_CFRAME
+	/* Lua callees close at frame reuse; C callees reach the fixed-up RETM. */
+	break;
+#endif
       case BC_RETM: case BC_RET: case BC_RET0: case BC_RET1:
 	offset = bcemit_INS(fs, ins);  /* Copy original instruction. */
 	fs->bcbase[offset].line = fs->bcbase[pc].line;
@@ -2785,13 +2789,18 @@ static void parse_return(LexState *ls, int eflags)
       }
     }
   }
+#if LUA_COMPAT_TAILCALL_CFRAME
+  if (emit_ret) {
+    bcemit_INS(fs, ins);
+    if (fs->flags & PROTO_CHILD)
+      bcemit_AJ(fs, BC_UCLO, 0, 0);  /* C caller closes after the call. */
+    bcemit_INS(fs, ins_ret);
+    return;
+  }
+#endif
   if (fs->flags & PROTO_CHILD)
     bcemit_AJ(fs, BC_UCLO, 0, 0);  /* May need to close upvalues first. */
   bcemit_INS(fs, ins);
-#if LUA_COMPAT_TAILCALL_CFRAME
-  if (emit_ret)
-    bcemit_INS(fs, ins_ret);
-#endif
 }
 
 /* Parse 'break' statement. */
