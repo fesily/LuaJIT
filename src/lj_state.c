@@ -69,35 +69,51 @@ static void resizestack(lua_State *L, MSize n)
   ptrdiff_t delta;
   MSize oldsize = L->stacksize;
   MSize realsize = n + 1 + LJ_STACK_EXTRA;
+#if LUA_COMPAT_TAILCALL_COUNT
+  global_State *g = G(L);
+  int *tc;
+#endif
 #if !LJ_HASGCMARK
   GCobj *up;
 #endif
   lj_assertL((MSize)(tvref(L->maxstack)-oldst) == L->stacksize-LJ_STACK_EXTRA-1,
 	     "inconsistent stack size");
-  st = (TValue *)lj_mem_realloc(L, tvref(L->stack),
+#if LUA_COMPAT_TAILCALL_COUNT
+  /* Prepare counts without changing the live arrays. A failed stack realloc
+  ** must release this temporary before raising OOM on the unchanged state. */
+  tc = lj_mem_newvec(L, realsize, int);
+  memcpy(tc, mref(L->tailcalls, int),
+	 (oldsize < realsize ? oldsize : realsize)*sizeof(int));
+  {
+    MSize i;
+    for (i = oldsize; i < realsize; i++) tc[i] = 0;
+  }
+  st = (TValue *)g->allocf(g->allocd, oldst,
+			 oldsize*sizeof(TValue), realsize*sizeof(TValue));
+  if (st == NULL) {
+    lj_mem_freevec(g, tc, realsize, int);
+    lj_err_mem(L);
+  }
+  lj_assertG(checkptrGC(st),
+	     "allocated memory address %p outside required range", st);
+  g->gc.total = (g->gc.total - oldsize*sizeof(TValue)) +
+	       realsize*sizeof(TValue);
+  lj_mem_freevec(g, mref(L->tailcalls, int), oldsize, int);
+  setmref(L->tailcalls, tc);
+#else
+  st = (TValue *)lj_mem_realloc(L, oldst,
 				(MSize)(oldsize*sizeof(TValue)),
 				(MSize)(realsize*sizeof(TValue)));
+#endif
   setmref(L->stack, st);
   delta = (char *)st - (char *)oldst;
   setmref(L->maxstack, st + n);
-  /* Do not clobber oldsize: LUA_COMPAT_TAILCALL_COUNT realloc/zeroing and the
-  ** jit_base range check below still need the pre-resize stack length. */
+  /* The jit_base range check below needs the pre-resize stack length. */
   {
     MSize i = oldsize;
     while (i < realsize)  /* Clear new slots. */
       setnilV(st + i++);
   }
-#if LUA_COMPAT_TAILCALL_COUNT
-  {
-    int *tc = (int *)lj_mem_realloc(L, mref(L->tailcalls, void),
-				    (MSize)(oldsize * sizeof(int)),
-				    (MSize)(realsize * sizeof(int)));
-    MSize i;
-    for (i = oldsize; i < realsize; i++)
-      tc[i] = 0;
-    setmref(L->tailcalls, tc);
-  }
-#endif
   L->stacksize = realsize;
   if ((size_t)(mref(G(L)->jit_base, char) - (char *)oldst) < (size_t)oldsize * sizeof(TValue))
     setmref(G(L)->jit_base, mref(G(L)->jit_base, char) + delta);
@@ -282,11 +298,14 @@ static void close_state(lua_State *L)
   lj_str_freetab(g);
   lj_buf_free(g, &g->tmpbuf);
 #if LJ_HASGCMARK
-  lj_mem_freevec(g, mref(g->gc.ssb, GCobj *), 1024, GCobj *);
+  if (mref(g->gc.ssb, GCobj *) != NULL)
+    lj_mem_freevec(g, mref(g->gc.ssb, GCobj *), 1024, GCobj *);
 #endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
 #if LUA_COMPAT_TAILCALL_COUNT
-  lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
+  /* stack_init() may fail after allocating only the value stack. */
+  if (mref(L->tailcalls, int) != NULL)
+    lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
 #endif
 #if LJ_64
   if (mref(g->gc.lightudseg, uint32_t)) {
@@ -456,6 +475,9 @@ lua_State *lj_state_new(lua_State *L)
   L1->status = LUA_OK;
   L1->stacksize = 0;
   setmref(L1->stack, NULL);
+#if LUA_COMPAT_TAILCALL_COUNT
+  setmref(L1->tailcalls, NULL);
+#endif
   L1->cframe = NULL;
 #if LJ_DS_LUA_STATE_LAYOUT
   L1->userdata = NULL;
@@ -513,7 +535,8 @@ void LJ_FASTCALL lj_state_free(global_State *g, lua_State *L)
 #endif
   lj_mem_freevec(g, tvref(L->stack), L->stacksize, TValue);
 #if LUA_COMPAT_TAILCALL_COUNT
-  lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
+  if (mref(L->tailcalls, int) != NULL)
+    lj_mem_freevec(g, mref(L->tailcalls, int), L->stacksize, int);
 #endif
   lj_mem_freegco(g, L, sizeof(lua_State));
 }
