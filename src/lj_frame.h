@@ -111,7 +111,6 @@ enum { LJ_CONT_TAILCALL, LJ_CONT_FFI_CALLBACK };  /* Special continuations. */
 /* Note: this macro does not skip over FRAME_VARG. */
 
 #if LUA_COMPAT_TAILCALL_COUNT
-#define LJ_TAILCALL_COUNT_MAX	1000000
 #define frame_tc_idx(L, f)	((MSize)((f) - tvref((L)->stack)))
 #define frame_tailcalls_raw(L, f) \
   (mref((L)->tailcalls, int)[frame_tc_idx((L), (f))])
@@ -129,7 +128,7 @@ enum { LJ_CONT_TAILCALL, LJ_CONT_FFI_CALLBACK };  /* Special continuations. */
     MSize _i = frame_tc_idx((L), (f)); \
     if (_i < (L)->stacksize) { \
       int *_p = &frame_tailcalls_raw((L), (f)); \
-      if (*_p < LJ_TAILCALL_COUNT_MAX) (*_p)++; \
+      if (*_p < INT32_MAX) (*_p)++; \
     } \
   } while (0)
 #else

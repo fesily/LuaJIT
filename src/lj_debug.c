@@ -62,7 +62,6 @@ cTValue *lj_debug_frame(lua_State *L, int level, int *size)
       if (debug_isluaframe(frame)) {
 	tc = frame_tailcalls(L, frame);
 	if (tc < 0) tc = 0;
-	if (tc > LJ_TAILCALL_COUNT_MAX) tc = LJ_TAILCALL_COUNT_MAX;
       }
       if (level-- == 0) {
 	*size = (int)(nextframe - frame);

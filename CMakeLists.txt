@@ -607,6 +607,11 @@ if(LUA_COMPAT_TAILCALL_COUNT_ON)
     set_tests_properties(${_lj_tailcall_vm}_compat51_tailcall_count_jit PROPERTIES
       WORKING_DIRECTORY ${LUAJIT_DIR}
       LABELS luajit_compat51)
+    add_test(NAME ${_lj_tailcall_vm}_compat51_tailcall_depth
+      COMMAND ${_lj_tailcall_vm} ${LUAJIT_DIR}/test/compat51/tailcall_depth.lua)
+    set_tests_properties(${_lj_tailcall_vm}_compat51_tailcall_depth PROPERTIES
+      WORKING_DIRECTORY ${LUAJIT_DIR}
+      LABELS luajit_compat51 TIMEOUT 120)
   endforeach()
 endif()
 

@@ -6,6 +6,9 @@ typedef struct HookRun {
   int logref;
   int callbackref;
   int events;
+  int calls;
+  int returns;
+  int tails;
 } HookRun;
 
 static char context_key;
@@ -107,6 +110,58 @@ static int run_hook(lua_State *L)
   return 3;
 }
 
+static void count_hook(lua_State *L, lua_Debug *ar)
+{
+  HookRun *run = context_get(L);
+  if (!run) return;
+  if (ar->event == LUA_HOOKCALL) run->calls++;
+  else if (ar->event == LUA_HOOKRET) run->returns++;
+  else if (ar->event == LUA_HOOKTAILRET) run->tails++;
+}
+
+/* Keep million-event tests bounded in memory and avoid compiling the hook. */
+static int count_hooks(lua_State *L)
+{
+  HookRun run, *previous;
+  lua_State *target = lua_isnoneornil(L, 3) ? L : lua_tothread(L, 3);
+  lua_Hook oldhook;
+  int oldmask, oldcount;
+  int mask = luaL_optint(L, 2, LUA_MASKCALL|LUA_MASKRET);
+  int status;
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  if (!target) return luaL_argerror(L, 3, "thread expected");
+  oldhook = lua_gethook(target);
+  oldmask = lua_gethookmask(target);
+  oldcount = lua_gethookcount(target);
+  run.calls = run.returns = run.tails = 0;
+  previous = context_get(target);
+  context_set(target, &run);
+  lua_sethook(target, count_hook, mask, 0);
+  lua_pushvalue(L, 1);
+  status = lua_pcall(L, 0, 1, 0);
+  lua_sethook(target, oldhook, oldmask, oldcount);
+  context_set(target, previous);
+  lua_pushboolean(L, status == 0);
+  lua_insert(L, -2);
+  lua_pushinteger(L, run.calls);
+  lua_pushinteger(L, run.returns);
+  lua_pushinteger(L, run.tails);
+  return 5;
+}
+
+static int get_frame(lua_State *L)
+{
+  lua_Debug ar;
+  if (!lua_getstack(L, luaL_checkint(L, 1), &ar)) {
+    lua_pushnil(L);
+    return 1;
+  }
+  if (!lua_getinfo(L, "Sf", &ar)) return luaL_error(L, "frame info unavailable");
+  lua_pushstring(L, ar.what);
+  lua_insert(L, -2);
+  return 2;
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
@@ -115,5 +170,9 @@ int luaopen_hookprobe(lua_State *L)
   lua_newtable(L);
   lua_pushcfunction(L, run_hook);
   lua_setfield(L, -2, "run");
+  lua_pushcfunction(L, count_hooks);
+  lua_setfield(L, -2, "count");
+  lua_pushcfunction(L, get_frame);
+  lua_setfield(L, -2, "frame");
   return 1;
 }

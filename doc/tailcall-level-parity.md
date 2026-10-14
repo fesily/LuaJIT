@@ -61,4 +61,4 @@ static int debug_isluaframe(cTValue *frame)
 ## 边界
 
 - `LUA_COMPAT_TAILCALL_COUNT` 仍只在 x64（`vm_x64.dasc` 是唯一实现写入侧的后端）默认开启；x86、x64 非 GC64、arm 等保持 stock。
-- 计数上限 `LJ_TAILCALL_COUNT_MAX`（1e6）与数组扩容/清零语义未变；栈重分配时 `lj_state.c` 会迁移/清零新数组。
+- 2026-10-14 已删除层级查询和 C helper 的一百万阈值，保留原有 32 位计数表示及数组扩容/清零语义；直接查询与 traceback 输出省略分开处理。百万级深度、原生 API 和返回 hook 的验证见 [tailcall-depth-limit.md](tailcall-depth-limit.md)。
