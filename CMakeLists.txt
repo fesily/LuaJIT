@@ -38,6 +38,7 @@ INCLUDE(CheckTypeSize)
 option(LUAJIT_DISABLE_FFI "Disable FFI." OFF)
 option(LUAJIT_ENABLE_LUA52COMPAT "Enable Lua 5.2 compatibility." OFF)
 option(LUAJIT_DISABLE_JIT "Disable JIT." OFF)
+option(LUAJIT_DISABLE_ETW "Disable Windows ETW JIT symbols." OFF)
 option(LUAJIT_CPU_SSE2 "Use SSE2 instead of x87 instructions." ON)
 option(LUAJIT_CPU_NOCMOV "Disable NOCMOV." OFF)
 option(LUAJIT_DISABLE_GC64 "Disable GC64" OFF)
@@ -46,7 +47,7 @@ option(LUAJIT_ENABLE_FSANITIZE "Enable fsanitize" OFF)
 option(LUAJIT_NUMMODE "num mode" 2)
 MARK_AS_ADVANCED(LUAJIT_DISABLE_FFI LUAJIT_ENABLE_LUA52COMPAT
   LUAJIT_DISABLE_GC64
-  LUAJIT_DISABLE_JIT LUAJIT_CPU_SSE2 LUAJIT_CPU_NOCMOV)
+  LUAJIT_DISABLE_JIT LUAJIT_DISABLE_ETW LUAJIT_CPU_SSE2 LUAJIT_CPU_NOCMOV)
 
 IF(LUAJIT_DISABLE_FFI)
   ADD_DEFINITIONS(-DLUAJIT_DISABLE_FFI)
@@ -62,6 +63,10 @@ ENDIF()
 
 IF(LUAJIT_DISABLE_JIT)
   ADD_DEFINITIONS(-DLUAJIT_DISABLE_JIT)
+ENDIF()
+
+IF(LUAJIT_DISABLE_ETW)
+  ADD_DEFINITIONS(-DLUAJIT_DISABLE_ETW)
 ENDIF()
 
 IF(LUAJIT_CPU_SSE2)
@@ -126,6 +131,11 @@ Apparently you are not on a Windows platform as well.
 So lua has no way to deal with shared libraries!")
   ENDIF(NOT LUA_USE_DLOPEN)
 ENDIF(NOT WIN32)
+
+IF(WIN32)
+  # lj_etw.c uses the ETW provider API (EventRegister/EventWrite).
+  LIST(APPEND LIBS advapi32)
+ENDIF()
 
 check_library_exists(m sin "" LUA_USE_LIBM)
 if ( LUA_USE_LIBM )
@@ -678,6 +688,36 @@ if(LUAJIT_TEST_STACK_OOM)
     set_tests_properties(luajit_${_lj_oom_variant}_stack_oom PROPERTIES
       LABELS luajit_stack_oom TIMEOUT 30)
   endforeach()
+endif()
+
+# Windows ETW JIT symbol integration tests: real ETW sessions in both GC
+# variants. Exit code 77 means "no privilege for a trace session" and is the
+# only skippable outcome; a missing/mismatched event fails.
+option(LUAJIT_TEST_ETW "Build Windows ETW symbol integration tests." OFF)
+if(LUAJIT_TEST_ETW)
+  if(WIN32 AND NOT LUAJIT_DISABLE_JIT AND NOT LUAJIT_DISABLE_ETW)
+    foreach(_lj_etw_variant default arenagc)
+      if(_lj_etw_variant STREQUAL "default")
+        set(_lj_etw_lib luajit-5.1)
+      else()
+        set(_lj_etw_lib luajit-5.1-arenagc)
+      endif()
+      add_executable(etw-symbols-${_lj_etw_variant} test/etw_symbols.c)
+      target_include_directories(etw-symbols-${_lj_etw_variant} PRIVATE "${LUAJIT_DIR}/src")
+      if(_lj_etw_variant STREQUAL "arenagc")
+        target_compile_definitions(etw-symbols-${_lj_etw_variant} PRIVATE LUAJIT_ENABLE_GCARENA)
+      endif()
+      target_link_libraries(etw-symbols-${_lj_etw_variant} PRIVATE ${_lj_etw_lib} advapi32)
+      set_target_properties(etw-symbols-${_lj_etw_variant} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+      add_test(NAME luajit_${_lj_etw_variant}_etw_symbols
+        COMMAND etw-symbols-${_lj_etw_variant})
+      set_tests_properties(luajit_${_lj_etw_variant}_etw_symbols PROPERTIES
+        LABELS luajit_etw TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+  else()
+    message(STATUS "LUAJIT_TEST_ETW ignored: needs WIN32 with JIT and ETW enabled")
+  endif()
 endif()
 
 MACRO(LUAJIT_add_custom_commands luajit_target)

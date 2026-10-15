@@ -302,6 +302,9 @@ typedef struct GCtrace {
 #ifdef LUAJIT_USE_GDBJIT
   void *gdbjit_entry;	/* GDB JIT entry. */
 #endif
+#if LJ_HASETW
+  void *etw_entry;	/* ETW JIT symbol record (see lj_etw.c). */
+#endif
 } GCtrace;
 
 #if LJ_GC64
@@ -571,6 +574,10 @@ typedef struct jit_State {
   GCproto *prev_pt;	/* Previous prototype. */
   BCLine prev_line;	/* Previous line. */
   int prof_mode;	/* Profiling mode: 0, 'f', 'l'. */
+#endif
+
+#if LJ_HASETW
+  void *etw_context;	/* ETW JIT symbols (see lj_etw.c). */
 #endif
 } jit_State;
 

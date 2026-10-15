@@ -618,6 +618,13 @@
 #define LJ_HASJIT		1
 #endif
 
+/* Disable or enable the Windows ETW JIT symbol provider. */
+#if LJ_TARGET_WINDOWS && LJ_HASJIT && !defined(LUAJIT_DISABLE_ETW)
+#define LJ_HASETW		1
+#else
+#define LJ_HASETW		0
+#endif
+
 /* Disable or enable the FFI extension. */
 #if defined(LUAJIT_DISABLE_FFI) || defined(LJ_ARCH_NOFFI)
 #define LJ_HASFFI		0

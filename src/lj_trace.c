@@ -24,6 +24,7 @@
 #include "lj_trace.h"
 #include "lj_snap.h"
 #include "lj_gdbjit.h"
+#include "lj_etw.h"
 #include "lj_record.h"
 #include "lj_asm.h"
 #include "lj_dispatch.h"
@@ -132,6 +133,7 @@ GCtrace * LJ_FASTCALL lj_trace_alloc(lua_State *L, GCtrace *T)
   T2->gct = ~LJ_TTRACE;
   T2->marked = 0;
   T2->traceno = 0;
+  LJ_ETW_CLEAR_ENTRY(T2);
   T2->ir = (IRIns *)p - T->nk;
   T2->nins = T->nins;
   T2->nk = T->nk;
@@ -148,6 +150,7 @@ static void trace_save(jit_State *J, GCtrace *T)
   size_t szins = (J->cur.nins-J->cur.nk)*sizeof(IRIns);
   char *p = (char *)T + sztr;
   memcpy(T, &J->cur, sizeof(GCtrace));
+  LJ_ETW_CLEAR_ENTRY(T);  /* The current trace is never published. */
 #if !LJ_HASGCMARK
   setgcrefr(T->nextgc, J2G(J)->gc.root);
   setgcrefp(J2G(J)->gc.root, T);
@@ -166,6 +169,7 @@ static void trace_save(jit_State *J, GCtrace *T)
   setgcrefp(J->trace[T->traceno], T);
   lj_gc_barriertrace(J2G(J), T->traceno);
   lj_gdbjit_addtrace(J, T);
+  lj_etw_addtrace(J, T);
 #ifdef LUAJIT_USE_PERFTOOLS
   perftools_addtrace(T);
 #endif
@@ -176,6 +180,7 @@ void LJ_FASTCALL lj_trace_free(global_State *g, GCtrace *T)
   jit_State *J = G2J(g);
   if (T->traceno) {
     lj_gdbjit_deltrace(J, T);
+    lj_etw_deltrace(J, T);
     if (T->traceno < J->freetrace)
       J->freetrace = T->traceno;
     setgcrefnull(J->trace[T->traceno]);
@@ -287,6 +292,7 @@ int lj_trace_flushall(lua_State *L)
       if (T->root == 0)
 	trace_flushroot(J, T);
       lj_gdbjit_deltrace(J, T);
+      lj_etw_deltrace(J, T);
       T->traceno = T->link = 0;  /* Blacklist the link for cont_stitch. */
       setgcrefnull(J->trace[i]);
     }
@@ -355,6 +361,8 @@ void lj_trace_initstate(global_State *g)
   J->k64[LJ_K64_VM_EXIT_HANDLER].u64 = (uintptr_t)lj_ptr_sign((void *)lj_vm_exit_handler, 0);
   J->k64[LJ_K64_VM_EXIT_INTERP].u64 = (uintptr_t)lj_ptr_sign((void *)lj_vm_exit_interp, 0);
 #endif
+
+  lj_etw_initstate(J);
 }
 
 /* Free everything associated with the JIT compiler state. */
@@ -369,6 +377,7 @@ void lj_trace_freestate(global_State *g)
 		 "trace still allocated");
   }
 #endif
+  lj_etw_freestate(J);
   lj_mcode_free(J);
   lj_mem_freevec(g, J->snapmapbuf, J->sizesnapmap, SnapEntry);
   lj_mem_freevec(g, J->snapbuf, J->sizesnap, SnapShot);
