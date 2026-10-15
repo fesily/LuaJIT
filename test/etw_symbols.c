@@ -658,6 +658,36 @@ static void *vm_ctx(lua_State *L)
   return (void *)J2G(L2J(L));
 }
 
+/* Enable/disable ETW symbol publishing from this VM: jit.profile.etw([on]).
+** The switch is process-global and off by default, so every scenario that
+** expects JIT events turns it on before compiling the traces under test.
+*/
+static int vm_etw(lua_State *L, int on)
+{
+  int rc, state;
+  lua_getglobal(L, "require");
+  lua_pushliteral(L, "jit.profile");
+  rc = lua_pcall(L, 1, 1, 0);
+  if (rc != 0) {
+    fprintf(stderr, "FAIL: require jit.profile: %s\n", lua_tostring(L, -1));
+    exit(1);
+  }
+  lua_getfield(L, -1, "etw");
+  if (on < 0) {
+    rc = lua_pcall(L, 0, 1, 0);
+  } else {
+    lua_pushboolean(L, on);
+    rc = lua_pcall(L, 1, 1, 0);
+  }
+  if (rc != 0) {
+    fprintf(stderr, "FAIL: profile.etw: %s\n", lua_tostring(L, -1));
+    exit(1);
+  }
+  state = lua_toboolean(L, -1);
+  lua_pop(L, 2);
+  return state;
+}
+
 static lua_State *vm_new(void)
 {
   lua_State *L = luaL_newstate();
@@ -762,6 +792,83 @@ static int wait_rundown(EventLog *log, int mark, const char *sc,
   return 1;
 }
 
+/* 0. Runtime switch: off by default, enabling flushes this VM's traces,
+** disabling unloads the published records and stops new publications.
+*/
+static void scenario_runtime_switch(void)
+{
+  const char *sc = "runtime-switch";
+  EventLog *log = log_new();
+  Session s;
+  DWORD err = 0;
+  lua_State *L = vm_new();
+  TraceRef traces[ETW_MAX_TRACES];
+  int ntraces, mark, idx, i;
+  uint32_t first_id = 0;
+  EventMsg m;
+  memset(&m, 0, sizeof(m));
+  /* Off by default: traces compiled now must not be published. */
+  if (vm_etw(L, -1)) fail(sc, "etw() reports enabled before any enable call");
+  vm_prewarm(L, "@etw-a.lua", 3, sc);
+  if (vm_traces_count(L) < 1) fail(sc, "no trace committed while disabled");
+  if (!session_start(&s, L"switch", 0x3, log, &err)) {
+    need_privilege(err);
+    fail(sc, "session_start: %s", winerr(err));
+    lua_close(L);
+    return;
+  }
+  log_settle();
+  if (log_count(log) != 0)
+    fail(sc, "%d events published while the switch was off", log_count(log));
+  /* Enabling flushes this VM's traces and starts publishing. */
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
+  if (vm_traces_count(L) != 0)
+    fail(sc, "etw(true) did not flush the traces (%d left)",
+	 vm_traces_count(L));
+  if (log_wait(log, 0, pred_id, (const void *)(uintptr_t)11, ETW_WAIT_MS) < 0)
+    fail(sc, "no ScriptContextLoad after enabling");
+  mark = log_count(log);
+  vm_prewarm(L, "@etw-a.lua", 3, sc);
+  ntraces = vm_traces(L, traces, ETW_MAX_TRACES);
+  if (ntraces < 1) fail(sc, "no trace committed after enabling");
+  for (i = 0; i < ntraces; i++) {
+    idx = log_wait(log, mark, pred_load_addr, &traces[i], ETW_WAIT_MS);
+    if (idx < 0) {
+      fail(sc, "no MethodLoad for trace %u after enabling", traces[i].traceno);
+      continue;
+    }
+    if (i == 0 && log_msg(log, idx, &m)) first_id = m.method_id;
+  }
+  if (first_id == 0) fail(sc, "no MethodID observed");
+  /* Disabling reports the unloads and stops publishing new traces. */
+  mark = log_count(log);
+  if (vm_etw(L, 0)) fail(sc, "etw(false) still reports enabled");
+  if (log_wait(log, mark, pred_unload_id, (const void *)(uintptr_t)first_id,
+	       ETW_WAIT_MS) < 0)
+    fail(sc, "no MethodUnload when disabling");
+  mark = log_count(log);
+  vm_prewarm(L, "@etw-b.lua", 3, sc);
+  log_settle();
+  if (log_count_if(log, mark, pred_id, (const void *)(uintptr_t)9) != 0)
+    fail(sc, "published a trace while the switch was off");
+  /* Re-enabling flushes again and publishes again. */
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled again");
+  if (vm_traces_count(L) != 0) fail(sc, "second enable did not flush");
+  mark = log_count(log);
+  vm_prewarm(L, "@etw-a.lua", 3, sc);
+  if (log_wait(log, mark, pred_id, (const void *)(uintptr_t)9,
+	       ETW_WAIT_MS) < 0)
+    fail(sc, "no MethodLoad after re-enabling");
+  if (log_bad(log)) fail(sc, "malformed/overflowed/foreign event log");
+  lua_close(L);
+  {
+    const char *why = NULL;
+    session_stop(&s, &why);
+    if (why) fail(sc, "%s", why);
+  }
+  if (!failures) ok(sc);
+}
+
 /* 1. Collector before VM/trace. */
 static void scenario_collector_first(void)
 {
@@ -781,6 +888,7 @@ static void scenario_collector_first(void)
     return;
   }
   L = vm_new();
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   mark = 0;
   vm_prewarm(L, "@etw-a.lua", 3, sc);
   ntraces = vm_traces(L, traces, ETW_MAX_TRACES);
@@ -839,7 +947,8 @@ static void scenario_empty_cache(void)
   EventLog *log = log_new();
   Session s;
   DWORD err = 0;
-  lua_State *L = vm_new();		/* Registers the provider, no traces. */
+  lua_State *L = vm_new();		/* Publishes the context, no traces. */
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   if (!session_start(&s, L"empty", 0x3, log, &err)) {
     need_privilege(err);
     fail(sc, "session_start: %s", winerr(err));
@@ -880,6 +989,7 @@ static void scenario_trace_first_idle(void)
   TraceRef traces[ETW_MAX_TRACES];
   int ntraces, mark;
   L = vm_new();
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   vm_prewarm(L, "@etw-a.lua", 3, sc);
   ntraces = vm_traces(L, traces, ETW_MAX_TRACES);
   if (ntraces < 1) fail(sc, "no trace committed");
@@ -918,6 +1028,7 @@ static DWORD WINAPI runner_proc(LPVOID param)
   double v = 0;
   int first = 1;
   r->L = vm_new();
+  if (!vm_etw(r->L, 1)) r->checksum_bad = 1;
   vm_load_work(r->L, "@etw-a.lua");
   for (;;) {
     /* lua_pcall consumes the function, so push a fresh copy every round. */
@@ -990,6 +1101,7 @@ static void scenario_keyword_matrix(void)
     { L"kw2", 0x2, 0, 1, 0 },
     { L"kw4", 0x4, 0, 0, 1 },
   };
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   vm_prewarm(L, "@etw-a.lua", 3, sc);
   ntraces = vm_traces(L, traces, ETW_MAX_TRACES);
   if (ntraces < 1) fail(sc, "no trace committed");
@@ -1070,6 +1182,7 @@ static void scenario_two_sessions(void)
     return;
   }
   mark_a = 0;
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   vm_prewarm(L, "@etw-a.lua", 3, sc);
   ntraces = vm_traces(L, traces, ETW_MAX_TRACES);
   if (ntraces < 1) fail(sc, "no trace committed");
@@ -1143,6 +1256,7 @@ static void scenario_capture_repeat(void)
   int ntraces, mark, idx, i;
   EventMsg m0[ETW_MAX_TRACES], m1;
   memset(m0, 0, sizeof(m0));
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   vm_prewarm(L, "@etw-a.lua", 3, sc);
   ntraces = vm_traces(L, traces, ETW_MAX_TRACES);
   if (ntraces < 1) fail(sc, "no trace committed");
@@ -1207,6 +1321,7 @@ static void scenario_flush_reprewarm(void)
   int ntraces, mark, idx;
   EventMsg old;
   memset(&old, 0, sizeof(old));
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   vm_prewarm(L, "@etw-a.lua", 3, sc);
   ntraces = vm_traces(L, traces, ETW_MAX_TRACES);
   if (ntraces < 1) fail(sc, "no trace committed");
@@ -1265,6 +1380,7 @@ static void scenario_single_flush_gc(void)
   int mark, idx;
   EventMsg m;
   memset(&m, 0, sizeof(m));
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   vm_prewarm(L, "@etw-a.lua", 3, sc);
   if (!vm_first_root(L, &root)) fail(sc, "no root trace committed");
   if (!session_start(&s, L"single", 0x3, log, &err)) {
@@ -1318,6 +1434,7 @@ static void scenario_two_vms_coroutine(void)
   TraceRef ta[ETW_MAX_TRACES], tb[ETW_MAX_TRACES];
   int na, nb, mark, idx;
   EventMsg m;
+  if (!vm_etw(La, 1)) fail(sc, "etw(true) did not report enabled");
   vm_prewarm(La, "@etw-a.lua", 3, sc);
   vm_prewarm(Lb, "@etw-b.lua", 3, sc);
   na = vm_traces(La, ta, ETW_MAX_TRACES);
@@ -1428,6 +1545,11 @@ static void scenario_concurrent_close(void)
     fail(sc, "session_start: %s", winerr(err));
     return;
   }
+  {
+    lua_State *Lw = vm_new();
+    if (!vm_etw(Lw, 1)) fail(sc, "etw(true) did not report enabled");
+    lua_close(Lw);
+  }
   memset(&c, 0, sizeof(c));
   c.s = &s;
   c.stop = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -1485,6 +1607,7 @@ static void scenario_names_and_lines(void)
     lua_close(L);
     return;
   }
+  if (!vm_etw(L, 1)) fail(sc, "etw(true) did not report enabled");
   /* Non-ASCII chunk name: "etw-\u00e4\u20ac.lua" (10 code units). */
   {
     int mark = log_count(log), idx;
@@ -1616,6 +1739,7 @@ static int hold_for_profile(void)
   /* Prewarm first: the ETW_PROFILE_READY signal must mean "the traces a
   ** profiler attaches to already exist", which is what the rundown replay
   ** (and therefore mid-session symbolization) depends on. */
+  if (!vm_etw(L, 1)) return 1;
   vm_load_work(L, "@etw-a.lua");
   lua_pushvalue(L, -1);
   if (vm_call_work(L, &v) != 0) return 1;
@@ -1644,6 +1768,7 @@ typedef struct Scenario {
 } Scenario;
 
 static const Scenario scenarios[] = {
+  { "runtime-switch", scenario_runtime_switch },
   { "collector-first", scenario_collector_first },
   { "empty-cache", scenario_empty_cache },
   { "trace-first-idle", scenario_trace_first_idle },

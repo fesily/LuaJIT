@@ -49,6 +49,13 @@
 ** (resourceFileName %SystemRoot%\system32\Chakra.dll), so nothing is
 ** installed and no manifest or PDB is produced here.
 **
+** The publisher is off by default at runtime and is switched globally from
+** Lua with jit.profile.etw(true|false) (query with etw()). Enabling also
+** flushes the calling VM's traces so every live trace has a record; disabling
+** reports the unloads at once and stops publishing. Every VM keeps one small
+** context while the switch is off, so any of them can turn it on later
+** without being recreated.
+**
 ** Wire layouts (little-endian, pointer-width follows the emitting process):
 **
 **   Method events: uintptr_t ScriptContextID, uintptr_t MethodStartAddress,
@@ -173,6 +180,7 @@ typedef struct EtwContext {
   struct EtwContext *next;	/* Cache list (cache lock). */
   struct EtwContext *prev;
   void *id;			/* ScriptContextID == global_State pointer. */
+  int published;		/* Participating in the current runtime state. */
 } EtwContext;
 
 typedef struct EtwRecord {
@@ -183,9 +191,10 @@ typedef struct EtwRecord {
   uint64_t size;		/* Size of the trace machine code. */
   uint64_t source_id;		/* Generation; stable for this trace. */
   uint32_t method_id;		/* Low 32 bits of the generation. */
-  uint32_t line;		/* Starting line (0 if there is no line info). */
+  uint32_t line;			/* Starting line (0 if there is no line info). */
   int method_chars;		/* UTF-16 units, excluding the NUL. */
   int source_chars;
+  int retired;			/* Unload already reported; owner frees it. */
   WCHAR strings[1];		/* Method name, then source URL. */
 } EtwRecord;
 
@@ -199,9 +208,12 @@ static HANDLE etw_worker = NULL;	/* Worker thread (lifecycle lock). */
 static volatile LONG etw_stop = 0;	/* Worker stop request. */
 static volatile LONG etw_pending = 0;	/* Snapshot request bit. */
 static int etw_running = 0;		/* Provider registered (lifecycle lock). */
-static int etw_vms = 0;			/* Registered VMs (lifecycle lock). */
-static EtwContext *etw_contexts = NULL;	/* Cache lock. */
-static EtwRecord *etw_records = NULL;	/* Cache lock. */
+static int etw_vms = 0;			/* Listed VM contexts (lifecycle lock). */
+static int etw_published = 0;		/* Published contexts (lifecycle lock). */
+static volatile LONG etw_on = 0;	/* Runtime switch; default off. */
+static EtwContext *etw_contexts = NULL;	/* Cache lock, all VMs. */
+static EtwRecord *etw_records = NULL;	/* Cache lock, published records. */
+static EtwRecord *etw_retired = NULL;	/* Cache lock, awaiting owner free. */
 static uint64_t etw_generation = 0;	/* Cache lock. */
 static int etw_callback_token;		/* Static callback context. */
 
@@ -302,7 +314,7 @@ static void etw_snapshot(REGHANDLE h)
   if (etw_enabled(h, &etw_evt_dcstart_init)) {
     etw_write_event(h, &etw_evt_dcstart_init);
     for (c = etw_contexts; c; c = c->next)
-      etw_write_ctx(h, &etw_evt_ctx_dcstart, c);
+      if (c->published) etw_write_ctx(h, &etw_evt_ctx_dcstart, c);
     for (r = etw_records; r; r = r->next) {
       etw_write_source(h, &etw_evt_source_dcstart, r);
       etw_write_method(h, &etw_evt_method_dcstart, r);
@@ -311,7 +323,7 @@ static void etw_snapshot(REGHANDLE h)
   }
   if (etw_enabled(h, &etw_evt_method_load)) {
     for (c = etw_contexts; c; c = c->next)
-      etw_write_ctx(h, &etw_evt_ctx_load, c);
+      if (c->published) etw_write_ctx(h, &etw_evt_ctx_load, c);
     for (r = etw_records; r; r = r->next) {
       etw_write_source(h, &etw_evt_source_load, r);
       etw_write_method(h, &etw_evt_method_load, r);
@@ -320,7 +332,7 @@ static void etw_snapshot(REGHANDLE h)
   if (etw_enabled(h, &etw_evt_dcstop_init)) {
     etw_write_event(h, &etw_evt_dcstop_init);
     for (c = etw_contexts; c; c = c->next)
-      etw_write_ctx(h, &etw_evt_ctx_dcstop, c);
+      if (c->published) etw_write_ctx(h, &etw_evt_ctx_dcstop, c);
     for (r = etw_records; r; r = r->next) {
       etw_write_source(h, &etw_evt_source_dcstop, r);
       etw_write_method(h, &etw_evt_method_dcstop, r);
@@ -544,6 +556,83 @@ static WCHAR *etw_method_alloc(const WCHAR *source, int source_chars,
   return m;
 }
 
+/* -- Runtime switch ------------------------------------------------------
+**
+** The provider is process-global and off by default: nothing is published
+** until a VM asks for it with jit.profile.etw(true), which also flushes that
+** VM's traces so every live trace has a record and no stale identity
+** survives. Turning it off reports the unloads immediately and moves the
+** records to a retired list: only the owning VM frees them (its traces may
+** still point at them), so a foreign VM's GCtrace is never dereferenced here.
+*/
+
+/* Report every listed VM context. Lifecycle lock held, module running. */
+static void etw_publish_all(void)
+{
+  EtwContext *c;
+  AcquireSRWLockExclusive(&etw_cache_lock);
+  for (c = etw_contexts; c; c = c->next) {
+    if (c->published) continue;
+    c->published = 1;
+    etw_published++;
+    etw_write_ctx(etw_provider, &etw_evt_ctx_load, c);
+  }
+  ReleaseSRWLockExclusive(&etw_cache_lock);
+}
+
+/* Stop publishing: unload the live records and the contexts. Lifecycle lock
+** held (the records stay alive until their owning VM releases them).
+*/
+static void etw_unpublish_all(void)
+{
+  EtwContext *c;
+  EtwRecord *r, *next;
+  AcquireSRWLockExclusive(&etw_cache_lock);
+  for (r = etw_records; r; r = next) {
+    next = r->next;
+    etw_write_method(etw_provider, &etw_evt_method_unload, r);
+    etw_write_source(etw_provider, &etw_evt_source_unload, r);
+    r->retired = 1;
+    r->prev = NULL;
+    r->next = etw_retired;
+    if (etw_retired) etw_retired->prev = r;
+    etw_retired = r;
+  }
+  etw_records = NULL;
+  for (c = etw_contexts; c; c = c->next) {
+    if (!c->published) continue;
+    c->published = 0;
+    if (etw_published > 0) etw_published--;
+    etw_write_ctx(etw_provider, &etw_evt_ctx_unload, c);
+  }
+  ReleaseSRWLockExclusive(&etw_cache_lock);
+}
+
+void lj_etw_setstate(jit_State *J, int on)
+{
+  UNUSED(J);
+  on = on != 0;
+  if (on == (etw_on != 0)) return;	/* No transition. */
+  etw_ensure_locks();
+  AcquireSRWLockExclusive(&etw_lifecycle_lock);
+  if (on) {
+    if (etw_module_start()) {
+      InterlockedExchange(&etw_on, 1);
+      etw_publish_all();
+    }
+  } else {
+    etw_unpublish_all();
+    InterlockedExchange(&etw_on, 0);
+    if (etw_published == 0) etw_module_stop();
+  }
+  ReleaseSRWLockExclusive(&etw_lifecycle_lock);
+}
+
+int lj_etw_getstate(void)
+{
+  return etw_on != 0;
+}
+
 /* -- Trace hooks --------------------------------------------------------- */
 
 void lj_etw_initstate(jit_State *J)
@@ -551,26 +640,33 @@ void lj_etw_initstate(jit_State *J)
   EtwContext *ctx;
   J->etw_context = NULL;
   etw_ensure_locks();
+  /* The context is always allocated and listed, even while the switch is off,
+  ** so any VM can turn publishing on later without being recreated. Off costs
+  ** one small allocation: no provider, no thread, no per-trace record.
+  */
   ctx = (EtwContext *)HeapAlloc(GetProcessHeap(), 0, sizeof(EtwContext));
   if (!ctx) {
     etw_fail(ETW_FAIL_RECORD, "HeapAlloc", ERROR_OUTOFMEMORY);
     return;
   }
   ctx->id = (void *)J2G(J);
+  ctx->published = 0;
   AcquireSRWLockExclusive(&etw_lifecycle_lock);
-  if (etw_module_start()) {
-    AcquireSRWLockExclusive(&etw_cache_lock);
-    ctx->prev = NULL;
-    ctx->next = etw_contexts;
-    if (etw_contexts) etw_contexts->prev = ctx;
-    etw_contexts = ctx;
-    etw_vms++;
+  if (etw_on && !etw_running) etw_module_start();
+  AcquireSRWLockExclusive(&etw_cache_lock);
+  ctx->prev = NULL;
+  ctx->next = etw_contexts;
+  if (etw_contexts) etw_contexts->prev = ctx;
+  etw_contexts = ctx;
+  etw_vms++;
+  if (etw_on && etw_running) {
+    ctx->published = 1;
+    etw_published++;
     etw_write_ctx(etw_provider, &etw_evt_ctx_load, ctx);
-    ReleaseSRWLockExclusive(&etw_cache_lock);
-    J->etw_context = ctx;
   }
+  ReleaseSRWLockExclusive(&etw_cache_lock);
+  J->etw_context = ctx;
   ReleaseSRWLockExclusive(&etw_lifecycle_lock);
-  if (!J->etw_context) HeapFree(GetProcessHeap(), 0, ctx);
 }
 
 void lj_etw_freestate(jit_State *J)
@@ -582,8 +678,8 @@ void lj_etw_freestate(jit_State *J)
   etw_ensure_locks();
   AcquireSRWLockExclusive(&etw_lifecycle_lock);
   AcquireSRWLockExclusive(&etw_cache_lock);
-  /* Defensive: drop any leftovers of partially initialized/destroyed VMs.
-  ** The owning traces are already gone, so nothing else points at them.
+  /* Live records of this VM (defensive leftovers of destroyed VMs): their
+  ** traces are already gone, so nothing else points at them.
   */
   for (r = etw_records; r; r = next) {
     next = r->next;
@@ -596,13 +692,29 @@ void lj_etw_freestate(jit_State *J)
       HeapFree(GetProcessHeap(), 0, r);
     }
   }
+  /* Retired records of this VM: the unload was reported when publishing
+  ** stopped, so only the memory is left.
+  */
+  for (r = etw_retired; r; r = next) {
+    next = r->next;
+    if (r->context_id == ctx->id) {
+      if (r->prev) r->prev->next = r->next;
+      else etw_retired = r->next;
+      if (r->next) r->next->prev = r->prev;
+      HeapFree(GetProcessHeap(), 0, r);
+    }
+  }
+  if (ctx->published) {
+    ctx->published = 0;
+    if (etw_published > 0) etw_published--;
+  }
   if (etw_contexts == ctx) etw_contexts = ctx->next;
   if (ctx->next) ctx->next->prev = ctx->prev;
   if (ctx->prev) ctx->prev->next = ctx->next;
-  etw_write_ctx(etw_provider, &etw_evt_ctx_unload, ctx);
+  if (etw_running) etw_write_ctx(etw_provider, &etw_evt_ctx_unload, ctx);
   ReleaseSRWLockExclusive(&etw_cache_lock);
   if (etw_vms > 0) etw_vms--;
-  if (etw_vms == 0) etw_module_stop();
+  if (etw_published == 0) etw_module_stop();
   ReleaseSRWLockExclusive(&etw_lifecycle_lock);
   HeapFree(GetProcessHeap(), 0, ctx);
 }
@@ -620,7 +732,7 @@ void lj_etw_addtrace(jit_State *J, GCtrace *T)
   size_t sz;
   EtwRecord *r;
   uint64_t gen;
-  if (!ctx) return;
+  if (!ctx || !ctx->published) return;
   /* Metadata is read and converted on the VM thread. */
   pt = &gcref(T->startpt)->pt;
   startpc = mref(T->startpc, const BCIns);
@@ -652,6 +764,7 @@ void lj_etw_addtrace(jit_State *J, GCtrace *T)
     return;
   }
   r->context_id = ctx->id;
+  r->retired = 0;
   r->mcode = (void *)T->mcode;
   r->size = (uint64_t)T->szmcode;
   r->line = line;
@@ -697,6 +810,15 @@ void lj_etw_deltrace(jit_State *J, GCtrace *T)
   if (!r) return;
   T->etw_entry = NULL;
   AcquireSRWLockExclusive(&etw_cache_lock);
+  if (r->retired) {
+    /* The unload was already reported when publishing stopped. */
+    if (r->prev) r->prev->next = r->next;
+    else etw_retired = r->next;
+    if (r->next) r->next->prev = r->prev;
+    ReleaseSRWLockExclusive(&etw_cache_lock);
+    HeapFree(GetProcessHeap(), 0, r);
+    return;
+  }
   if (r->prev) r->prev->next = r->next;
   else etw_records = r->next;
   if (r->next) r->next->prev = r->prev;

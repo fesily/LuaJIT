@@ -30,6 +30,7 @@
 #endif
 #include "lj_trace.h"
 #include "lj_dispatch.h"
+#include "lj_etw.h"
 #include "lj_vm.h"
 #include "lj_vmevent.h"
 #include "lj_lib.h"
@@ -615,6 +616,30 @@ LJLIB_CF(jit_profile_stop)
   setnilV(lj_tab_set(L, registry, &key));
   lj_gc_anybarriert(L, registry);
   return 0;
+}
+
+/* state = profile.etw([on]) */
+LJLIB_CF(jit_profile_etw)
+{
+  TValue *o = L->base;
+  int state;
+  if (o >= L->top || tvisnil(o)) {
+    state = lj_etw_getstate();
+  } else {
+    if (tvistruecond(o)) {
+      lj_etw_setstate(L2J(L), 1);
+      /* Enabling starts from a clean symbol table: drop the traces recorded
+      ** while the provider was off, so every live trace has a record and no
+      ** stale identity survives.
+      */
+      lj_trace_flushall(L);
+    } else {
+      lj_etw_setstate(L2J(L), 0);
+    }
+    state = lj_etw_getstate();
+  }
+  setboolV(L->top++, state);
+  return 1;
 }
 
 /* dump = profile.dumpstack([thread,] fmt, depth) */
