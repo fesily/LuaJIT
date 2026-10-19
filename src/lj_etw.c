@@ -179,24 +179,37 @@ static void etw_fail(int cls, const char *op, unsigned long code)
 typedef struct EtwContext {
   struct EtwContext *next;	/* Cache list (cache lock). */
   struct EtwContext *prev;
+  struct EtwContext *wnext;	/* Write batch chain (cache lock). */
   void *id;			/* ScriptContextID == global_State pointer. */
   int published;		/* Participating in the current runtime state. */
+  int refs;			/* List membership plus active writers. */
 } EtwContext;
 
 typedef struct EtwRecord {
   struct EtwRecord *next;	/* Cache list (cache lock). */
   struct EtwRecord *prev;
+  struct EtwRecord *wnext;	/* Write batch chain (cache lock). */
   void *context_id;		/* Owning ScriptContextID. */
   void *mcode;			/* Start of the trace machine code. */
   uint64_t size;		/* Size of the trace machine code. */
   uint64_t source_id;		/* Generation; stable for this trace. */
   uint32_t method_id;		/* Low 32 bits of the generation. */
-  uint32_t line;			/* Starting line (0 if there is no line info). */
+  uint32_t line;		/* Starting line (0 if there is no line info). */
   int method_chars;		/* UTF-16 units, excluding the NUL. */
   int source_chars;
   int retired;			/* Unload already reported; owner frees it. */
+  int refs;			/* T ownership + list membership + writers. */
   WCHAR strings[1];		/* Method name, then source URL. */
 } EtwRecord;
+
+/* Nodes borrowed (or handed over) so that ETW writes happen outside the cache
+** lock. Every chained node owns one reference, so a concurrent unlink or free
+** on the owning VM cannot invalidate the payload while it is being written.
+*/
+typedef struct EtwBatch {
+  EtwRecord *recs;
+  EtwContext *ctxs;
+} EtwBatch;
 
 static INIT_ONCE etw_once = INIT_ONCE_STATIC_INIT;
 static SRWLOCK etw_lifecycle_lock;
@@ -205,9 +218,11 @@ static SRWLOCK etw_cache_lock;
 static REGHANDLE etw_provider = 0;	/* Lifecycle lock (0: not running). */
 static HANDLE etw_wake = NULL;		/* Auto-reset event (lifecycle lock). */
 static HANDLE etw_worker = NULL;	/* Worker thread (lifecycle lock). */
+static HANDLE etw_stop_done = NULL;	/* Manual-reset, created once. */
 static volatile LONG etw_stop = 0;	/* Worker stop request. */
 static volatile LONG etw_pending = 0;	/* Snapshot request bit. */
-static int etw_running = 0;		/* Provider registered (lifecycle lock). */
+enum { ETW_DOWN, ETW_UP, ETW_STOPPING };
+static int etw_state = ETW_DOWN;	/* Lifecycle lock. */
 static int etw_vms = 0;			/* Listed VM contexts (lifecycle lock). */
 static int etw_published = 0;		/* Published contexts (lifecycle lock). */
 static volatile LONG etw_on = 0;	/* Runtime switch; default off. */
@@ -225,6 +240,7 @@ static BOOL CALLBACK etw_once_cb(PINIT_ONCE once, PVOID param, PVOID *ctx)
   UNUSED(once); UNUSED(param);
   InitializeSRWLock(&etw_lifecycle_lock);
   InitializeSRWLock(&etw_cache_lock);
+  etw_stop_done = CreateEventW(NULL, TRUE, FALSE, NULL);
   if (ctx) *ctx = NULL;
   return TRUE;
 }
@@ -232,6 +248,81 @@ static BOOL CALLBACK etw_once_cb(PINIT_ONCE once, PVOID param, PVOID *ctx)
 static void etw_ensure_locks(void)
 {
   InitOnceExecuteOnce(&etw_once, etw_once_cb, NULL, NULL);
+}
+
+/* Acquire the lifecycle lock, waiting out a stop that another thread is
+** finishing. The join happens outside the lock, so this wait can always make
+** progress; the final acquire is a best-effort fallback for cleanup paths.
+*/
+static void etw_lifecycle_acquire(void)
+{
+  int tries;
+  for (tries = 0; tries < 8; tries++) {
+    AcquireSRWLockExclusive(&etw_lifecycle_lock);
+    if (etw_state != ETW_STOPPING) return;
+    ReleaseSRWLockExclusive(&etw_lifecycle_lock);
+    if (!etw_stop_done) break;
+    WaitForSingleObject(etw_stop_done, 5000);
+  }
+  AcquireSRWLockExclusive(&etw_lifecycle_lock);
+}
+
+/* -- Write batches -------------------------------------------------------
+**
+** The cache lock only ever covers list/flag mutations. Payloads are handed to
+** a batch, the lock is dropped and the ETW writes happen afterwards, so a VM
+** committing or freeing a trace is never blocked behind an EventWrite (and
+** behind ETW buffer backpressure in particular).
+*/
+
+static void etw_batch_init(EtwBatch *b)
+{
+  b->recs = NULL;
+  b->ctxs = NULL;
+}
+
+/* Cache lock held: take a borrowed reference (snapshot) or hand over an
+** unlinked list reference (unpublish/freestate). */
+static void etw_batch_chain_rec(EtwBatch *b, EtwRecord *r)
+{
+  r->wnext = b->recs;
+  b->recs = r;
+}
+
+static void etw_batch_chain_ctx(EtwBatch *b, EtwContext *c)
+{
+  c->wnext = b->ctxs;
+  b->ctxs = c;
+}
+
+/* Drop one reference per chained node and free what reached zero. Called
+** without the cache lock; the chained order is reversed, which does not
+** matter because consumers key records by MethodID/SourceID.
+*/
+static void etw_batch_release(EtwBatch *b)
+{
+  EtwRecord *r, *rn, *rfree = NULL;
+  EtwContext *c, *cn, *cfree = NULL;
+  AcquireSRWLockExclusive(&etw_cache_lock);
+  for (r = b->recs; r; r = rn) {
+    rn = r->wnext;
+    if (--r->refs <= 0) { r->wnext = rfree; rfree = r; }
+  }
+  for (c = b->ctxs; c; c = cn) {
+    cn = c->wnext;
+    if (--c->refs <= 0) { c->wnext = cfree; cfree = c; }
+  }
+  ReleaseSRWLockExclusive(&etw_cache_lock);
+  while (rfree) {
+    rn = rfree->wnext;
+    HeapFree(GetProcessHeap(), 0, rfree);
+    rfree = rn;
+  }
+  while (cfree) {
+    cn = cfree->wnext;
+    HeapFree(GetProcessHeap(), 0, cfree);
+    cfree = cn;
+  }
 }
 
 static int etw_enabled(REGHANDLE h, const EVENT_DESCRIPTOR *evt)
@@ -306,39 +397,54 @@ static void etw_write_source(REGHANDLE h, const EVENT_DESCRIPTOR *evt,
 */
 static void etw_snapshot(REGHANDLE h)
 {
+  EtwBatch b;
   EtwContext *c;
   EtwRecord *r;
-  /* Independent gates: sessions may subscribe to any combination of the
-  ** runtime (0x1), start rundown (0x2) and end rundown (0x4) keywords.
+  int do_start, do_load, do_stop;
+  /* EventEnabled is a lock-free query, so the block gating happens before any
+  ** borrowing. Sessions may subscribe to any combination of the runtime
+  ** (0x1), start rundown (0x2) and end rundown (0x4) keywords.
   */
-  if (etw_enabled(h, &etw_evt_dcstart_init)) {
+  do_start = etw_enabled(h, &etw_evt_dcstart_init);
+  do_load = etw_enabled(h, &etw_evt_method_load);
+  do_stop = etw_enabled(h, &etw_evt_dcstop_init);
+  if (!do_start && !do_load && !do_stop) return;
+  etw_batch_init(&b);
+  AcquireSRWLockExclusive(&etw_cache_lock);
+  for (c = etw_contexts; c; c = c->next) {
+    if (c->published) { c->refs++; etw_batch_chain_ctx(&b, c); }
+  }
+  for (r = etw_records; r; r = r->next) { r->refs++; etw_batch_chain_rec(&b, r); }
+  ReleaseSRWLockExclusive(&etw_cache_lock);
+  if (do_start) {
     etw_write_event(h, &etw_evt_dcstart_init);
-    for (c = etw_contexts; c; c = c->next)
-      if (c->published) etw_write_ctx(h, &etw_evt_ctx_dcstart, c);
-    for (r = etw_records; r; r = r->next) {
+    for (c = b.ctxs; c; c = c->wnext)
+      etw_write_ctx(h, &etw_evt_ctx_dcstart, c);
+    for (r = b.recs; r; r = r->wnext) {
       etw_write_source(h, &etw_evt_source_dcstart, r);
       etw_write_method(h, &etw_evt_method_dcstart, r);
     }
     etw_write_event(h, &etw_evt_dcstart_complete);
   }
-  if (etw_enabled(h, &etw_evt_method_load)) {
-    for (c = etw_contexts; c; c = c->next)
-      if (c->published) etw_write_ctx(h, &etw_evt_ctx_load, c);
-    for (r = etw_records; r; r = r->next) {
+  if (do_load) {
+    for (c = b.ctxs; c; c = c->wnext)
+      etw_write_ctx(h, &etw_evt_ctx_load, c);
+    for (r = b.recs; r; r = r->wnext) {
       etw_write_source(h, &etw_evt_source_load, r);
       etw_write_method(h, &etw_evt_method_load, r);
     }
   }
-  if (etw_enabled(h, &etw_evt_dcstop_init)) {
+  if (do_stop) {
     etw_write_event(h, &etw_evt_dcstop_init);
-    for (c = etw_contexts; c; c = c->next)
-      if (c->published) etw_write_ctx(h, &etw_evt_ctx_dcstop, c);
-    for (r = etw_records; r; r = r->next) {
+    for (c = b.ctxs; c; c = c->wnext)
+      etw_write_ctx(h, &etw_evt_ctx_dcstop, c);
+    for (r = b.recs; r; r = r->wnext) {
       etw_write_source(h, &etw_evt_source_dcstop, r);
       etw_write_method(h, &etw_evt_method_dcstop, r);
     }
     etw_write_event(h, &etw_evt_dcstop_complete);
   }
+  etw_batch_release(&b);
 }
 
 /* Standard PENABLECALLBACK. Only records a request: no locks, no allocation,
@@ -364,12 +470,9 @@ static DWORD WINAPI etw_worker_proc(LPVOID param)
     if (WaitForSingleObject(etw_wake, INFINITE) != WAIT_OBJECT_0) break;
     if (etw_stop) break;
     if (InterlockedExchange(&etw_pending, 0) != 0) {
+      /* The handle stays valid until the join that precedes unregistering. */
       REGHANDLE h = etw_provider;
-      if (h) {
-	AcquireSRWLockExclusive(&etw_cache_lock);
-	if (h == etw_provider) etw_snapshot(h);
-	ReleaseSRWLockExclusive(&etw_cache_lock);
-      }
+      if (h) etw_snapshot(h);
     }
   }
   return 0;
@@ -380,7 +483,8 @@ static int etw_module_start(void)
 {
   static const GUID guid = LJ_ETW_PROVIDER_GUID;
   ULONG rc;
-  if (etw_running) return 1;
+  if (etw_state == ETW_UP) return 1;
+  if (etw_state == ETW_STOPPING) return 0;	/* Retry once the stop lands. */
   InterlockedExchange(&etw_pending, 0);
   InterlockedExchange(&etw_stop, 0);
   etw_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -407,32 +511,57 @@ static int etw_module_start(void)
     CloseHandle(etw_wake); etw_wake = NULL;
     return 0;
   }
-  etw_running = 1;
+  etw_state = ETW_UP;
   return 1;
 }
 
-/* Stop the worker thread and unregister the provider. Lifecycle lock held,
-** cache lock NOT held (the worker may still need the cache lock to leave).
+/* Stop phase 1 (lifecycle lock held): ask the worker to exit and hand back
+** its handle so the join can happen *outside* the lock.
 */
-static void etw_module_stop(void)
+static HANDLE etw_module_stop_begin(void)
 {
+  HANDLE w;
+  if (etw_state != ETW_UP) return NULL;
+  etw_state = ETW_STOPPING;
   InterlockedExchange(&etw_stop, 1);
   if (etw_wake) SetEvent(etw_wake);
-  if (etw_worker) {
-    WaitForSingleObject(etw_worker, INFINITE);
-    CloseHandle(etw_worker); etw_worker = NULL;
+  w = etw_worker;
+  etw_worker = NULL;
+  return w;
+}
+
+/* Join the worker without holding the lifecycle lock, so a VM create/close or
+** another enable never waits behind ETW buffer backpressure. Correctness
+** still requires the worker to be gone before EventUnregister, so a timeout
+** is reported once and then waited out instead of silently hanging.
+*/
+static void etw_module_stop_join(HANDLE w)
+{
+  if (!w) return;
+  if (WaitForSingleObject(w, 5000) == WAIT_TIMEOUT) {
+    etw_fail(ETW_FAIL_THREAD, "worker join", WAIT_TIMEOUT);
+    WaitForSingleObject(w, INFINITE);
   }
+  CloseHandle(w);
+}
+
+/* Stop phase 2 (lifecycle lock held): unregister and release the wake event. */
+static void etw_module_stop_finish(void)
+{
+  if (etw_state != ETW_STOPPING) return;
   if (etw_provider) {
-    /* Keeps the callback context and wake event alive until the last
-    ** callback has returned. */
     EventUnregister(etw_provider);
     etw_provider = 0;
   }
   if (etw_wake) { CloseHandle(etw_wake); etw_wake = NULL; }
   InterlockedExchange(&etw_pending, 0);
-  etw_running = 0;
+  etw_state = ETW_DOWN;
+  if (etw_stop_done) SetEvent(etw_stop_done);
 }
 
+/* Stop the worker thread and unregister the provider. Lifecycle lock held,
+** cache lock NOT held (the worker may still need the cache lock to leave).
+*/
 /* -- Chunk name to UTF-16 ------------------------------------------------- */
 
 static int etw_is_high_surrogate(WCHAR c)
@@ -569,15 +698,21 @@ static WCHAR *etw_method_alloc(const WCHAR *source, int source_chars,
 /* Report every listed VM context. Lifecycle lock held, module running. */
 static void etw_publish_all(void)
 {
+  EtwBatch b;
   EtwContext *c;
+  etw_batch_init(&b);
   AcquireSRWLockExclusive(&etw_cache_lock);
   for (c = etw_contexts; c; c = c->next) {
     if (c->published) continue;
     c->published = 1;
     etw_published++;
-    etw_write_ctx(etw_provider, &etw_evt_ctx_load, c);
+    c->refs++;
+    etw_batch_chain_ctx(&b, c);
   }
   ReleaseSRWLockExclusive(&etw_cache_lock);
+  for (c = b.ctxs; c; c = c->wnext)
+    etw_write_ctx(etw_provider, &etw_evt_ctx_load, c);
+  etw_batch_release(&b);
 }
 
 /* Stop publishing: unload the live records and the contexts. Lifecycle lock
@@ -585,47 +720,78 @@ static void etw_publish_all(void)
 */
 static void etw_unpublish_all(void)
 {
+  EtwBatch b;
+  EtwRecord *r;
   EtwContext *c;
-  EtwRecord *r, *next;
+  etw_batch_init(&b);
   AcquireSRWLockExclusive(&etw_cache_lock);
-  for (r = etw_records; r; r = next) {
-    next = r->next;
-    etw_write_method(etw_provider, &etw_evt_method_unload, r);
-    etw_write_source(etw_provider, &etw_evt_source_unload, r);
+  for (r = etw_records; r; r = r->next) {
     r->retired = 1;
-    r->prev = NULL;
-    r->next = etw_retired;
-    if (etw_retired) etw_retired->prev = r;
-    etw_retired = r;
+    etw_batch_chain_rec(&b, r);		/* hands over the list reference */
   }
   etw_records = NULL;
   for (c = etw_contexts; c; c = c->next) {
     if (!c->published) continue;
     c->published = 0;
     if (etw_published > 0) etw_published--;
-    etw_write_ctx(etw_provider, &etw_evt_ctx_unload, c);
+    c->refs++;
+    etw_batch_chain_ctx(&b, c);
   }
   ReleaseSRWLockExclusive(&etw_cache_lock);
+  for (r = b.recs; r; r = r->wnext) {
+    etw_write_method(etw_provider, &etw_evt_method_unload, r);
+    etw_write_source(etw_provider, &etw_evt_source_unload, r);
+  }
+  for (c = b.ctxs; c; c = c->wnext)
+    etw_write_ctx(etw_provider, &etw_evt_ctx_unload, c);
+  etw_batch_release(&b);
 }
 
-void lj_etw_setstate(jit_State *J, int on)
+int lj_etw_setstate(jit_State *J, int on)
 {
+  HANDLE worker;
+  int transition = 0;
   UNUSED(J);
   on = on != 0;
-  if (on == (etw_on != 0)) return;	/* No transition. */
-  etw_ensure_locks();
-  AcquireSRWLockExclusive(&etw_lifecycle_lock);
-  if (on) {
-    if (etw_module_start()) {
-      InterlockedExchange(&etw_on, 1);
-      etw_publish_all();
+  if (on == (etw_on != 0)) {
+    /* Already in the requested state: still publish contexts that appeared
+    ** while a stop was finishing, but report "no transition" so the caller
+    ** only flushes traces when publishing was actually switched on.
+    */
+    if (on) {
+      etw_ensure_locks();
+      etw_lifecycle_acquire();
+      if (etw_state == ETW_DOWN) etw_module_start();
+      if (etw_state == ETW_UP) etw_publish_all();
+      ReleaseSRWLockExclusive(&etw_lifecycle_lock);
     }
-  } else {
-    etw_unpublish_all();
+    return 0;
+  }
+  etw_ensure_locks();
+  etw_lifecycle_acquire();
+  if (!on) {
+    if (etw_on == 0) {
+      ReleaseSRWLockExclusive(&etw_lifecycle_lock);
+      return 0;
+    }
     InterlockedExchange(&etw_on, 0);
-    if (etw_published == 0) etw_module_stop();
+    etw_unpublish_all();
+    worker = etw_module_stop_begin();
+    ReleaseSRWLockExclusive(&etw_lifecycle_lock);
+    etw_module_stop_join(worker);
+    /* This thread owns the stop, so do not wait for our own stop_done. */
+    AcquireSRWLockExclusive(&etw_lifecycle_lock);
+    etw_module_stop_finish();
+    ReleaseSRWLockExclusive(&etw_lifecycle_lock);
+    return 1;
+  }
+  if (etw_module_start()) {
+    InterlockedExchange(&etw_on, 1);
+    etw_publish_all();
+    transition = 1;
   }
   ReleaseSRWLockExclusive(&etw_lifecycle_lock);
+  return transition;
 }
 
 int lj_etw_getstate(void)
@@ -638,6 +804,7 @@ int lj_etw_getstate(void)
 void lj_etw_initstate(jit_State *J)
 {
   EtwContext *ctx;
+  EtwBatch b;
   J->etw_context = NULL;
   etw_ensure_locks();
   /* The context is always allocated and listed, even while the switch is off,
@@ -651,20 +818,28 @@ void lj_etw_initstate(jit_State *J)
   }
   ctx->id = (void *)J2G(J);
   ctx->published = 0;
-  AcquireSRWLockExclusive(&etw_lifecycle_lock);
-  if (etw_on && !etw_running) etw_module_start();
+  ctx->wnext = NULL;
+  etw_batch_init(&b);
+  etw_lifecycle_acquire();
+  if (etw_on && etw_state == ETW_DOWN) etw_module_start();
   AcquireSRWLockExclusive(&etw_cache_lock);
   ctx->prev = NULL;
   ctx->next = etw_contexts;
   if (etw_contexts) etw_contexts->prev = ctx;
   etw_contexts = ctx;
+  ctx->refs = 1;			/* list membership */
   etw_vms++;
-  if (etw_on && etw_running) {
+  if (etw_on && etw_state == ETW_UP) {
     ctx->published = 1;
     etw_published++;
-    etw_write_ctx(etw_provider, &etw_evt_ctx_load, ctx);
+    ctx->refs++;			/* this writer */
+    etw_batch_chain_ctx(&b, ctx);
   }
   ReleaseSRWLockExclusive(&etw_cache_lock);
+  if (b.ctxs) {
+    etw_write_ctx(etw_provider, &etw_evt_ctx_load, ctx);
+    etw_batch_release(&b);
+  }
   J->etw_context = ctx;
   ReleaseSRWLockExclusive(&etw_lifecycle_lock);
 }
@@ -673,37 +848,37 @@ void lj_etw_freestate(jit_State *J)
 {
   EtwContext *ctx = (EtwContext *)J->etw_context;
   EtwRecord *r, *next;
+  EtwBatch b, dead;
+  HANDLE worker = NULL;
+  int was_published, need_stop;
   if (!ctx) return;
   J->etw_context = NULL;
   etw_ensure_locks();
-  AcquireSRWLockExclusive(&etw_lifecycle_lock);
+  etw_batch_init(&b);
+  etw_batch_init(&dead);
+  etw_lifecycle_acquire();
   AcquireSRWLockExclusive(&etw_cache_lock);
-  /* Live records of this VM (defensive leftovers of destroyed VMs): their
-  ** traces are already gone, so nothing else points at them.
+  /* All traces of this VM are gone already, so nothing points at its records
+  ** any more: unlink the live ones (their unloads still have to be reported)
+  ** and the retired ones (already reported) into the write batches.
   */
   for (r = etw_records; r; r = next) {
     next = r->next;
-    if (r->context_id == ctx->id) {
-      if (r->prev) r->prev->next = r->next;
-      else etw_records = r->next;
-      if (r->next) r->next->prev = r->prev;
-      etw_write_method(etw_provider, &etw_evt_method_unload, r);
-      etw_write_source(etw_provider, &etw_evt_source_unload, r);
-      HeapFree(GetProcessHeap(), 0, r);
-    }
+    if (r->context_id != ctx->id) continue;
+    if (r->prev) r->prev->next = r->next;
+    else etw_records = r->next;
+    if (r->next) r->next->prev = r->prev;
+    etw_batch_chain_rec(&b, r);		/* hands over the list reference */
   }
-  /* Retired records of this VM: the unload was reported when publishing
-  ** stopped, so only the memory is left.
-  */
   for (r = etw_retired; r; r = next) {
     next = r->next;
-    if (r->context_id == ctx->id) {
-      if (r->prev) r->prev->next = r->next;
-      else etw_retired = r->next;
-      if (r->next) r->next->prev = r->prev;
-      HeapFree(GetProcessHeap(), 0, r);
-    }
+    if (r->context_id != ctx->id) continue;
+    if (r->prev) r->prev->next = r->next;
+    else etw_retired = r->next;
+    if (r->next) r->next->prev = r->prev;
+    etw_batch_chain_rec(&dead, r);	/* no events left to send */
   }
+  was_published = ctx->published;
   if (ctx->published) {
     ctx->published = 0;
     if (etw_published > 0) etw_published--;
@@ -711,12 +886,31 @@ void lj_etw_freestate(jit_State *J)
   if (etw_contexts == ctx) etw_contexts = ctx->next;
   if (ctx->next) ctx->next->prev = ctx->prev;
   if (ctx->prev) ctx->prev->next = ctx->next;
-  if (etw_running) etw_write_ctx(etw_provider, &etw_evt_ctx_unload, ctx);
+  etw_batch_chain_ctx(&b, ctx);		/* hands over the list reference */
   ReleaseSRWLockExclusive(&etw_cache_lock);
+  /* Report the unloads outside the cache lock; the provider stays registered
+  ** until the stop below finishes.
+  */
+  if (was_published) {
+    for (r = b.recs; r; r = r->wnext) {
+      etw_write_method(etw_provider, &etw_evt_method_unload, r);
+      etw_write_source(etw_provider, &etw_evt_source_unload, r);
+    }
+    etw_write_ctx(etw_provider, &etw_evt_ctx_unload, ctx);
+  }
+  etw_batch_release(&b);
+  etw_batch_release(&dead);
   if (etw_vms > 0) etw_vms--;
-  if (etw_published == 0) etw_module_stop();
+  need_stop = (etw_published == 0);
+  worker = need_stop ? etw_module_stop_begin() : NULL;
   ReleaseSRWLockExclusive(&etw_lifecycle_lock);
-  HeapFree(GetProcessHeap(), 0, ctx);
+  if (worker) {
+    etw_module_stop_join(worker);
+    /* This thread owns the stop, so do not wait for our own stop_done. */
+    AcquireSRWLockExclusive(&etw_lifecycle_lock);
+    etw_module_stop_finish();
+    ReleaseSRWLockExclusive(&etw_lifecycle_lock);
+  }
 }
 
 void lj_etw_addtrace(jit_State *J, GCtrace *T)
@@ -793,39 +987,51 @@ void lj_etw_addtrace(jit_State *J, GCtrace *T)
   gen = etw_generation;
   r->source_id = gen;
   r->method_id = (uint32_t)gen;
+  r->wnext = NULL;
+  r->refs = 2;			/* T->etw_entry ownership + list membership */
   r->prev = NULL;
   r->next = etw_records;
   if (etw_records) etw_records->prev = r;
   etw_records = r;
+  r->refs++;			/* this writer */
   T->etw_entry = r;
+  ReleaseSRWLockExclusive(&etw_cache_lock);
+  /* Writes happen outside the cache lock; our reference keeps the payload
+  ** alive even if another thread unpublishes the record meanwhile.
+  */
   etw_write_source(etw_provider, &etw_evt_source_load, r);
   etw_write_method(etw_provider, &etw_evt_method_load, r);
+  AcquireSRWLockExclusive(&etw_cache_lock);
+  r->refs--;			/* drop the writer reference */
   ReleaseSRWLockExclusive(&etw_cache_lock);
 }
 
 void lj_etw_deltrace(jit_State *J, GCtrace *T)
 {
   EtwRecord *r = (EtwRecord *)T->etw_entry;
+  int retired, dead;
   UNUSED(J);
   if (!r) return;
   T->etw_entry = NULL;
   AcquireSRWLockExclusive(&etw_cache_lock);
   if (r->retired) {
-    /* The unload was already reported when publishing stopped. */
     if (r->prev) r->prev->next = r->next;
     else etw_retired = r->next;
-    if (r->next) r->next->prev = r->prev;
-    ReleaseSRWLockExclusive(&etw_cache_lock);
-    HeapFree(GetProcessHeap(), 0, r);
-    return;
+  } else {
+    if (r->prev) r->prev->next = r->next;
+    else etw_records = r->next;
   }
-  if (r->prev) r->prev->next = r->next;
-  else etw_records = r->next;
   if (r->next) r->next->prev = r->prev;
-  etw_write_method(etw_provider, &etw_evt_method_unload, r);
-  etw_write_source(etw_provider, &etw_evt_source_unload, r);
+  retired = r->retired;
+  r->refs--;			/* drop the T->etw_entry ownership */
+  dead = (r->refs == 0);
   ReleaseSRWLockExclusive(&etw_cache_lock);
-  HeapFree(GetProcessHeap(), 0, r);
+  /* A retired record already reported its unload when publishing stopped. */
+  if (!retired) {
+    etw_write_method(etw_provider, &etw_evt_method_unload, r);
+    etw_write_source(etw_provider, &etw_evt_source_unload, r);
+  }
+  if (dead) HeapFree(GetProcessHeap(), 0, r);
 }
 
 #endif

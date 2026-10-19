@@ -628,12 +628,13 @@ LJLIB_CF(jit_profile_etw)
     state = lj_etw_getstate();
   } else {
     if (tvistruecond(o)) {
-      lj_etw_setstate(L2J(L), 1);
-      /* Enabling starts from a clean symbol table: drop the traces recorded
-      ** while the provider was off, so every live trace has a record and no
-      ** stale identity survives.
-      */
-      lj_trace_flushall(L);
+      if (lj_etw_setstate(L2J(L), 1)) {
+	/* A transition to "on" starts from a clean symbol table: drop the
+	** traces recorded while the provider was off, so every live trace has
+	** a record and no stale identity survives.
+	*/
+	lj_trace_flushall(L);
+      }
     } else {
       lj_etw_setstate(L2J(L), 0);
     }

@@ -18,7 +18,7 @@ LJ_FUNC void lj_etw_addtrace(jit_State *J, GCtrace *T);
 LJ_FUNC void lj_etw_deltrace(jit_State *J, GCtrace *T);
 
 /* Runtime switch (process-global, off by default): jit.profile.etw()/etw(on). */
-LJ_FUNC void lj_etw_setstate(jit_State *J, int on);
+LJ_FUNC int lj_etw_setstate(jit_State *J, int on);
 LJ_FUNC int lj_etw_getstate(void);
 
 /* GCtrace.etw_entry may alias other state copied along with the trace. */
@@ -30,7 +30,7 @@ LJ_FUNC int lj_etw_getstate(void);
 #define lj_etw_addtrace(J, T)		UNUSED(T)
 #define lj_etw_deltrace(J, T)		UNUSED(T)
 #define LJ_ETW_CLEAR_ENTRY(T)		UNUSED(T)
-#define lj_etw_setstate(J, on)		((void)(J), (void)(on))
+#define lj_etw_setstate(J, on)		((void)(J), (void)(on), 0)
 #define lj_etw_getstate()		0
 #endif
 
