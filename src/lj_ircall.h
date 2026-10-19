@@ -69,7 +69,6 @@ typedef struct CCallInfo {
 #define IRCALLCOND_GCMARK(x)		NULL
 #endif
 
-
 #if LJ_TARGET_X86ORX64 || LJ_TARGET_ARM64
 #define IRCALLCOND_FPMATH(x)		NULL
 #else

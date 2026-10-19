@@ -43,9 +43,9 @@ single-allocation cases. The test is optional and registered with CTest by
 `LUAJIT_TEST_STACK_OOM=ON`; it does not instrument the VM.
 
 ```powershell
-cmake -S test/retm/runner -B build-stack-oom -G Ninja `
+cmake -S test/tailcall/runner -B build-stack-oom -G Ninja `
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLUAJIT_NUMMODE=OFF `
-  -DLUAJIT_TEST_RETM=ON -DLUAJIT_TEST_STACK_OOM=ON `
+  -DLUAJIT_TEST_TAILCALL=ON -DLUAJIT_TEST_STACK_OOM=ON `
   "-DCMAKE_C_FLAGS=/DLUA_USE_ASSERT /DLUA_USE_APICHECK"
 cmake --build build-stack-oom
 ctest --test-dir build-stack-oom --output-on-failure

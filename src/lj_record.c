@@ -828,12 +828,7 @@ static TRef rec_call_specialize(jit_State *J, GCfunc *fn, TRef tr)
 }
 
 /* Record call setup. */
-#if LUA_COMPAT_TAILCALL_CFRAME
-static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs,
-			   TValue *calleep)
-#else
 static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs)
-#endif
 {
   RecordIndex ix;
   TValue *functv = &J->L->base[func];
@@ -855,10 +850,6 @@ static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs)
     fbase[0] = ix.mobj;  /* Replace function. */
     functv = &ix.mobjv;
   }
-#if LUA_COMPAT_TAILCALL_CFRAME
-  if (calleep)  /* Return the resolved callee (BC_CALLT dispatch needs it). */
-    copyTV(J->L, calleep, functv);
-#endif
   kfunc = rec_call_specialize(J, funcV(functv), fbase[0]);
 #if LJ_FR2
   fbase[0] = kfunc;
@@ -869,109 +860,18 @@ static void rec_call_setup(jit_State *J, BCReg func, ptrdiff_t nargs)
   J->maxslot = (BCReg)nargs;
 }
 
-#if LUA_COMPAT_TAILCALL_COUNT && LJ_TARGET_X64
-/* REF_BASE is the trace entry base, not the base of an inlined call. */
-static void rec_tailcall_count(jit_State *J, int tailcall)
-{
-  TRef trL, trstack, trtc, trbs, tridx, trofs, traddr, trn;
-  /* FFH_TAILCALL replaces a fast function with its metamethod. The
-  ** interpreter preserves the count there, without eliding a Lua caller. */
-  if (tailcall && !isluafunc(J->fn)) return;
-  trL = emitir(IRT(IR_LREF, IRT_THREAD), 0, 0);
-  trstack = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_STACK);
-  trtc = emitir(IRT(IR_FLOAD, IRT_PGC), trL, IRFL_THREAD_TAILCALLS);
-  trbs = emitir(IRT(IR_SUB, IRT_INTP), REF_BASE, trstack);
-  tridx = emitir(IRTI(IR_BSHR), trbs, lj_ir_kint(J, 3));
-  tridx = emitir(IRTI(IR_ADD), tridx,
-		lj_ir_kint(J, (int32_t)J->baseslot - 2 - LJ_FR2));
-  trofs = emitir(IRTI(IR_BSHL), tridx, lj_ir_kint(J, 2));
-  traddr = emitir(IRT(IR_ADD, IRT_PGC), trtc, trofs);
-  trn = lj_ir_kint(J, 0);
-  if (tailcall) {
-    TRef trv = emitir(IRT(IR_XLOAD, IRT_INT), traddr, 0);
-    trn = emitir(IRTI(IR_ADD), trv, lj_ir_kint(J, 1));
-  }
-  emitir(IRT(IR_XSTORE, IRT_INT), traddr, trn);
-  J->needsnap = 1;  /* A trace exit must not replay the counter update. */
-}
-#else
-#define rec_tailcall_count(J, tailcall)	((void)0)
-#endif
-
 /* Record call. */
 void lj_record_call(jit_State *J, BCReg func, ptrdiff_t nargs)
 {
-#if LUA_COMPAT_TAILCALL_CFRAME
-  rec_call_setup(J, func, nargs, NULL);
-#else
   rec_call_setup(J, func, nargs);
-#endif
   /* Bump frame. */
   J->framedepth++;
   J->base += func+1+LJ_FR2;
   J->baseslot += func+1+LJ_FR2;
   if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
     lj_trace_err(J, LJ_TRERR_STACKOV);
-  rec_tailcall_count(J, 0);
 }
 
-#if LUA_COMPAT_TAILCALL_CFRAME
-/* Record the frame replacement of a tail call. Also used for the
-** FFH_TAILCALL path (recff_metacall), which replaces the fast function frame.
-*/
-static void rec_tailcall(jit_State *J, BCReg func)
-{
-  if (frame_isvarg(J->L->base - 1)) {
-    BCReg cbase = (BCReg)frame_delta(J->L->base - 1);
-    if (--J->framedepth < 0)
-      lj_trace_err(J, LJ_TRERR_NYIRETL);
-    J->baseslot -= (BCReg)cbase;
-    J->base -= cbase;
-    func += cbase;
-  }
-  /* Move func + args down. */
-  if (LJ_FR2 && J->baseslot == 2)
-    J->base[func+1] = TREF_FRAME;
-  memmove(&J->base[-1-LJ_FR2], &J->base[func], sizeof(TRef)*(J->maxslot+1+LJ_FR2));
-  /* Note: the new TREF_FRAME is now at J->base[-1] (even for slot #0). */
-  rec_tailcall_count(J, 1);
-  /* Tailcalls can form a loop, so count towards the loop unroll limit. */
-  if (++J->tailcalled > J->loopunroll)
-    lj_trace_err(J, LJ_TRERR_LUNROLL);
-}
-
-/* Record tail call. */
-void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
-{
-  rec_call_setup(J, func, nargs, NULL);
-  rec_tailcall(J, func);
-}
-
-/* Record BC_CALLT with dispatch on the callee type (ditto the interpreter): a
-** Lua callee replaces the frame (stock tail call), a C/FF callee is recorded
-** like a normal call (5.1 PCRC) and the trailing BC_RETM emitted by the parser
-** records the return. */
-static void rec_callt(jit_State *J, BCReg func, ptrdiff_t nargs)
-{
-  TValue callee;
-  /* A tail frame with children may need to close upvalues before Lua reuse. */
-  if ((J->pt->flags & PROTO_CHILD)) {
-    setintV(&J->errinfo, (int32_t)BC_UCLO);
-    lj_trace_err_info(J, LJ_TRERR_NYIBC);
-  }
-  rec_call_setup(J, func, nargs, &callee);
-  if (!isluafunc(funcV(&callee))) {  /* C/FF callee: normal call. */
-    J->framedepth++;
-    J->base += func+1+LJ_FR2;
-    J->baseslot += func+1+LJ_FR2;
-    if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
-      lj_trace_err(J, LJ_TRERR_STACKOV);
-    rec_tailcall_count(J, 0);
-  } else {
-    rec_tailcall(J, func);
-  }
-}
-#else
 /* Record tail call. */
 void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
 {
@@ -989,12 +889,10 @@ void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
     J->base[func+1] = TREF_FRAME;
   memmove(&J->base[-1-LJ_FR2], &J->base[func], sizeof(TRef)*(J->maxslot+1+LJ_FR2));
   /* Note: the new TREF_FRAME is now at J->base[-1] (even for slot #0). */
-  rec_tailcall_count(J, 1);
   /* Tailcalls can form a loop, so count towards the loop unroll limit. */
   if (++J->tailcalled > J->loopunroll)
     lj_trace_err(J, LJ_TRERR_LUNROLL);
 }
-#endif
 
 /* Check unroll limits for down-recursion. */
 static int check_downrec_unroll(jit_State *J, GCproto *pt)
@@ -1004,11 +902,9 @@ static int check_downrec_unroll(jit_State *J, GCproto *pt)
     if (ir_kgc(IR(ptref)) == obj2gco(pt)) {
       int count = 0;
       IRRef ref;
-      IROp op;
-      for (op = IR_RETF; op <= IR_RETFV; op++)
-	for (ref = J->chain[op]; ref; ref = IR(ref)->prev)
-	  if (IR(ref)->op1 == ptref)
-	    count++;
+      for (ref = J->chain[IR_RETF]; ref; ref = IR(ref)->prev)
+	if (IR(ref)->op1 == ptref)
+	  count++;
       if (count) {
 	if (J->pc == J->startpc) {
 	  if (count + J->tailcalled > J->param[JIT_P_recunroll])
@@ -1029,9 +925,6 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
   TValue *frame = J->L->base - 1;
   ptrdiff_t i;
   BCReg baseadj = 0;
-  int entry_varg = J->cur.stitch_entry && !J->retdepth &&
-    J->framedepth == 0 && J->pc == trace_retm_pc(&J->cur) &&
-    frame_isvarg(frame);
   for (i = 0; i < gotresults; i++)
     (void)getslot(J, rbase+i);  /* Ensure all results have a reference. */
   while (frame_ispcall(frame)) {  /* Immediately resolve pcall() returns. */
@@ -1050,7 +943,7 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
   }
   /* Return to lower frame via interpreter for unhandled cases. */
   if (J->framedepth == 0 && J->pt && bc_isret(bc_op(*J->pc)) &&
-       ((!frame_islua(frame) && !entry_varg) ||
+       (!frame_islua(frame) ||
 	(J->parent == 0 && J->exitno == 0 &&
 	 !bc_isret(bc_op(J->cur.startins))))) {
     /* NYI: specialize to frame type and return directly, not via RET*. */
@@ -1060,9 +953,7 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
     lj_record_stop(J, LJ_TRLINK_RETURN, 0);  /* Return to interpreter. */
     return;
   }
-  if (entry_varg) {
-    frame = frame_prevd(frame);
-  } else if (frame_isvarg(frame)) {
+  if (frame_isvarg(frame)) {
     BCReg cbase = (BCReg)frame_delta(frame);
     if (--J->framedepth < 0)  /* NYI: return of vararg func to lower frame. */
       lj_trace_err(J, LJ_TRERR_NYIRETL);
@@ -1109,10 +1000,7 @@ void lj_record_ret(jit_State *J, BCReg rbase, ptrdiff_t gotresults)
     } else {  /* Return to lower frame. Guard for the target we return to. */
       TRef trpt = lj_ir_kgc(J, obj2gco(pt), IRT_PROTO);
       TRef trpc = lj_ir_kptr(J, (void *)frame_pc(frame));
-      TRef ret = emitir(IRTG(entry_varg ? IR_RETFV : IR_RETF, IRT_PGC),
-			trpt, trpc);
-      if (J->cur.stitch_entry && !J->cur.retm_retref)
-	J->cur.retm_retref = tref_ref(ret);
+      emitir(IRTG(IR_RETF, IRT_PGC), trpt, trpc);
       J->retdepth++;
       J->needsnap = 1;
       J->scev.idx = REF_NIL;
@@ -2780,10 +2668,14 @@ void lj_record_ins(jit_State *J)
     /* fallthrough */
   case BC_CALLT:
 #if LUA_COMPAT_TAILCALL_CFRAME
-    rec_callt(J, ra, (ptrdiff_t)rc-1);
-#else
-    lj_record_tailcall(J, ra, (ptrdiff_t)rc-1);
+    /* The parser puts tail-call UCLO after CALLT for retained C callers.
+    ** Native replacement closes first. Keep the existing UCLO NYI boundary. */
+    if (bc_op(pc[1]) == BC_UCLO) {
+      setintV(&J->errinfo, (int32_t)BC_UCLO);
+      lj_trace_err_info(J, LJ_TRERR_NYIBC);
+    }
 #endif
+    lj_record_tailcall(J, ra, (ptrdiff_t)rc-1);
     break;
 
   case BC_VARG:
@@ -2794,11 +2686,7 @@ void lj_record_ins(jit_State *J)
 
   case BC_RETM:
     /* L->top is set to L->base+ra+rc+NRESULTS-1, see lj_dispatch_ins(). */
-    if (J->cur.stitch_entry == LJ_STITCH_RETM_FIXED &&
-	J->pc == trace_retm_pc(&J->cur) && !J->retdepth)
-      rc = J->cur.retm_wanted + 1;
-    else
-      rc = (BCReg)(J->L->top - J->L->base) - ra + 1;
+    rc = (BCReg)(J->L->top - J->L->base) - ra + 1;
     /* fallthrough */
   case BC_RET: case BC_RET0: case BC_RET1:
 #if LJ_HASPROFILE
@@ -2969,32 +2857,6 @@ static const BCIns *rec_setup_root(jit_State *J)
     /* No bytecode range check for down-recursive root traces. */
     J->maxslot = ra + bc_d(ins) - 1;
     break;
-  case BC_RETM:
-  {
-    TValue *frame = J->L->base-1;
-    BCReg wanted = 0;
-    lj_assertJ(J->exitno && is_tailcall_retm(pc), "invalid RETM entry");
-    J->maxslot = (BCReg)(J->L->top - J->L->base);
-    J->cur.stitch_multres = J->maxslot - ra - bc_d(ins) + 1;
-    J->cur.stitch_entry = LJ_STITCH_RETM_EXACT;
-    if (frame_isvarg(frame)) frame = frame_prevd(frame);
-    if (frame_islua(frame)) wanted = bc_b(frame_pc(frame)[-1]);
-    if (wanted) {
-      BCReg actual = J->maxslot;
-      J->cur.stitch_entry = LJ_STITCH_RETM_FIXED;
-      J->cur.retm_wanted = (uint8_t)(wanted-1);
-      J->maxslot = ra + wanted-1;
-      /* Padding is outside the logical raw result range kept in L->top. */
-      if (J->maxslot > actual) {
-	BCReg i;
-	lj_state_checkstack(J->L, J->maxslot-actual);
-	for (i = actual; i < J->maxslot; i++) setnilV(J->L->base+i);
-      }
-    }
-    if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
-      lj_trace_err(J, LJ_TRERR_STACKOV);
-    break;
-  }
   case BC_FUNCF:
     /* No bytecode range check for root traces started by a hot call. */
     J->maxslot = J->pt->numparams;
@@ -3060,19 +2922,6 @@ void lj_record_setup(jit_State *J)
     TraceNo root = T->root ? T->root : J->parent;
     J->cur.root = (uint16_t)root;
     J->cur.startins = BCINS_AD(BC_JMP, 0, 0);
-    if (trace_retm_pending(T, &T->snap[J->exitno]) &&
-	J->pc == trace_retm_pc(T)) {
-      TValue *frame = J->L->base-1;
-      if (frame_isvarg(frame)) frame = frame_prevd(frame);
-      /* A different receiver needs its own normalized root entry. */
-      if (T->stitch_entry == LJ_STITCH_RETM_FIXED &&
-	  (!frame_islua(frame) ||
-	   bc_b(frame_pc(frame)[-1]) != T->retm_wanted+1))
-	lj_trace_err(J, LJ_TRERR_NYIRETL);
-      J->cur.stitch_entry = T->stitch_entry;
-      J->cur.stitch_multres = T->stitch_multres;
-      J->cur.retm_wanted = T->retm_wanted;
-    }
     /* Check whether we could at least potentially form an extra loop. */
     if (J->exitno == 0 && T->snap[0].nent == 0) {
       /* We can narrow a FORL for some side traces, too. */

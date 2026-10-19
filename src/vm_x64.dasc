@@ -2440,10 +2440,6 @@ static void build_subroutines(BuildCtx *ctx)
   |  add NARGS:RDd, 1
   |  jmp RB
   |
-  /* Keep this hot ELF entry aligned independently of subroutine layout. */
-  if (ctx->mode == BUILD_elfasm) {
-    |.align 64
-  }
   |->cont_stitch:			// Trace stitching.
   |.if JIT
   |  // BASE = base, RC = result, RB = mbase
@@ -2930,80 +2926,6 @@ static void build_subroutines(BuildCtx *ctx)
   |  mov rax, CTSTATE->cb.gpr[0]
   |  movsd xmm0, qword CTSTATE->cb.fpr[0]
   |  jmp ->vm_leave_unw
-  |.endif
-  |
-  |// Place the RETM handler after ordinary stitch and exit code; FFI stays last.
-  |->cont_stitch_retm:
-  |.if JIT
-  |  endbr
-  |  mov TRACE:ITYPE, [RB-40]
-  |  cleartp TRACE:ITYPE
-  |  mov TMPRd, MULTRES
-  |  movzx RAd, PC_RA
-  |  lea RA, [BASE+RA*8]
-  |  sub TMPRd, 1
-  |  jz >2
-  |1:
-  |  mov RB, [RC]
-  |  mov [RA], RB
-  |  add RC, 8
-  |  add RA, 8
-  |  sub TMPRd, 1
-  |  jnz <1
-  |2:
-  |  test TRACE:ITYPE, TRACE:ITYPE
-  |  jz ->cont_nop
-  |  movzx RBd, word TRACE:ITYPE->traceno
-  |  movzx RDd, word TRACE:ITYPE->link
-  |  cmp RDd, RBd
-  |  je ->cont_nop
-  |  test RDd, RDd
-  |  jz >4
-  |  mov RB, [DISPATCH+DISPATCH_J(trace)]
-  |  mov TRACE:RB, [RB+RD*8]
-  |  mov TMPRd, MULTRES
-  |  cmp byte TRACE:RB->stitch_entry, LJ_STITCH_RETM_FIXED
-  |  je >5
-  |  cmp TMPRd, TRACE:RB->stitch_multres
-  |  jne >8
-  |  jmp >7
-  |5:
-  |  movzx RBd, byte TRACE:RB->retm_wanted
-  |  movzx ITYPEd, PC_RA
-  |  add RBd, ITYPEd
-  |  lea RB, [BASE+RB*8]
-  |  cmp RA, RB
-  |  jae >7
-  |  mov L:ITYPE, SAVE_L
-  |  cmp RB, L:ITYPE->maxstack
-  |  ja >8
-  |6:
-  |  mov aword [RA], LJ_TNIL
-  |  add RA, 8
-  |  cmp RA, RB
-  |  jb <6
-  |7:
-#ifdef LUAJIT_TEST_RETM
-  |  inc dword [DISPATCH+DISPATCH_J(retm_entries)]
-#endif
-  |  jmp =>BC_JLOOP
-  |8:
-#ifdef LUAJIT_TEST_RETM
-  |  inc dword [DISPATCH+DISPATCH_J(retm_fallbacks)]
-#endif
-  |  jmp ->cont_nop
-  |4:
-  |
-  |  // Stitch a new trace to the previous trace.
-  |  mov [DISPATCH+DISPATCH_J(exitno)], RB
-  |  mov L:RB, SAVE_L
-  |  mov L:RB->base, BASE
-  |  mov CARG2, PC
-  |  lea CARG1, [DISPATCH+GG_DISP2J]
-  |  mov aword [DISPATCH+DISPATCH_J(L)], L:RB
-  |  call extern lj_dispatch_stitch	// (jit_State *J, const BCIns *pc)
-  |  mov BASE, L:RB->base
-  |  jmp ->cont_nop
   |.endif
   |
   |->vm_ffi_call:			// Call C function via FFI.
@@ -4444,8 +4366,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cleartp TMPR
     |  cmp byte LFUNC:TMPR->ffid, 0	// FF_LUA == 0 (lj_obj.h:496)
 #if LUA_COMPAT_TAILCALL_CFRAME
-    |  // 5.1 PCRC parity: a C/FF callee keeps the caller frame (normal call).
-    |  jne ->BC_CALLT_CFRAME
+    |  jne >6
 #else
     |  jne >9
 #endif
@@ -4454,6 +4375,24 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp ITYPEd, LUA_MASKCALL
     |  je ->BC_CALLT_HOOK
 #if LUA_COMPAT_TAILCALL_CFRAME
+    |  jmp >9
+    |6:
+    |.if JIT
+    |  // Select by the Lua caller before its frame is overwritten.
+    |  test dword [DISPATCH+DISPATCH_J(flags)], JIT_F_ON
+    |  jz ->BC_CALLT_CFRAME
+    |  mov LFUNC:TMPR, [BASE-16]
+    |  cleartp LFUNC:TMPR
+    |  mov TMPR, LFUNC:TMPR->pc
+    |  test byte [TMPR+PC2PROTO(flags)], PROTO_NOJIT
+    |  jnz ->BC_CALLT_CFRAME
+    |.else
+    |  jmp ->BC_CALLT_CFRAME
+    |.endif
+#endif
+    |9:
+#if LUA_COMPAT_TAILCALL_CFRAME
+    |  // Native Lua/C/FF tails close before reusing the caller's slots.
     |  mov L:TMPR, SAVE_L
     |.if LJ_HASGCMARK
     |  cmp dword L:TMPR->openuvtop, 0
@@ -4462,8 +4401,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |.endif
     |  jne ->BC_CALLT_CLOSEUV
 #endif
-    |9:
-    |->BC_CALLT_LUA:
+    |->BC_CALLT_NATIVE:
     |  mov PC, [BASE-8]
     |  test PCd, FRAME_TYPE
     |  jnz >7
@@ -4496,10 +4434,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |3:
     |  cleartp LFUNC:RB
     |  mov NARGS:RDd, MULTRES
-#if LUA_COMPAT_TAILCALL_CFRAME
-    |  // Only Lua callees reach this point (C/FF took ->BC_CALLT_CFRAME).
-    |  ins_callt
-#else
     |  cmp byte LFUNC:RB->ffid, 1	// (> FF_C) Calling a fast function?
     |  ja >5
     |4:
@@ -4516,7 +4450,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov KBASE, [KBASE+PC2PROTO(k)]
     |  jmp <4
     |
-#endif
     |->BC_CALLT_CFRAME:			// C/FF callee: normal call, caller frame kept.
 #if LUA_COMPAT_TAILCALL_CFRAME
     |  cleartp LFUNC:RB
@@ -4543,7 +4476,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  jmp <1
     |->BC_CALLT_CLOSEUV:
 #if LUA_COMPAT_TAILCALL_CFRAME
-    |  // Close before the Lua branch overwrites this frame, including varargs.
+    |  // Close before native frame replacement, including C/FF and varargs.
     |  mov L:TMPR->base, BASE
     |  mov TMP1d, NARGS:RDd
     |  mov SAVE_PC, PC
@@ -4556,7 +4489,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  movzx RAd, PC_RA
     |  lea RA, [BASE+RA*8+16]
     |  mov KBASE, BASE
-    |  jmp ->BC_CALLT_LUA
+    |  jmp ->BC_CALLT_NATIVE
 #endif
     |->BC_CALLT_HOOK:
     |  mov L:TMPR, SAVE_L

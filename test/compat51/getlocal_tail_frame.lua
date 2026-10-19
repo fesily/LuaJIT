@@ -15,6 +15,7 @@
     lua5.1     luajit/test/compat51/getlocal_tail_frame.lua
 ]]
 
+if jit then jit.off() end
 io.stdout:setvbuf("no")
 io.stderr:setvbuf("no")
 

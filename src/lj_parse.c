@@ -1692,7 +1692,7 @@ static void fs_fixup_ret(FuncState *fs)
       switch (bc_op(ins)) {
       case BC_CALLMT: case BC_CALLT:
 #if LUA_COMPAT_TAILCALL_CFRAME
-	/* Lua callees close at frame reuse; C callees reach the fixed-up RETM. */
+	/* Native tails close at reuse; retained C tails reach the fixed-up RETM. */
 	break;
 #endif
       case BC_RETM: case BC_RET: case BC_RET0: case BC_RET1:
@@ -2769,7 +2769,7 @@ static void parse_return(LexState *ls, int eflags)
 	fs->pc--;
 	ins = BCINS_AD(bc_op(*ip)-BC_CALL+BC_CALLT, bc_a(*ip), bc_c(*ip));
 #if LUA_COMPAT_TAILCALL_CFRAME
-	/* A C/FF callee runs as a normal call; this RET forwards its results. */
+	/* An interpreted compatibility caller retains C/FF calls, then returns. */
 	ins_ret = BCINS_AD(BC_RETM, bc_a(*ip), 0);
 	emit_ret = 1;
 #endif

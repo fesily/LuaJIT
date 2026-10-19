@@ -1,5 +1,8 @@
 # 保留 PUC 5.1 帧的 RETM 缝合：实现与验证
 
+2026-10-17：本文保留为历史记录。RETM JIT 支持已删除，当前范围见
+[仅解释器尾调用兼容](tailcall-interpreter-only.md)。
+
 日期：2026-10-12。
 隔离分支：`codex/retm-stitch-evaluation`。
 基线：`c04ae378c9d1b79086fe7de5ec86dde0deb518fd`。

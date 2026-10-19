@@ -605,7 +605,7 @@ void LJ_FASTCALL lj_dispatch_stitch(jit_State *J, const BCIns *pc)
     setcframe_pc(cf, pc);
     /* Before dispatch, have to bias PC by 1. */
     L->top = L->base + cur_topslot(curr_proto(L), pc+1, cframe_multres_n(cf));
-    lj_trace_stitch(J, bc_op(*pc) == BC_RETM ? pc : pc-1);
+    lj_trace_stitch(J, pc-1);  /* Point to the CALL instruction. */
     setcframe_pc(cf, oldpc);
     ERRNO_RESTORE
   }

@@ -1017,7 +1017,10 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
-/* Also a DynASM define for vm_x64.dasc; the build systems read it back from
+/* Tail-call compatibility is interpreter-only. Compiled code does not keep
+** virtual tail counts or provide Lua 5.1 tail-frame/debug-hook semantics.
+** Disable JIT for the functions whose call chains need these guarantees.
+** Also a DynASM define for vm_x64.dasc; the build systems read it back from
 ** this header (Makefile: -dM text), so keep the value a literal 1 or 0. */
 #ifndef LUA_COMPAT_TAILCALL_COUNT
 #if LJ_TARGET_X64 && LUAJIT_ENABLE_LUA51COMPAT
@@ -1035,12 +1038,14 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 ** frame.  5.1's OP_TAILCALL only replaces the frame for Lua callees (PCRLUA);
 ** for C callees it calls them normally and keeps the caller frame
 ** (src/lua51/src/lvm.c:611-636).  With this switch on, BC_CALLT tests the
-** callee's ffid: Lua callees keep the stock eliding path, C/FF callees run as
-** a normal call and the function's trailing BC_RETM (emitted by the parser)
-** returns their results to the caller's caller.
+** caller's JIT mode: when the engine is off, the caller has PROTO_NOJIT, or
+** this build has no JIT, C/FF callees run as a normal call. The trailing
+** BC_RETM (emitted by the parser) returns their results. JIT-eligible callers
+** use native frame replacement even during warmup, preserving C stitching
+** and direct fast-function recording. Lua callees always replace the frame.
 ** Implemented by the x64+GC64 interpreter backend only (vm_x64.dasc, LJ_FR2);
 ** all other backends (x86, x64 without GC64, arm, ...) keep stock semantics and
-** never emit the trailing BC_RETM.
+** never emit the trailing BC_RETM. The JIT does not record retained C frames.
 ** Default: on with LJ_DS.  Override -DLUA_COMPAT_TAILCALL_CFRAME=0 for stock
 ** LuaJIT behavior (caller frame elided, C frame unnamed). */
 #ifndef LUA_COMPAT_TAILCALL_CFRAME

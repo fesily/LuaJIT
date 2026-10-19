@@ -118,9 +118,6 @@ static void recff_stitch(jit_State *J)
   TValue *pframe = frame_prevl(base-1);
   int errcode;
 
-#if LJ_TARGET_X64
-  if (is_tailcall_retm(pc)) cont = lj_cont_stitch_retm;
-#endif
   /* Move func + args up in IR slots and insert continuation. */
   memmove(&J->base[1], &J->base[-1-LJ_FR2], sizeof(TRef)*nslot);
 #if LJ_FR2
@@ -170,10 +167,9 @@ static void LJ_FASTCALL recff_nyi(jit_State *J, RecordFFData *rd)
     /* Can only stitch from Lua call. */
     if (J->framedepth && frame_islua(J->L->base-1)) {
       BCOp op = bc_op(*frame_pc(J->L->base-1));
-      int retm_stitch = is_tailcall_retm(frame_pc(J->L->base-1));
       /* Stitched trace cannot start with *M op with variable # of args. */
       if (!(op == BC_CALLM || op == BC_CALLMT ||
-	    (op == BC_RETM && !retm_stitch) || op == BC_TSETM)) {
+	    op == BC_RETM || op == BC_TSETM)) {
 	switch (J->fn->c.ffid) {
 	case FF_error:
 	case FF_debug_sethook:

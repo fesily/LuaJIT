@@ -2,6 +2,7 @@
 local jit = jit
 local stock = arg and arg[1] == "stock"
 local escaped, calls = nil, 0
+local force_off = false
 
 local function update(wrapper, read, value)
   -- Debug writes are outside the immutable-upvalue contract of compiled reads.
@@ -33,7 +34,7 @@ local function update(wrapper, read, value)
   end
   error("retained caller local not found")
 end
--- Inspect physical frames from the interpreter, as in tailcall_count_jit.lua.
+-- Inspect physical frames from the interpreter.
 if jit then jit.off(update) end
 
 local function pcall_case(expanded, hot)
@@ -313,6 +314,7 @@ local function dump_case()
     end
   ]]
   local wrapper = assert(loadstring(source))()
+  if force_off then jit.off(wrapper, true) end
   local blob = string.dump(wrapper)
   if jit then
     assert(blob:byte(4) == 0x81, "retained C-tail dump version")
@@ -324,6 +326,7 @@ local function dump_case()
     end
   end
   wrapper = assert(loadstring(blob))
+  if force_off then jit.off(wrapper, true) end
   local function callback(read, value)
     if jit then jit.off(read) end
     for level = 1, 20 do
@@ -377,11 +380,12 @@ if jit then
 end
 suite("interp")
 if jit then
-  if pcall(jit.on) then
-    jit.opt.start("hotloop=3", "hotexit=2", "minstitch=0")
-    for i = 1, 12 do suite("jit-" .. i) end
-    local util = require("jit.util")
-    assert(util.traceinfo(1), "heated suite must compile traces")
+  for _, fn in ipairs({pcall_case, fixup_case, native_case, metacall_case,
+      ff_case, error_case, unwind_case, branch_case, grow, growth_case,
+      yield_case, many_results_case, lua_case, block_case, dump_case}) do
+    jit.off(fn, true)
   end
+  force_off = true
+  if pcall(jit.on) then suite("function-off") end
   jit.off()
 end

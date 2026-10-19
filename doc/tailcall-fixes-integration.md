@@ -1,5 +1,9 @@
 # Tail-call fixes: mainline integration
 
+Historical validation: as of 2026-10-17, tail-call compatibility is
+[interpreter-only](tailcall-interpreter-only.md). JIT-specific guarantees and
+the old RETM diagnostic build commands below no longer apply.
+
 Date: 2026-10-14. Integration base: `96888b49`.
 Integration branch: `codex/tailcall-fixes-integration`.
 Target: LuaJIT `dontstarve`, followed by the superproject `master` gitlink.

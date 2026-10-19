@@ -29,7 +29,6 @@
   \
   _(ABC,	N , ref, ref) \
   _(RETF,	S , ref, ref) \
-  _(RETFV,	S , ref, ref) \
   \
   /* Miscellaneous ops. */ \
   _(NOP,	N , ___, ___) \
@@ -191,21 +190,12 @@ IRFPMDEF(FPMENUM)
 } IRFPMathOp;
 
 /* FLOAD fields. */
-#if LUA_COMPAT_TAILCALL_COUNT
-#define IRFLDEF_TCCOUNT(_) \
-  _(THREAD_STACK,	offsetof(lua_State, stack)) \
-  _(THREAD_TAILCALLS,	offsetof(lua_State, tailcalls))
-#else
-#define IRFLDEF_TCCOUNT(_)
-#endif
-
 #define IRFLDEF(_) \
   _(STR_LEN,	offsetof(GCstr, len)) \
   _(FUNC_ENV,	offsetof(GCfunc, l.env)) \
   _(FUNC_PC,	offsetof(GCfunc, l.pc)) \
   _(FUNC_FFID,	offsetof(GCfunc, l.ffid)) \
   _(THREAD_ENV,	offsetof(lua_State, env)) \
-  IRFLDEF_TCCOUNT(_) \
   _(TAB_META,	offsetof(GCtab, metatable)) \
   _(TAB_ARRAY,	offsetof(GCtab, array)) \
   _(TAB_NODE,	offsetof(GCtab, node)) \

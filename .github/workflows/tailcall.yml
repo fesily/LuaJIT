@@ -1,0 +1,42 @@
+name: Tail-call Compatibility
+on: [push, pull_request]
+jobs:
+  tailcall:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-24.04]
+        flavor: [release, assert, nocframe, nocount, noboth, nodebug, nojit]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: amd64
+      - name: Configure
+        shell: bash
+        run: |
+          flags="-DLUA_USE_ASSERT -DLUA_USE_APICHECK"
+          case "${{ matrix.flavor }}" in
+            release) flags="";;
+            nocframe) flags="$flags -DLUA_COMPAT_TAILCALL_CFRAME=0";;
+            nocount) flags="$flags -DLUA_COMPAT_TAILCALL_COUNT=0";;
+            noboth) flags="$flags -DLUA_COMPAT_TAILCALL_CFRAME=0 -DLUA_COMPAT_TAILCALL_COUNT=0";;
+            nodebug) flags="$flags -DLUA_COMPAT_TAILCALL_DEBUG=0";;
+          esac
+          extra=""
+          if [ "${{ matrix.flavor }}" = nojit ]; then extra="-DLUAJIT_DISABLE_JIT=ON"; fi
+          cmake -S test/tailcall/runner -B build-tailcall -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLUAJIT_NUMMODE=OFF \
+            -DLUAJIT_TEST_TAILCALL=ON -DLUAJIT_TEST_STACK_OOM=ON \
+            "-DCMAKE_C_FLAGS=$flags" $extra
+      - name: Build Both VMs and Probes
+        run: cmake --build build-tailcall --parallel 4
+      - name: Test
+        run: ctest --test-dir build-tailcall --output-on-failure
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tailcall-${{ matrix.os }}-${{ matrix.flavor }}
+          path: build-tailcall/Testing/Temporary/

@@ -1,6 +1,5 @@
 -- Direct level queries must preserve every tail frame beyond one million.
 local jit = jit
-local util = jit and require("jit.util")
 local probe = arg and arg[1] == "native" and require("hookprobe")
 local depths = {0, 1, 999999, 1000000, 1000005}
 
@@ -66,15 +65,10 @@ local function run(n, mode, vararg, mask)
     return value
   end
   driverref[1] = driver
-  local compiled, started = false, {}
-  local function traceevent(what, tr, fn)
-    if what == "start" then started[tr] = fn == rec
-    elseif what == "stop" and started[tr] then compiled = true end
-  end
   if jit then
     jit.off(driver)
-    if jit.opt then jit.opt.start("hotloop=3", "hotexit=2") end
-    if mode == "jit" then jit.attach(traceevent, "trace"); jit.on() end
+    jit.off(rec, true)
+    if mode == "off" then pcall(jit.on) end
   end
   local co = coroutine.create(driver)
   local ok, result, calls, returns, tails
@@ -91,12 +85,8 @@ local function run(n, mode, vararg, mask)
   end
   if jit then
     jit.off()
-    if mode == "jit" then jit.attach(traceevent) end
   end
   assert(ok and result == true, tostring(n) .. "/" .. mode .. ": " .. tostring(result))
-  if mode == "jit" and not vararg and n > 100 then
-    assert(compiled and util.traceinfo(1), "target recursion did not compile")
-  end
   if mask then
     assert(tails == (mask == 1 and 0 or n), "tail hook count truncated")
     assert(mask == 2 or calls >= n+1, "call hooks missing from recursion")
@@ -117,8 +107,8 @@ for _, n in ipairs(depths) do
 end
 run(1000005, "interp", true)
 if jit and pcall(jit.on) then
-  for _, n in ipairs(depths) do run(n, "jit", false) end
-  run(1000005, "jit", true)
+  for _, n in ipairs(depths) do run(n, "off", false) end
+  run(1000005, "off", true)
 end
 if probe then
   for mask = 1, 3 do run(1000005, "interp", false, mask) end

@@ -1,5 +1,8 @@
 # JIT tail-call counter investigation
 
+Historical report: JIT counter support was removed on 2026-10-17. See
+[interpreter-only tail-call compatibility](tailcall-interpreter-only.md).
+
 Date: 2026-10-11. Baseline: `25fb1bfb` on `dontstarve`.
 Branch: `codex/tailcall-count-investigation`.
 This investigates item 10 in the hot-path review on `docs/hotpath-review`.

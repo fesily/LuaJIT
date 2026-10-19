@@ -18,10 +18,7 @@ SET(CMAKE_REQUIRED_INCLUDES
 
 OPTION(WITH_AMALG "Build eveything in one shot (needs memory)" ON)
 option(WITH_SHARED_LUA "build shared lua" ON)
-option(LUAJIT_TEST_RETM "Build RETM stitch diagnostics and native tests." OFF)
-if(LUAJIT_TEST_RETM)
-  add_compile_definitions(LUAJIT_TEST_RETM)
-endif()
+option(LUAJIT_TEST_TAILCALL "Build native tail-call and hook tests." OFF)
 
 # Ugly warnings
 IF(MSVC)
@@ -63,6 +60,7 @@ ENDIF()
 
 IF(LUAJIT_DISABLE_JIT)
   ADD_DEFINITIONS(-DLUAJIT_DISABLE_JIT)
+  LIST(APPEND CMAKE_REQUIRED_DEFINITIONS -DLUAJIT_DISABLE_JIT)
 ENDIF()
 
 IF(LUAJIT_DISABLE_ETW)
@@ -598,6 +596,10 @@ add_luajit_variant(
 foreach(_lj_compat51_case arg_bug function_args function_args_alloc
         function_args_closure function_args_debug function_args_main_chunk
         getlocal_tail_frame str_order51 str_intern_collide tailcall_debug)
+  if(LUAJIT_DISABLE_JIT AND
+      _lj_compat51_case MATCHES "^(function_args_alloc|str_order51)$")
+    continue() # These unrelated scripts explicitly enable the JIT engine.
+  endif()
   if(NOT LUA_COMPAT_TAILCALL_COUNT_ON AND
       _lj_compat51_case MATCHES "^(getlocal_tail_frame|tailcall_debug)$")
     continue() # These cases explicitly require virtual tail frames.
@@ -609,12 +611,12 @@ foreach(_lj_compat51_case arg_bug function_args function_args_alloc
     LABELS luajit_compat51)
 endforeach()
 
-# Frame counts must survive compiled calls and exits in both GC variants.
+# Tail-call compatibility is guaranteed only for interpreted functions.
 if(LUA_COMPAT_TAILCALL_COUNT_ON)
   foreach(_lj_tailcall_vm luajit luajit-arenagc)
-    add_test(NAME ${_lj_tailcall_vm}_compat51_tailcall_count_jit
-      COMMAND ${_lj_tailcall_vm} ${LUAJIT_DIR}/test/compat51/tailcall_count_jit.lua)
-    set_tests_properties(${_lj_tailcall_vm}_compat51_tailcall_count_jit PROPERTIES
+    add_test(NAME ${_lj_tailcall_vm}_compat51_tailcall_count
+      COMMAND ${_lj_tailcall_vm} ${LUAJIT_DIR}/test/compat51/tailcall_count.lua)
+    set_tests_properties(${_lj_tailcall_vm}_compat51_tailcall_count PROPERTIES
       WORKING_DIRECTORY ${LUAJIT_DIR}
       LABELS luajit_compat51)
     add_test(NAME ${_lj_tailcall_vm}_compat51_tailcall_depth
@@ -663,8 +665,8 @@ foreach(_lj_ds_case gc_steptime)
     LABELS luajit_ds)
 endforeach()
 
-if(LUAJIT_TEST_RETM)
-  add_subdirectory(test/retm)
+if(LUAJIT_TEST_TAILCALL)
+  add_subdirectory(test/tailcall)
   add_subdirectory(test/hooks)
 endif()
 

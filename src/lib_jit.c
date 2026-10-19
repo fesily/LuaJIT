@@ -621,8 +621,9 @@ LJLIB_CF(jit_profile_stop)
 /* state = profile.etw([on]) */
 LJLIB_CF(jit_profile_etw)
 {
+  int state = 0;
+#if LJ_HASETW
   TValue *o = L->base;
-  int state;
   if (o >= L->top || tvisnil(o)) {
     state = lj_etw_getstate();
   } else {
@@ -638,6 +639,7 @@ LJLIB_CF(jit_profile_etw)
     }
     state = lj_etw_getstate();
   }
+#endif
   setboolV(L->top++, state);
   return 1;
 }

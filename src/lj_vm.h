@@ -112,9 +112,6 @@ LJ_ASMF void lj_cont_condt(void);  /* Branch if result is true. */
 LJ_ASMF void lj_cont_condf(void);  /* Branch if result is false. */
 LJ_ASMF void lj_cont_hook(void);  /* Continue from hook yield. */
 LJ_ASMF void lj_cont_stitch(void);  /* Trace stitching. */
-#if LJ_TARGET_X64
-LJ_ASMF void lj_cont_stitch_retm(void);  /* PUC C-tail return stitching. */
-#endif
 
 /* Start of the ASM code. */
 LJ_ASMF char lj_vm_asm_begin[];

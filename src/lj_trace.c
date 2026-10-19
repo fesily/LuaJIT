@@ -492,8 +492,7 @@ static void trace_start(jit_State *J)
       setintV(V->top++, J->exitno);
     } else {
       BCOp op = bc_op(*J->pc);
-      if (op == BC_CALLM || op == BC_CALL || op == BC_ITERC ||
-          (op == BC_RETM && J->exitno != 0)) {
+      if (op == BC_CALLM || op == BC_CALL || op == BC_ITERC) {
 	setintV(V->top++, J->exitno);  /* Parent of stitched trace. */
 	setintV(V->top++, -1);
       }
@@ -558,7 +557,6 @@ static void trace_stop(jit_State *J)
   case BC_CALLM:
   case BC_CALL:
   case BC_ITERC:
-  case BC_RETM:
     /* Trace stitching: patch link of previous trace. */
     traceref(J, J->exitno)->link = traceno;
     break;
@@ -615,8 +613,7 @@ static int trace_abort(jit_State *J)
     return 1;  /* Retry ASM with new MCode area. */
   }
   /* Penalize or blacklist starting bytecode instruction. */
-  if (J->parent == 0 &&
-      (!bc_isret(bc_op(J->cur.startins)) || J->exitno != 0)) {
+  if (J->parent == 0 && !bc_isret(bc_op(J->cur.startins))) {
     if (J->exitno == 0) {
       BCIns *startpc = mref(J->cur.startpc, BCIns);
       if (e == LJ_TRERR_RETRY)
@@ -932,19 +929,6 @@ int LJ_FASTCALL lj_trace_exit(jit_State *J, void *exptr)
   lj_assertJ(T != NULL && J->exitno < T->nsnap, "bad trace or exit number");
   exd.J = J;
   exd.exptr = exptr;
-  if (trace_retm_pending(T, &T->snap[J->exitno])) {
-    const BCIns *rpc = trace_retm_pc(T);
-    uint32_t multres = (uint32_t)ex->spill[T->retm_spill];
-    L->top = L->base + bc_a(*rpc) + bc_d(*rpc) + multres-1;
-#ifdef LUAJIT_TEST_RETM
-    J->retm_preexits++;
-#endif
-  }
-#ifdef LUAJIT_TEST_RETM
-  else if (T->stitch_entry) {
-    J->retm_postexits++;
-  }
-#endif
   errcode = lj_vm_cpcall(L, NULL, &exd, trace_exit_cp);
   if (errcode)
     return -errcode;  /* Return negated error code. */

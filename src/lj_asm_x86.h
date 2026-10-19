@@ -478,7 +478,6 @@ static Reg asm_fuseload(ASMState *as, IRRef ref, RegSet allow)
     if (ir->o == IR_SLOAD) {
       if (!(ir->op2 & (IRSLOAD_PARENT|IRSLOAD_CONVERT)) &&
 	  noconflict(as, ref, IR_RETF, 2) &&
-	  noconflict(as, ref, IR_RETFV, 2) &&
 	  !(LJ_GC64 && irt_isaddr(ir->t))) {
 	as->mrm.base = (uint8_t)ra_alloc1(as, REF_BASE, xallow);
 	as->mrm.ofs = 8*((int32_t)ir->op1-1-LJ_FR2) +
@@ -800,10 +799,6 @@ static void asm_retf(ASMState *as, IRIns *ir)
   as->topslot -= (BCReg)delta;
   if ((int32_t)as->topslot < 0) as->topslot = 0;
   irt_setmark(IR(REF_BASE)->t);  /* Children must not coalesce with BASE reg. */
-#ifdef LUAJIT_TEST_RETM
-  if (as->T->stitch_entry && as->curins == as->T->retm_retref)
-    emit_rma(as, XO_GROUP5, 0, &as->J->retm_returns);
-#endif
   emit_setgl(as, base, jit_base);
   emit_addptr(as, base, -8*delta);
   asm_guardcc(as, CC_NE);
@@ -814,40 +809,6 @@ static void asm_retf(ASMState *as, IRIns *ir)
   emit_gmroi(as, XG_ARITHi(XOg_CMP), base, -4, ptr2addr(pc));
 #endif
 }
-
-#if LJ_TARGET_X64
-/* Entry vararg frames have a runtime span, outside the trace's frame depth. */
-static void asm_retfv(ASMState *as, IRIns *ir)
-{
-  Reg base = ra_alloc1(as, REF_BASE, RSET_GPR);
-  Reg span = ra_scratch(as, rset_exclude(RSET_GPR, base));
-  Reg frame = ra_scratch(as, RSET_GPR & ~RID2RSET(base) & ~RID2RSET(span));
-  Reg rpc = ra_scratch(as, RSET_GPR & ~RID2RSET(base) &
-		      ~RID2RSET(span) & ~RID2RSET(frame));
-  void *pc = ir_kptr(IR(ir->op2));
-  int32_t delta = 8*(1+LJ_FR2+bc_a(*((const BCIns *)pc-1)));
-  checkmclim(as);
-  as->topslot = 0;
-  irt_setmark(IR(REF_BASE)->t);
-#ifdef LUAJIT_TEST_RETM
-  emit_rma(as, XO_GROUP5, 0, &as->J->retm_returns);
-#endif
-  emit_setgl(as, base, jit_base);
-  emit_rmro(as, XO_LEA, base|REX_64, frame, -delta);
-  asm_guardcc(as, CC_NE);
-  emit_rmro(as, XO_CMP, rpc|REX_64, frame, -8);
-  emit_loadu64(as, rpc, u64ptr(pc));
-  checkmclim(as);
-  emit_rr(as, XO_ARITH(XOg_SUB), frame|REX_64, span);
-  emit_rr(as, XO_MOV, frame|REX_64, base);
-  emit_gri(as, XG_ARITHi(XOg_AND), span|REX_64, ~FRAME_TYPEP);
-  asm_guardcc(as, CC_NE);
-  emit_gri(as, XG_ARITHi(XOg_CMP), frame, FRAME_VARG);
-  emit_gri(as, XG_ARITHi(XOg_AND), frame, FRAME_TYPEP);
-  emit_rr(as, XO_MOV, frame, span);
-  emit_rmro(as, XO_MOV, span|REX_64, base, -8);
-}
-#endif
 
 /* -- Buffer operations --------------------------------------------------- */
 

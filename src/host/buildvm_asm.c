@@ -249,8 +249,7 @@ void emit_asm(BuildCtx *ctx)
 #if LJ_TARGET_MIPS
   fprintf(ctx->fp, "\t.set nomips16\n\t.abicalls\n\t.set noreorder\n\t.set nomacro\n");
 #endif
-  /* Keep x64 ELF dispatch offsets stable within instruction-cache lines. */
-  emit_asm_align(ctx, LJ_TARGET_X64 && ctx->mode == BUILD_elfasm ? 6 : 4);
+  emit_asm_align(ctx, 4);
 
 #if LJ_TARGET_PS3
   emit_asm_label(ctx, ctx->beginsym, ctx->codesz, 0);

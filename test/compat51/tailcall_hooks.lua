@@ -424,9 +424,10 @@ end
 
 if jit then jit.off(); jit.flush() end
 suite("interp")
-if jit and pcall(jit.on) then
-  -- Start the hook suite with a fresh trace cache.
-  jit.flush()
-  suite("jit-on")
+if jit then
+  for _, fn in ipairs({check, grow, chain_case, alias_case, ctail_case,
+      multres_case, error_case, tail_error_case, coroutine_case, recursion_case,
+      mixed_case, metamethod_case, native_case, suite}) do jit.off(fn, true) end
+  if pcall(jit.on) then suite("function-off") end
   jit.off()
 end

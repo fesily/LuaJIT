@@ -5,6 +5,7 @@
 ]]
 
 
+if jit then jit.off() end
 io.stdout:setvbuf("no")
 io.stderr:setvbuf("no")
 
