@@ -12,10 +12,10 @@
 
 /* Windows Vista is the baseline for the ETW provider API (EventRegister).
 ** An explicitly lower target is a build error instead of a silent partial
-** implementation -- define LUAJIT_DISABLE_ETW to build without ETW symbols.
+** implementation (the default): define LUAJIT_ENABLE_ETW to compile it in.
 */
 #if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0600
-#error "lj_etw.c requires _WIN32_WINNT >= 0x0600 (Windows Vista). Define LUAJIT_DISABLE_ETW to disable ETW JIT symbols."
+#error "lj_etw.c requires _WIN32_WINNT >= 0x0600 (Windows Vista). Raise the target or drop LUAJIT_ENABLE_ETW."
 #endif
 #if !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0600

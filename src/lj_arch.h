@@ -618,8 +618,10 @@
 #define LJ_HASJIT		1
 #endif
 
-/* Disable or enable the Windows ETW JIT symbol provider. */
-#if LJ_TARGET_WINDOWS && LJ_HASJIT && !defined(LUAJIT_DISABLE_ETW)
+/* Windows ETW JIT symbol provider. Off by default: define LUAJIT_ENABLE_ETW
+** (CMake: -DLUAJIT_ENABLE_ETW=ON) to compile it in.
+*/
+#if LJ_TARGET_WINDOWS && LJ_HASJIT && defined(LUAJIT_ENABLE_ETW)
 #define LJ_HASETW		1
 #else
 #define LJ_HASETW		0

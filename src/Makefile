@@ -335,8 +335,11 @@ ifeq (Windows,$(TARGET_SYS))
   TARGET_STRIP+= --strip-unneeded
   TARGET_XSHLDFLAGS= -shared -Wl,--out-implib,$(TARGET_DLLDOTANAME)
   TARGET_DYNXLDOPTS=
-  # lj_etw.c uses the ETW provider API (EventRegister/EventWrite).
-  TARGET_XLIBS+= -ladvapi32
+  # lj_etw.c uses the ETW provider API and is compiled in only with
+  # -DLUAJIT_ENABLE_ETW (see lj_arch.h).
+  ifneq (,$(findstring LUAJIT_ENABLE_ETW,$(XCFLAGS)))
+    TARGET_XLIBS+= -ladvapi32
+  endif
 else
   TARGET_AR+= 2>/dev/null
 ifeq (,$(shell $(TARGET_CC) -o /dev/null -c -x c /dev/null -fno-stack-protector 2>/dev/null || echo 1))

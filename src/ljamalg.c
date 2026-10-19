@@ -14,13 +14,13 @@
 /* ETW JIT symbols (lj_etw.c) need the Vista provider API, so the default
 ** target is raised unless the feature is explicitly disabled. */
 #ifndef WINVER
-#if defined(_WIN32) && !defined(LUAJIT_DISABLE_ETW)
+#if defined(_WIN32) && defined(LUAJIT_ENABLE_ETW)
 #define WINVER 0x0600
 #else
 #define WINVER 0x0501
 #endif
 #endif
-#if defined(_WIN32) && !defined(LUAJIT_DISABLE_ETW) && !defined(_WIN32_WINNT)
+#if defined(_WIN32) && defined(LUAJIT_ENABLE_ETW) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0600
 #endif
 
