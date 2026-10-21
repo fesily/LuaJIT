@@ -42,6 +42,9 @@ LJ_FUNC void lj_debug_pushloc(lua_State *L, GCproto *pt, BCPos pc);
 LJ_FUNC int lj_debug_getinfo(lua_State *L, const char *what, lj_Debug *ar,
 			     int ext);
 #if LJ_HASPROFILE
+/* Put the chunkname of a prototype into a buffer, like dumpstack does. */
+LJ_FUNC int lj_debug_putchunkname(SBuf *sb, GCproto *pt, int pathstrip);
+
 LJ_FUNC void lj_debug_dumpstack(lua_State *L, SBuf *sb, const char *fmt,
 				int depth);
 #endif

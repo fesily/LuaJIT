@@ -420,6 +420,9 @@ endif
 ifneq (,$(findstring LJ_HASFFI 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D FFI
 endif
+ifneq (,$(findstring LJ_HASSYSPROF 1,$(TARGET_TESTARCH)))
+  DASM_AFLAGS+= -D LJ_HASSYSPROF
+endif
 ifneq (,$(findstring LJ_DUALNUM 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D DUALNUM
 endif
@@ -454,6 +457,7 @@ endif
 DASM_AFLAGS+= -D VER=$(subst LJ_ARCH_VERSION_,,$(filter LJ_ARCH_VERSION_%,$(subst LJ_ARCH_VERSION ,LJ_ARCH_VERSION_,$(TARGET_TESTARCH))))
 ifeq (Windows,$(TARGET_SYS))
   DASM_AFLAGS+= -D WIN
+  TARGET_LDFLAGS+= -ldbghelp
 endif
 ifeq (x64,$(TARGET_LJARCH))
   ifeq (,$(findstring LJ_FR2 1,$(TARGET_TESTARCH)))
@@ -511,7 +515,7 @@ LJVM_MODE= elfasm
 
 LJLIB_O= lib_base.o lib_math.o lib_bit.o lib_string.o lib_table.o \
 	 lib_io.o lib_os.o lib_package.o lib_debug.o lib_jit.o lib_ffi.o \
-	 lib_buffer.o
+	 lib_buffer.o lib_misc.o
 LJLIB_C= $(LJLIB_O:.o=.c)
 
 LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
@@ -527,6 +531,8 @@ LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
 	  lj_ctype.o lj_cdata.o lj_cconv.o lj_ccall.o lj_ccallback.o \
 	  lj_carith.o lj_clib.o lj_cparse.o \
 	  lj_lib.o lj_alloc.o lib_aux.o \
+	  lj_sysprof.o lj_profile_timer.o lj_symtab.o lj_mapi.o \
+	  lj_wbuf.o lj_utils_leb128.o \
 	  $(LJLIB_O) lib_init.o
 
 LJVMCORE_O= $(LJVM_O) $(LJCORE_O)
@@ -705,6 +711,9 @@ lj_recdef.h: $(BUILDVM_T) $(LJLIB_C)
 $(LIB_VMDEF): $(BUILDVM_T) $(LJLIB_C)
 	$(E) "BUILDVM   $@"
 	$(Q)$(BUILDVM_X) -m vmdef -o $(LIB_VMDEFP) $(LJLIB_C)
+
+# All the library modules include the generated definitions.
+$(LJLIB_O): lj_libdef.h
 
 lj_folddef.h: $(BUILDVM_T) lj_opt_fold.c
 	$(E) "BUILDVM   $@"

@@ -32,7 +32,7 @@
 @set DASC=vm_x64.dasc
 @set LJDLLNAME=lua51.dll
 @set LJLIBNAME=lua51.lib
-@set ALL_LIB=lib_base.c lib_math.c lib_bit.c lib_string.c lib_table.c lib_io.c lib_os.c lib_package.c lib_debug.c lib_jit.c lib_ffi.c lib_buffer.c
+@set ALL_LIB=lib_base.c lib_math.c lib_bit.c lib_string.c lib_table.c lib_io.c lib_os.c lib_package.c lib_debug.c lib_jit.c lib_ffi.c lib_buffer.c lib_misc.c
 
 @setlocal
 @call :SETHOSTVARS
@@ -44,12 +44,12 @@ if exist minilua.exe.manifest^
   %LJMT% -manifest minilua.exe.manifest -outputresource:minilua.exe
 @endlocal
 
-@set DASMFLAGS=-D WIN -D JIT -D FFI -D ENDIAN_LE -D FPU -D P64
+@set DASMFLAGS=-D WIN -D JIT -D FFI -D ENDIAN_LE -D FPU -D P64 -D LJ_HASSYSPROF
 @set LJARCH=x64
 @minilua
 @if errorlevel 8 goto :NO32
 @set DASC=vm_x86.dasc
-@set DASMFLAGS=-D WIN -D JIT -D FFI -D ENDIAN_LE -D FPU
+@set DASMFLAGS=-D WIN -D JIT -D FFI -D ENDIAN_LE -D FPU -D LJ_HASSYSPROF
 @set LJARCH=x86
 @set LJCOMPILE=%LJCOMPILE% /arch:SSE2
 @goto :DA
@@ -113,7 +113,7 @@ buildvm -m folddef -o lj_folddef.h lj_opt_fold.c
 %LJCOMPILE% %LJDYNBUILD% lj_*.c lib_*.c
 @if errorlevel 1 goto :BAD
 @if "%1"=="mixed" goto :STATICLIB
-%LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj
+%LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj dbghelp.lib
 @if errorlevel 1 goto :BAD
 @goto :MTDLL
 :STATIC
@@ -143,7 +143,7 @@ if exist %LJDLLNAME%.manifest^
 
 %LJCOMPILE% luajit.c
 @if errorlevel 1 goto :BAD
-%LJLINK% /OUT:luajit.exe luajit.obj %LJLIBNAME%
+%LJLINK% /OUT:luajit.exe luajit.obj %LJLIBNAME% dbghelp.lib
 @if errorlevel 1 goto :BAD
 if exist luajit.exe.manifest^
   %LJMT% -manifest luajit.exe.manifest -outputresource:luajit.exe

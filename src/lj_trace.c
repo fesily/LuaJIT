@@ -24,6 +24,7 @@
 #include "lj_trace.h"
 #include "lj_snap.h"
 #include "lj_gdbjit.h"
+#include "lj_sysprof.h"
 #include "lj_record.h"
 #include "lj_asm.h"
 #include "lj_dispatch.h"
@@ -167,6 +168,9 @@ static void trace_save(jit_State *J, GCtrace *T)
 #ifdef LUAJIT_USE_PERFTOOLS
   perftools_addtrace(T);
 #endif
+#if LJ_HASSYSPROF
+  lj_sysprof_add_trace(T);
+#endif
 }
 
 void LJ_FASTCALL lj_trace_free(global_State *g, GCtrace *T)
@@ -174,6 +178,9 @@ void LJ_FASTCALL lj_trace_free(global_State *g, GCtrace *T)
   jit_State *J = G2J(g);
   if (T->traceno) {
     lj_gdbjit_deltrace(J, T);
+#if LJ_HASSYSPROF
+    lj_sysprof_del_trace(T);
+#endif
     if (T->traceno < J->freetrace)
       J->freetrace = T->traceno;
     setgcrefnull(J->trace[T->traceno]);
@@ -285,6 +292,9 @@ int lj_trace_flushall(lua_State *L)
       if (T->root == 0)
 	trace_flushroot(J, T);
       lj_gdbjit_deltrace(J, T);
+#if LJ_HASSYSPROF
+      lj_sysprof_del_trace(T);
+#endif
       T->traceno = T->link = 0;  /* Blacklist the link for cont_stitch. */
       setgcrefnull(J->trace[i]);
     }

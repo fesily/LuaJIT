@@ -528,7 +528,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  move CRET1, CARG2
   |->vm_unwind_c_eh:			// Landing pad for external unwinder.
   |  ld L, SAVE_L
-  |   li TMP0, ~LJ_VMST_C
+  |   li TMP0, ~LJ_VMST_CFUNC
   |  ld GL:TMP1, L->glref
   |  b ->vm_leave_unw
   |.  sw TMP0, GL:TMP1->vmstate

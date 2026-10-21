@@ -639,7 +639,7 @@ static void build_subroutines(BuildCtx *ctx)
   |->vm_unwind_c_eh:			// Landing pad for external unwinder.
   |  lwz L, SAVE_L
   |  .toc ld TOCREG, SAVE_TOC
-  |   li TMP0, ~LJ_VMST_C
+  |   li TMP0, ~LJ_VMST_CFUNC
   |  lwz GL:TMP1, L->glref
   |   stw TMP0, GL:TMP1->vmstate
   |  b ->vm_leave_unw
