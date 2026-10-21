@@ -24,6 +24,7 @@
 #endif
 #include "lj_strfmt.h"
 #include "lj_lex.h"
+#include "lj_sysprof.h"
 #include "lj_parse.h"
 #include "lj_vm.h"
 #include "lj_vmevent.h"
@@ -1744,6 +1745,11 @@ static GCproto *fs_finish(LexState *ls)
   lj_vmevent_send(G(L), BC,
     setprotoV(V, V->top++, pt);
   );
+
+  /* Add a new prototype to the profiler. */
+#if LJ_HASSYSPROF
+  lj_sysprof_add_proto(pt);
+#endif
 
   L->top--;  /* Pop table of constants. */
   ls->vtop = fs->vbase;  /* Reset variable stack. */

@@ -602,6 +602,118 @@ LJLIB_CF(jit_profile_stop)
   return 0;
 }
 
+/* -- jit.profile.symtab() ------------------------------------------------ */
+
+typedef struct {
+  const void *addr;
+  char *name;
+} JitProfileSym;
+
+typedef struct {
+  JitProfileSym *v;
+  size_t n, cap;
+  int oom;
+} JitProfileSymTab;
+
+static void jit_profile_sym_cb(void *data, const void *addr, const char *name)
+{
+  JitProfileSymTab *st = (JitProfileSymTab *)data;
+  size_t len = strlen(name);
+  char *copy;
+
+  if (st->n == st->cap) {
+    size_t cap = st->cap != 0 ? st->cap * 2 : 512;
+    JitProfileSym *v = (JitProfileSym *)realloc(st->v, cap * sizeof(*v));
+    if (v == NULL) {
+      st->oom = 1;
+      return;
+    }
+    st->v = v;
+    st->cap = cap;
+  }
+
+  copy = (char *)malloc(len + 1);
+  if (copy == NULL) {
+    st->oom = 1;
+    return;
+  }
+  memcpy(copy, name, len + 1);
+  st->v[st->n].addr = addr;
+  st->v[st->n].name = copy;
+  st->n++;
+}
+
+static int jit_profile_sym_cmp(const void *a, const void *b)
+{
+  const JitProfileSym *x = (const JitProfileSym *)a;
+  const JitProfileSym *y = (const JitProfileSym *)b;
+  return x->addr < y->addr ? -1 : (x->addr > y->addr);
+}
+
+/* syms = profile.symtab() */
+LJLIB_CF(jit_profile_symtab)
+{
+  JitProfileSymTab st;
+  size_t i;
+  memset(&st, 0, sizeof(st));
+  luaJIT_profile_symtab(jit_profile_sym_cb, &st);
+  if (st.oom) {
+    for (i = 0; i < st.n; i++)
+      free(st.v[i].name);
+    free(st.v);
+    lj_err_mem(L);
+  }
+  if (st.n != 0)
+    qsort(st.v, st.n, sizeof(*st.v), jit_profile_sym_cmp);
+  lua_createtable(L, (int)st.n, 0);
+  for (i = 0; i < st.n; i++) {
+    lua_createtable(L, 2, 0);
+    lua_pushnumber(L, (lua_Number)(uintptr_t)st.v[i].addr);
+    lua_rawseti(L, -2, 1);
+    lua_pushstring(L, st.v[i].name);
+    lua_rawseti(L, -2, 2);
+    lua_rawseti(L, -2, (int)(i + 1));
+    free(st.v[i].name);
+  }
+  free(st.v);
+  return 1;
+}
+
+/* frames = profile.hoststack([depth]) */
+LJLIB_CF(jit_profile_hoststack)
+{
+  const void *buf[LUAJIT_PROFILE_HOSTSTACK_MAX];
+  int depth = lj_lib_optint(L, 1, 16);
+  int i, n;
+  if (depth > LUAJIT_PROFILE_HOSTSTACK_MAX)
+    depth = LUAJIT_PROFILE_HOSTSTACK_MAX;
+  n = luaJIT_profile_hoststack(L, buf, depth);
+  lua_createtable(L, n, 0);
+  for (i = 0; i < n; i++) {
+    lua_pushnumber(L, (lua_Number)(uintptr_t)buf[i]);
+    lua_rawseti(L, -2, i+1);
+  }
+  return 1;
+}
+
+/* dump = profile.mixedstack([thread,] depth) */
+LJLIB_CF(jit_profile_mixedstack)
+{
+  lua_State *L2 = L;
+  int arg = 0;
+  int depth;
+  size_t len;
+  const char *p;
+  if (L->top > L->base && tvisthread(L->base)) {
+    L2 = threadV(L->base);
+    arg = 1;
+  }
+  depth = lj_lib_optint(L, arg+1, 20);
+  p = luaJIT_profile_mixedstack(L2, depth, &len);
+  lua_pushlstring(L, p, len);
+  return 1;
+}
+
 /* dump = profile.dumpstack([thread,] fmt, depth) */
 LJLIB_CF(jit_profile_dumpstack)
 {

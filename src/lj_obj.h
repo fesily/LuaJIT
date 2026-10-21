@@ -528,7 +528,9 @@ typedef struct GCtab {
 /* VM states. */
 enum {
   LJ_VMST_INTERP,	/* Interpreter. */
-  LJ_VMST_C,		/* C function. */
+  LJ_VMST_LFUNC,	/* Lua function. */
+  LJ_VMST_FFUNC,	/* Fast function. */
+  LJ_VMST_CFUNC,	/* C function. */
   LJ_VMST_GC,		/* Garbage collector. */
   LJ_VMST_EXIT,		/* Trace exit handler. */
   LJ_VMST_RECORD,	/* Trace recorder. */
@@ -536,6 +538,8 @@ enum {
   LJ_VMST_ASM,		/* Assembler. */
   LJ_VMST__MAX
 };
+
+#define LJ_VMST_TRACE		(LJ_VMST__MAX)
 
 #define setvmstate(g, st)	((g)->vmstate = ~LJ_VMST_##st)
 
@@ -591,6 +595,11 @@ typedef enum {
 #define mmname_str(g, mm)	(strref((g)->gcroot[GCROOT_MMNAME+(mm)]))
 
 /* Garbage collector state. */
+struct lj_sysprof_topframe {
+  uint8_t ffid; /* FFID of the fast function VM is about to execute. */
+  TValue *top_frame; /* Top frame for sysprof. */
+};
+
 typedef struct GCState {
   GCSize total;		/* Memory currently allocated. */
   GCSize threshold;	/* Memory threshold. */
@@ -662,6 +671,9 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
+#if LJ_HASSYSPROF
+  struct lj_sysprof_topframe top_frame_info;  /* Top frame info for sysprof. */
+#endif
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)

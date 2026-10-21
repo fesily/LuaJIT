@@ -643,6 +643,25 @@
 #define LJ_HASPROFILE		0
 #endif
 
+/* Disable or enable the platform and Lua profiler (sysprof). */
+#if defined(LUAJIT_DISABLE_SYSPROF) || defined(LJ_ARCH_NOSYSPROF) || \
+    (!LJ_TARGET_LINUX && !(LJ_TARGET_WINDOWS && LJ_TARGET_X64))
+#define LJ_HASSYSPROF		0
+#else
+#define LJ_HASSYSPROF		1
+#endif
+
+/*
+** The memory profiler is not part of this port, but the ELF symbol resolver
+** it shares with sysprof is what gives a Linux profile its C symbols.
+*/
+#define LJ_HASMEMPROF		0
+#if LJ_HASSYSPROF && LJ_TARGET_LINUX
+#define LJ_HASRESOLVER		1
+#else
+#define LJ_HASRESOLVER		0
+#endif
+
 #ifndef LJ_ARCH_HASFPU
 #define LJ_ARCH_HASFPU		1
 #endif

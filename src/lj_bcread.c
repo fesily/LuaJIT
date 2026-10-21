@@ -19,6 +19,7 @@
 #include "lualib.h"
 #endif
 #include "lj_lex.h"
+#include "lj_sysprof.h"
 #include "lj_bcdump.h"
 #include "lj_state.h"
 #include "lj_strfmt.h"
@@ -387,6 +388,12 @@ GCproto *lj_bcread_proto(LexState *ls)
     setmref(pt->uvinfo, NULL);
     setmref(pt->varinfo, NULL);
   }
+
+  /* Add a new prototype to the profiler. */
+#if LJ_HASSYSPROF
+  lj_sysprof_add_proto(pt);
+#endif
+
   return pt;
 }
 

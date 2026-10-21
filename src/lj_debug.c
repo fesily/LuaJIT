@@ -554,7 +554,7 @@ LUA_API int lua_getstack(lua_State *L, int level, lua_Debug *ar)
 
 #if LJ_HASPROFILE
 /* Put the chunkname into a buffer. */
-static int debug_putchunkname(SBuf *sb, GCproto *pt, int pathstrip)
+int lj_debug_putchunkname(SBuf *sb, GCproto *pt, int pathstrip)
 {
   GCstr *name = proto_chunkname(pt);
   const char *p = strdata(name);
@@ -609,7 +609,7 @@ void lj_debug_dumpstack(lua_State *L, SBuf *sb, const char *fmt, int depth)
 	    if (c == 'F' && isluafunc(fn)) {  /* Dump module:name for 'F'. */
 	      GCproto *pt = funcproto(fn);
 	      if (pt->firstline != ~(BCLine)0) {  /* Not a bytecode builtin. */
-		debug_putchunkname(sb, pt, pathstrip);
+		lj_debug_putchunkname(sb, pt, pathstrip);
 		lj_buf_putb(sb, ':');
 	      }
 	    }
@@ -621,7 +621,7 @@ void lj_debug_dumpstack(lua_State *L, SBuf *sb, const char *fmt, int depth)
 	case 'l':  /* Dump module:line. */
 	  if (isluafunc(fn)) {
 	    GCproto *pt = funcproto(fn);
-	    if (debug_putchunkname(sb, pt, pathstrip)) {
+	    if (lj_debug_putchunkname(sb, pt, pathstrip)) {
 	      /* Regular Lua function. */
 	      BCLine line = c == 'l' ? debug_frameline(L, fn, nextframe) :
 				       pt->firstline;

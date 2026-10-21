@@ -84,6 +84,7 @@ static void print_usage(void)
   "  -e chunk  Execute string " LUA_QL("chunk") ".\n"
   "  -l name   Require library " LUA_QL("name") ".\n"
   "  -b ...    Save or list bytecode.\n"
+  "  -t<cmd>   Execute a tool, e.g. -ts parses a sysprof profile.\n"
   "  -j cmd    Perform LuaJIT control command.\n"
   "  -O[opt]   Control LuaJIT optimizations.\n"
   "  -i        Enter interactive mode after executing " LUA_QL("script") ".\n"
@@ -91,6 +92,16 @@ static void print_usage(void)
   "  -E        Ignore environment variables.\n"
   "  --        Stop handling options.\n"
   "  -         Execute stdin and stop handling options.\n", stderr);
+  fflush(stderr);
+}
+
+static void print_tools_usage(void)
+{
+  fputs("usage: ", stderr);
+  fputs(progname, stderr);
+  fputs(" -t<cmd>\n"
+  "Available tools are:\n"
+  "  -s input                Sysprof profile data parser.\n", stderr);
   fflush(stderr);
 }
 
@@ -413,6 +424,7 @@ static int dobytecode(lua_State *L, char **argv)
 #define FLAGS_EXEC		4
 #define FLAGS_OPTION		8
 #define FLAGS_NOENV		16
+#define FLAGS_TOOL		32
 
 static int collectargs(char **argv, int *flags)
 {
@@ -434,6 +446,9 @@ static int collectargs(char **argv, int *flags)
       notail(argv[i]);
       *flags |= FLAGS_VERSION;
       break;
+    case 't':
+      *flags |= FLAGS_TOOL;
+      return i + 1;
     case 'e':
       *flags |= FLAGS_EXEC;
       /* fallthrough */
@@ -457,6 +472,35 @@ static int collectargs(char **argv, int *flags)
     }
   }
   return i;
+}
+
+static int runtoolcmd(lua_State *L, const char *tool_name)
+{
+  lua_getglobal(L, "require");
+  lua_pushstring(L, tool_name);
+  if (lua_pcall(L, 1, 1, 0)) {
+    const char *msg = lua_tostring(L, -1);
+    if (msg) {
+      if (!strncmp(msg, "module ", 7))
+	msg = "unknown luaJIT command or tools not installed";
+      l_message(msg);
+    }
+    return 1;
+  }
+  lua_getglobal(L, "arg");
+  return report(L, lua_pcall(L, 1, 1, 0));
+}
+
+static int dotoolcmd(lua_State *L, const char *cmd)
+{
+  switch (cmd[0]) {
+  case 's':
+    return runtoolcmd(L, "sysprof");
+  default:
+    print_tools_usage();
+    break;
+  }
+  return -1;
 }
 
 static int runargs(lua_State *L, char **argv, int argn)
@@ -496,6 +540,8 @@ static int runargs(lua_State *L, char **argv, int argn)
       break;
     case 'b':  /* LuaJIT extension. */
       return dobytecode(L, argv+i);
+    case 't':  /* Execute a tool. */
+      return dotoolcmd(L, argv[i] + 2) != LUA_OK;
     default: break;
     }
   }
@@ -549,7 +595,7 @@ static int pmain(lua_State *L)
   luaL_openlibs(L);
   lua_gc(L, LUA_GCRESTART, -1);
 
-  createargtable(L, argv, s->argc, argn);
+  createargtable(L, argv, s->argc, (flags & FLAGS_TOOL) ? argn - 1 : argn);
 
   if (!(flags & FLAGS_NOENV)) {
     s->status = handle_luainit(L);

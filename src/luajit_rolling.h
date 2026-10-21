@@ -73,6 +73,36 @@ LUA_API void luaJIT_profile_stop(lua_State *L);
 LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 					     int depth, size_t *len);
 
+/* Maximum number of host (native) frames luaJIT_profile_hoststack() returns.
+** Host sampling is enabled with the 'h' mode option.
+*/
+#define LUAJIT_PROFILE_HOSTSTACK_MAX	64
+
+/* Copy the host (native) callchain of the most recent sample into buf.
+** Returns the number of frames written, 0 if host sampling is disabled or
+** the last sample has no host stack.
+*/
+LUA_API int luaJIT_profile_hoststack(lua_State *L, const void **buf,
+				     int maxdepth);
+
+/* Return the merged (Lua + host) callchain of the most recent sample, in the
+** same notation as luaJIT_profile_dumpstack() with the "l" format. Returns
+** an empty string when host sampling is disabled.
+*/
+LUA_API const char *luaJIT_profile_mixedstack(lua_State *L, int depth,
+					      size_t *len);
+
+/* Callback for luaJIT_profile_symtab(). `name` is valid only until the
+** callback returns.
+*/
+typedef void (*luaJIT_symtab_callback)(void *data, const void *addr,
+				       const char *name);
+
+/* Walk the C function symbols of the loaded modules. Independent of the
+** profiler state and of any Lua state (Windows only for now).
+*/
+LUA_API void luaJIT_profile_symtab(luaJIT_symtab_callback cb, void *data);
+
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);
 
