@@ -330,9 +330,9 @@ same thread; on Windows the sampler is a different thread, hence:
 
 | file | change |
 |---|---|
-| `tools/utils/symtab.lua` | ljs 3..5, module base entries, VM markers, trace ranges, `trace_at()` |
-| `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; `TRACE [N]` for mcode addresses |
-| `tools/utils/symresolver.lua` | C name sources: DbgHelp/PDB (FFI, batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing |
+| `tools/utils/symtab.lua` | ljs 3..5, module base entries, VM markers, trace ranges, `trace_at()`, exact-start name lookup (`cfunc_name`, `lfunc_name`) |
+| `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; `TRACE [N]` for mcode addresses; raw address for frames without an exact symbol |
+| `tools/utils/symresolver.lua` | C name sources: addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; name accepted only for the containing function (symbol start == frame function start) |
 | `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--debug=`, `--addr2line=` (two-pass collection + batched resolution) |
 | `doc/ext_profiler.html` | `h` mode, `profile.hoststack`, `profile.mixedstack`, `profile.symtab`, C APIs |
 
@@ -398,9 +398,11 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
   re-applied to the v2.1 interpreter (the tarantool hunks do not apply: the
   dasc differs);
 * build files: `-D LJ_HASSYSPROF` for **dynasm** (`msvcbuild.bat`
-  `DASMFLAGS`, `Makefile` `DASM_AFLAGS`), the new objects, `-ldbghelp`
-  (`Makefile`), `dbghelp.lib` (MSVC link), `lib_misc.o` in the `libdef`
-  input list, and a `$(LJLIB_O): lj_libdef.h` dependency;
+  `DASMFLAGS`, `Makefile` `DASM_AFLAGS`), the new objects, `lib_misc.o` in
+  the `libdef` input list, and a `$(LJLIB_O): lj_libdef.h` dependency. No
+  extra import library is needed: the symbol collector reads the COFF/export
+  tables from the images and the unwinder uses the ntdll Rtl* routines, so
+  DbgHelp is not involved;
 * `luajit.h` does not exist in v2.1: the new APIs go into
   `luajit_rolling.h`, from which `host/genversion.lua` generates `luajit.h`;
 * `lj_profile.c`: v2.1 keeps `lj_profile_lock()`/`lj_profile_unlock()` for
@@ -427,10 +429,15 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 | soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
 | MSVC and MinGW builds | both build the same sources and reproduce the numbers above |
 
-Host symbol names are those of the embedded COFF/export table (nearest
-export for internal functions: a `calloc` frame may be shown as
-`luaopen_jit`); `--map=` / `--debug=` refine them. A map of one module is
-applied to that module only.
+Host symbol names are never guessed. The stream carries the start of the
+function that contains every frame (`func-off`), and a name is printed only
+when the symbol table has a symbol at exactly that address — so an internal
+function between two exports shows up as a raw address (`0x7ff6d4f114f0`)
+instead of the nearest export above it (`luaopen_jit`). Exported functions,
+COFF symbols (MinGW) and Lua prototypes are all exact by construction, and
+`--map=` / `--debug=` add the names the embedded table lacks. A map of one
+module is applied to that module only, and a map symbol is accepted only when
+it also starts at the frame's function.
 
 ### 11.3 Defects found while verifying (fixed)
 

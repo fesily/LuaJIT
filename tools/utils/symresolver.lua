@@ -343,7 +343,7 @@ function M:debug_lookup(addr)
   return name, m and m.addr or 0
 end
 
-function M:map_lookup(addr)
+function M:map_lookup(addr, entry)
   local m = self:module_of(addr)
   -- MSVC maps list RVAs, GNU maps list link-time addresses.
   local key = self.map.is_rva and (addr - (m and m.addr or 0))
@@ -353,20 +353,29 @@ function M:map_lookup(addr)
   if key < self.map.min_key or key > self.map.max_key then
     return nil
   end
-  local entry = map_floor(self.map.entries, key)
-  if entry then
+  local hit = map_floor(self.map.entries, key)
+  if hit then
     local base = m and m.addr or 0
-    local addr_of_sym = self.map.is_rva and (entry[1] + base)
-                                        or (entry[1] - self:link_base(m and m.path or "") + base)
-    return entry[2], addr_of_sym
+    local addr_of_sym = self.map.is_rva and (hit[1] + base)
+                                        or (hit[1] - self:link_base(m and m.path or "") + base)
+    -- A map lists the symbols of one image, not their sizes: accept the name
+    -- only when the symbol starts at the function that contains the address
+    -- (and the caller knows where that function starts).
+    if entry == nil or entry == 0 or addr_of_sym ~= entry then
+      return nil
+    end
+    return hit[2], addr_of_sym
   end
   return nil
 end
 
-function M:embedded_lookup(addr)
+function M:embedded_lookup(addr, entry)
   if not self.embedded or not self.embedded.cfunc then return nil end
-  local key, value = avl.floor(self.embedded.cfunc, addr)
-  if key then
+  if entry == nil or entry == 0 then
+    return nil
+  end
+  local key, value = avl.floor(self.embedded.cfunc, entry)
+  if key == entry and entry <= addr then
     return value.name, key
   end
   return nil
@@ -439,20 +448,24 @@ function M:preload(addrs)
 end
 
 -- Returns "name:address", like utils.symtab.demangle(), or nil.
-function M:resolve(addr)
+-- `entry` is the start of the function that contains `addr` (0 or nil if
+-- unknown). A source that only stores symbol addresses uses it to reject
+-- names that belong to a neighbouring function.
+function M:resolve(addr, entry)
   local cached = self.cache[addr]
   if cached ~= nil then
     return cached or nil
   end
   local name, base
   if self.debug then
+    -- The debug info names the function that contains the address.
     name, base = self:debug_lookup(addr)
   end
   if not name and self.map then
-    name, base = self:map_lookup(addr)
+    name, base = self:map_lookup(addr, entry)
   end
   if not name and self.embedded then
-    name, base = self:embedded_lookup(addr)
+    name, base = self:embedded_lookup(addr, entry)
   end
   local result
   if name then

@@ -57,12 +57,17 @@ local function new_event()
   }
 end
 
+-- A frame that the symbol table does not describe keeps its raw address: a
+-- guessed name is worse than none for a profiler report.
+local function raw_name(addr)
+  return string_format("%#x", addr)
+end
+
 local function parse_lfunc(reader, symbols)
   local addr = reader:read_uleb128()
   local line = reader:read_uleb128()
-  local loc = symtab.loc({ addr = addr, line = line })
-  loc.type = FRAME.LFUNC
-  return { name = symtab.demangle(symbols, loc) }
+  local name = symtab.lfunc_name(symbols, addr, line) or raw_name(addr)
+  return { name = name, addr = addr }
 end
 
 local function parse_ffunc(reader, _)
@@ -72,12 +77,11 @@ end
 
 local function parse_cfunc(reader, symbols, resolver)
   local addr = reader:read_uleb128()
-  -- The entry address lets the frame be matched to the host callchain.
-  local name = resolver and resolver:resolve(addr)
+  -- The entry address lets the frame be matched to the host callchain, and
+  -- it is the exact start of the function, so the name is never guessed.
+  local name = resolver and resolver:resolve(addr, addr)
   if not name then
-    local loc = symtab.loc({ addr = addr })
-    loc.type = FRAME.CFUNC
-    name = symtab.demangle(symbols, loc)
+    name = symtab.cfunc_name(symbols, addr, addr) or raw_name(addr)
   end
   return { name = name, addr = addr }
 end
@@ -115,14 +119,16 @@ local function parse_host_callchain(reader, event, symbols, version, resolver)
         entry = addr - (off - 1)
       end
     end
-    local name = resolver and resolver:resolve(addr)
+    -- `entry` is the start of the function that contains the frame: the name
+    -- is accepted only when a symbol starts there (see symtab.cfunc_name).
+    local name = resolver and resolver:resolve(addr, entry)
     if not name then
       -- JIT compiled code: the machine code range names the trace.
       local traceno = symtab.trace_at(symbols, addr)
       if traceno then
         name = string_format("TRACE [%d]", traceno)
       else
-        name = symtab.demangle(symbols, symtab.loc({ addr = addr }))
+        name = symtab.cfunc_name(symbols, addr, entry) or raw_name(addr)
       end
     end
     event.host.callchain[#event.host.callchain + 1] = {

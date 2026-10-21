@@ -457,7 +457,6 @@ endif
 DASM_AFLAGS+= -D VER=$(subst LJ_ARCH_VERSION_,,$(filter LJ_ARCH_VERSION_%,$(subst LJ_ARCH_VERSION ,LJ_ARCH_VERSION_,$(TARGET_TESTARCH))))
 ifeq (Windows,$(TARGET_SYS))
   DASM_AFLAGS+= -D WIN
-  TARGET_LDFLAGS+= -ldbghelp
 endif
 ifeq (x64,$(TARGET_LJARCH))
   ifeq (,$(findstring LJ_FR2 1,$(TARGET_TESTARCH)))
