@@ -250,9 +250,11 @@ typedef struct {
   void *data;
 } SymtabCb;
 
-static void profile_symtab_cb(void *ctx, uintptr_t addr, const char *name)
+static void profile_symtab_cb(void *ctx, uintptr_t addr, const char *name,
+			      uint32_t size)
 {
   SymtabCb *c = (SymtabCb *)ctx;
+  UNUSED(size);
   c->cb(c->data, (const void *)addr, name);
 }
 

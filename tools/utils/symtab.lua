@@ -13,7 +13,7 @@ local string_format = string.format
 
 local LJS_MAGIC = "ljs"
 local LJS_MIN_VERSION = 0x3
-local LJS_CURRENT_VERSION = 0x6
+local LJS_CURRENT_VERSION = 0x7
 local LJS_EPILOGUE_HEADER = 0x80
 local LJS_SYMTYPE_MASK = 0x03
 
@@ -96,6 +96,32 @@ end
 
 -- Trace whose machine code contains addr, or nil. The list is sorted lazily:
 -- trace records arrive both in the prologue and as stream events.
+-- File name of a module path, used to qualify a symbol: lua51.dll, not the
+-- full path.
+function M.module_name(path)
+  return (path:match("([^/\\]+)$")) or path
+end
+
+-- Module that contains addr, or nil. With version 7 data the image size is
+-- known, so an address outside every image (JIT machine code, heap) does not
+-- get attributed to the module before it; for older profiles the nearest
+-- base below the address is used.
+function M.module_of(symtab, addr)
+  local best
+  for _, m in ipairs(symtab.modules or {}) do
+    if m.addr <= addr then
+      if m.size and m.size > 0 then
+        if addr < m.addr + m.size then
+          return m
+        end
+      elseif not best or m.addr > best.addr then
+        best = m
+      end
+    end
+  end
+  return best
+end
+
 -- Interval of the trace that covers addr: the last one whose offset is not
 -- greater, the same mapping lj_trace_unwind() uses to pick the exit.
 -- Returns the trace number and, when version 6 data is present, the interval.
@@ -152,12 +178,16 @@ function M.parse_sym_vm(reader, symtab)
 end
 
 -- Parse a single entry in a symtab: .so library
-function M.parse_sym_cfunc(reader, symtab)
+function M.parse_sym_cfunc(reader, symtab, version)
   local addr = reader:read_uleb128()
   local name = reader:read_string()
+  -- Size in bytes; the entry that records an image carries the image size,
+  -- which tells whether an address belongs to that image (version 7+).
+  local size = version >= 7 and reader:read_uleb128() or 0
 
   symtab.cfunc = avl.insert(symtab.cfunc, addr, {
-    name = name
+    name = name,
+    size = size,
   })
   -- A module base entry carries the path of the image: keep it, the
   -- resolver needs it to turn load addresses into link-time addresses.
@@ -165,7 +195,8 @@ function M.parse_sym_cfunc(reader, symtab)
   if name:match("[/\\]") and
      (lower:match("%.exe$") or lower:match("%.dll$") or
       lower:match("%.so$") or lower:match("%.dylib$")) then
-    symtab.modules[#symtab.modules + 1] = { addr = addr, path = name }
+    symtab.modules[#symtab.modules + 1] =
+      { addr = addr, path = name, size = size }
   end
 end
 

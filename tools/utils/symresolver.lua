@@ -254,12 +254,19 @@ function M.new(opts)
   return setmetatable(self, { __index = M })
 end
 
--- Load address of the module that contains addr, or nil.
+-- Module that contains addr, or nil. The image sizes recorded in the profile
+-- make this exact; without them the nearest base below the address is used.
 function M:module_of(addr)
   local best
   for _, m in ipairs(self.modules) do
-    if m.addr <= addr and (not best or m.addr > best.addr) then
-      best = m
+    if m.addr <= addr then
+      if m.size and m.size > 0 then
+        if addr < m.addr + m.size then
+          return m
+        end
+      elseif not best or m.addr > best.addr then
+        best = m
+      end
     end
   end
   return best
@@ -356,6 +363,13 @@ local function file_exists(path)
   local f = io.open(path, "rb")
   if f then f:close() return true end
   return false
+end
+
+-- Symbol file of an image, as given with --pdb and matched to the image by
+-- its name: lua51.pdb belongs to lua51.dll. A file next to the image is not
+-- used: it may belong to another build than the profiled one.
+local function symbol_file(self, path)
+  return self.pdb_by_stem[stem(path)]
 end
 
 -- Read one PDB without its image.
@@ -458,7 +472,7 @@ function M:_pdb_load(module)
   pdb.loaded[module.addr] = true
 
   local _, size = pe_info(module.path)
-  local file = self.pdb_by_stem[stem(module.path)]
+  local file = symbol_file(self, module.path)
   local loaded = false
 
   local function load(image, symfile, flags)
@@ -474,6 +488,8 @@ function M:_pdb_load(module)
     loaded = load(module.path, nil, 0)
   end
   if not loaded and file then
+    -- The addresses come from another process, so the symbol file is bound to
+    -- the load address recorded in the profile instead of one DbgHelp picks.
     loaded = load(nil, file, SLMFLAG_VIRTUAL)
   end
   if not loaded and file then
@@ -490,7 +506,7 @@ function M:_pdb_standalone(module)
   end
   self.pdb_tables[key] = false
 
-  local file = self.pdb_by_stem[stem(module.path)]
+  local file = symbol_file(self, module.path)
   if not file then return nil end
   local tool = self.pdbutil or "llvm-pdbutil"
   local table_, err = load_pdb_file(tool, file)
@@ -547,8 +563,17 @@ end
 function M:_pdb_from_file(addr, entry, module)
   local table_ = self:_pdb_standalone(module)
   if not table_ then return nil end
-  local fn = table_.functions[entry - module.addr]
+  local rva = entry - module.addr
+  local fn = table_.functions[rva]
   if not fn then return nil end
+  -- The symbol must cover the address: a symbol file of another build (or a
+  -- stale frame start) must not give the name of a neighbouring function.
+  if fn.size and fn.size > 0 then
+    local off = addr - module.addr - rva
+    if off < 0 or off >= fn.size then return nil end
+  elseif addr ~= entry then
+    return nil
+  end
   return fn.name, entry
 end
 
@@ -558,10 +583,12 @@ end
 function M:pdb_lookup(addr, entry)
   if entry == nil or entry == 0 then return nil end
   local module = self:module_of(addr)
-  self:_pdb_load(module)
-  local name, base = self:_pdb_dbghelp(addr, entry, module)
+  -- The symbol file first: it is read on its own, so the answer does not
+  -- depend on where this process has mapped the images.
+  local name, base = self:_pdb_from_file(addr, entry, module)
   if name then return name, base end
-  return self:_pdb_from_file(addr, entry, module)
+  self:_pdb_load(module)
+  return self:_pdb_dbghelp(addr, entry, module)
 end
 
 -- Release the DbgHelp state (optional: the process is usually about to exit).
@@ -683,7 +710,11 @@ function M:preload(addrs)
           local loc = pipe:read("*l")  -- file:line, not used
           local addr = list[k]
           if name and name ~= "" and name ~= "??" and loc then
-            self.cache[addr] = string_format("%s:%#x", name, mod_base)
+            self.cache[addr] = {
+              dump = string_format("%s:%#x", name, mod_base),
+              name = name,
+              base = mod_base,
+            }
           else
             self.cache[addr] = false
           end
@@ -699,10 +730,22 @@ end
 -- `entry` is the start of the function that contains `addr` (0 or nil if
 -- unknown). A source that only stores symbol addresses uses it to reject
 -- names that belong to a neighbouring function.
+-- Returns "name:address", then the plain name and the address of the symbol,
+-- so that a caller can qualify the name with the module it belongs to.
+--
+-- A symbol file resolves a function start (entry), not just an address: the
+-- same address may be looked up with a wrong entry first (a stale frame), so
+-- results are keyed by entry when it is known and a miss does not hide the
+-- answer for the address itself.
 function M:resolve(addr, entry)
-  local cached = self.cache[addr]
+  local key = (entry and entry ~= 0) and entry or addr
+  local cached = self.cache[key]
+  if cached == nil and key ~= addr then
+    cached = self.cache[addr]
+  end
   if cached ~= nil then
-    return cached or nil
+    if not cached then return nil end
+    return cached.dump, cached.name, cached.base
   end
   local name, base
   if self.debug then
@@ -717,12 +760,13 @@ function M:resolve(addr, entry)
   if not name and self.embedded then
     name, base = self:embedded_lookup(addr, entry)
   end
-  local result
   if name then
-    result = string_format("%s:%#x", name, base or 0)
+    local result = string_format("%s:%#x", name, base or 0)
+    self.cache[key] = { dump = result, name = name, base = base or 0 }
+    return result, name, base or 0
   end
-  self.cache[addr] = result or false
-  return result
+  self.cache[key] = false
+  return nil
 end
 
 return M
