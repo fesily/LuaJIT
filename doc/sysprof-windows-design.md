@@ -156,6 +156,7 @@ Windows parts (`#if LJ_TARGET_WINDOWS`):
 | host unwinder (`RtlPcToFileHeader` / `RtlLookupFunctionEntry` / `RtlVirtualUnwind`, leaf fallback) | `backtrace()` only works on the current thread |
 | JIT frame and VM assembly frame skip through `L->cframe` (§3.5.2), with a cursor that follows `cframe_prev()` | mcode has no `.pdata`; the VM `.xdata` is for SEH dispatch only |
 | deferred writer + spare buffer | a flush must not run while the VM is frozen |
+| interval table per trace, built in `add_trace` (§3.5.3) | the sampler must not decode snapshots while the thread is frozen |
 | C-symbol dump on the timer thread (`stream_prologue_c`, timer `startup` hook) | the profiled thread owns the GC heap |
 | stream error re-check after `SuspendThread` | the VM writes symbol events itself (see §6) |
 
@@ -192,6 +193,37 @@ caller's RSP     == cframe + CFRAME_SIZE
 The addresses are validated (stack bounds, and the return address must be in
 a PE image or in another trace) before the walk continues, so a broken
 invariant truncates the chain instead of crashing.
+
+#### 3.5.3 Machine code intervals (function and line per range)
+
+A trace cannot be unwound instruction by instruction, but every exit snapshot
+of it carries the bytecode PC of that point (the exit stub loads it into
+`RID_LPC`, see `lj_asm.c`), and `snap[i].mcofs` gives its offset in the
+machine code. `lj_symtab_trace_intervals()` turns that into a plain table once
+per trace, in `lj_sysprof_add_trace()` (the profiled thread, right after the
+trace is saved):
+
+* for each snapshot: `pc = snap_pc(&snapmap[mapofs + nent])`, walk back to the
+  function header bytecode (`while (bc_op(*startpc) < BC_FUNCF) startpc--`,
+  the same trick `jit.util.traceinfo(tr, sn, true)` uses), the prototype is
+  `(GCproto *)((char *)startpc - sizeof(GCproto))`, the line is
+  `lj_debug_line(pt, pc - startpc)`;
+* the table is stored next to the mcode range (`struct sysprof_mcode`) and
+  freed when profiling stops; `lj_sysprof_del_trace()` clears the count so a
+  flushed trace stops matching, but the memory stays (the sampler may be in
+  the middle of a lookup);
+* the sampler only binary searches the table (last interval with `off <= pc`)
+  — no JIT state, no IR decoding, no GC pointers while the thread is frozen;
+* the same records go into the profile (`SYMTAB_TRACE`, §4.2) so the tools
+  resolve mcode addresses to `chunk:line` after the fact.
+
+Traces that existed when profiling started are handled the same way in
+`sysprof_collect_mcode()`, and the ones created while the prologue dumps C
+symbols are queued as plain data and written by the timer thread right after
+the `ljp` header (they are events of the sample stream).
+
+Known gap: exit *stub* code lives in a separate allocation, so a sample taken
+there is not covered by a trace range and shows as a raw address.
 
 ### 3.6 `lj_symtab.c/.h` — symbol table
 
@@ -303,15 +335,27 @@ func-off     := <ULEB128>  exec-addr - function start + 1, 0 = unknown
 `func-off` is what makes the Lua/host merge work without symbols; the trace
 sample's host chain is what gives JIT samples their native callers.
 
-### 4.2 ljs (symbol table), version 5
+On Windows the `sym-addr` and `line-no` of a trace sample are not the trace's
+start: they are taken from the interval table of the trace that covers the
+sampled address (§3.5.1), so the frame is reported at the function and line
+the bytecode was at.
+
+### 4.2 ljs (symbol table), version 6
 
 | record | payload |
 |---|---|
 | `SYMTAB_LFUNC` | proto address, chunk name, firstline |
 | `SYMTAB_CFUNC` | address, name (also image base + path entries) |
-| `SYMTAB_TRACE` | traceno, proto address, line, **mcode, mcode size** (v5+) |
+| `SYMTAB_TRACE` | traceno, proto address, line, mcode, mcode size (v5+), **niv + { off, proto, line }** (v6) |
 | `SYMTAB_VM` | address of a VM assembly function (v4+) |
 | `SYMTAB_FINAL` | – |
+
+The intervals of a trace are the exit snapshots of its machine code: `off` is
+the byte offset of the snapshot in the trace, `proto`/`line` name the bytecode
+executed there. A tool maps any address inside the trace to the last interval
+whose `off` is not greater — the same rule `lj_trace_unwind()` uses to pick
+the exit — and prints `chunk:line` instead of only the trace number. Version 5
+records (mcode range only) still parse; the frame then shows as `TRACE [N]`.
 
 ## 5. Concurrency rules
 
@@ -449,6 +493,7 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 | `-ts <file>` (`tools/sysprof.lua`) | parses, prints `chain\tcount`, trace names resolved |
 | `jit.profile` `h` mode | `profile.hoststack()`, `profile.mixedstack()` (Lua + native frames), `profile.symtab()` (12000+ C symbols) |
 | `jit.mixprof` (C-only sampling) | `start(24, 1)`, workload, `stop()`, `report()`: the counts sum to the reported ticks, chains contain Lua frames (`file.lua:line`) and host frames (`@0x...`); 180 start/stop sessions on MSVC + MinGW without a crash |
+| trace intervals (`SYMTAB_TRACE` v6) | a loop compiled into one trace reports several lines (`file:6 [TRACE 1]`, `file:3 [TRACE 1]`) instead of the trace start only; every interval is inside its trace, increasing, and points at a proto present in the symbol table with `line >= linedefined` |
 | soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
 | MSVC and MinGW builds | both build the same sources and reproduce the numbers above |
 

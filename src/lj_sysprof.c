@@ -88,6 +88,24 @@ enum sysprof_state {
 ** upper bound of J->sizetrace.
 */
 
+/*
+** Trace records created while the timer thread still owns the stream (the C
+** symbol dump of the prologue) are queued and written by that thread when it
+** finishes. Only plain values are queued: no GC object is touched by the
+** consumer, and the interval table is borrowed from the mcode entry.
+*/
+#define SYSPROF_MAX_PENDING_TRACES	64
+
+struct sysprof_pending_trace {
+  uint32_t traceno;
+  uintptr_t mcode;
+  uint32_t size;
+  GCproto *pt;
+  BCLine line;
+  const lj_symtab_trace_iv *iv;
+  uint32_t niv;
+};
+
 struct sysprof {
   global_State *g; /* Profiled VM. */
 #if LJ_TARGET_WINDOWS
@@ -97,6 +115,8 @@ struct sysprof {
   uintptr_t stack_high;
   int frozen; /* The profiled thread is suspended by the sampler. */
   int prologue_c_pending; /* C symbols are dumped by the profiler thread. */
+  struct sysprof_pending_trace pending[SYSPROF_MAX_PENDING_TRACES];
+  uint32_t npending;	/* Traces queued while the symbols were dumped. */
   uintptr_t vm_func[4]; /* Function entries of the VM assembly. */
   int nvm_func;
   uint8_t *own_buf; /* Buffer owned by the deferred writer (or NULL). */
@@ -126,6 +146,13 @@ struct sysprof {
     uintptr_t start;
     uint32_t size;
     uint32_t traceno;
+    /* Machine code intervals with the Lua position of each (see
+    ** lj_symtab_trace_intervals). Owned by this entry, freed at stop; the
+    ** entries are zeroed on del_trace, never freed then: the sampler may be
+    ** in the middle of a lookup.
+    */
+    lj_symtab_trace_iv *iv;
+    uint32_t niv;
   } *mcode;
   uint32_t nmcode;	/* Entries in use. */
   uint32_t mcode_cap;	/* Allocated entries; never shrinks while profiling. */
@@ -180,10 +207,24 @@ static void stream_prologue(struct sysprof *sp)
 
 #if LJ_TARGET_WINDOWS
 /* The rest of the stream prologue, called on the profiler thread. */
+static void sysprof_flush_pending(struct sysprof *sp);
+
 static void stream_prologue_c(struct sysprof *sp)
 {
+  int i;
   lj_symtab_dump_c(&sp->out);
   lj_wbuf_addn(&sp->out, ljp_header, sizeof(ljp_header));
+  /*
+  ** Traces created while the symbols were dumped are queued by the profiled
+  ** thread. They are events of the sample stream (like the ones the profiled
+  ** thread writes itself), so they go after the header; drain until the queue
+  ** stays empty, a trace can be created in between.
+  */
+  for (i = 0; i < 16; i++) {
+    sysprof_flush_pending(sp);
+    if (sp->npending == 0)
+      break;
+  }
   sp->prologue_c_pending = 0;
 
   if (LJ_UNLIKELY(lj_wbuf_test_flag(&sp->out, STREAM_ERRIO | STREAM_STOP))) {
@@ -367,12 +408,17 @@ static void *stream_frame_host(int frame_no, void *addr)
 #if LJ_TARGET_WINDOWS && LJ_HASJIT
 /* Remember the machine code range of a trace. Profiled thread only. */
 static void sysprof_add_mcode(struct sysprof *sp, uintptr_t start, uint32_t size,
-			      uint32_t traceno)
+			      uint32_t traceno, lj_symtab_trace_iv *iv,
+			      uint32_t niv)
 {
-  if (size == 0 || sp->mcode == NULL || sp->nmcode >= sp->mcode_cap)
+  if (size == 0 || sp->mcode == NULL || sp->nmcode >= sp->mcode_cap) {
+    free(iv);
     return;
+  }
   sp->mcode[sp->nmcode].start = start;
   sp->mcode[sp->nmcode].size = size;
+  sp->mcode[sp->nmcode].iv = iv;
+  sp->mcode[sp->nmcode].niv = niv;
   sp->mcode[sp->nmcode].traceno = traceno;
   sp->nmcode++;
 }
@@ -398,8 +444,12 @@ static void sysprof_collect_mcode(struct sysprof *sp)
   }
   for (n = 1; n < J->sizetrace; n++) {
     GCtrace *T = traceref(J, n);
-    if (T != NULL && T->mcode != NULL)
-      sysprof_add_mcode(sp, (uintptr_t)T->mcode, T->szmcode, T->traceno);
+    if (T != NULL && T->mcode != NULL) {
+      lj_symtab_trace_iv *iv = NULL;
+      int niv = lj_symtab_trace_intervals(T, &iv);
+      sysprof_add_mcode(sp, (uintptr_t)T->mcode, T->szmcode, T->traceno, iv,
+			(uint32_t)niv);
+    }
   }
 }
 
@@ -413,6 +463,50 @@ static const void *sysprof_trace_at(const struct sysprof *sp, uintptr_t pc)
       return &sp->mcode[i];
   }
   return NULL;
+}
+
+/* Release the machine code snapshot and the interval tables. */
+static void sysprof_free_mcode(struct sysprof *sp)
+{
+  uint32_t i;
+  for (i = 0; i < sp->nmcode; i++)
+    free(sp->mcode[i].iv);
+  free(sp->mcode);
+  sp->mcode = NULL;
+  sp->nmcode = sp->mcode_cap = 0;
+}
+
+/* Lua position of an address inside a trace: the last interval whose offset
+** is not greater than the address, the same mapping lj_trace_unwind() uses to
+** pick the exit. Returns NULL when the trace has no interval table.
+*/
+static const lj_symtab_trace_iv *sysprof_iv_at(const struct sysprof_mcode *mc,
+					       uintptr_t pc)
+{
+  uint32_t lo = 0, hi = mc->niv, found = 0;
+  uint32_t off;
+  if (mc->iv == NULL || mc->niv == 0)
+    return NULL;
+  off = (uint32_t)(pc - mc->start);
+  while (lo < hi) {
+    uint32_t mid = (lo + hi) >> 1;
+    if (mc->iv[mid].off <= off) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return &mc->iv[found];
+}
+
+/* Lua position of a host frame address (JIT compiled code only). */
+static const lj_symtab_trace_iv *sysprof_iv_at_pc(const struct sysprof *sp,
+						  uintptr_t pc)
+{
+  const struct sysprof_mcode *mc =
+    (const struct sysprof_mcode *)sysprof_trace_at(sp, pc);
+  return mc != NULL ? sysprof_iv_at(mc, pc) : NULL;
 }
 
 /*
@@ -595,11 +689,28 @@ static void stream_trace(struct sysprof *sp, uint32_t vmstate)
   jit_State *J = G2J(sp->g);
   GCtrace *trace = traceref(J, traceno);
 
-  GCproto *startpt = gco2pt(gcref(trace->startpt));
+  GCproto *pt = gco2pt(gcref(trace->startpt));
+  BCLine line = pt->firstline;
+
+#if LJ_TARGET_WINDOWS
+  /*
+  ** Prefer the interval that covers the sampled address: it names the
+  ** function and line of the bytecode the trace is at, not just the line
+  ** the trace started at.
+  */
+  if (sysprof_sample_ctx_valid) {
+    const lj_symtab_trace_iv *iv =
+      sysprof_iv_at_pc(sp, (uintptr_t)sysprof_sample_ctx.Rip);
+    if (iv != NULL) {
+      pt = iv->pt;
+      line = iv->line;
+    }
+  }
+#endif
 
   lj_wbuf_addu64(out, traceno);
-  lj_wbuf_addu64(out, (uintptr_t)startpt);
-  lj_wbuf_addu64(out, startpt->firstline);
+  lj_wbuf_addu64(out, (uintptr_t)pt);
+  lj_wbuf_addu64(out, (uint64_t)line);
   /* The native callers of the trace: the frame in mcode is unwound through
   ** the trace's stack layout, see sysprof_unwind_jit().
   */
@@ -846,6 +957,54 @@ static void sysprof_signal_handler(int sig, siginfo_t *info, void *ctx)
     default:
       lj_assertX(0, "bad sysprof profiler state");
       break;
+  }
+}
+
+
+static void sysprof_queue_trace(struct sysprof *sp, const struct GCtrace *tr,
+				const lj_symtab_trace_iv *iv, uint32_t niv)
+{
+  struct sysprof_pending_trace *p;
+  if (sp->npending >= SYSPROF_MAX_PENDING_TRACES)
+    return;  /* Only degrades the name of a trace, the sample stays valid. */
+  p = &sp->pending[sp->npending];
+  p->traceno = (uint32_t)tr->traceno;
+  p->mcode = (uintptr_t)tr->mcode;
+  p->size = tr->szmcode;
+  p->pt = &gcref(tr->startpt)->pt;
+  p->line = lj_debug_line(p->pt, proto_bcpos(p->pt, mref(tr->startpc, const BCIns)));
+  p->iv = iv;
+  p->niv = niv;
+  sp->npending++;  /* Publish last: the timer thread reads the entry. */
+}
+
+/* Write the queued trace records (timer thread, owns the stream here). */
+static void sysprof_flush_pending(struct sysprof *sp)
+{
+  uint32_t i, n = sp->npending;
+  for (i = 0; i < n; i++) {
+    const struct sysprof_pending_trace *p = &sp->pending[i];
+    uint32_t k;
+    lj_wbuf_addbyte(&sp->out, LJP_SYMTAB_TRACE_EVENT);
+    lj_wbuf_addu64(&sp->out, p->traceno);
+    lj_wbuf_addu64(&sp->out, (uintptr_t)p->pt);
+    lj_wbuf_addu64(&sp->out, (uint64_t)p->line);
+    lj_wbuf_addu64(&sp->out, p->mcode);
+    lj_wbuf_addu64(&sp->out, (uint64_t)p->size);
+    lj_wbuf_addu64(&sp->out, (uint64_t)p->niv);
+    for (k = 0; k < p->niv; k++) {
+      lj_wbuf_addu64(&sp->out, (uint64_t)p->iv[k].off);
+      lj_wbuf_addu64(&sp->out, (uintptr_t)p->iv[k].pt);
+      lj_wbuf_addu64(&sp->out, (uint64_t)p->iv[k].line);
+    }
+  }
+  /* Keep the records that were queued while the flush was running. */
+  if (sp->npending > n) {
+    memmove(&sp->pending[0], &sp->pending[n],
+	    (sp->npending - n) * sizeof(sp->pending[0]));
+    sp->npending -= n;
+  } else {
+    sp->npending = 0;
   }
 }
 
@@ -1113,9 +1272,7 @@ int lj_sysprof_stop(lua_State *L)
   sysprof_release_stream(sp);
 #endif
 #if LJ_HASJIT
-  free(sp->mcode);
-  sp->mcode = NULL;
-  sp->nmcode = sp->mcode_cap = 0;
+  sysprof_free_mcode(sp);
 #endif
   return PROFILE_SUCCESS;
 }
@@ -1156,9 +1313,19 @@ void lj_sysprof_add_proto(const struct GCproto *pt)
 void lj_sysprof_add_trace(const struct GCtrace *tr)
 {
   struct sysprof *sp = &sysprof;
+  lj_symtab_trace_iv *iv = NULL;
+  int niv;
 
   if (sp->state != SPS_PROFILE || sp->opt.mode == LUAM_SYSPROF_DEFAULT)
     return;
+
+  /*
+  ** Map the trace machine code to Lua positions once, here: the snapshots are
+  ** complete now and never change, so the sampler only has to binary search
+  ** the prepared table, and the profile carries the mapping for later use.
+  */
+  niv = lj_symtab_trace_intervals(tr, &iv);
+
 #if LJ_TARGET_WINDOWS
   /*
   ** The machine code snapshot must be complete for every trace created while
@@ -1168,15 +1335,23 @@ void lj_sysprof_add_trace(const struct GCtrace *tr)
   ** Appending is safe here, it does not touch the stream that the timer
   ** thread may still own.
   */
-  sysprof_add_mcode(sp, (uintptr_t)tr->mcode, tr->szmcode, tr->traceno);
-  if (sp->prologue_c_pending)
+  sysprof_add_mcode(sp, (uintptr_t)tr->mcode, tr->szmcode, tr->traceno, iv,
+		    (uint32_t)niv);
+  if (sp->prologue_c_pending) {
+    /* The timer thread owns the stream: it writes the record when done. */
+    sysprof_queue_trace(sp, tr, iv, (uint32_t)niv);
     return;
+  }
+#else
+  free(iv);
+  iv = NULL;
+  niv = 0;
 #endif
 
   /* See the comment about the sysprof state above. */
   sp->state = SPS_IDLE;
   lj_wbuf_addbyte(&sp->out, LJP_SYMTAB_TRACE_EVENT);
-  lj_symtab_dump_trace(&sp->out, tr);
+  lj_symtab_dump_trace(&sp->out, tr, iv, niv);
   sp->state = SPS_PROFILE;
 }
 #endif /* LJ_HASJIT */
@@ -1199,6 +1374,7 @@ void lj_sysprof_del_trace(const struct GCtrace *tr)
 	sp->mcode[i].start == (uintptr_t)tr->mcode) {
       sp->mcode[i].size = 0;
       sp->mcode[i].traceno = 0;
+      sp->mcode[i].niv = 0;
       break;
     }
   }

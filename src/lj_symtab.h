@@ -16,7 +16,7 @@
 #include "lj_dispatch.h"
 #endif
 
-#define LJS_CURRENT_VERSION 0x5
+#define LJS_CURRENT_VERSION 0x6
 
 /*
 ** symtab format:
@@ -29,6 +29,11 @@
 ** sym-lua        := sym-header sym-addr sym-chunk sym-line
 ** sym-cfunc      := sym-header sym-addr sym-name
 ** sym-trace      := sym-header trace-no sym-addr sym-line mcode mcode-size
+**                   intervals
+** intervals      := <ULEB128> {iv-off iv-addr iv-line}   (version 6+)
+** iv-off         := <ULEB128>  offset into mcode, in bytes
+** iv-addr        := <ULEB128>  prototype of the function executing there
+** iv-line        := <ULEB128>  line of the bytecode executing there
 ** sym-header     := <BYTE>
 ** sym-addr       := <ULEB128>
 ** sym-chunk      := string
@@ -68,9 +73,29 @@
 
 #if LJ_HASJIT
 /*
-** Dumps traceinfo into the symbol table.
+** One machine code interval of a trace and the Lua position it maps to: the
+** exit snapshot that covers the interval was taken at that bytecode, so a
+** sampled address inside the interval belongs to that function and line.
 */
-void lj_symtab_dump_trace(struct lj_wbuf *out, const GCtrace *trace);
+typedef struct lj_symtab_trace_iv {
+  uint32_t off;		/* Offset into the trace machine code, in bytes. */
+  BCLine line;		/* Line of the bytecode executed in the interval. */
+  GCproto *pt;		/* Prototype of the function executing there. */
+} lj_symtab_trace_iv;
+
+/*
+** Build the interval table of a trace from its snapshots (malloc'd, the
+** caller owns it). Must run on the thread that owns the VM, the trace has to
+** be complete. Returns the number of intervals, 0 if there are none.
+*/
+LJ_FUNC int lj_symtab_trace_intervals(const GCtrace *trace,
+				      lj_symtab_trace_iv **ivp);
+
+/*
+** Dumps traceinfo into the symbol table. The intervals may be NULL.
+*/
+void lj_symtab_dump_trace(struct lj_wbuf *out, const GCtrace *trace,
+			  const lj_symtab_trace_iv *iv, int niv);
 #endif /* LJ_HASJIT */
 
 /*

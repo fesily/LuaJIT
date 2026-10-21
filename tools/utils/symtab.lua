@@ -13,7 +13,7 @@ local string_format = string.format
 
 local LJS_MAGIC = "ljs"
 local LJS_MIN_VERSION = 0x3
-local LJS_CURRENT_VERSION = 0x5
+local LJS_CURRENT_VERSION = 0x6
 local LJS_EPILOGUE_HEADER = 0x80
 local LJS_SYMTYPE_MASK = 0x03
 
@@ -78,10 +78,51 @@ function M.parse_sym_trace(reader, symtab, version)
     mcode = mcode,
     size = mcode_size,
   }
+
+  if version >= 6 then
+    -- Intervals: the exit snapshot that covers each range of the machine
+    -- code, with the function and line of the bytecode it was taken at.
+    local niv = reader:read_uleb128()
+    local iv = {}
+    for k = 1, niv do
+      local off = reader:read_uleb128()
+      local addr = reader:read_uleb128()
+      local line = reader:read_uleb128()
+      iv[k] = { off = off, addr = addr, line = line }
+    end
+    symtab.trace[traceno].iv = iv
+  end
 end
 
 -- Trace whose machine code contains addr, or nil. The list is sorted lazily:
 -- trace records arrive both in the prologue and as stream events.
+-- Interval of the trace that covers addr: the last one whose offset is not
+-- greater, the same mapping lj_trace_unwind() uses to pick the exit.
+-- Returns the trace number and, when version 6 data is present, the interval.
+function M.trace_iv_at(symtab, addr)
+  local traceno = M.trace_at(symtab, addr)
+  if not traceno then
+    return nil
+  end
+  local tr = symtab.trace[traceno]
+  local iv = tr and tr.iv
+  if not iv or #iv == 0 then
+    return traceno
+  end
+  local off = addr - tr.mcode
+  local lo, hi, found = 1, #iv, nil
+  while lo <= hi do
+    local mid = math.floor((lo + hi) / 2)
+    if iv[mid].off <= off then
+      found = iv[mid]
+      lo = mid + 1
+    else
+      hi = mid - 1
+    end
+  end
+  return traceno, found
+end
+
 function M.trace_at(symtab, addr)
   local list = symtab.tracelist
   if not list or #list == 0 then return nil end
