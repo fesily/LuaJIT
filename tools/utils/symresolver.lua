@@ -51,6 +51,16 @@ do
   end
 end
 
+local function basename(path)
+  return path:match("([^/\\]+)$") or path
+end
+
+-- File name without the extension, lower case: how a PDB is matched to the
+-- image it belongs to (lua51.pdb -> lua51.dll).
+local function stem(path)
+  return (basename(path):gsub("%.[^.]*$", "")):lower()
+end
+
 local function is_pe(path)
   local lower = path:lower()
   return lower:match("%.exe$") ~= nil or lower:match("%.dll$") ~= nil
@@ -175,40 +185,57 @@ typedef struct {
   char Name[1];
 } LJ_SYMBOL_INFO;
 
-int SymInitialize(void *hProcess, const char *UserSearchPath,
-                  int fInvadeProcess);
+int SymInitializeW(void *hProcess, const uint16_t *UserSearchPath,
+                   int fInvadeProcess);
 uint32_t SymSetOptions(uint32_t SymOptions);
-uint64_t SymLoadModuleEx(void *hProcess, void *hFile, const char *ImageName,
-                         const char *ModuleName, uint64_t BaseOfDll,
-                         uint32_t DllSize, void *Data, uint32_t Flags);
+uint64_t SymLoadModuleExW(void *hProcess, void *hFile, const uint16_t *ImageName,
+                          const uint16_t *ModuleName, uint64_t BaseOfDll,
+                          uint32_t DllSize, void *Data, uint32_t Flags);
 int SymFromAddr(void *hProcess, uint64_t Address, uint64_t *Displacement,
                 LJ_SYMBOL_INFO *Symbol);
 int SymCleanup(void *hProcess);
+int MultiByteToWideChar(uint32_t CodePage, uint32_t dwFlags,
+                        const char *lpMultiByteStr, int cbMultiByte,
+                        uint16_t *lpWideCharStr, int cchWideChar);
 ]]
 
 local SYMOPT_UNDNAME = 0x2
 local SYMOPT_DEFERRED_LOADS = 0x4
+-- Do not block on a symbol-server dialog when a file is missing.
+local SYMOPT_NO_PROMPTS = 0x80000
+-- Load a symbol file that is not next to its image (see _pdb_load).
+local SLMFLAG_VIRTUAL = 0x1
 -- Pseudo handle of the current process.
 local CURRENT_PROCESS = -1
+local CP_UTF8 = 65001
 
 -- opts:
 --   embedded -- symbol table parsed from the profile (utils.symtab)
 --   map      -- path to a linker map file
 --   debug    -- { binary = <path>, tool = "addr2line" } or nil
+--   pdb      -- list of symbol files, matched to the images by their name
 --   base     -- link-time base of the binary, overrides the detection
 function M.new(opts)
   local self = {
     embedded = opts.embedded,
     map = opts.map and load_map(opts.map) or nil,
     debug = opts.debug,
+    pdb_files = opts.pdb or {},
     base = opts.base,
     modules = {},
     cache = {},
+    warnings = {},
   }
   if self.embedded and self.embedded.modules then
     for _, m in ipairs(self.embedded.modules) do
       self.modules[#self.modules + 1] = m
     end
+  end
+  -- Symbol files are matched to the images by their name: lua51.pdb belongs
+  -- to lua51.dll. The load address comes from the profile.
+  self.pdb_by_stem = {}
+  for _, f in ipairs(self.pdb_files) do
+    self.pdb_by_stem[stem(f)] = f
   end
   if self.debug and self.debug.binary then
     -- The main binary is always a module, even if the profile has no entry
@@ -254,6 +281,17 @@ function M:link_addr(addr)
   return addr - m.addr + base
 end
 
+-- Convert a UTF-8 path to a zero-terminated UTF-16 buffer. Every DbgHelp
+-- entry point that takes a file name has a W variant: the A ones go through
+-- the ANSI code page and would mangle non-ASCII paths.
+local function utf8_to_wide(ffi, k32, s)
+  local n = k32.MultiByteToWideChar(CP_UTF8, 0, s, -1, nil, 0)
+  if n <= 0 then return nil end
+  local buf = ffi.new("uint16_t[?]", n)
+  if k32.MultiByteToWideChar(CP_UTF8, 0, s, -1, buf, n) <= 0 then return nil end
+  return buf
+end
+
 -- Lazily open dbghelp.dll. Returns nil when PDB support is unavailable.
 function M:_pdb()
   if self.pdb ~= nil then
@@ -266,17 +304,22 @@ function M:_pdb()
   if not ok then return nil end
   local ok_lib, lib = pcall(ffi.load, "dbghelp")
   if not ok_lib then return nil end
+  local ok_k32, k32 = pcall(ffi.load, "kernel32")
+  if not ok_k32 then return nil end
   pcall(ffi.cdef, PDB_CDEF)  -- Already defined if the tool is called twice.
 
   local handle = ffi.cast("void *", CURRENT_PROCESS)
-  if lib.SymInitialize(handle, nil, 0) == 0 then
+  local search = self:_pdb_search_path()
+  local wide = search ~= "" and utf8_to_wide(ffi, k32, search) or nil
+  if lib.SymInitializeW(handle, wide, 0) == 0 then
     return nil
   end
-  lib.SymSetOptions(SYMOPT_UNDNAME + SYMOPT_DEFERRED_LOADS)
+  lib.SymSetOptions(SYMOPT_UNDNAME + SYMOPT_DEFERRED_LOADS + SYMOPT_NO_PROMPTS)
 
   self.pdb = {
     ffi = ffi,
     lib = lib,
+    k32 = k32,
     handle = handle,
     loaded = {},  -- addresses of the images already handed to DbgHelp
     info = ffi.new("uint8_t[?]",
@@ -285,21 +328,82 @@ function M:_pdb()
   return self.pdb
 end
 
+-- Directories DbgHelp searches for the symbol file of an image: the ones of
+-- the given symbol files first, then the ones of the images of the profile.
+function M:_pdb_search_path()
+  local dirs, seen = {}, {}
+
+  local function add(path)
+    local dir = path:match("^(.*)[/\\]")
+    if not dir then return end
+    local key = dir:lower()
+    if not seen[key] then
+      seen[key] = true
+      dirs[#dirs + 1] = dir
+    end
+  end
+
+  for _, f in ipairs(self.pdb_files) do add(f) end
+  for _, m in ipairs(self.modules) do
+    if m.path and m.path ~= "" then add(m.path) end
+  end
+  return table.concat(dirs, ";")
+end
+
+local function file_exists(path)
+  local f = io.open(path, "rb")
+  if f then f:close() return true end
+  return false
+end
+
 -- Teach DbgHelp about one image of the profile.
+--
+-- The image is what ties a symbol file to a build: DbgHelp reads the debug
+-- directory (GUID and age) of the image and then looks for the matching PDB,
+-- next to the image first and then in the search path built above, so a
+-- symbol file may live anywhere. Without the image the symbol file given on
+-- the command line is loaded on its own (SLMFLAG_VIRTUAL); DbgHelp accepts
+-- the load, but whether it answers lookups afterwards depends on its version.
 function M:_pdb_load(module)
   local pdb = self:_pdb()
   if not pdb or not module then return end
   if pdb.loaded[module.addr] then return end
   pdb.loaded[module.addr] = true
+
   local _, size = pe_info(module.path)
-  pdb.lib.SymLoadModuleEx(pdb.handle, nil, module.path, nil, module.addr,
-                          size, nil, 0)
+  local file = self.pdb_by_stem[stem(module.path)]
+  local loaded = false
+
+  local function load(image, symfile, flags)
+    local wimage = image and utf8_to_wide(pdb.ffi, pdb.k32, image) or nil
+    local wfile = symfile and utf8_to_wide(pdb.ffi, pdb.k32, symfile) or nil
+    if image and not wimage then return false end
+    if symfile and not wfile then return false end
+    return pdb.lib.SymLoadModuleExW(pdb.handle, nil, wimage, wfile,
+                                    module.addr, size, nil, flags) ~= 0
+  end
+
+  if file_exists(module.path) then
+    loaded = load(module.path, nil, 0)
+  end
+  if not loaded and file then
+    loaded = load(nil, file, SLMFLAG_VIRTUAL)
+  end
+  if not loaded and file then
+    self.warnings[#self.warnings + 1] = string_format(
+      "cannot load symbols for %s from %s", module.path, file)
+  end
 end
 
--- Name of the function that contains addr, from the PDB of its image.
-function M:pdb_lookup(addr)
+-- Name of the function that contains addr, from the symbol file of its image.
+--
+-- SymFromAddr() reports the nearest symbol, not the containing function: a
+-- function symbol carries its extent, a public symbol is only a label. The
+-- name is accepted only when both the address and the start of the frame's
+-- function (the entry, from the stream) really belong to that symbol.
+function M:pdb_lookup(addr, entry)
   local pdb = self:_pdb()
-  if not pdb then return nil end
+  if not pdb or entry == nil or entry == 0 then return nil end
   local module = self:module_of(addr)
   self:_pdb_load(module)
 
@@ -311,21 +415,39 @@ function M:pdb_lookup(addr)
   if pdb.lib.SymFromAddr(pdb.handle, addr, nil, info) == 0 then
     return nil
   end
+
+  local sym_addr = tonumber(info.Address)
+  local size = tonumber(info.Size)
+  local inside
+  if size > 0 then
+    inside = entry >= sym_addr and entry < sym_addr + size and
+             addr >= sym_addr and addr < sym_addr + size
+  else
+    inside = sym_addr == entry
+  end
+  if not inside then
+    return nil
+  end
+
   local name = ffi.string(info.Name, info.NameLen)
   if name == "" then return nil end
   local real = name:match("^ILT%+%x+%((.+)%)$")
   if real then name = real end
-  return name, module and module.addr or 0
+  -- The address of the symbol itself, not the image base.
+  return name, sym_addr
 end
 
-function M:debug_lookup(addr)
-  -- A tool named explicitly (--addr2line=) means DWARF; otherwise the PDB is
-  -- the debug source and there is no point in starting a tool per address.
-  if not self.debug.tool then
-    if self:_pdb() then
-      return self:pdb_lookup(addr)
-    end
+-- Release the DbgHelp state (optional: the process is usually about to exit).
+function M:close()
+  if self.pdb then
+    self.pdb.lib.SymCleanup(self.pdb.handle)
+    self.pdb = false
   end
+end
+
+-- Name of the function that contains addr, from the DWARF debug info of the
+-- image (via addr2line). The PDB source is separate: see pdb_lookup().
+function M:debug_lookup(addr, entry)
   local m = self:module_of(addr)
   local path = m and m.path or self.debug.binary
   local link = self:link_addr(addr)
@@ -391,13 +513,10 @@ end
 function M:preload(addrs)
   if not self.debug then return end
 
-  if not self.debug.tool and self:_pdb() then
-    -- In-process: one call per address, nothing to batch.
-    for addr in pairs(addrs) do
-      local name, base = self:pdb_lookup(addr)
-      self.cache[addr] = name and string_format("%s:%#x", name, base or 0)
-                          or false
-    end
+  if not self.debug.tool then
+    -- The PDB is read in-process and a name is only accepted for the exact
+    -- function that contains the address, which is known here only for the
+    -- addresses the caller will pass to resolve(). Nothing to preload.
     return
   end
 
@@ -459,7 +578,9 @@ function M:resolve(addr, entry)
   local name, base
   if self.debug then
     -- The debug info names the function that contains the address.
-    name, base = self:debug_lookup(addr)
+    name, base = self:debug_lookup(addr, entry)
+  elseif #self.pdb_files > 0 then
+    name, base = self:pdb_lookup(addr, entry)
   end
   if not name and self.map then
     name, base = self:map_lookup(addr, entry)
