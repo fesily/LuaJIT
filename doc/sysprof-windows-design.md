@@ -222,8 +222,19 @@ Traces that existed when profiling started are handled the same way in
 symbols are queued as plain data and written by the timer thread right after
 the `ljp` header (they are events of the sample stream).
 
-Known gap: exit *stub* code lives in a separate allocation, so a sample taken
-there is not covered by a trace range and shows as a raw address.
+Exit *stubs* live in a separate allocation, shared by all traces: one group
+per `EXITSTUBS_PER_GROUP` exit numbers, each stub only pushing its exit number
+and jumping to the common exit handler (`lj_asm_x86.h`). The address therefore
+gives the exit number (`(pc - group base) / EXITSTUB_SPACING`), while the trace
+is only known at run time: the handler reads it from `g->vmstate`, which still
+holds the trace number while the stub runs (it switches it to `EXIT` itself,
+and from then on the number lives in `J->parent`). The interval table is
+indexed by exit number for that reason: a sample in a stub is attributed to
+the snapshot of its exit (a root trace's extra parent exit clamps to the last
+one), and the stub frame is not emitted again — the trace sample already
+carries the position — the walk continues with the callers of the VM entry.
+Samples taken inside the exit handler itself are reported as `EXIT` (host
+only), as before.
 
 ### 3.6 `lj_symtab.c/.h` — symbol table
 

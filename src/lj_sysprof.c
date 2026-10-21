@@ -18,6 +18,7 @@
 #if LJ_HASJIT
 #include "lj_jit.h"
 #include "lj_trace.h"
+#include "lj_target.h"
 #endif
 
 #include "lj_wbuf.h"
@@ -509,6 +510,64 @@ static const lj_symtab_trace_iv *sysprof_iv_at_pc(const struct sysprof *sp,
   return mc != NULL ? sysprof_iv_at(mc, pc) : NULL;
 }
 
+/* Snapshot entry of a trace, found by trace number. */
+static const struct sysprof_mcode *sysprof_mcode_of(const struct sysprof *sp,
+						    uint32_t traceno)
+{
+  uint32_t i;
+  for (i = 0; i < sp->nmcode; i++)
+    if (sp->mcode[i].traceno == traceno && sp->mcode[i].size != 0)
+      return &sp->mcode[i];
+  return NULL;
+}
+
+/*
+** Exit stubs are shared by all traces: there is one group per
+** EXITSTUBS_PER_GROUP exit numbers, and each stub only pushes its exit number
+** and jumps to the shared exit handler (lj_asm_x86.h). The address therefore
+** gives the exit number, but not the trace: the handler reads that from
+** g->vmstate, which still holds the trace number while the stub runs (the
+** handler switches it to EXIT itself). The interval of that exit is the
+** attribution of a sample taken in the stub.
+*/
+static const lj_symtab_trace_iv *sysprof_iv_at_stub(const struct sysprof *sp,
+						    uintptr_t pc)
+{
+  TraceNo traceno;
+  jit_State *J;
+  const struct sysprof_mcode *mc;
+  uint32_t g;
+
+  if (sp->g == NULL)
+    return NULL;
+  traceno = (TraceNo)sp->g->vmstate;
+  if ((int32_t)traceno < 0)
+    return NULL;  /* Not executing a trace, the stub is not ours. */
+  J = G2J(sp->g);
+  if (traceno >= J->sizetrace)
+    return NULL;
+  mc = sysprof_mcode_of(sp, (uint32_t)traceno);
+  if (mc == NULL)
+    return NULL;
+  for (g = 0; g < LJ_MAX_EXITSTUBGR; g++) {
+    uintptr_t base = (uintptr_t)J->exitstubgroup[g];
+    uint32_t exitno;
+    if (base == 0 || pc < base ||
+	pc >= base + EXITSTUBS_PER_GROUP * EXITSTUB_SPACING)
+      continue;
+    exitno = g * EXITSTUBS_PER_GROUP +
+	     (uint32_t)((pc - base) / EXITSTUB_SPACING);
+    /*
+    ** A root trace has one exit more than snapshots: the one back to its
+    ** parent. It is attributed to the last position the trace was at.
+    */
+    if (mc->niv == 0)
+      return NULL;
+    return &mc->iv[exitno < mc->niv ? exitno : mc->niv - 1];
+  }
+  return NULL;
+}
+
 /*
 ** Skip a frame that cannot be unwound generically.
 **
@@ -611,6 +670,14 @@ static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
 	/* Continue on the other side of the trace. */
 	if (sysprof_unwind_entry(sp, &cf, &ctx))
 	  continue;
+      } else if (sp->g != NULL && sysprof_iv_at_stub(sp, addr) != NULL) {
+	/*
+	** An exit stub: the same position as the trace sample itself (which is
+	** already streamed as the trace frame with its own line), so it is not
+	** reported again; continue with the callers of the VM entry.
+	*/
+	if (sysprof_unwind_entry(sp, &cf, &ctx))
+	  continue;
       }
 #endif
       break;
@@ -699,8 +766,10 @@ static void stream_trace(struct sysprof *sp, uint32_t vmstate)
   ** the trace started at.
   */
   if (sysprof_sample_ctx_valid) {
-    const lj_symtab_trace_iv *iv =
-      sysprof_iv_at_pc(sp, (uintptr_t)sysprof_sample_ctx.Rip);
+    uintptr_t pc = (uintptr_t)sysprof_sample_ctx.Rip;
+    const lj_symtab_trace_iv *iv = sysprof_iv_at_pc(sp, pc);
+    if (iv == NULL)
+      iv = sysprof_iv_at_stub(sp, pc);
     if (iv != NULL) {
       pt = iv->pt;
       line = iv->line;

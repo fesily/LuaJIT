@@ -72,19 +72,21 @@ int lj_symtab_trace_intervals(const GCtrace *trace, lj_symtab_trace_iv **ivp)
   if (iv == NULL)
     return 0;
   for (i = 0; i < trace->nsnap; i++) {
-    uint32_t off = (uint32_t)snap[i].mcofs * sizeof(MCode);
     const BCIns *pc = snap_pc((SnapEntry *)&map[snap[i].mapofs + snap[i].nent]);
     const BCIns *startpc = pc;
     GCproto *pt;
-    /* Snapshots without code in between share the interval of the next one. */
-    if (n > 0 && off <= iv[n-1].off)
-      continue;
+    /*
+    ** One entry per snapshot, in snapshot order: the index is the exit
+    ** number, which is what an address inside an exit stub gives (the stub
+    ** only carries the exit number, see lj_asm_x86.h). Snapshots may share an
+    ** offset, the address lookup takes the last one at or below the address.
+    */
+    iv[i].off = (uint32_t)snap[i].mcofs * sizeof(MCode);
     while (bc_op(*startpc) < BC_FUNCF)
       startpc--;  /* Back to the function header bytecode. */
     pt = (GCproto *)((char *)startpc - sizeof(GCproto));
-    iv[n].off = off;
-    iv[n].line = lj_debug_line(pt, (BCLine)(pc - startpc));
-    iv[n].pt = pt;
+    iv[i].line = lj_debug_line(pt, (BCLine)(pc - startpc));
+    iv[i].pt = pt;
     n++;
   }
   if (n == 0) {
