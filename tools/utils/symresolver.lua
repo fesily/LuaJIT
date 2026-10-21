@@ -121,7 +121,14 @@ local function load_map(path)
   end
   f:close()
   table.sort(entries, function(a, b) return a[1] < b[1] end)
-  return { entries = entries, is_rva = is_rva }
+  -- The address range of the image: lets map_lookup reject addresses that
+  -- belong to another module (a map describes exactly one image).
+  return {
+    entries = entries,
+    is_rva = is_rva,
+    min_key = #entries > 0 and entries[1][1] or 0,
+    max_key = #entries > 0 and entries[#entries][1] or 0,
+  }
 end
 
 local function map_floor(entries, addr)
@@ -341,6 +348,11 @@ function M:map_lookup(addr)
   -- MSVC maps list RVAs, GNU maps list link-time addresses.
   local key = self.map.is_rva and (addr - (m and m.addr or 0))
                            or self:link_addr(addr)
+  -- A map describes one image: an address outside its range belongs to
+  -- another module and must fall through to the next source.
+  if key < self.map.min_key or key > self.map.max_key then
+    return nil
+  end
   local entry = map_floor(self.map.entries, key)
   if entry then
     local base = m and m.addr or 0

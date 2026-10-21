@@ -107,6 +107,15 @@ void lj_symtab_cfuncs(lj_symtab_cfunc_cb cb, void *ctx);
 */
 void lj_symtab_dump_lua(struct lj_wbuf *out, const struct global_State *g);
 void lj_symtab_dump_c(struct lj_wbuf *out);
+
+/*
+** Function entries of the VM assembly (one or two, see buildvm_peobj.c).
+** The hand-written unwind data of the interpreter is meant for the SEH
+** dispatch path, so the sampler identifies these frames by their function
+** entry instead of unwinding through them. Returns the number of entries
+** written to `begin` (at most `max`).
+*/
+int lj_symtab_vm_functions(uintptr_t *begin, int max);
 #endif
 
 /*

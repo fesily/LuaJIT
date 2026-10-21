@@ -97,6 +97,8 @@ struct sysprof {
   uintptr_t stack_high;
   int frozen; /* The profiled thread is suspended by the sampler. */
   int prologue_c_pending; /* C symbols are dumped by the profiler thread. */
+  uintptr_t vm_func[4]; /* Function entries of the VM assembly. */
+  int nvm_func;
   uint8_t *own_buf; /* Buffer owned by the deferred writer (or NULL). */
   uint8_t *spare_buf; /* Spare stream buffer for the deferred write. */
   uint8_t *pending_buf; /* Full buffer waiting for the writer. */
@@ -304,6 +306,14 @@ static void stream_backtrace_lua(struct sysprof *sp, uint32_t vmstate)
 	 frame = frame_prev(frame)) {
       if (frame_gc(frame) == obj2gco(L) || frame_isvarg(frame))
 	continue;  /* Skip dummy frames. See lj_err_optype_call(). */
+      /*
+      ** The sample point is an arbitrary instruction, and on Windows the VM
+      ** state is not restored around C calls (see save_vmstate in
+      ** vm_x64.dasc), so a slot may already belong to the next frame. Only a
+      ** function cell is dereferenced: anything else is a stale slot.
+      */
+      if (!tvisfunc((frame) - LJ_FR2))
+	continue;
       stream_frame_lua(buf, frame);
     }
   }
@@ -406,11 +416,13 @@ static const void *sysprof_trace_at(const struct sysprof *sp, uintptr_t pc)
 }
 
 /*
-** Unwind one JIT frame.
+** Skip a frame that cannot be unwound generically.
 **
-** The trace frame itself is abandoned: the VM entry frame below it is exactly
-** what the Win64 SEH contract describes (lj_err.c, buildvm_peobj.c), so its
-** caller is reached at a fixed offset:
+** JIT compiled code has no unwind information at all, and the hand-written
+** data of the VM assembly is meant for the SEH dispatch path. Both are
+** abandoned: the VM entry frame below them is exactly what the Win64 SEH
+** contract describes (lj_err.c, buildvm_peobj.c), so its caller is reached
+** at a fixed offset:
 **
 **   L->cframe      == RSP of the entry frame (establisher frame)
 **   return address == [cframe + CFRAME_SIZE - 8]
@@ -419,11 +431,12 @@ static const void *sysprof_trace_at(const struct sysprof *sp, uintptr_t pc)
 ** This does not depend on the trace's own stack usage (spadjust), which is
 ** only an approximation at call sites inside the trace.
 */
-static int sysprof_unwind_jit(const struct sysprof *sp, CONTEXT *ctx)
+static int sysprof_unwind_entry(const struct sysprof *sp, void **cfp,
+				CONTEXT *ctx)
 {
-  lua_State *L = gco2th(gcref(sp->g->cur_L));
-  uintptr_t cf = (uintptr_t)L->cframe;
+  uintptr_t cf = (uintptr_t)*cfp;
   uintptr_t ra, base;
+  void *prev;
 
   if (cf == 0 || cf < sp->stack_low || cf + CFRAME_SIZE > sp->stack_high)
     return 0;
@@ -434,6 +447,15 @@ static int sysprof_unwind_jit(const struct sysprof *sp, CONTEXT *ctx)
       sysprof_trace_at(sp, ra) == NULL)
     return 0;
 
+  /*
+  ** Each skipped frame consumes one entry frame: the next one, if any, is
+  ** reached through the cframe chain. Without this the walk would jump back
+  ** to the same caller every time the interpreter is entered again.
+  */
+  prev = cframe_prev(*cfp);
+  *cfp = ((uintptr_t)prev >= sp->stack_low &&
+	  (uintptr_t)prev + CFRAME_SIZE <= sp->stack_high) ? prev : NULL;
+
   ctx->Rip = ra;
   ctx->Rsp = cf + CFRAME_SIZE;
   return 1;
@@ -441,11 +463,25 @@ static int sysprof_unwind_jit(const struct sysprof *sp, CONTEXT *ctx)
 #endif
 
 #if LJ_TARGET_WINDOWS
+/* Is this address inside the VM assembly? */
+static int sysprof_is_vm_func(const struct sysprof *sp, uintptr_t addr)
+{
+  uintptr_t fn = stream_func_begin(addr);
+  int i;
+
+  if (fn == 0)
+    return 0;
+  for (i = 0; i < sp->nvm_func; i++)
+    if (sp->vm_func[i] == fn)
+      return 1;
+  return 0;
+}
+
 static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
 {
   struct sysprof *sp = &sysprof;
   CONTEXT ctx = sysprof_sample_ctx;
-  UNWIND_HISTORY_TABLE hist;
+  void *cf;
   DWORD64 frame_base;
   DWORD64 est_frame;
   void *handler_data;
@@ -454,7 +490,11 @@ static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
   if (!sysprof_sample_ctx_valid)
     return;
 
-  memset(&hist, 0, sizeof(hist));
+  {
+    global_State *g = sp->g;
+    cf = g != NULL && gcref(g->cur_L) != NULL ?
+	 gco2th(gcref(g->cur_L))->cframe : NULL;
+  }
 
   for (level = 0; level < SYSPROF_BACKTRACE_FRAME_MAX; level++) {
     uintptr_t addr = (uintptr_t)ctx.Rip;
@@ -475,7 +515,7 @@ static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
 	if (!writer(level + 1, (void *)addr))
 	  return;
 	/* Continue on the other side of the trace. */
-	if (sysprof_unwind_jit(sp, &ctx))
+	if (sysprof_unwind_entry(sp, &cf, &ctx))
 	  continue;
       }
 #endif
@@ -485,7 +525,19 @@ static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
     if (!writer(level + 1, (void *)addr))
       return;
 
-    func = RtlLookupFunctionEntry(addr, &frame_base, &hist);
+    /*
+    ** The VM assembly is identified by its function entry (see
+    ** lj_symtab_vm_functions): its hand-written unwind data is not meant
+    ** for generic unwinding, a sample inside it is continued at the caller
+    ** of the interpreter's entry frame instead.
+    */
+    if (sp->nvm_func > 0 && sysprof_is_vm_func(sp, addr)) {
+      if (sysprof_unwind_entry(sp, &cf, &ctx))
+	continue;
+      break;
+    }
+
+    func = RtlLookupFunctionEntry(addr, &frame_base, NULL);
     if (func != NULL) {
       RtlVirtualUnwind(UNW_FLAG_NHANDLER, frame_base, addr, func, &ctx,
                        &handler_data, &est_frame, NULL);
@@ -982,9 +1034,15 @@ int lj_sysprof_start(lua_State *L, const struct luam_Sysprof_Options *opt)
   }
 #endif
 
-#if LJ_HASJIT && LJ_TARGET_WINDOWS
+#if LJ_TARGET_WINDOWS
+  /* Frames of the interpreter are recognised by these entries. */
+  sp->nvm_func = lj_symtab_vm_functions(sp->vm_func,
+					(int)(sizeof(sp->vm_func) /
+					      sizeof(sp->vm_func[0])));
+#if LJ_HASJIT
   if (stream_is_needed(sp))
     sysprof_collect_mcode(sp);
+#endif
 #endif
 
   sp->timer.opt.interval_msec = opt->interval;
@@ -1102,12 +1160,17 @@ void lj_sysprof_add_trace(const struct GCtrace *tr)
   if (sp->state != SPS_PROFILE || sp->opt.mode == LUAM_SYSPROF_DEFAULT)
     return;
 #if LJ_TARGET_WINDOWS
+  /*
+  ** The machine code snapshot must be complete for every trace created while
+  ** profiling, including those created before the timer thread finished the C
+  ** symbol dump: the sampler reads the snapshot to recognise JIT frames, and
+  ** a missing range silently truncates every host chain that runs through it.
+  ** Appending is safe here, it does not touch the stream that the timer
+  ** thread may still own.
+  */
+  sysprof_add_mcode(sp, (uintptr_t)tr->mcode, tr->szmcode, tr->traceno);
   if (sp->prologue_c_pending)
     return;
-#endif
-
-#if LJ_TARGET_WINDOWS
-  sysprof_add_mcode(sp, (uintptr_t)tr->mcode, tr->szmcode, tr->traceno);
 #endif
 
   /* See the comment about the sysprof state above. */

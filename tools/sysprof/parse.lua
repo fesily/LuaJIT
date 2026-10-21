@@ -248,26 +248,31 @@ local function merge(event, symbols)
     end
   end
   -- A trace sample carries no Lua chain: the innermost Lua-side frame is the
-  -- trace itself. The host frames above it belong to the code it called.
+  -- trace itself, and the host frames are the code it called (deeper) and its
+  -- callers (shallower). Replace the frame that belongs to the trace machine
+  -- code range with the trace name; if the sampler already abandoned it,
+  -- insert the name in front of the host frames.
   local trace = event.lua.trace
   if trace and trace.name and trace.traceno and trace.traceno ~= 0 then
     local t = symbols.trace[trace.traceno]
-    local mcode, msize = 0, 0
-    if t then
-      mcode, msize = t.mcode or 0, t.size or 0
-    end
+    local mcode = t and t.mcode or 0
+    local msize = t and t.size or 0
+    local inserted = false
+
     while hi <= #host do
       local fr = host[hi]
-      if mcode ~= 0 and fr.addr >= mcode and fr.addr < mcode + msize then
-        hi = hi + 1  -- The trace frame itself.
-        break
-      end
-      if not is_vm_frame(symbols, fr.entry) then
+      if not inserted and mcode ~= 0 and fr.addr >= mcode and
+         fr.addr < mcode + msize then
+        chain[#chain + 1] = trace.name
+        inserted = true
+      elseif not is_vm_frame(symbols, fr.entry) then
         chain[#chain + 1] = fr.name
       end
       hi = hi + 1
     end
-    chain[#chain + 1] = trace.name
+    if not inserted then
+      table.insert(chain, 1, trace.name)
+    end
   end
 
   while hi <= #host do
