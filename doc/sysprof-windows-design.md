@@ -332,8 +332,8 @@ same thread; on Windows the sampler is a different thread, hence:
 |---|---|
 | `tools/utils/symtab.lua` | ljs 3..5, module base entries, VM markers, trace ranges, `trace_at()`, exact-start name lookup (`cfunc_name`, `lfunc_name`) |
 | `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; `TRACE [N]` for mcode addresses; raw address for frames without an exact symbol |
-| `tools/utils/symresolver.lua` | C name sources: addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; name accepted only for the containing function (symbol start == frame function start) |
-| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--debug=`, `--addr2line=` (two-pass collection + batched resolution) |
+| `tools/utils/symresolver.lua` | C name sources: PDB through DbgHelp (in-process, extent check), addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; a name is accepted only for the function that contains the frame |
+| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--debug=`, `--addr2line=` (two-pass collection + batched resolution) |
 | `doc/ext_profiler.html` | `h` mode, `profile.hoststack`, `profile.mixedstack`, `profile.symtab`, C APIs |
 
 `-ts` needs `luajit.c`'s `-t<cmd>` support (tarantool extension): it does
@@ -434,10 +434,19 @@ function that contains every frame (`func-off`), and a name is printed only
 when the symbol table has a symbol at exactly that address — so an internal
 function between two exports shows up as a raw address (`0x7ff6d4f114f0`)
 instead of the nearest export above it (`luaopen_jit`). Exported functions,
-COFF symbols (MinGW) and Lua prototypes are all exact by construction, and
-`--map=` / `--debug=` add the names the embedded table lacks. A map of one
-module is applied to that module only, and a map symbol is accepted only when
-it also starts at the frame's function.
+COFF symbols (MinGW) and Lua prototypes are all exact by construction.
+
+For the build that produces a PDB the tools do not guess either:
+
+* `--pdb=<file>` (repeatable) adds the directory of a symbol file to the
+  DbgHelp search path; DbgHelp still matches it to an image by the GUID and
+  age recorded in the image, so a mismatched PDB is ignored rather than
+  trusted, and the image itself has to be reachable. `SymFromAddr()` answers
+  with the nearest symbol, so a name is used only when the symbol's extent
+  (function symbols carry one) contains the frame and its function start;
+* `--map=` / `--debug=` remain for builds whose symbols are gone.
+
+A map or a PDB of one module never names frames of another one.
 
 ### 11.3 Defects found while verifying (fixed)
 

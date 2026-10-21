@@ -24,12 +24,15 @@ Supported options are:
   --debug=<binary>                  Resolve C names with the debug info of
                                     <binary> (through addr2line)
   --addr2line=<tool>                Debug info tool to use (default: addr2line)
+  --pdb=<file>                       Symbol file of an image (repeatable);
+                                    matched to the image by its name
 ]]
   os.exit(0)
 end
 
 -- Sources of C function names (see utils/symresolver.lua).
 local sym_map, sym_debug, sym_tool
+local sym_pdbs = {}
 
 -- Options that take a value accept both --name=value and --name value.
 local function opt_value(v, args)
@@ -53,6 +56,12 @@ function opt_map.debug(v, args)
   local binary = opt_value(v, args)
   if binary == nil or binary == "" then opterror("--debug needs a binary") end
   sym_debug = binary
+end
+
+function opt_map.pdb(v, args)
+  local path = opt_value(v, args)
+  if path == nil or path == "" then opterror("--pdb needs a file name") end
+  sym_pdbs[#sym_pdbs + 1] = path
 end
 
 function opt_map.addr2line(v, args)
@@ -120,12 +129,13 @@ local function parseargs(args)
 end
 
 local function make_resolver(symbols)
-  if not sym_map and not sym_debug then
-    return nil  -- Only the map embedded in the profile.
+  if not sym_map and not sym_debug and #sym_pdbs == 0 then
+    return nil  -- Only the table embedded in the profile.
   end
   return symresolver.new({
     embedded = symbols,
     map = sym_map,
+    pdb = sym_pdbs,
     debug = sym_debug and { binary = sym_debug, tool = sym_tool or "addr2line" },
   })
 end
@@ -151,14 +161,23 @@ local function dump(inputfile)
   -- prints an error message if it encounters any failure during
   -- the process of parsing.
   local resolver
-  if sym_debug or sym_map then
+  if sym_debug or sym_map or #sym_pdbs > 0 then
     local addrs, symbols = collect_addresses(inputfile)
     resolver = make_resolver(symbols)
-    resolver:preload(addrs)
+    if sym_debug then
+      resolver:preload(addrs)
+    end
   end
   local events = evread(function(reader, symbols)
     return sysprof.parse(reader, symbols, resolver)
   end, inputfile)
+
+  if resolver then
+    for _, w in ipairs(resolver.warnings or {}) do
+      stderr:write("luajit-parse-sysprof: warning: ", w, "\n")
+    end
+    resolver:close()
+  end
 
   for stack, count in pairs(events) do
     print(stack, count)
