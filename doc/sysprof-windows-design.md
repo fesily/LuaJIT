@@ -414,10 +414,33 @@ same thread; on Windows the sampler is a different thread, hence:
 | file | change |
 |---|---|
 | `tools/utils/symtab.lua` | ljs 3..5, module base entries, VM markers, trace ranges, `trace_at()`, exact-start name lookup (`cfunc_name`, `lfunc_name`) |
-| `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; `TRACE [N]` for mcode addresses; raw address for frames without an exact symbol |
+| `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; frames are records (see below), so one parse feeds both the text report and `--format=json`; `TRACE [N]` for mcode addresses; `module+offset` for frames without an exact symbol |
 | `tools/utils/symresolver.lua` | C name sources: PDB through DbgHelp (in-process, extent check), PDB without its image through `llvm-pdbutil`, addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; a name is accepted only for the function that contains the frame |
-| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--pdbutil=`, `--debug=`, `--addr2line=` (two-pass collection + batched resolution) |
+| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--pdbutil=`, `--debug=`, `--addr2line=`, `--format=text\|json` (two-pass collection + batched resolution) |
 | `doc/ext_profiler.html` | `h` mode, `profile.hoststack`, `profile.mixedstack`, `profile.symtab`, C APIs |
+
+The parser builds one record per frame and aggregates samples by the text
+form of the whole chain; the default report prints `chain<TAB>count`, and
+`--format=json` prints one object per aggregated chain:
+
+```json
+{"count":13,"frames":[
+  {"kind":"host","module":"luajit.exe","symbol":"main","addr":"0x7ff76ea0457e","entry":"0x7ff76ea04500"},
+  {"kind":"host","module":"luajit.exe","offset":26207,"addr":"0x…","entry":"0x…"},
+  {"kind":"jit","chunk":"@f.lua","line":3,"addr":"0x…"},
+  {"kind":"trace","traceno":2,"chunk":"@f.lua","line":3},
+  {"kind":"lua","chunk":"@f.lua","line":7,"addr":"0x…"},
+  {"kind":"cfunc","module":"lua51.dll","symbol":"lua_pcall","addr":"0x…","entry":"0x…"},
+  {"kind":"vm","name":"ffi.meta.__call"}]}
+```
+
+`kind` is `host` (native frame of the profiled thread), `jit` (native frame
+in JIT machine code, named by the interval that covers it), `trace` (the JIT
+trace frame of a trace sample), `lua` (Lua frame), `cfunc` (a C function on
+the Lua stack), `vm` (a VM handler such as a fast function). A frame carries
+`module`+`symbol`, or `module`+`offset`, or only `addr` when the address is
+outside every image; addresses are hex strings so that no consumer loses
+them to a float.
 
 `-ts` needs `luajit.c`'s `-t<cmd>` support (tarantool extension): it does
 `require("sysprof")` and calls the returned function with `arg`. A v2.1
@@ -512,6 +535,7 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 | `jit.mixprof` (C-only sampling) | `start(24, 1)`, workload, `stop()`, `report()`: the counts sum to the reported ticks, chains contain Lua frames (`file.lua:line`) and host frames (`@0x...`); 180 start/stop sessions on MSVC + MinGW without a crash |
 | trace intervals (`SYMTAB_TRACE` v6) | a loop compiled into one trace reports several lines (`file:6 [TRACE 1]`, `file:3 [TRACE 1]`) instead of the trace start only; every interval is inside its trace, increasing, and points at a proto present in the symbol table with `line >= linedefined` |
 | soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
+| `--format=json` | every aggregated chain is one JSON object; `count` matches the text report line by line, `frames` keep `kind/module/symbol/offset/addr/entry/chunk/line/traceno`; the text report is byte-identical to the one before the frame records were introduced |
 | module-qualified frames (`ljs` v7) | every host frame of a parsed profile reads `module!function` or `module+offset`; image sizes come from the symbol table, so JIT machine code and heap addresses are never attributed to the image before them |
 | `--pdb=` naming | the symbol file is read standalone: `luajit.exe!main`, `luajit.exe!pmain`, `luajit.exe!handle_script`, `lua51.dll!lj_str_new` from the same profile that shows `luajit.exe+0x457e` without it; a PDB of another build names nothing (extent check) |
 | MSVC and MinGW builds | both build the same sources and reproduce the numbers above |
