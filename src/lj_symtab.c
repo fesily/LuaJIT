@@ -214,6 +214,7 @@ static void write_c_symtab(ElfW(Sym *) sym, char *strtab, ElfW(Addr) so_addr,
       lj_wbuf_addbyte(buf, header);
       lj_wbuf_addu64(buf, sym[sym_index].st_value + so_addr);
       lj_wbuf_addstring(buf, sym_name);
+      lj_wbuf_addu64(buf, (uint64_t)sym[sym_index].st_size);
     }
   }
 }
@@ -503,6 +504,7 @@ static int resolve_symbolnames(struct dl_phdr_info *info, size_t info_size,
     lj_wbuf_addbyte(buf, SYMTAB_CFUNC);
     lj_wbuf_addu64(buf, info->dlpi_addr);
     lj_wbuf_addstring(buf, info->dlpi_name);
+    lj_wbuf_addu64(buf, 0);  /* Image size unknown here. */
     ++conf->cur_lib;
   }
 
@@ -607,7 +609,7 @@ static int dump_pe_exports(lj_symtab_cfunc_cb cb, void *ctx,
     if (memchr(name, '\0', size - name_off) == NULL)
       continue;
 
-    cb(ctx, (uintptr_t)base + rva, name);
+    cb(ctx, (uintptr_t)base + rva, name, 0);
     dumped++;
   }
 
@@ -733,7 +735,7 @@ static int dump_pe_coff_symtab(lj_symtab_cfunc_cb cb, void *ctx,
     }
 
     cb(ctx, (uintptr_t)base +
-       sections[sect - 1].VirtualAddress + (uint32_t)value, name);
+       sections[sect - 1].VirtualAddress + (uint32_t)value, name, 0);
     dumped++;
   }
 
@@ -766,7 +768,7 @@ static void dump_win_symtab(lj_symtab_cfunc_cb cb, void *ctx)
       size_t size = (size_t)me.modBaseSize;
       /* The image itself is always reported: its load address and path are
       ** what lets a profile be symbolised later (tools/utils/symresolver). */
-      cb(ctx, (uintptr_t)base, me.szExePath);
+      cb(ctx, (uintptr_t)base, me.szExePath, (uint32_t)size);
       if (dump_pe_coff_symtab(cb, ctx, base, size, me.szExePath) == 0)
 	continue;
       dump_pe_exports(cb, ctx, base, size);
@@ -851,12 +853,14 @@ void lj_symtab_dump_lua(struct lj_wbuf *out, const struct global_State *g)
 }
 
 /* Serializes a collected symbol into the stream format. */
-static void symtab_cfunc_stream(void *ctx, uintptr_t addr, const char *name)
+static void symtab_cfunc_stream(void *ctx, uintptr_t addr, const char *name,
+				uint32_t size)
 {
   struct lj_wbuf *out = (struct lj_wbuf *)ctx;
   lj_wbuf_addbyte(out, SYMTAB_CFUNC);
   lj_wbuf_addu64(out, (uint64_t)addr);
   lj_wbuf_addstring(out, name);
+  lj_wbuf_addu64(out, (uint64_t)size);
 }
 
 /*

@@ -58,15 +58,32 @@ local function new_event()
 end
 
 -- A frame that the symbol table does not describe keeps its raw address: a
--- guessed name is worse than none for a profiler report.
-local function raw_name(addr)
+-- guessed name is worse than none for a profiler report. Addresses are
+-- qualified with the module they belong to, so a bare number never appears
+-- when the image is known: module!function, or module+offset.
+local function raw_name(symbols, addr)
+  local m = symtab.module_of(symbols, addr)
+  if m then
+    return string_format("%s+%#x", symtab.module_name(m.path), addr - m.addr)
+  end
   return string_format("%#x", addr)
+end
+
+local function qualified_name(symbols, addr, name)
+  if not name then
+    return raw_name(symbols, addr)
+  end
+  local m = symtab.module_of(symbols, addr)
+  if m then
+    return string_format("%s!%s", symtab.module_name(m.path), name)
+  end
+  return name
 end
 
 local function parse_lfunc(reader, symbols)
   local addr = reader:read_uleb128()
   local line = reader:read_uleb128()
-  local name = symtab.lfunc_name(symbols, addr, line) or raw_name(addr)
+  local name = symtab.lfunc_name(symbols, addr, line) or raw_name(symbols, addr)
   return { name = name, addr = addr }
 end
 
@@ -79,10 +96,15 @@ local function parse_cfunc(reader, symbols, resolver)
   local addr = reader:read_uleb128()
   -- The entry address lets the frame be matched to the host callchain, and
   -- it is the exact start of the function, so the name is never guessed.
-  local name = resolver and resolver:resolve(addr, addr)
-  if not name then
-    name = symtab.cfunc_name(symbols, addr, addr) or raw_name(addr)
+  local name
+  if resolver then
+    local _, resolved = resolver:resolve(addr, addr)
+    name = resolved
   end
+  if not name then
+    name = symtab.cfunc_name(symbols, addr, addr)
+  end
+  name = qualified_name(symbols, addr, name)
   return { name = name, addr = addr }
 end
 
@@ -121,18 +143,31 @@ local function parse_host_callchain(reader, event, symbols, version, resolver)
     end
     -- `entry` is the start of the function that contains the frame: the name
     -- is accepted only when a symbol starts there (see symtab.cfunc_name).
-    local name = resolver and resolver:resolve(addr, entry)
+    local name
+    if resolver then
+      local _, resolved = resolver:resolve(addr, entry)
+      name = resolved
+    end
+    local is_c_name = name ~= nil
     if not name then
       -- JIT compiled code: the interval that covers the address names the
       -- function and line it is at; without intervals fall back to the trace.
       local traceno, iv = symtab.trace_iv_at(symbols, addr)
       if iv then
-        name = symtab.lfunc_name(symbols, iv.addr, iv.line) or raw_name(addr)
+        name = symtab.lfunc_name(symbols, iv.addr, iv.line) or
+               raw_name(symbols, addr)
       elseif traceno then
         name = string_format("TRACE [%d]", traceno)
       else
-        name = symtab.cfunc_name(symbols, addr, entry) or raw_name(addr)
+        name = symtab.cfunc_name(symbols, addr, entry)
+        is_c_name = name ~= nil
       end
+    end
+    if is_c_name then
+      name = qualified_name(symbols, addr, name)
+    elseif not name then
+      -- No symbol and no interval: module + offset, never a bare number.
+      name = raw_name(symbols, addr)
     end
     event.host.callchain[#event.host.callchain + 1] = {
       name = name,
@@ -190,7 +225,8 @@ local function parse_symtab(reader, symbols, vmstate, version)
   if vmstate == SYMTAB_LFUNC_EVENT then
     symtab.parse_sym_lfunc(reader, symbols)
   elseif vmstate == SYMTAB_CFUNC_EVENT then
-    symtab.parse_sym_cfunc(reader, symbols)
+    -- The cfunc record carries a size from symbol table version 7 on.
+    symtab.parse_sym_cfunc(reader, symbols, symbols.version)
   elseif vmstate == SYMTAB_TRACE_EVENT then
     -- The trace record layout follows the symbol table version.
     symtab.parse_sym_trace(reader, symbols, symbols.version)

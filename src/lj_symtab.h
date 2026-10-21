@@ -16,7 +16,7 @@
 #include "lj_dispatch.h"
 #endif
 
-#define LJS_CURRENT_VERSION 0x6
+#define LJS_CURRENT_VERSION 0x7
 
 /*
 ** symtab format:
@@ -27,7 +27,7 @@
 ** reserved       := <BYTE> <BYTE> <BYTE>
 ** sym            := sym-lua | sym-cfunc | sym-trace | sym-final
 ** sym-lua        := sym-header sym-addr sym-chunk sym-line
-** sym-cfunc      := sym-header sym-addr sym-name
+** sym-cfunc      := sym-header sym-addr sym-name sym-size
 ** sym-trace      := sym-header trace-no sym-addr sym-line mcode mcode-size
 **                   intervals
 ** intervals      := <ULEB128> {iv-off iv-addr iv-line}   (version 6+)
@@ -44,6 +44,10 @@
 ** trace-addr     := <ULEB128>
 ** mcode          := <ULEB128>  start of the trace's machine code
 ** mcode-size     := <ULEB128>  its size in bytes (version 5+)
+** sym-size       := <ULEB128>  size of the symbol in bytes; for the entry
+**                              that records an image (load address and path)
+**                              this is the size of the image, so a tool can
+**                              tell "inside a module" (version 7+)
 ** string         := string-len string-payload
 ** string-len     := <ULEB128>
 ** string-payload := <BYTE> {string-len}
@@ -118,7 +122,8 @@ void lj_symtab_dump_newc(uint32_t *lib_adds, struct lj_wbuf *out,
 ** does not touch the VM, so it may run on any thread. `name` is valid only
 ** until the callback returns.
 */
-typedef void (*lj_symtab_cfunc_cb)(void *ctx, uintptr_t addr, const char *name);
+typedef void (*lj_symtab_cfunc_cb)(void *ctx, uintptr_t addr, const char *name,
+				   uint32_t size);
 
 void lj_symtab_cfuncs(lj_symtab_cfunc_cb cb, void *ctx);
 
