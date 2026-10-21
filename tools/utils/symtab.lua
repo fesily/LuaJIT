@@ -207,6 +207,35 @@ local function demangle_trace(symtab, loc)
   return trace_str
 end
 
+-- Name of the prototype at `addr`, or nil. The prototype table is keyed by
+-- the exact address, so no heuristic is involved.
+function M.lfunc_name(symtab, addr, line)
+  local entry = symtab.lfunc[addr]
+  if not entry then
+    return nil
+  end
+  return string_format("%s:%d", symtab.alias[entry.source] or entry.source, line)
+end
+
+-- Name of the C function stored at `addr`, or nil.
+--
+-- The symbol tables carry no sizes, so a nearest-symbol lookup names an
+-- internal function after whatever unrelated symbol happens to precede it.
+-- `entry` is the start of the function that contains `addr` (the sampler
+-- reports the offset within it and 0 when it is unknown): the name is only
+-- used when a symbol starts at exactly that address. Anything else stays
+-- unnamed, the caller falls back to a raw address.
+function M.cfunc_name(symtab, addr, entry)
+  if not symtab.cfunc or entry == nil or entry == 0 then
+    return nil
+  end
+  local key, value = avl.floor(symtab.cfunc, entry)
+  if key == entry and entry <= addr then
+    return value.name, key
+  end
+  return nil
+end
+
 function M.demangle(symtab, loc)
   if loc.traceno ~= 0 and loc.traceno ~= nil then
     return demangle_trace(symtab, loc)

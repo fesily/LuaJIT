@@ -113,7 +113,7 @@ buildvm -m folddef -o lj_folddef.h lj_opt_fold.c
 %LJCOMPILE% %LJDYNBUILD% lj_*.c lib_*.c
 @if errorlevel 1 goto :BAD
 @if "%1"=="mixed" goto :STATICLIB
-%LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj dbghelp.lib
+%LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj
 @if errorlevel 1 goto :BAD
 @goto :MTDLL
 :STATIC
@@ -143,7 +143,7 @@ if exist %LJDLLNAME%.manifest^
 
 %LJCOMPILE% luajit.c
 @if errorlevel 1 goto :BAD
-%LJLINK% /OUT:luajit.exe luajit.obj %LJLIBNAME% dbghelp.lib
+%LJLINK% /OUT:luajit.exe luajit.obj %LJLIBNAME%
 @if errorlevel 1 goto :BAD
 if exist luajit.exe.manifest^
   %LJMT% -manifest luajit.exe.manifest -outputresource:luajit.exe
