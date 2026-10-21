@@ -332,8 +332,8 @@ same thread; on Windows the sampler is a different thread, hence:
 |---|---|
 | `tools/utils/symtab.lua` | ljs 3..5, module base entries, VM markers, trace ranges, `trace_at()`, exact-start name lookup (`cfunc_name`, `lfunc_name`) |
 | `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; `TRACE [N]` for mcode addresses; raw address for frames without an exact symbol |
-| `tools/utils/symresolver.lua` | C name sources: PDB through DbgHelp (in-process, extent check), addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; a name is accepted only for the function that contains the frame |
-| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--debug=`, `--addr2line=` (two-pass collection + batched resolution) |
+| `tools/utils/symresolver.lua` | C name sources: PDB through DbgHelp (in-process, extent check), PDB without its image through `llvm-pdbutil`, addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; a name is accepted only for the function that contains the frame |
+| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--pdbutil=`, `--debug=`, `--addr2line=` (two-pass collection + batched resolution) |
 | `doc/ext_profiler.html` | `h` mode, `profile.hoststack`, `profile.mixedstack`, `profile.symtab`, C APIs |
 
 `-ts` needs `luajit.c`'s `-t<cmd>` support (tarantool extension): it does
@@ -441,9 +441,18 @@ For the build that produces a PDB the tools do not guess either:
 * `--pdb=<file>` (repeatable) adds the directory of a symbol file to the
   DbgHelp search path; DbgHelp still matches it to an image by the GUID and
   age recorded in the image, so a mismatched PDB is ignored rather than
-  trusted, and the image itself has to be reachable. `SymFromAddr()` answers
-  with the nearest symbol, so a name is used only when the symbol's extent
-  (function symbols carry one) contains the frame and its function start;
+  trusted. `SymFromAddr()` answers with the nearest symbol, so a name is used
+  only when the symbol's extent (function symbols carry one) contains the
+  frame and its function start;
+* when the image itself is not on the analysis machine, DbgHelp cannot read
+  its symbol file at all (`SymLoadModuleEx` with only a PDB loads but answers
+  nothing, with or without `SLMFLAG_VIRTUAL`). The same `--pdb=` file is then
+  read by `llvm-pdbutil` (LLVM's own PDB reader, `--pdbutil=` to point at the
+  tool): `dump -section-headers` gives the section RVAs and `dump -symbols`
+  the procedures with section offset and size, so the name is still exact and
+  the table is built once per module (a second or two for a LuaJIT-sized
+  PDB). DIA (`msdia140.dll`, `loadDataFromPdb`) would do the same in-process
+  through COM, at the price of a registered COM server and FFI vtable calls;
 * `--map=` / `--debug=` remain for builds whose symbols are gone.
 
 A map or a PDB of one module never names frames of another one.

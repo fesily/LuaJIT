@@ -26,6 +26,8 @@ Supported options are:
   --addr2line=<tool>                Debug info tool to use (default: addr2line)
   --pdb=<file>                       Symbol file of an image (repeatable);
                                     matched to the image by its name
+  --pdbutil=<tool>                   Reader for a symbol file without the
+                                    image (default: llvm-pdbutil)
 ]]
   os.exit(0)
 end
@@ -33,6 +35,7 @@ end
 -- Sources of C function names (see utils/symresolver.lua).
 local sym_map, sym_debug, sym_tool
 local sym_pdbs = {}
+local sym_pdbutil
 
 -- Options that take a value accept both --name=value and --name value.
 local function opt_value(v, args)
@@ -62,6 +65,12 @@ function opt_map.pdb(v, args)
   local path = opt_value(v, args)
   if path == nil or path == "" then opterror("--pdb needs a file name") end
   sym_pdbs[#sym_pdbs + 1] = path
+end
+
+function opt_map.pdbutil(v, args)
+  local tool = opt_value(v, args)
+  if tool == nil or tool == "" then opterror("--pdbutil needs a tool") end
+  sym_pdbutil = tool
 end
 
 function opt_map.addr2line(v, args)
@@ -136,6 +145,7 @@ local function make_resolver(symbols)
     embedded = symbols,
     map = sym_map,
     pdb = sym_pdbs,
+    pdbutil = sym_pdbutil,
     debug = sym_debug and { binary = sym_debug, tool = sym_tool or "addr2line" },
   })
 end

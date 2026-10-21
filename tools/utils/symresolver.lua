@@ -221,10 +221,12 @@ function M.new(opts)
     map = opts.map and load_map(opts.map) or nil,
     debug = opts.debug,
     pdb_files = opts.pdb or {},
+    pdbutil = opts.pdbutil,  -- tool that reads a PDB without its image
     base = opts.base,
     modules = {},
     cache = {},
     warnings = {},
+    pdb_tables = {},  -- module base -> symbol table read without the image
   }
   if self.embedded and self.embedded.modules then
     for _, m in ipairs(self.embedded.modules) do
@@ -356,6 +358,91 @@ local function file_exists(path)
   return false
 end
 
+-- Read one PDB without its image.
+--
+-- DbgHelp needs the image: it validates the symbol file against the GUID and
+-- age recorded in the image and refuses a symbol file on its own. The LLVM PDB
+-- reader does not: `llvm-pdbutil dump -section-headers` gives the RVA of every
+-- section and `dump -symbols` gives the procedures with their section offset
+-- and code size, which is all the resolver needs. The symbol table and the
+-- symbols are also in the PDB itself.
+-- Run a tool through the shell. The doubled outer quotes are what cmd.exe
+-- needs when the program path itself is quoted (llvm-pdbutil usually lives in
+-- "C:\Program Files\..."): with a single pair the shell splits the path.
+local function shell_cmd(tool, args)
+  return string_format('""%s" %s"', tool, args)
+end
+
+local function load_pdb_file(tool, path)
+  local function run(args)
+    local cmd = shell_cmd(tool, string_format('%s "%s"', args, path)) .. " 2>&1"
+    local pipe = io.popen(cmd)
+    if not pipe then return nil end
+    local text = pipe:read("*a")
+    pipe:close()
+    return text
+  end
+
+  local headers = run("dump -section-headers")
+  if not headers then return nil, "cannot run " .. tool end
+
+  local sections, cur = {}, nil
+  for line in headers:gmatch("[^\r\n]+") do
+    local idx = line:match("^%s*SECTION HEADER #(%d+)")
+    if idx then
+      cur = { index = tonumber(idx) }
+      sections[#sections + 1] = cur
+    elseif cur then
+      local name = line:match("^%s+(%S+) name%s*$")
+      if name then cur.name = name end
+      local vsize = line:match("^%s+(%x+) virtual size%s*$")
+      if vsize then cur.vsize = tonumber(vsize, 16) end
+      local rva = line:match("^%s+(%x+) virtual address%s*$")
+      if rva then cur.rva = tonumber(rva, 16) end
+    end
+  end
+  local rva_of = {}
+  for _, sec in ipairs(sections) do
+    if sec.index and sec.rva then rva_of[sec.index] = sec.rva end
+  end
+  if #sections == 0 then
+    return nil, "unexpected output of " .. tool .. " (no section headers)"
+  end
+
+  local text = run("dump -symbols")
+  if not text then return nil, "cannot run " .. tool end
+
+  local functions, pending = {}, nil
+  local count = 0
+  for line in text:gmatch("[^\r\n]+") do
+    local name = line:match("| S_[GL]PROC32 %[size = %d+%] `(.+)`%s*$")
+    if name then
+      -- The record continues on the next line with the address and the size.
+      pending = name
+    elseif pending then
+      -- llvm-pdbutil prints the section index and the offset in decimal
+      -- (the section headers above are hexadecimal).
+      local sec, off, csize = line:match("addr = (%d+):(%d+), code size = (%d+)")
+      if sec then
+        local base = rva_of[tonumber(sec, 10)]
+        if base then
+          local rva = base + tonumber(off, 10)
+          -- First name wins: identical code may be folded into one address.
+          if functions[rva] == nil then
+            functions[rva] = { name = pending, size = tonumber(csize) }
+            count = count + 1
+          end
+        end
+        pending = nil
+      end
+    end
+  end
+  if count == 0 then
+    return nil, "unexpected output of " .. tool .. " (no procedures)"
+  end
+  return { functions = functions }
+end
+
 -- Teach DbgHelp about one image of the profile.
 --
 -- The image is what ties a symbol file to a build: DbgHelp reads the debug
@@ -395,17 +482,36 @@ function M:_pdb_load(module)
   end
 end
 
--- Name of the function that contains addr, from the symbol file of its image.
+-- Symbol table of an image read from its PDB alone (see load_pdb_file).
+function M:_pdb_standalone(module)
+  local key = module.addr
+  if self.pdb_tables[key] ~= nil then
+    return self.pdb_tables[key] or nil
+  end
+  self.pdb_tables[key] = false
+
+  local file = self.pdb_by_stem[stem(module.path)]
+  if not file then return nil end
+  local tool = self.pdbutil or "llvm-pdbutil"
+  local table_, err = load_pdb_file(tool, file)
+  if not table_ then
+    self.warnings[#self.warnings + 1] = string_format(
+      "cannot read %s: %s (use --pdbutil= to point at llvm-pdbutil)", file, err)
+    return nil
+  end
+  self.pdb_tables[key] = table_
+  return table_
+end
+
+-- Name of the function that contains addr, from the symbols DbgHelp loaded.
 --
 -- SymFromAddr() reports the nearest symbol, not the containing function: a
 -- function symbol carries its extent, a public symbol is only a label. The
 -- name is accepted only when both the address and the start of the frame's
 -- function (the entry, from the stream) really belong to that symbol.
-function M:pdb_lookup(addr, entry)
+function M:_pdb_dbghelp(addr, entry, module)
   local pdb = self:_pdb()
   if not pdb or entry == nil or entry == 0 then return nil end
-  local module = self:module_of(addr)
-  self:_pdb_load(module)
 
   local ffi = pdb.ffi
   local info = ffi.cast("LJ_SYMBOL_INFO *", pdb.info)
@@ -437,6 +543,27 @@ function M:pdb_lookup(addr, entry)
   return name, sym_addr
 end
 
+-- Name of the function that starts at `entry`, from the PDB read directly.
+function M:_pdb_from_file(addr, entry, module)
+  local table_ = self:_pdb_standalone(module)
+  if not table_ then return nil end
+  local fn = table_.functions[entry - module.addr]
+  if not fn then return nil end
+  return fn.name, entry
+end
+
+-- Name of the function that contains addr, from the PDB of its image. The
+-- image is used when it is available (DbgHelp then validates the symbol file
+-- against it); otherwise the symbol file is read on its own.
+function M:pdb_lookup(addr, entry)
+  if entry == nil or entry == 0 then return nil end
+  local module = self:module_of(addr)
+  self:_pdb_load(module)
+  local name, base = self:_pdb_dbghelp(addr, entry, module)
+  if name then return name, base end
+  return self:_pdb_from_file(addr, entry, module)
+end
+
 -- Release the DbgHelp state (optional: the process is usually about to exit).
 function M:close()
   if self.pdb then
@@ -455,8 +582,9 @@ function M:debug_lookup(addr, entry)
   local devnull = package.config:sub(1, 1) == "\\" and "2>nul" or "2>/dev/null"
   -- %q would double the backslashes of a Windows path, which the shell does
   -- not undo; quote by hand instead.
-  local cmd = string_format('%s -f -C -e "%s" 0x%x %s',
-                            self.debug.tool or "addr2line", path, link, devnull)
+  local cmd = shell_cmd(self.debug.tool or "addr2line",
+                        string_format('-f -C -e "%s" 0x%x', path, link)) ..
+              " " .. devnull
   local pipe = io.popen(cmd)
   if not pipe then return nil end
   local name = pipe:read("*l")
@@ -544,9 +672,10 @@ function M:preload(addrs)
       for k = i, last do
         query[#query + 1] = string_format("0x%x", list[k] - mod_base + link_base)
       end
-      local cmd = string_format('%s -f -C -e "%s" %s %s',
-                                self.debug.tool or "addr2line", path,
-                                table.concat(query, " "), devnull)
+      local cmd = shell_cmd(self.debug.tool or "addr2line",
+                            string_format('-f -C -e "%s" %s', path,
+                                          table.concat(query, " "))) ..
+                  " " .. devnull
       local pipe = io.popen(cmd)
       if pipe then
         for k = i, last do
