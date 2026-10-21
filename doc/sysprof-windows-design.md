@@ -232,21 +232,42 @@ Two additions to the existing `LJ_PROFILE_WTHREAD` backend:
   interval, otherwise `Sleep()` overshoots the requested interval several
   times over.
 
-### 3.8 `lj_profile.c/.h` — jit.profile
+### 3.8 `lj_profile.c/.h` — the profile hook, `lj_mixprof.c/.h` — mixed stacks
 
-New, all on the profiled thread at the safepoint (no suspension):
+`lj_profile.c` keeps what the profile interface is about: the timer, the
+hook mask protocol, the callback invocation and `luaJIT_profile_start/stop/
+dumpstack`. The mixed (Lua + host) stack work lives in its own module,
+`lj_mixprof.c/.h`, on the profiled thread at the safepoint (no suspension):
 
-* mode option `h` enables host sampling;
-* `profile_capture_mixed()` reads the host stack with
-  `RtlCaptureStackBackTrace(skip = 4)`, skipping the profiler's own frames,
-  and collects the Lua chain with `lj_debug_frame()`;
+* mode option `h` makes the hook call `lj_mixprof_capture()`, which reads the
+  host stack with `RtlCaptureStackBackTrace(skip = 4)` (the sampler's own
+  frames) and collects the Lua chain with `lj_debug_frame()`;
 * the merge splices host frames in at every C function of the Lua chain,
   matching by **entry address** (from `RtlLookupFunctionEntry`); fast
   functions keep their `[builtin#N]` marker and are followed by the host
   frames of their implementation; VM assembly frames are dropped (identified
   through the same two PE unwind entries as `SYMTAB_VM`);
-* `luaJIT_profile_hoststack()` and `luaJIT_profile_mixedstack()` expose the
-  raw and merged chains.
+* `luaJIT_profile_hoststack()` and `luaJIT_profile_mixedstack()` are thin
+  wrappers around the module's accessors;
+* the module can also collect on its own: see `jit.mixprof` below.
+
+#### `jit.mixprof` — sampling without a Lua callback
+
+`lib_mixprof.c` exposes the module as `require("jit.mixprof")`:
+
+| function | meaning |
+|---|---|
+| `start(depth, interval)` | start collecting, `depth` frames per sample (default 32), `interval` ms (default 10); returns nothing |
+| `stop()` | stop the profile run; the samples stay for the report |
+| `report()` | `chains, ticks = report()`; `chains` maps a merged callchain (same notation as `mixedstack`) to the number of ticks, `ticks` is their sum |
+| `active()` | is the collector running |
+
+The collection is pure C: `start()` calls the ordinary
+`luaJIT_profile_start(L, "hiN", mixprof_cb, NULL)` with a C callback, so no
+Lua function (and no Lua allocation for the callback machinery) is entered
+per sample. Each sample is formatted once, at the safepoint, and appended to
+an arena; `report()` sorts the records, groups equal chains and builds the
+Lua table only then.
 
 ### 3.9 `lj_debug.c/.h`
 
@@ -261,6 +282,7 @@ the mixed-stack formatter prints `chunk:line` with exactly the same rules as
 | `luajit.h` | `luaJIT_profile_hoststack`, `luaJIT_profile_mixedstack`, `luaJIT_profile_symtab`, `LUAJIT_PROFILE_HOSTSTACK_MAX` |
 | `lib_jit.c` | `jit.profile.hoststack`, `jit.profile.mixedstack`, `jit.profile.symtab` |
 | `lib_misc.c` | `misc.sysprof` is registered on Windows (`#if LJ_HASSYSPROF`); the profile file is opened with `O_BINARY` (text mode would expand `0x0a` to `0x0d 0x0a` and corrupt the stream) |
+| `lib_mixprof.c` | `require("jit.mixprof")`: `start`/`stop`/`report`/`active`, the C-only mixed sampler (§3.8) |
 | `luajit.c` | tarantool-only `-t<cmd>` tool runner; needed for `-ts` (§8) |
 
 ## 4. Stream formats
@@ -426,6 +448,7 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 | `jit.flush()` every round during a `mode="C"` profile | clean, samples still attributed after the flush, `TRACE [N]` in the report |
 | `-ts <file>` (`tools/sysprof.lua`) | parses, prints `chain\tcount`, trace names resolved |
 | `jit.profile` `h` mode | `profile.hoststack()`, `profile.mixedstack()` (Lua + native frames), `profile.symtab()` (12000+ C symbols) |
+| `jit.mixprof` (C-only sampling) | `start(24, 1)`, workload, `stop()`, `report()`: the counts sum to the reported ticks, chains contain Lua frames (`file.lua:line`) and host frames (`@0x...`); 180 start/stop sessions on MSVC + MinGW without a crash |
 | soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
 | MSVC and MinGW builds | both build the same sources and reproduce the numbers above |
 
