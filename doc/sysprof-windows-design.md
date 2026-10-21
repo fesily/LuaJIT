@@ -154,7 +154,7 @@ Windows parts (`#if LJ_TARGET_WINDOWS`):
 |---|---|
 | timer-thread sampling (`SuspendThread`/`GetThreadContext`) | no signals |
 | host unwinder (`RtlPcToFileHeader` / `RtlLookupFunctionEntry` / `RtlVirtualUnwind`, leaf fallback) | `backtrace()` only works on the current thread |
-| JIT frame unwind through `L->cframe` (§3.5.2) | mcode has no `.pdata` |
+| JIT frame and VM assembly frame skip through `L->cframe` (§3.5.2), with a cursor that follows `cframe_prev()` | mcode has no `.pdata`; the VM `.xdata` is for SEH dispatch only |
 | deferred writer + spare buffer | a flush must not run while the VM is frozen |
 | C-symbol dump on the timer thread (`stream_prologue_c`, timer `startup` hook) | the profiled thread owns the GC heap |
 | stream error re-check after `SuspendThread` | the VM writes symbol events itself (see §6) |
@@ -213,10 +213,13 @@ Rules that the Windows code depends on:
 * the symbol table records the load address and path of every image (not
   only as a fallback), because the tools use it to turn load addresses into
   link-time addresses;
-* `SYMTAB_VM` marks the function(s) that cover the VM assembly blob; they
-  are found with `RtlLookupFunctionEntry()` on `lj_vm_asm_begin` and
-  `lj_vm_profhook` (buildvm emits one or two PE unwind entries for the whole
-  blob), which lets the tools drop VM frames without symbols.
+* `SYMTAB_VM` marks the function(s) that cover the VM assembly: they are
+  found with `RtlLookupFunctionEntry()` on `lj_vm_asm_begin` and
+  `lj_vm_profhook`, plus the second half of the blob (buildvm splits `.text`
+  at `vm_ffi_call`, so the end of the first entry is the start of the
+  second). `lj_symtab_vm_functions()` is shared by the symtab dump and by
+  the sampler, which uses the entries to recognise — and skip — interpreter
+  frames; the tools then drop them without symbols.
 
 ### 3.7 `lj_profile_timer.c/.h` — the timer thread
 
@@ -416,26 +419,55 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 |---|---|
 | `misc.sysprof.start{mode="D"}` counters | `report()` counts samples and per-vmstate hits |
 | `mode="C"` / `"L"`, interpreter (`jit.off()`) | Lua chain with `chunk:line`, C frames (`string.format`, `ffi.meta.__call`, `sqrt`), host frames from `RtlUserThreadStart` down |
-| parsed events == `report().samples` | 158/158, 152/152, 152/152 on three runs |
-| `jit.flush()` every round during a `mode="C"` profile | 6/6 runs clean, samples still attributed after the flush, `TRACE [N]` in the report |
+| JIT samples (`mode="C"`, JIT on) | `...;lua_pcall;TRACE [N];` plus the trace's callees, callers continue down to `mainCRTStartup` |
+| parsed events == `report().samples` | 158/158, 152/152, 500/500, 527/527 on four runs |
+| `jit.flush()` every round during a `mode="C"` profile | clean, samples still attributed after the flush, `TRACE [N]` in the report |
 | `-ts <file>` (`tools/sysprof.lua`) | parses, prints `chain\tcount`, trace names resolved |
-| `jit.profile` `h` mode | `profile.hoststack()`, `profile.mixedstack()` (Lua + native frames), `profile.symtab()` (12094 C symbols) |
-| MSVC and MinGW builds | both build the same sources; the MinGW binary reproduces the numbers above |
+| `jit.profile` `h` mode | `profile.hoststack()`, `profile.mixedstack()` (Lua + native frames), `profile.symtab()` (12000+ C symbols) |
+| soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
+| MSVC and MinGW builds | both build the same sources and reproduce the numbers above |
 
 Host symbol names are those of the embedded COFF/export table (nearest
-export for internal functions); `--map=` / `--debug=` refine them.
+export for internal functions: a `calloc` frame may be shown as
+`luaopen_jit`); `--map=` / `--debug=` refine them. A map of one module is
+applied to that module only.
 
-### 11.3 Open item: callers below a JIT frame
+### 11.3 Defects found while verifying (fixed)
 
-Samples taken inside a trace (`vmstate == TRACE`) resolve the trace number,
-the innermost frame (`TRACE [1];sqrt:...`) and the trace's own callees, but
-the native callers *below* the trace frame are wrong on this build: the
-chain continues with a few repeated addresses inside `lua51.dll` and one or
-two entries that resolve to the image base, instead of `lua_pcall` and
-`main`. Interpreter samples are unaffected. The JIT-frame abandon path
-(`RtlVirtualUnwind` is skipped, the walk resumes at `L->cframe`,
-`CFRAME_SIZE = 80`, return address at `cframe + 72`) is the suspect; the
-same code was reported to work on the tarantool master tree, so the
-difference is in the v2.1 frame layout or in the entry that pushed the
-frame (traces call C functions through `vm_ffi_call`, not only `vm_call`).
-Not fixed at the time of writing.
+Four independent bugs produced the symptoms that the tarantool tree did not
+show. All of them failed silently or crashed only under load.
+
+**a. Incomplete machine code snapshot.** `lj_sysprof_add_trace()` returned
+before updating the snapshot while `prologue_c_pending` (the timer thread
+was still dumping C symbols). Every trace compiled in that window — in
+practice the first traces of a profile — was then unknown to the sampler:
+`RtlPcToFileHeader()` failed, `sysprof_trace_at()` failed, and the walk
+stopped at the JIT frame, so all callers below a trace were missing and the
+chain degraded into the leaf/VM fallback (the "repeated frames" symptoms).
+The snapshot is now updated before the early return; it is plain data, so
+appending it does not touch the stream that the timer thread may own.
+
+**b. Generic unwinding through the VM assembly.** The `.xdata` that
+`host/buildvm_peobj.c` emits describes the interpreter frame for the SEH
+dispatch path; `RtlVirtualUnwind` is not guaranteed to agree with it. Under
+load it faulted inside `ntdll!RtlVirtualUnwind` (read at a near-NULL
+address) — the sampler crashed the process. VM frames are now recognised by
+their function entry (`lj_symtab_vm_functions()`, shared with the symtab
+dump) and skipped with the entry-frame contract instead of being unwound.
+
+**c. The skipped frames consumed the wrong entry frame.** The end of a
+chain that re-enters the VM (`lua_pcall` → interpreter → ...) made the walk
+reuse the same `L->cframe` and loop (`lua_pcall; main; lua_pcall; ...`
+until the frame limit). The walk now keeps a cursor into the cframe chain
+(`cframe_prev()`) and consumes one entry frame per skipped frame.
+
+**d. A stale Lua frame slot was dereferenced.** A sample taken while the
+stack is mid-update (Windows does not restore the VM state around C calls)
+can leave a slot that is no longer a function cell; `frame_func()` then read
+freed memory and the sampler crashed. Only cells that pass
+`tvisfunc(frame - LJ_FR2)` are dereferenced now.
+
+Tool side: a trace sample now keeps the trace at its real depth
+(`...;lua_pcall;TRACE [N];sqrt`), and `utils/symresolver.lua` no longer
+applies a map to addresses of a different module (it checks that the
+resolved link-time address lies inside the map range).

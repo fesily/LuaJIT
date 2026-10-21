@@ -789,27 +789,53 @@ static void symtab_cfunc_stream(void *ctx, uintptr_t addr, const char *name)
 }
 
 /*
-** The VM assembly blob is covered by one or two PE functions (see
-** buildvm_peobj.c), so their start addresses identify "this frame belongs to
-** the VM" without any symbol. Emitted before any sample, they let the parser
-** find the boundary between the Lua stack and the host stack.
+** Collect the function entries of the VM assembly: buildvm splits the
+** .text section at vm_ffi_call (see host/buildvm_peobj.c), so a frame in
+** the second half has an entry of its own. The end of one entry is the
+** start of the next one; the reverse lookup makes sure that the address
+** really is a function entry and not the end of the blob.
 */
-static void dump_vm_functions(struct lj_wbuf *out)
+int lj_symtab_vm_functions(uintptr_t *begin, int max)
 {
   const void *const pcs[2] = {
     (const void *)lj_vm_asm_begin, (const void *)lj_vm_profhook
   };
-  uintptr_t begin[2];
   int n = 0, i;
 
-  for (i = 0; i < 2; i++) {
+  for (i = 0; i < 2 && n < max; i++) {
     DWORD64 base = 0;
     PRUNTIME_FUNCTION rf =
       RtlLookupFunctionEntry((DWORD64)(uintptr_t)pcs[i], &base, NULL);
-    uintptr_t b = rf != NULL ? (uintptr_t)(base + rf->BeginAddress) : 0;
-    if (b != 0 && (n == 0 || begin[0] != b))
-      begin[n++] = b;
+    int k;
+
+    if (rf == NULL)
+      continue;
+    for (k = 0; k < 2 && n < max; k++) {
+      uintptr_t b = (uintptr_t)(base + (k == 0 ? rf->BeginAddress
+					       : rf->EndAddress));
+      int j, dup = 0;
+
+      if (k == 1) {
+	DWORD64 base2 = 0;
+	PRUNTIME_FUNCTION rf2 = RtlLookupFunctionEntry((DWORD64)b, &base2, NULL);
+	if (rf2 == NULL || base2 + rf2->BeginAddress != b)
+	  continue;
+      }
+      for (j = 0; j < n; j++)
+	if (begin[j] == b)
+	  dup = 1;
+      if (!dup)
+	begin[n++] = b;
+    }
   }
+  return n;
+}
+
+static void dump_vm_functions(struct lj_wbuf *out)
+{
+  uintptr_t begin[4];
+  int n = lj_symtab_vm_functions(begin, 4), i;
+
   for (i = 0; i < n; i++) {
     lj_wbuf_addbyte(out, SYMTAB_VM);
     lj_wbuf_addu64(out, (uint64_t)begin[i]);
