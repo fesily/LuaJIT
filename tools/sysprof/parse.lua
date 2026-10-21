@@ -123,9 +123,12 @@ local function parse_host_callchain(reader, event, symbols, version, resolver)
     -- is accepted only when a symbol starts there (see symtab.cfunc_name).
     local name = resolver and resolver:resolve(addr, entry)
     if not name then
-      -- JIT compiled code: the machine code range names the trace.
-      local traceno = symtab.trace_at(symbols, addr)
-      if traceno then
+      -- JIT compiled code: the interval that covers the address names the
+      -- function and line it is at; without intervals fall back to the trace.
+      local traceno, iv = symtab.trace_iv_at(symbols, addr)
+      if iv then
+        name = symtab.lfunc_name(symbols, iv.addr, iv.line) or raw_name(addr)
+      elseif traceno then
         name = string_format("TRACE [%d]", traceno)
       else
         name = symtab.cfunc_name(symbols, addr, entry) or raw_name(addr)
@@ -148,10 +151,17 @@ local function parse_trace_callchain(reader, event, symbols, version, resolver)
   loc.addr = reader:read_uleb128()
   loc.line = reader:read_uleb128()
 
-  local name_lua = symtab.demangle(symbols, {
-    addr = loc.addr,
-    traceno = loc.traceno,
-  })
+  -- The stream carries the function and line of the sampled position (the
+  -- exit snapshot that covers it); fall back to the trace start.
+  local name_lua = symtab.lfunc_name(symbols, loc.addr, loc.line)
+  if name_lua then
+    name_lua = string_format("%s [TRACE %d]", name_lua, loc.traceno)
+  else
+    name_lua = symtab.demangle(symbols, {
+      addr = loc.addr,
+      traceno = loc.traceno,
+    })
+  end
   event.lua.trace = loc
   event.lua.trace.name = name_lua
   if version >= 4 then

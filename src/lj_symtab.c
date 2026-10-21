@@ -14,6 +14,11 @@
 
 #include "lj_symtab.h"
 
+#include "lj_jit.h"
+#include "lj_bc.h"
+
+#include <stdlib.h>
+
 #if LJ_HASRESOLVER
 
 #include <linux/limits.h>
@@ -39,10 +44,63 @@ static const unsigned char ljs_header[] = {'l', 'j', 's', LJS_CURRENT_VERSION,
 
 #if LJ_HASJIT
 
-void lj_symtab_dump_trace(struct lj_wbuf *out, const GCtrace *trace)
+/*
+** Map every snapshot of a trace to the bytecode it was taken at.
+**
+** The exit stubs of a trace are emitted per snapshot and carry the bytecode
+** PC of that point (see lj_asm.c), and the snapshot stores it right after
+** its entries: lib_jit's jit.util.traceinfo(tr, sn, true) uses the same trick
+** to report a position inside the function. Walking back from the PC to the
+** function header bytecode and up to the prototype gives the function, and
+** lj_debug_line() gives the line.
+**
+** The exit snapshot that covers an address is the last one whose mcode
+** offset is not greater than the address, exactly like lj_trace_unwind().
+*/
+int lj_symtab_trace_intervals(const GCtrace *trace, lj_symtab_trace_iv **ivp)
+{
+  const SnapShot *snap = trace->snap;
+  const SnapEntry *map = trace->snapmap;
+  lj_symtab_trace_iv *iv;
+  SnapNo i;
+  int n = 0;
+
+  *ivp = NULL;
+  if (trace->nsnap == 0 || snap == NULL || map == NULL)
+    return 0;
+  iv = (lj_symtab_trace_iv *)malloc(sizeof(*iv) * trace->nsnap);
+  if (iv == NULL)
+    return 0;
+  for (i = 0; i < trace->nsnap; i++) {
+    uint32_t off = (uint32_t)snap[i].mcofs * sizeof(MCode);
+    const BCIns *pc = snap_pc((SnapEntry *)&map[snap[i].mapofs + snap[i].nent]);
+    const BCIns *startpc = pc;
+    GCproto *pt;
+    /* Snapshots without code in between share the interval of the next one. */
+    if (n > 0 && off <= iv[n-1].off)
+      continue;
+    while (bc_op(*startpc) < BC_FUNCF)
+      startpc--;  /* Back to the function header bytecode. */
+    pt = (GCproto *)((char *)startpc - sizeof(GCproto));
+    iv[n].off = off;
+    iv[n].line = lj_debug_line(pt, (BCLine)(pc - startpc));
+    iv[n].pt = pt;
+    n++;
+  }
+  if (n == 0) {
+    free(iv);
+    return 0;
+  }
+  *ivp = iv;
+  return n;
+}
+
+void lj_symtab_dump_trace(struct lj_wbuf *out, const GCtrace *trace,
+			  const lj_symtab_trace_iv *iv, int niv)
 {
   GCproto *pt = &gcref(trace->startpt)->pt;
   BCLine lineno = 0;
+  int i;
 
   const BCIns *startpc = mref(trace->startpc, const BCIns);
   lj_assertX(startpc >= proto_bc(pt) && startpc < proto_bc(pt) + pt->sizebc,
@@ -63,6 +121,13 @@ void lj_symtab_dump_trace(struct lj_wbuf *out, const GCtrace *trace)
   /* The machine code range makes a host frame inside JIT code resolvable. */
   lj_wbuf_addu64(out, (uintptr_t)trace->mcode);
   lj_wbuf_addu64(out, (uint64_t)trace->szmcode);
+  /* The intervals refine the range to function + line (version 6+). */
+  lj_wbuf_addu64(out, (uint64_t)(niv > 0 ? niv : 0));
+  for (i = 0; i < niv; i++) {
+    lj_wbuf_addu64(out, (uint64_t)iv[i].off);
+    lj_wbuf_addu64(out, (uintptr_t)iv[i].pt);
+    lj_wbuf_addu64(out, (uint64_t)iv[i].line);
+  }
 }
 
 #endif /* LJ_HASJIT */
@@ -759,8 +824,12 @@ static void dump_lua_objects(struct lj_wbuf *out, const struct global_State *g)
     }
 #if LJ_HASJIT
     case (~LJ_TTRACE): {
+      const GCtrace *tr = gco2trace(o);
+      lj_symtab_trace_iv *iv = NULL;
+      int niv = lj_symtab_trace_intervals(tr, &iv);
       lj_wbuf_addbyte(out, SYMTAB_TRACE);
-      lj_symtab_dump_trace(out, gco2trace(o));
+      lj_symtab_dump_trace(out, tr, iv, niv);
+      free(iv);
       break;
     }
 #endif /* LJ_HASJIT */
