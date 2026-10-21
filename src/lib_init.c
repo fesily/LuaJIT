@@ -14,6 +14,7 @@
 #include "lualib.h"
 
 #include "lj_arch.h"
+#include "lj_mixprof.h"
 #include "lmisclib.h"
 
 static const luaL_Reg lj_lib_load[] = {
@@ -31,6 +32,9 @@ static const luaL_Reg lj_lib_load[] = {
 };
 
 static const luaL_Reg lj_lib_preload[] = {
+#if LJ_HASPROFILE
+  { LUA_JITLIBNAME ".mixprof",	luaopen_mixprof },
+#endif
 #if LJ_HASSYSPROF
   { LUAM_MISCLIBNAME,	luaopen_misc },
 #endif
