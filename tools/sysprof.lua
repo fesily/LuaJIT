@@ -28,6 +28,11 @@ Supported options are:
                                     matched to the image by its name
   --pdbutil=<tool>                   Reader for a symbol file without the
                                     image (default: llvm-pdbutil)
+  --format=<fmt>                    Output format: text (default) or json.
+                                    json prints one object per aggregated
+                                    chain: {"count":N,"frames":[{"kind":..,
+                                    "module":..,"symbol":..,"offset":..,
+                                    "addr":..,"chunk":..,"line":..}]}
 ]]
   os.exit(0)
 end
@@ -86,6 +91,16 @@ local function opterror(...)
   os.exit(1)
 end
 
+local out_format = "text"
+
+function opt_map.format(v, args)
+  local fmt = opt_value(v, args)
+  if fmt ~= "text" and fmt ~= "json" then
+    opterror("--format needs text or json")
+  end
+  out_format = fmt
+end
+
 -- Parse single option.
 local function parseopt(opt, args)
   local opt_current = #opt == 1 and "-"..opt or "--"..opt
@@ -93,7 +108,8 @@ local function parseopt(opt, args)
   if not f then
     opterror("unrecognized option `", opt_current, "'. Try `--help'.\n")
   end
-  f(args)
+  -- No value in this argument: the option takes the next one, if any.
+  f(nil, args)
 end
 
 -- Parse arguments.
@@ -189,8 +205,12 @@ local function dump(inputfile)
     resolver:close()
   end
 
-  for stack, count in pairs(events) do
-    print(stack, count)
+  for _, entry in pairs(events) do
+    if out_format == "json" then
+      print(sysprof.event_json(entry))
+    else
+      print(sysprof.event_text(entry), entry.count)
+    end
   end
   -- XXX: The second argument is required to properly close Lua
   -- universe (i.e. invoke <lua_close> before exiting).

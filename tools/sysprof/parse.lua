@@ -57,39 +57,72 @@ local function new_event()
   }
 end
 
--- A frame that the symbol table does not describe keeps its raw address: a
--- guessed name is worse than none for a profiler report. Addresses are
--- qualified with the module they belong to, so a bare number never appears
--- when the image is known: module!function, or module+offset.
-local function raw_name(symbols, addr)
-  local m = symtab.module_of(symbols, addr)
-  if m then
-    return string_format("%s+%#x", symtab.module_name(m.path), addr - m.addr)
+-- The text form of a frame record, used by the default report.
+local function frame_text(fr)
+  if fr.kind == "lua" or fr.kind == "jit" then
+    if not fr.chunk then
+      return string_format("%#x", fr.addr)
+    end
+    return string_format("%s:%d", fr.chunk, fr.line)
+  elseif fr.kind == "trace" then
+    if fr.chunk then
+      return string_format("%s:%d [TRACE %d]", fr.chunk, fr.line, fr.traceno)
+    end
+    return string_format("TRACE [%d]", fr.traceno)
+  elseif fr.kind == "vm" then
+    return fr.name
   end
-  return string_format("%#x", addr)
+  -- host and cfunc frames: module!function, module+offset, or a raw address.
+  if fr.sym then
+    return fr.module and string_format("%s!%s", fr.module, fr.sym) or fr.sym
+  end
+  if fr.module then
+    return string_format("%s+%#x", fr.module, fr.off)
+  end
+  return string_format("%#x", fr.addr)
 end
 
-local function qualified_name(symbols, addr, name)
-  if not name then
-    return raw_name(symbols, addr)
-  end
+-- A host or C function frame of `addr`.
+local function addr_frame(kind, symbols, addr, entry, name)
   local m = symtab.module_of(symbols, addr)
-  if m then
-    return string_format("%s!%s", symtab.module_name(m.path), name)
+  if not m then
+    return { kind = kind, addr = addr, entry = entry }
   end
-  return name
+  local fr = { kind = kind, addr = addr, entry = entry,
+               module = symtab.module_name(m.path) }
+  if name then
+    fr.sym = name
+  else
+    fr.off = addr - m.addr
+  end
+  return fr
+end
+
+-- A Lua position as a frame: the chunk of the prototype and the line.
+local function parse_lfunc_loc(symbols, addr, line)
+  local entry = symbols.lfunc[addr]
+  if not entry then
+    return nil
+  end
+  return {
+    kind = "lua",
+    addr = addr,
+    chunk = symbols.alias[entry.source] or entry.source,
+    line = line,
+  }
 end
 
 local function parse_lfunc(reader, symbols)
   local addr = reader:read_uleb128()
   local line = reader:read_uleb128()
-  local name = symtab.lfunc_name(symbols, addr, line) or raw_name(symbols, addr)
-  return { name = name, addr = addr }
+  return parse_lfunc_loc(symbols, addr, line) or
+         { kind = "lua", addr = addr, chunk = string_format("%#x", addr),
+           line = line }
 end
 
 local function parse_ffunc(reader, _)
   local ffid = reader:read_uleb128()
-  return { name = vmdef.ffnames[ffid] }
+  return { kind = "vm", name = vmdef.ffnames[ffid] }
 end
 
 local function parse_cfunc(reader, symbols, resolver)
@@ -104,8 +137,7 @@ local function parse_cfunc(reader, symbols, resolver)
   if not name then
     name = symtab.cfunc_name(symbols, addr, addr)
   end
-  name = qualified_name(symbols, addr, name)
-  return { name = name, addr = addr }
+  return addr_frame("cfunc", symbols, addr, addr, name)
 end
 
 local frame_parsers = {
@@ -148,32 +180,32 @@ local function parse_host_callchain(reader, event, symbols, version, resolver)
       local _, resolved = resolver:resolve(addr, entry)
       name = resolved
     end
-    local is_c_name = name ~= nil
+    local frame
     if not name then
       -- JIT compiled code: the interval that covers the address names the
       -- function and line it is at; without intervals fall back to the trace.
       local traceno, iv = symtab.trace_iv_at(symbols, addr)
       if iv then
-        name = symtab.lfunc_name(symbols, iv.addr, iv.line) or
-               raw_name(symbols, addr)
+        local proto = symbols.lfunc[iv.addr]
+        frame = {
+          kind = "jit",
+          addr = addr,
+          entry = entry,
+          chunk = proto and (symbols.alias[proto.source] or proto.source),
+          line = iv.line,
+        }
       elseif traceno then
-        name = string_format("TRACE [%d]", traceno)
+        frame = { kind = "trace", traceno = traceno, addr = addr }
       else
         name = symtab.cfunc_name(symbols, addr, entry)
-        is_c_name = name ~= nil
       end
     end
-    if is_c_name then
-      name = qualified_name(symbols, addr, name)
-    elseif not name then
-      -- No symbol and no interval: module + offset, never a bare number.
-      name = raw_name(symbols, addr)
+    if not frame then
+      -- A named frame, or the module with the offset inside it: a bare
+      -- number never appears when the image is known.
+      frame = addr_frame("host", symbols, addr, entry, name)
     end
-    event.host.callchain[#event.host.callchain + 1] = {
-      name = name,
-      addr = addr,
-      entry = entry,
-    }
+    event.host.callchain[#event.host.callchain + 1] = frame
     addr = reader:read_uleb128()
   end
 end
@@ -187,18 +219,12 @@ local function parse_trace_callchain(reader, event, symbols, version, resolver)
   loc.line = reader:read_uleb128()
 
   -- The stream carries the function and line of the sampled position (the
-  -- exit snapshot that covers it); fall back to the trace start.
-  local name_lua = symtab.lfunc_name(symbols, loc.addr, loc.line)
-  if name_lua then
-    name_lua = string_format("%s [TRACE %d]", name_lua, loc.traceno)
-  else
-    name_lua = symtab.demangle(symbols, {
-      addr = loc.addr,
-      traceno = loc.traceno,
-    })
-  end
+  -- exit snapshot that covers it); without it only the trace number is known.
   event.lua.trace = loc
-  event.lua.trace.name = name_lua
+  local pos = parse_lfunc_loc(symbols, loc.addr, loc.line)
+  if pos then
+    loc.chunk = pos.chunk
+  end
   if version >= 4 then
     -- Native callers of the trace, innermost first.
     parse_host_callchain(reader, event, symbols, version, resolver)
@@ -274,7 +300,7 @@ local function merge(event, symbols)
       end
       if j <= #host then
         -- The host frames above this C function are its callees.
-        for k = hi, j do chain[#chain + 1] = host[k].name end
+        for k = hi, j do chain[#chain + 1] = host[k] end
         hi = j + 1
         while hi <= #host and is_vm_frame(symbols, host[hi].entry) do
           hi = hi + 1
@@ -285,18 +311,18 @@ local function merge(event, symbols)
       -- A fast function has no C entry point: its implementation frames are
       -- the host frames above the VM handler that invoked it.
       while hi <= #host and not is_vm_frame(symbols, host[hi].entry) do
-        chain[#chain + 1] = host[hi].name
+        chain[#chain + 1] = host[hi]
         hi = hi + 1
       end
       while hi <= #host and is_vm_frame(symbols, host[hi].entry) do
         hi = hi + 1
       end
-      chain[#chain + 1] = fr.name
+      chain[#chain + 1] = fr
       spliced = true
     end
 
     if not spliced then
-      chain[#chain + 1] = fr.name
+      chain[#chain + 1] = fr
     end
   end
   -- A trace sample carries no Lua chain: the innermost Lua-side frame is the
@@ -305,39 +331,104 @@ local function merge(event, symbols)
   -- code range with the trace name; if the sampler already abandoned it,
   -- insert the name in front of the host frames.
   local trace = event.lua.trace
-  if trace and trace.name and trace.traceno and trace.traceno ~= 0 then
+  if trace and trace.traceno and trace.traceno ~= 0 then
     local t = symbols.trace[trace.traceno]
     local mcode = t and t.mcode or 0
     local msize = t and t.size or 0
+    local trace_frame = {
+      kind = "trace",
+      traceno = trace.traceno,
+      chunk = trace.chunk,
+      line = trace.chunk and trace.line or nil,
+    }
     local inserted = false
 
     while hi <= #host do
       local fr = host[hi]
       if not inserted and mcode ~= 0 and fr.addr >= mcode and
          fr.addr < mcode + msize then
-        chain[#chain + 1] = trace.name
+        chain[#chain + 1] = trace_frame
         inserted = true
       elseif not is_vm_frame(symbols, fr.entry) then
-        chain[#chain + 1] = fr.name
+        chain[#chain + 1] = fr
       end
       hi = hi + 1
     end
     if not inserted then
-      table.insert(chain, 1, trace.name)
+      table.insert(chain, 1, trace_frame)
     end
   end
 
   while hi <= #host do
     if not is_vm_frame(symbols, host[hi].entry) then
-      chain[#chain + 1] = host[hi].name
+      chain[#chain + 1] = host[hi]
     end
     hi = hi + 1
   end
 
-  -- Frames were read innermost first, the tools print outermost first.
+  -- Frames were read innermost first, the report shows them outermost first.
   local rev = {}
   for k = #chain, 1, -1 do rev[#rev + 1] = chain[k] end
-  return table.concat(rev, ';') .. ';'
+  return rev
+end
+
+-- The chain as one string: also the key the samples are aggregated by.
+local function frames_text(frames)
+  local text = {}
+  for k = 1, #frames do text[k] = frame_text(frames[k]) end
+  return table.concat(text, ';') .. ';'
+end
+
+local JSON_ESCAPES = {
+  ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r',
+  ['\t'] = '\\t',
+}
+
+local function json_string(value)
+  return '"' .. tostring(value):gsub('[%z\1-\31"\\]', function(c)
+    return JSON_ESCAPES[c] or string_format("\\u%04x", string.byte(c))
+  end) .. '"'
+end
+
+-- Machine readable form of one frame.
+local function json_frame(fr)
+  local out = { '{"kind":"' .. fr.kind .. '"' }
+  local function str(key, value)
+    out[#out + 1] = string_format(',"%s":%s', key, json_string(value))
+  end
+  local function num(key, value)
+    out[#out + 1] = string_format(',"%s":%d', key, value)
+  end
+  if fr.module then str("module", fr.module) end
+  if fr.sym then str("symbol", fr.sym) end
+  if fr.name then str("name", fr.name) end
+  if fr.chunk then str("chunk", fr.chunk) end
+  if fr.line and fr.kind == "lua" then num("line", fr.line) end
+  if fr.traceno and fr.traceno ~= 0 then num("traceno", fr.traceno) end
+  if fr.kind == "trace" and fr.line then num("line", fr.line) end
+  if fr.off then num("offset", fr.off) end
+  if fr.addr and fr.addr ~= 0 then str("addr", string_format("%#x", fr.addr)) end
+  if fr.entry and fr.entry ~= 0 then str("entry", string_format("%#x", fr.entry)) end
+  out[#out + 1] = '}'
+  return table.concat(out)
+end
+
+-- One aggregated chain as a JSON object: the frames keep their fields, so a
+-- consumer does not have to split the text form.
+function M.event_json(entry)
+  local frames = {}
+  for k = 1, #entry.frames do frames[k] = json_frame(entry.frames[k]) end
+  return string_format('{"count":%d,"frames":[%s]}', entry.count,
+                       table.concat(frames, ","))
+end
+
+-- The text form of an aggregated chain, as printed by the default report.
+function M.event_text(entry)
+  return entry.chain
+end
+
+function M.frames_text(frames)
+  return frames_text(frames)
 end
 
 local function parse_event(reader, events, symbols, version, resolver)
@@ -356,8 +447,14 @@ local function parse_event(reader, events, symbols, version, resolver)
   event.lua.vmstate = vmstate
 
   event_parsers[vmstate](reader, event, symbols, version, resolver)
-  local callchain = merge(event, symbols)
-  events[callchain] = (events[callchain] or 0) + 1
+  local frames = merge(event, symbols)
+  local chain = frames_text(frames)
+  local entry = events[chain]
+  if not entry then
+    entry = { chain = chain, frames = frames, count = 0 }
+    events[chain] = entry
+  end
+  entry.count = entry.count + 1
   return true
 end
 
