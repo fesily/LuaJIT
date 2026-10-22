@@ -18,7 +18,7 @@
 #include "lj_jit.h"
 #endif
 #include "lj_strfmt.h"
-#include "lj_profile.h"
+#include "lj_int3.h"
 #include "lj_bcdump.h"
 #include "lj_vm.h"
 

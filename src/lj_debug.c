@@ -14,7 +14,7 @@
 #include "lj_state.h"
 #include "lj_frame.h"
 #include "lj_bc.h"
-#include "lj_profile.h"
+#include "lj_int3.h"
 #include "lj_strfmt.h"
 #if LJ_HASJIT
 #include "lj_jit.h"

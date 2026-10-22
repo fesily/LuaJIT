@@ -42,6 +42,7 @@
 #include "lj_serialize.c"
 #include "lj_api.c"
 #include "lj_profile.c"
+#include "lj_int3.c"
 #include "lj_lex.c"
 #include "lj_parse.c"
 #include "lj_bcread.c"

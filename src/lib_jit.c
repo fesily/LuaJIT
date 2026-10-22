@@ -30,7 +30,7 @@
 #endif
 #include "lj_trace.h"
 #include "lj_dispatch.h"
-#include "lj_profile.h"
+#include "lj_int3.h"
 #include "lj_vm.h"
 #include "lj_vmevent.h"
 #include "lj_lib.h"
