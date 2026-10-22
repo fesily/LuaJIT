@@ -50,6 +50,14 @@ LJ_FUNC int lj_mixprof_active(void);
 LJ_FUNC int lj_mixprof_report(lua_State *L);
 
 /*
+** Push the clock of the last run { start_us, interval_us, ticks }:
+** a record collected at tick k was taken at start_us + k * interval_us,
+** both in microseconds since 1970, so a report can be lined up with other
+** logs.
+*/
+LJ_FUNC int lj_mixprof_info(lua_State *L);
+
+/*
 ** Called by the profile hook at every safepoint sample while host capture is
 ** enabled: reads both stacks and merges them into the "last sample" state
 ** that the public luaJIT_profile_hoststack/mixedstack API reads.

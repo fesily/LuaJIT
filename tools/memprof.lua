@@ -110,7 +110,7 @@ local function dump(inputfile)
   -- XXX: This function exits with a non-zero exit code and
   -- prints an error message if it encounters any failure during
   -- the process of parsing.
-  local events, symbols = evread(memprof.parse, inputfile)
+  local events, _, symbols = evread(memprof.parse, inputfile)
 
   if not config.leak_only then
     view.profile_info(events, config)

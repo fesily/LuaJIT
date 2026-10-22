@@ -21,7 +21,7 @@
 #include "lj_obj.h"
 #include "lmisclib.h"
 
-#define LJP_FORMAT_VERSION 0x4
+#define LJP_FORMAT_VERSION 0x5
 
 /*
 ** Event stream format:
@@ -29,14 +29,23 @@
 ** stream          := symtab sysprof
 ** symtab          := see symtab description
 ** sysprof         := prologue sample* epilogue
-** prologue        := 'l' 'j' 'p' version reserved
+** prologue        := 'l' 'j' 'p' version reserved time-base
 ** version         := <BYTE>
 ** reserved        := <BYTE> <BYTE> <BYTE>
+** time-base       := <U64>  wall clock at the start of the profile in 100ns
+**                         units since 1601-01-01 UTC, little endian
+**                         (version 5+; see time-delta for the epoch of the
+**                         first sample)
 ** sample          := sample-guest | sample-host | sample-trace
 ** sample-guest    := sample-header stack-lua stack-host
 ** sample-host     := sample-header stack-host
 ** sample-trace    := sample-header traceno sym-addr line-no stack-host
-** sample-header   := <BYTE>
+** sample-header   := <BYTE> [time-delta]
+** time-delta      := <ULEB128>  time since the previous sample (for the
+**                              first one: since the start of the profile) in
+**                              100ns units, version 5+. Taken when the
+**                              sample is taken, so it dates the sample, not
+**                              the moment the stream was written.
 ** stack-lua       := frame-lua* frame-lua-last
 ** stack-host      := frame-host* frame-host-last
 ** frame-lua       := frame-lfunc | frame-cfunc | frame-ffunc
@@ -56,7 +65,7 @@
 **                              that contains it, plus one; zero if the
 **                              function is unknown. It makes the Lua and
 **                              host callchains mergeable without symbols.)
-** epilogue        := sample-header
+** epilogue        := <BYTE>  (LJP_EPILOGUE_BYTE, no time-delta)
 **
 ** <BYTE>   :  A single byte (no surprises here)
 ** <ULEB128>:  Unsigned integer represented in ULEB128 encoding

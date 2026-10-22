@@ -55,6 +55,7 @@ typedef struct {
   uint32_t off;		/* Offset of the chain in the arena. */
   uint32_t len;		/* Length of the chain, without the terminator. */
   uint32_t count;	/* Number of ticks this chain was observed. */
+  uint32_t tick;	/* Tick index of the first one, since the start. */
 } MixRecord;
 
 typedef struct MixProfState {
@@ -75,6 +76,8 @@ typedef struct MixProfState {
   char *arena;
   size_t used, cap;
   uint32_t ticks;	/* Total number of ticks. */
+  uint64_t start_100ns;	/* Wall clock of the start (100ns since 1601). */
+  int interval_ms;	/* Sampling interval of the run. */
   SBuf sb;		/* Formatting buffer. */
 } MixProfState;
 
@@ -297,6 +300,7 @@ static void mixprof_store(MixProfState *mp, const char *s, size_t len,
   mp->recs[mp->nrecs].off = (uint32_t)mp->used;
   mp->recs[mp->nrecs].len = (uint32_t)len;
   mp->recs[mp->nrecs].count = ticks;
+  mp->recs[mp->nrecs].tick = mp->ticks;
   mp->nrecs++;
   mp->used = need;
   mp->ticks += ticks;
@@ -385,7 +389,17 @@ void lj_mixprof_start(lua_State *L, int interval, int depth)
     interval = 10;
   mp->L = L;
   mp->depth = depth;
+  mp->interval_ms = interval;
   mp->active = 1;
+#if LJ_TARGET_WINDOWS
+  {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    mp->start_100ns = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  }
+#else
+  mp->start_100ns = 0;
+#endif
   mixprof_vm_functions(mp);
   lj_buf_init(L, &mp->sb);
 
@@ -416,6 +430,13 @@ int lj_mixprof_active(void)
 /* Order two collected samples by their callchain. */
 static MixProfState *mixprof_sort_state;
 
+static int mixprof_cmp_tick(const void *a, const void *b)
+{
+  const MixRecord *x = (const MixRecord *)a;
+  const MixRecord *y = (const MixRecord *)b;
+  return x->tick < y->tick ? -1 : (x->tick > y->tick);
+}
+
 static int mixprof_cmp(const void *a, const void *b)
 {
   const MixRecord *x = (const MixRecord *)a;
@@ -432,6 +453,25 @@ int lj_mixprof_report(lua_State *L)
 {
   MixProfState *mp = &mixprof;
   uint32_t i, n = 0;
+
+  /*
+  ** The spans come first, in the order the samples were collected: the
+  ** aggregation below reorders the records by chain.
+  */
+  if (mp->nrecs > 1)
+    qsort(mp->recs, mp->nrecs, sizeof(MixRecord), mixprof_cmp_tick);
+  lua_createtable(L, (int)mp->nrecs, 0);
+  for (i = 0; i < mp->nrecs; i++) {
+    const MixRecord *r = &mp->recs[i];
+    lua_createtable(L, 0, 3);
+    lua_pushlstring(L, mp->arena + r->off, r->len);
+    lua_setfield(L, -2, "chain");
+    lua_pushinteger(L, (lua_Integer)r->tick);
+    lua_setfield(L, -2, "tick");
+    lua_pushinteger(L, (lua_Integer)r->count);
+    lua_setfield(L, -2, "count");
+    lua_rawseti(L, -2, (int)i + 1);
+  }
 
   if (mp->nrecs > 1) {
     mixprof_sort_state = mp;
@@ -453,7 +493,27 @@ int lj_mixprof_report(lua_State *L)
     lua_pushinteger(L, (lua_Integer)count);
     lua_rawset(L, -3);
   }
+  /* The caller gets the chains first, then the spans. */
+  lua_insert(L, -2);
   return (int)mp->ticks;
+}
+
+/* Push the clock of the last run: { start_us, interval_us, ticks }. */
+int lj_mixprof_info(lua_State *L)
+{
+  MixProfState *mp = &mixprof;
+  lua_createtable(L, 0, 3);
+  if (mp->start_100ns != 0) {
+    /* 100ns since 1601 -> microseconds since 1970 (fits a lua_Number). */
+    uint64_t us = (mp->start_100ns - UINT64_C(116444736000000000)) / 10;
+    lua_pushnumber(L, (lua_Number)us);
+    lua_setfield(L, -2, "start_us");
+  }
+  lua_pushnumber(L, (lua_Number)mp->interval_ms * 1000);
+  lua_setfield(L, -2, "interval_us");
+  lua_pushinteger(L, (lua_Integer)mp->ticks);
+  lua_setfield(L, -2, "ticks");
+  return 1;
 }
 
 /* -- Accessors behind luaJIT_profile_hoststack/mixedstack ---------------- */
@@ -514,6 +574,12 @@ int lj_mixprof_report(lua_State *L)
 {
   lua_createtable(L, 0, 0);
   return 0;
+}
+
+int lj_mixprof_info(lua_State *L)
+{
+  lua_createtable(L, 0, 3);
+  return 1;
 }
 
 void lj_mixprof_capture(lua_State *L)
