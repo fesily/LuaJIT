@@ -30,6 +30,7 @@
 #endif
 #include "lj_trace.h"
 #include "lj_dispatch.h"
+#include "lj_profile.h"
 #include "lj_vm.h"
 #include "lj_vmevent.h"
 #include "lj_lib.h"
@@ -214,7 +215,7 @@ LJLIB_CF(jit_util_funcbc)
   GCproto *pt = lj_lib_checkLproto(L, 1, 0);
   BCPos pc = (BCPos)lj_lib_checkint(L, 2);
   if (pc < pt->sizebc) {
-    BCIns ins = proto_bc(pt)[pc];
+    BCIns ins = lj_int3_bcins(G(L), &proto_bc(pt)[pc]);
     BCOp op = bc_op(ins);
     lj_assertL(op < BC__MAX, "bad bytecode op %d", op);
     setintV(L->top, ins);
@@ -320,7 +321,7 @@ LJLIB_CF(jit_util_tracek)
 {
   GCtrace *T = jit_checktrace(L);
   IRRef ref = (IRRef)lj_lib_checkint(L, 2) + REF_BIAS;
-  if (T && ref >= T->nk && ref < REF_BIAS) {
+  if (T && trace_isconstref(T->nk, ref)) {
     IRIns *ir = &T->ir[ref];
     int32_t slot = -1;
     if (ir->o == IR_KSLOT) {
@@ -571,11 +572,20 @@ static void jit_profile_callback(lua_State *L2, lua_State *L, int samples,
 /* profile.start(mode, cb) */
 LJLIB_CF(jit_profile_start)
 {
-  GCtab *registry = tabV(registry(L));
-  GCstr *mode = lj_lib_optstr(L, 1);
-  GCfunc *func = lj_lib_checkfunc(L, 2);
-  lua_State *L2 = lua_newthread(L);  /* Thread that runs profiler callback. */
+  GCtab *registry;
+  GCstr *mode;
+  GCfunc *func;
+  lua_State *L2;
   TValue key;
+  /* Check for a conflicting INT3 session before creating the callback
+  ** thread or touching the registry, so a failed start leaves no state.
+  */
+  if (lj_int3_active())
+    lj_err_callermsg(L, "cannot start profiling: interrupt session active");
+  registry = tabV(registry(L));
+  mode = lj_lib_optstr(L, 1);
+  func = lj_lib_checkfunc(L, 2);
+  L2 = lua_newthread(L);  /* Thread that runs profiler callback. */
   /* Anchor thread and function in registry. */
   key.u64 = KEY_PROFILE_THREAD;
   setthreadV(L, lj_tab_set(L, registry, &key), L2);

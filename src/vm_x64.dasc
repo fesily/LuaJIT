@@ -3599,6 +3599,35 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop sar, 1
     break;
 
+  /* -- One-shot interpreter interrupt ------------------------------------ */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. Restore the original instruction,
+    |  // run the read-only callback, then re-dispatch the original opcode
+    |  // through the dynamic table (hooks observe it exactly once).
+    |  mov r12, RD			// nargs+1, live for FUNC* headers.
+    |  mov L:RB, SAVE_L
+    |  mov L:RB->base, BASE
+    |  mov CARG2, PC
+    |  mov CARG1, L:RB
+    |  mov SAVE_PC, PC
+    |  call extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  mov BASE, L:RB->base
+    |  // Re-decode the restored instruction like ins_NEXT does.
+    |  mov RCd, [PC-4]
+    |  movzx RAd, RCH
+    |  movzx OP, RCL
+    |  shr RCd, 16
+    |  cmp OP, BC_FUNCF			// Headers need nargs+1, not operands.
+    |  je >8
+    |  cmp OP, BC_FUNCV
+    |  jne >9
+    |8:
+    |  mov RD, r12
+    |9:
+    |  jmp aword [DISPATCH+OP*8]
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -4382,11 +4411,22 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |5:  // Despecialize bytecode if any of the checks fail.
     |  mov PC_OP, BC_JMP
     |  branchPC RD
+    |  cmp byte [PC], BC_INT3
+    |  je >7
     |.if JIT
     |  cmp byte [PC], BC_ITERN
     |  jne >6
     |.endif
     |  mov byte [PC], BC_ITERC
+    |  jmp <1
+    |7:  // Pending INT3 at the target slot: update the shadowed opcode only.
+    |  mov L:RB, SAVE_L
+    |  mov L:RB->base, BASE		// C arg registers may alias BASE.
+    |  lea CARG1, [DISPATCH+GG_DISP2G]
+    |  mov CARG2, PC
+    |  mov CARG3d, BC_ITERC
+    |  call extern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
+    |  mov BASE, L:RB->base
     |  jmp <1
     |.if JIT
     |6:  // Unpatch JLOOP.

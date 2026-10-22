@@ -4457,6 +4457,44 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop sraw, 1
     break;
 
+  /* -- One-shot interpreter interrupt ------------------------------------ */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. Restore the original instruction,
+    |  // run the read-only callback, then re-dispatch the original opcode
+    |  // through the dynamic table (hooks observe it exactly once).
+    |  mr SAVE0, NARGS8:RC			// nargs*8, live for FUNC* headers.
+    |   mr SAVE1, RB			// LFUNC, live for FUNCV headers.
+    |  mr CARG1, L
+    |   stp BASE, L->base
+    |  mr CARG2, PC
+    |   stw PC, SAVE_PC
+    |  stw MULTRES, SAVE_MULTRES		// cframe_multres_n() reads this.
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  lp BASE, L->base
+    |  // Re-decode the restored instruction like ins_NEXT does.
+    |  lwz INS, -4(PC)
+    |  decode_OPP TMP1, INS
+    |   decode_RB8 RB, INS
+    |  lpx TMP0, DISPATCH, TMP1
+    |   decode_RD8 RD, INS
+    |   decode_RA8 RA, INS
+    |   decode_RC8 RC, INS
+    |  decode_OP1 TMP2, INS
+    |  cmpwi TMP2, BC_FUNCF			// Headers need nargs+1, not operands.
+    |   beq >8
+    |   cmpwi TMP2, BC_FUNCV
+    |  beq >8
+    |  mtctr TMP0
+    |  bctr
+    |8:  // Function headers: restore the call state the header entry reads.
+    |  mr NARGS8:RC, SAVE0
+    |   mr RB, SAVE1
+    |  add RA, RA, BASE			// Header entry wants BASE+framesize*8.
+    |  mtctr TMP0
+    |  bctr
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -5529,8 +5567,19 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   li TMP1, BC_ITERC
     |  stb TMP0, -1(PC)
     |    addis PC, TMP3, -(BCBIAS_J*4 >> 16)
+    |  // A pending INT3 at the target slot needs a coordinated write.
+    |  lwz TMP2, 0(PC)
+    |   decode_OP1 TMP2, TMP2
+    |  cmpwi TMP2, BC_INT3
+    |   beq >7
     |  // NYI on big-endian: unpatch JLOOP.
     |   stb TMP1, 3(PC)
+    |  b <1
+    |7:  // Update the shadowed opcode only, keep the trap in place.
+    |  addi CARG1, DISPATCH, GG_DISP2G
+    |   li CARG3, BC_ITERC
+    |  mr CARG2, PC
+    |  bl extern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
     |  b <1
     break;
 

@@ -24,6 +24,7 @@
 #endif
 #include "lj_trace.h"
 #include "lj_dispatch.h"
+#include "lj_profile.h"
 #include "lj_vm.h"
 #include "lj_prng.h"
 #include "lj_lex.h"
@@ -214,6 +215,7 @@ static TValue *cpluaopen(lua_State *L, lua_CFunction dummy, void *ud)
 static void close_state(lua_State *L)
 {
   global_State *g = G(L);
+  lj_int3_close(g);  /* Drop any pending interrupt before finalizers run. */
   lj_func_closeuv(L, tvref(L->stack));
   lj_gc_freeall(g);
   lj_assertG(gcref(g->gc.root) == obj2gco(L),

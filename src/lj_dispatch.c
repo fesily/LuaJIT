@@ -27,9 +27,7 @@
 #endif
 #include "lj_trace.h"
 #include "lj_dispatch.h"
-#if LJ_HASPROFILE
 #include "lj_profile.h"
-#endif
 #include "lj_vm.h"
 #include "luajit.h"
 
@@ -73,6 +71,8 @@ void lj_dispatch_init(GG_State *GG)
   disp[BC_LOOP] = disp[BC_ILOOP];
   disp[BC_FUNCF] = disp[BC_IFUNCF];
   disp[BC_FUNCV] = disp[BC_IFUNCV];
+  /* Physical BC_INT3 always dispatches to the dedicated handler. */
+  disp[BC_INT3] = disp[GG_LEN_DDISP+BC_INT3];
   GG->g.bc_cfunc_ext = GG->g.bc_cfunc_int = BCINS_AD(BC_FUNCC, LUA_MINSTACK, 0);
   for (i = 0; i < GG_NUM_ASMFF; i++)
     GG->bcff[i] = BCINS_AD(BC__MAX+i, 0, 0);
@@ -211,6 +211,10 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
       lj_dispatch_init_hotcount(g);
 #endif
   }
+  /* A physical BC_INT3 must never be dispatched through a hook or recorder
+  ** entry. This also covers the mode-unchanged fast path above.
+  */
+  G2GG(g)->dispatch[BC_INT3] = makeasmfunc(lj_bc_ofs[BC_INT3]);
 #if LJ_HASPROFILE && !LJ_PROFILE_SIGPROF
   if (profile_locked) lj_profile_unlock();
 #else
@@ -249,11 +253,34 @@ static void setptmode_all(global_State *g, GCproto *pt, int mode)
 }
 #endif
 
+/* Resolve the prototype argument of luaJIT_setmode. */
+static GCproto *setmode_proto(lua_State *L, int idx)
+{
+  cTValue *tv = idx == 0 ? frame_prev(L->base-1)-LJ_FR2 :
+		idx > 0 ? L->base + (idx-1) : L->top + idx;
+  if ((idx == 0 || tvisfunc(tv)) && isluafunc(&gcval(tv)->fn))
+    return funcproto(&gcval(tv)->fn);  /* Cannot use funcV() for frame slot. */
+  else if (tvisproto(tv))
+    return protoV(tv);
+  return NULL;
+}
+
 /* Public API function: control the JIT engine. */
 int luaJIT_setmode(lua_State *L, int idx, int mode)
 {
   global_State *g = G(L);
   int mm = mode & LUAJIT_MODE_MASK;
+  /* A pending interrupt request owns its prototype: enabling JIT compilation
+  ** for it would clear PROTO_NOJIT and let a new trace inline the trapped
+  ** bytecode. Refuse before aborting any recording.
+  */
+  if ((mode & LUAJIT_MODE_ON) &&
+      (mm == LUAJIT_MODE_FUNC || mm == LUAJIT_MODE_ALLFUNC ||
+       mm == LUAJIT_MODE_ALLSUBFUNC)) {
+    GCproto *bpt = setmode_proto(L, idx);
+    if (bpt != NULL && lj_int3_jit_on_blocked(g, bpt))
+      return 0;  /* Failed. */
+  }
   lj_trace_abort(g);  /* Abort recording on any state change. */
   /* Avoid pulling the rug from under our own feet. */
   if ((g->hookmask & HOOK_GC))
@@ -274,14 +301,8 @@ int luaJIT_setmode(lua_State *L, int idx, int mode)
   case LUAJIT_MODE_FUNC:
   case LUAJIT_MODE_ALLFUNC:
   case LUAJIT_MODE_ALLSUBFUNC: {
-    cTValue *tv = idx == 0 ? frame_prev(L->base-1)-LJ_FR2 :
-		  idx > 0 ? L->base + (idx-1) : L->top + idx;
-    GCproto *pt;
-    if ((idx == 0 || tvisfunc(tv)) && isluafunc(&gcval(tv)->fn))
-      pt = funcproto(&gcval(tv)->fn);  /* Cannot use funcV() for frame slot. */
-    else if (tvisproto(tv))
-      pt = protoV(tv);
-    else
+    GCproto *pt = setmode_proto(L, idx);
+    if (pt == NULL)
       return 0;  /* Failed. */
     if (mm != LUAJIT_MODE_ALLSUBFUNC)
       setptmode(g, pt, mode);
@@ -393,12 +414,15 @@ static void callhook(lua_State *L, int event, BCLine line)
 
 /* -- Dispatch callbacks -------------------------------------------------- */
 
-/* Calculate number of used stack slots in the current frame. */
-static BCReg cur_topslot(GCproto *pt, const BCIns *pc, uint32_t nres)
+/* Calculate number of used stack slots in the current frame.
+** Used by instruction hooks, recording and the INT3 callback.
+*/
+BCReg lj_dispatch_topslot(global_State *g, GCproto *pt, const BCIns *pc,
+			  uint32_t nres)
 {
-  BCIns ins = pc[-1];
+  BCIns ins = lj_int3_bcins(g, pc-1);
   if (bc_op(ins) == BC_UCLO)
-    ins = pc[bc_j(ins)];
+    ins = lj_int3_bcins(g, pc + bc_j(ins));
   switch (bc_op(ins)) {
   case BC_CALLM: case BC_CALLMT: return bc_a(ins) + bc_c(ins) + nres-1+1+LJ_FR2;
   case BC_RETM: return bc_a(ins) + bc_d(ins) + nres-1;
@@ -418,7 +442,7 @@ void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc)
   global_State *g = G(L);
   BCReg slots;
   setcframe_pc(cf, pc);
-  slots = cur_topslot(pt, pc, cframe_multres_n(cf));
+  slots = lj_dispatch_topslot(g, pt, pc, cframe_multres_n(cf));
   L->top = L->base + slots;  /* Fix top. */
 #if LJ_HASJIT
   {
@@ -448,7 +472,8 @@ void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc)
       L->top = L->base + slots;  /* Fix top again. */
     }
   }
-  if ((g->hookmask & LUA_MASKRET) && bc_isret(bc_op(pc[-1])))
+  if ((g->hookmask & LUA_MASKRET) &&
+      bc_isret(bc_op(lj_int3_bcins(g, pc-1))))
     callhook(L, LUA_HOOKRET, -1);
   ERRNO_RESTORE
 }
@@ -517,6 +542,17 @@ ASMFunction LJ_FASTCALL lj_dispatch_call(lua_State *L, const BCIns *pc)
 out:
 #endif
   op = bc_op(pc[-1]);  /* Get FUNC* op. */
+  if (op == BC_INT3) {
+    /* A trapped function header is only dispatched after the call hook ran.
+    ** Deliver the interrupt here and dispatch the restored header, so the
+    ** hook and call_init are not repeated. lj_int3_hit() fixes up L->top for
+    ** its read-only view, so restore the argument top afterwards.
+    */
+    TValue *top = L->top;
+    lj_int3_hit(L, pc);
+    L->top = top;
+    op = bc_op(pc[-1]);
+  }
 #if LJ_HASJIT
   /* Use the non-hotcounting variants if JIT is off or while recording. */
   if ((!(J->flags & JIT_F_ON) || J->state != LJ_TRACE_IDLE) &&
@@ -538,7 +574,9 @@ void LJ_FASTCALL lj_dispatch_stitch(jit_State *J, const BCIns *pc)
     const BCIns *oldpc = cframe_pc(cf);
     setcframe_pc(cf, pc);
     /* Before dispatch, have to bias PC by 1. */
-    L->top = L->base + cur_topslot(curr_proto(L), pc+1, cframe_multres_n(cf));
+    L->top = L->base +
+	    lj_dispatch_topslot(J2G(J), curr_proto(L), pc+1,
+				cframe_multres_n(cf));
     lj_trace_stitch(J, pc-1);  /* Point to the CALL instruction. */
     setcframe_pc(cf, oldpc);
     ERRNO_RESTORE
@@ -557,7 +595,7 @@ void LJ_FASTCALL lj_dispatch_profile(lua_State *L, const BCIns *pc)
   const BCIns *oldpc = cframe_pc(cf);
   global_State *g;
   setcframe_pc(cf, pc);
-  L->top = L->base + cur_topslot(pt, pc, cframe_multres_n(cf));
+  L->top = L->base + lj_dispatch_topslot(G(L), pt, pc, cframe_multres_n(cf));
   lj_profile_interpreter(L);
   setcframe_pc(cf, oldpc);
   g = G(L);

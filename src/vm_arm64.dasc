@@ -2942,6 +2942,39 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop asr
     break;
 
+  /* -- One-shot interpreter interrupt ------------------------------------ */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. Restore the original instruction,
+    |  // run the read-only callback, then re-dispatch the original opcode
+    |  // through the dynamic table (hooks observe it exactly once).
+    |  mov CARG1, L
+    |   str BASE, L->base
+    |  mov CARG2, PC
+    |   str PC, SAVE_PC
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  ldr BASE, L->base
+    |  // Re-decode the restored instruction like ins_NEXT does. RC is C
+    |  // callee-save and still holds nargs*8 for the FUNC* headers.
+    |  ldr INSw, [PC, #-4]
+    |  add TMP1, GL, INS, uxtb #3
+    |   decode_RA RA, INS
+    |  ldr TMP0, [TMP1, #GG_G2DISP]
+    |   and TMP2w, INSw, #0xff
+    |  cmp TMP2w, #BC_FUNCF
+    |  beq >8
+    |  cmp TMP2w, #BC_FUNCV
+    |  beq >8
+    |   decode_RD RC, INS
+    |  br_auth TMP0
+    |8:  // Function headers need nargs*8, the tagged function and an
+    |  // absolute RA, not the operands.
+    |   add RA, BASE, RA, lsl #3
+    |   ldr LFUNC:CARG3, [BASE, FRAME_FUNC]
+    |   and LFUNC:CARG3, CARG3, #LJ_GCVMASK
+    |  br_auth TMP0
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -3672,17 +3705,23 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_next
     |
     |5:  // Despecialize bytecode if any of the checks fail.
-    |.if JIT
     |  ldrb TMP2w, [RC, # OFS_OP]
-    |.endif
     |  mov TMP0, #BC_JMP
     |   mov TMP1, #BC_ITERC
     |  strb TMP0w, [PC, #-4+OFS_OP]
+    |  cmp TMP2w, #BC_INT3
+    |  beq >7
     |.if JIT
     |  cmp TMP2w, #BC_ITERN
     |  bne >6
     |.endif
     |   strb TMP1w, [RC, # OFS_OP]
+    |  b <1
+    |7:  // Pending INT3 at the target slot: update the shadowed opcode only.
+    |  mov CARG1, GL
+    |   mov CARG2, RC
+    |  mov CARG3, #BC_ITERC
+    |  bl extern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
     |  b <1
     |.if JIT
     |6:  // Unpatch JLOOP.

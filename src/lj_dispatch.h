@@ -48,7 +48,8 @@ extern double __divdf3(double a, double b);
   _(lj_dispatch_call) _(lj_dispatch_ins) _(lj_dispatch_stitch) \
   _(lj_dispatch_profile) _(lj_err_throw) \
   _(lj_ffh_coroutine_wrap_err) _(lj_func_closeuv) _(lj_func_newL_gc) \
-  _(lj_gc_barrieruv) _(lj_gc_step) _(lj_gc_step_fixtop) _(lj_meta_arith) \
+  _(lj_gc_barrieruv) _(lj_gc_step) _(lj_gc_step_fixtop) \
+  _(lj_int3_hit) _(lj_int3_setbc_op) _(lj_meta_arith) \
   _(lj_meta_bitop) \
   _(lj_meta_call) _(lj_meta_cat) _(lj_meta_comp) _(lj_meta_equal) \
   _(lj_meta_for) _(lj_meta_istype) _(lj_meta_len) _(lj_meta_tget) \
@@ -138,6 +139,8 @@ LJ_FUNC void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock);
 /* Instruction dispatch callback for hooks or when recording. */
 LJ_FUNCA void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc);
 LJ_FUNCA ASMFunction LJ_FASTCALL lj_dispatch_call(lua_State *L, const BCIns*pc);
+LJ_FUNC BCReg lj_dispatch_topslot(global_State *g, GCproto *pt,
+				  const BCIns *pc, uint32_t nres);
 #if LJ_HASJIT
 LJ_FUNCA void LJ_FASTCALL lj_dispatch_stitch(jit_State *J, const BCIns *pc);
 #endif

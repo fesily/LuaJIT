@@ -195,6 +195,9 @@
   _(BSHR,	dst,	var,	var,	___) \
   _(BSAR,	dst,	var,	var,	___) \
   \
+  /* One-shot interpreter interrupt (must stay after all plain opcodes). */ \
+  _(INT3,	rbase,	___,	___,	___) \
+  \
   /* Function headers. I/J = interp/JIT, F/V/C = fixarg/vararg/C func. */ \
   _(FUNCF,	rbase,	___,	___,	___) \
   _(IFUNCF,	rbase,	___,	___,	___) \

@@ -214,6 +214,15 @@ LJ_STATIC_ASSERT(SNAP_KEYINDEX == TREF_KEYINDEX);
 #define snap_isframe(sn)	((sn) & SNAP_FRAME)
 #define snap_setref(sn, ref)	(((sn) & (0xffff0000&~SNAP_NORESTORE)) | (ref))
 
+/* Test a reference against the constant area of a trace. This is exactly the
+** range jit.util.tracek() exposes, so read-only in-C users of trace constants
+** share one definition with it.
+*/
+static LJ_AINLINE int trace_isconstref(IRRef nk, IRRef ref)
+{
+  return ref >= nk && ref < REF_BIAS;
+}
+
 static LJ_AINLINE const BCIns *snap_pc(SnapEntry *sn)
 {
 #if LJ_FR2

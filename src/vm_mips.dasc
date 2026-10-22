@@ -3961,6 +3961,45 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop srav
     break;
 
+  /* -- One-shot interpreter interrupt ------------------------------------ */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. Restore the original instruction,
+    |  // run the read-only callback, then re-dispatch the original opcode
+    |  // through the dynamic table (hooks observe it exactly once).
+    |  move RA, RC			// NARGS8:RC, live for FUNC* headers.
+    |   sw MULTRES, SAVE_MULTRES	// Read back as cframe MULTRES by C.
+    |  load_got lj_int3_hit
+    |   sw BASE, L->base
+    |  move CARG2, PC
+    |   sw PC, SAVE_PC
+    |  call_intern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |.  move CARG1, L
+    |  lw BASE, L->base
+    |  lw INS, -4(PC)			// Re-decode the restored instruction.
+    |  decode_OP4a TMP1, INS
+    |   move RC, RA			// Restore nargs*8 after the C call.
+    |  decode_OP4b TMP1
+    |   decode_RD8a RD, INS
+    |  addu TMP0, DISPATCH, TMP1
+    |   decode_RA8a RA, INS
+    |  decode_RD8b RD
+    |   decode_RA8b RA
+    |  li AT, BC_FUNCF*4		// Headers take nargs, not the operands.
+    |  beq TMP1, AT, >8
+    |.  nop
+    |  li AT, BC_FUNCV*4
+    |  bne TMP1, AT, >9
+    |.  nop
+    |8:  // Function header: ins_callt passes an absolute RA and nargs in RC.
+    |  lw LFUNC:RB, FRAME_FUNC(BASE)	// RB is not C callee-save.
+    |  addu RA, RA, BASE
+    |9:
+    |  lw AT, 0(TMP0)
+    |  jr AT
+    |.  nop
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -4905,14 +4944,26 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   li TMP1, BC_ITERC
     |  sb TMP3, -4+OFS_OP(PC)
     |  addu PC, TMP0, TMP2
+    |  lb TMP0, OFS_OP(PC)		// Opcode at the target slot.
+    |  li AT, BC_INT3
+    |  beq TMP0, AT, >7
+    |.  nop
     |.if JIT
-    |  lb TMP0, OFS_OP(PC)
     |  li AT, BC_ITERN
     |  bne TMP0, AT, >6
     |.  lhu TMP2, OFS_RD(PC)
     |.endif
     |  b <1
     |.  sb TMP1, OFS_OP(PC)
+    |7:  // Pending INT3 at the target slot: update the shadowed opcode only.
+    |  load_got lj_int3_setbc_op
+    |   addiu CARG1, DISPATCH, GG_DISP2G
+    |  move CARG2, PC
+    |   li CARG3, BC_ITERC
+    |  call_intern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
+    |.  nop
+    |  b <1
+    |.  nop
     |.if JIT
     |6:  // Unpatch JLOOP.
     |  lw TMP0, DISPATCH_J(trace)(DISPATCH)

@@ -14,6 +14,7 @@
 #include "lj_state.h"
 #include "lj_frame.h"
 #include "lj_bc.h"
+#include "lj_profile.h"
 #include "lj_strfmt.h"
 #if LJ_HASJIT
 #include "lj_jit.h"
@@ -310,10 +311,11 @@ const char *lj_debug_funcname(lua_State *L, cTValue *frame, const char **name)
   if (pc != NO_BCPOS) {
     GCproto *pt = funcproto(fn);
     const BCIns *ip = &proto_bc(pt)[check_exp(pc < pt->sizebc, pc)];
-    MMS mm = bcmode_mm(bc_op(*ip));
+    BCIns ins = lj_int3_bcins(G(L), ip);
+    MMS mm = bcmode_mm(bc_op(ins));
     if (mm == MM_call) {
-      BCReg slot = bc_a(*ip);
-      if (bc_op(*ip) == BC_ITERC) slot -= 3;
+      BCReg slot = bc_a(ins);
+      if (bc_op(ins) == BC_ITERC) slot -= 3;
       return lj_debug_slotname(pt, ip, slot, name);
     } else if (mm != MM__MAX) {
       *name = strdata(mmname_str(G(L), mm));
