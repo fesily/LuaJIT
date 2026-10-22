@@ -3,6 +3,31 @@ local sysprof = require "sysprof.parse"
 local symresolver = require "utils.symresolver"
 
 local stdout, stderr = io.stdout, io.stderr
+
+-- Windows maps "\n" to "\r\n" on stdout. Every output of this tool is data
+-- for another program (a folded stack, a JSON line), so the bytes are kept
+-- as they are: a CR at the end of a folded stack makes flamegraph.pl reject
+-- the line. Best effort: without ffi the output stays text mode.
+local function stdout_binary()
+  if type(jit) ~= "table" or jit.os ~= "Windows" then return end
+  local ok, ffi = pcall(require, "ffi")
+  if not ok then return end
+  pcall(ffi.cdef, "int _setmode(int fd, int mode);")
+  -- 1 = stdout, 0x8000 = O_BINARY. The executable's own C runtime owns the
+  -- stdout FILE, so ffi.C finds the right _setmode; the named runtimes are
+  -- the fallbacks (a build links one of them).
+  for _, crt in ipairs{ffi.C, "ucrtbase", "msvcrt"} do
+    local lib = crt
+    if type(crt) == "string" then
+      local ok_lib, loaded = pcall(ffi.load, crt)
+      lib = ok_lib and loaded or nil
+    end
+    if lib and pcall(function() lib._setmode(1, 0x8000) end) then
+      return
+    end
+  end
+end
+stdout_binary()
 local match, gmatch = string.match, string.gmatch
 
 -- Program options.
@@ -28,14 +53,17 @@ Supported options are:
                                     matched to the image by its name
   --pdbutil=<tool>                   Reader for a symbol file without the
                                     image (default: llvm-pdbutil)
-  --format=<fmt>                    Output format: text (default), json or
-                                    samples. json prints one object per
-                                    aggregated chain
+  --format=<fmt>                    Output format: text (default), json,
+                                    samples or folded. json prints one object
+                                    per aggregated chain
                                     {"count":N,"first_us":..,"last_us":..,
                                     "frames":[{"kind":..,"module":..,
                                     "symbol":..,"addr":..}]}; samples
                                     prints every sample in order
-                                    {"time_us":..,"vmstate":..,"frames":[..]}
+                                    {"time_us":..,"vmstate":..,"frames":[..]};
+                                    folded prints the chains as folded stacks
+                                    ("a;b;c 123"), the input of flamegraph.pl
+                                    and inferno
 ]]
   os.exit(0)
 end
@@ -98,8 +126,9 @@ local out_format = "text"
 
 function opt_map.format(v, args)
   local fmt = opt_value(v, args)
-  if fmt ~= "text" and fmt ~= "json" and fmt ~= "samples" then
-    opterror("--format needs text, json or samples")
+  if fmt ~= "text" and fmt ~= "json" and fmt ~= "samples" and
+     fmt ~= "folded" then
+    opterror("--format needs text, json, samples or folded")
   end
   out_format = fmt
 end
@@ -207,7 +236,11 @@ local function dump(inputfile)
     resolver:close()
   end
 
-  if out_format == "samples" then
+  if out_format == "folded" then
+    for _, entry in pairs(events) do
+      print(sysprof.event_folded(entry))
+    end
+  elseif out_format == "samples" then
     -- Every sample with the time it was taken at: the aggregate below loses
     -- the timeline.
     if samples and samples[1] and not samples[1].time then
