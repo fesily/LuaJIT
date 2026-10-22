@@ -22,11 +22,14 @@ return function(parser, inputfile)
     reader
   )
 
-  local _, events = xpcall(
+  local _, events, extra = xpcall(
     parser,
     make_error_handler('Failed to parse profile data from %s.', inputfile),
     reader,
     symbols
   )
-  return events, symbols
+  -- `extra` is the parser's second result (the per-sample records of
+  -- sysprof); the symbol table stays the second result for the callers that
+  -- only want it.
+  return events, extra, symbols
 end

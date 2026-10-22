@@ -38,6 +38,7 @@
 #else
 #include <pthread.h>
 #include <execinfo.h>
+#include <time.h>
 #endif
 
 /*
@@ -128,6 +129,17 @@ struct sysprof {
   pthread_t thread; /* Profiled thread. */
 #endif
   volatile sig_atomic_t state; /* Internal state. */
+  /* Sample clock: the start in 100ns units since 1601, and the elapsed time
+  ** of the previous sample, so that every sample carries its own delay.
+  */
+  uint64_t time_base;
+  uint64_t time_last;
+#if LJ_TARGET_WINDOWS
+  LARGE_INTEGER qpc_base; /* Performance counter at the start. */
+  LARGE_INTEGER qpc_freq;
+#else
+  uint64_t mono_base; /* Monotonic clock at the start, in 100ns. */
+#endif
   struct lj_wbuf out; /* Output accumulator. */
   struct luam_Sysprof_Counters counters; /* Profiling counters. */
   struct luam_Sysprof_Options opt; /* Profiling options. */
@@ -176,6 +188,94 @@ static int sysprof_sample_ctx_valid;
 static const uint8_t ljp_header[] = {'l', 'j', 'p', LJP_FORMAT_VERSION,
                                       0x0, 0x0, 0x0};
 
+/*
+** Time of a sample in 100ns units since the start of the profile.
+**
+** The monotonic performance counter drives the deltas (the wall clock may be
+** stepped), the wall clock only dates the start: a profile is compared with
+** other logs by the time of its samples, not by the drift of the clock.
+*/
+/* Monotonic clock in 100ns units (the epoch is private to the process). */
+static uint64_t sysprof_mono(void)
+{
+#if LJ_TARGET_WINDOWS
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  return (uint64_t)now.QuadPart;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 10000000 + (uint64_t)ts.tv_nsec / 100;
+#endif
+}
+
+static uint64_t sysprof_now(struct sysprof *sp)
+{
+#if LJ_TARGET_WINDOWS
+  LARGE_INTEGER now;
+  LONGLONG delta, freq;
+  QueryPerformanceCounter(&now);
+  delta = now.QuadPart - sp->qpc_base.QuadPart;
+  freq = sp->qpc_freq.QuadPart;
+  /* Split the division: a whole-day profile must not overflow the product. */
+  return (uint64_t)(delta / freq) * 10000000 +
+         (uint64_t)((delta % freq) * 10000000 / freq);
+#else
+  return sysprof_mono() - sp->mono_base;
+#endif
+}
+
+/* Wall clock of the start of the profile in 100ns since 1601 (UTC). */
+static uint64_t sysprof_wall_clock(void)
+{
+#if LJ_TARGET_WINDOWS
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  return ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  /* 11644473600 seconds from 1601 to 1970. */
+  return ((uint64_t)ts.tv_sec + UINT64_C(11644473600)) * 10000000 +
+         (uint64_t)ts.tv_nsec / 100;
+#endif
+}
+
+/* Start the clock of the stream: the base goes to the prologue. */
+static void sysprof_clock_start(struct sysprof *sp)
+{
+  sp->time_base = sysprof_wall_clock();
+  sp->time_last = 0;
+#if LJ_TARGET_WINDOWS
+  QueryPerformanceFrequency(&sp->qpc_freq);
+  QueryPerformanceCounter(&sp->qpc_base);
+#else
+  sp->mono_base = sysprof_mono();
+#endif
+}
+
+/* Write the wall clock of the start: a fixed 8-byte little endian value. */
+static void stream_time_base(struct sysprof *sp)
+{
+  uint8_t bytes[8];
+  uint64_t t = sp->time_base;
+  int i;
+  for (i = 0; i < 8; i++) {
+    bytes[i] = (uint8_t)(t & 0xffu);
+    t >>= 8;
+  }
+  lj_wbuf_addn(&sp->out, bytes, sizeof(bytes));
+}
+
+/* A sample starts with its vmstate and the time since the previous one. */
+static void stream_sample_header(struct sysprof *sp, uint32_t vmstate)
+{
+  uint64_t now = sysprof_now(sp);
+  lj_wbuf_addbyte(&sp->out, (uint8_t)vmstate);
+  lj_wbuf_addu64(&sp->out, now - sp->time_last);
+  sp->time_last = now;
+}
+
 static int stream_is_needed(struct sysprof *sp)
 {
   return sp->opt.mode != LUAM_SYSPROF_DEFAULT;
@@ -203,6 +303,7 @@ static void stream_prologue(struct sysprof *sp)
   uint32_t unused_lib_adds = 0;
   lj_symtab_dump(&sp->out, sp->g, &unused_lib_adds);
   lj_wbuf_addn(&sp->out, ljp_header, sizeof(ljp_header));
+  stream_time_base(sp);
 #endif
 }
 
@@ -215,6 +316,7 @@ static void stream_prologue_c(struct sysprof *sp)
   int i;
   lj_symtab_dump_c(&sp->out);
   lj_wbuf_addn(&sp->out, ljp_header, sizeof(ljp_header));
+  stream_time_base(sp);
   /*
   ** Traces created while the symbols were dumped are queued by the profiled
   ** thread. They are events of the sample stream (like the ones the profiled
@@ -750,7 +852,7 @@ static void stream_backtrace_host(struct sysprof *sp)
 #if LJ_HASJIT
 static void stream_trace(struct sysprof *sp, uint32_t vmstate)
 {
-  lj_wbuf_addbyte(&sp->out, (uint8_t)vmstate);
+  stream_sample_header(sp, vmstate);
   struct lj_wbuf *out = &sp->out;
   uint32_t traceno = sp->g->vmstate;
   jit_State *J = G2J(sp->g);
@@ -789,14 +891,14 @@ static void stream_trace(struct sysprof *sp, uint32_t vmstate)
 
 static void stream_guest(struct sysprof *sp, uint32_t vmstate)
 {
-  lj_wbuf_addbyte(&sp->out, (uint8_t)vmstate);
+  stream_sample_header(sp, vmstate);
   stream_backtrace_lua(sp, vmstate);
   stream_backtrace_host(sp);
 }
 
 static void stream_host(struct sysprof *sp, uint32_t vmstate)
 {
-  lj_wbuf_addbyte(&sp->out, (uint8_t)vmstate);
+  stream_sample_header(sp, vmstate);
   stream_backtrace_host(sp);
 }
 
@@ -1225,6 +1327,7 @@ int lj_sysprof_start(lua_State *L, const struct luam_Sysprof_Options *opt)
   sp->state = SPS_PROFILE;
 
   if (stream_is_needed(sp)) {
+    sysprof_clock_start(sp);
     stream_prologue(sp);
     if (LJ_UNLIKELY(lj_wbuf_test_flag(&sp->out, STREAM_ERRIO|STREAM_STOP))) {
       /* on_stop call may change errno value. */

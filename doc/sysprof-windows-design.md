@@ -302,8 +302,15 @@ dumpstack`. The mixed (Lua + host) stack work lives in its own module,
 |---|---|
 | `start(depth, interval)` | start collecting, `depth` frames per sample (default 32), `interval` ms (default 10); returns nothing |
 | `stop()` | stop the profile run; the samples stay for the report |
-| `report()` | `chains, ticks = report()`; `chains` maps a merged callchain (same notation as `mixedstack`) to the number of ticks, `ticks` is their sum |
+| `report()` | `chains, spans, ticks = report()`; `chains` maps a merged callchain (same notation as `mixedstack`) to the number of ticks, `spans` lists every collected record in time order as `{chain = .., tick = .., count = ..}`, `ticks` is their sum |
+| `info()` | `{ start_us = .., interval_us = .., ticks = .. }`: the wall clock of the run (microseconds since 1970) and its interval, so a record collected at `tick` happened at `start_us + tick * interval_us` |
 | `active()` | is the collector running |
+
+The sampling interval is the resolution of the timeline: the hook reports
+the number of ticks that elapsed between two safepoints, so a record covers
+`count` ticks starting at its own `tick` — consecutive records are the
+timeline, and the `tick` of a record is exact even when the hook coalesced
+several timer ticks into one call.
 
 The collection is pure C: `start()` calls the ordinary
 `luaJIT_profile_start(L, "hiN", mixprof_cb, NULL)` with a C callback, so no
@@ -333,15 +340,27 @@ the mixed-stack formatter prints `chunk:line` with exactly the same rules as
 Both formats are versioned and the tools accept a range, so an older
 profile stays readable.
 
-### 4.1 ljp (event stream), version 4
+### 4.1 ljp (event stream), version 5
 
 ```text
+prologue     := 'l' 'j' 'p' version reserved time-base
+time-base    := <U64LE>   wall clock of the start, 100ns since 1601 UTC (v5+)
 sample-guest := sample-header stack-lua stack-host
 sample-host  := sample-header stack-host
 sample-trace := sample-header traceno sym-addr line-no stack-host   (v4+: host chain)
+sample-header := <BYTE> [time-delta]
+time-delta   := <ULEB128>  time since the previous sample (for the first
+                           one: since the start) in 100ns units       (v5+)
 frame-host   := exec-addr func-off                                   (v3+)
 func-off     := <ULEB128>  exec-addr - function start + 1, 0 = unknown
 ```
+
+The time base is taken once, when the profile starts; the deltas come from
+the monotonic performance counter (the wall clock may be stepped), so sample
+times are monotonic and dated by the wall clock of the start. On Windows the
+delta is taken when the profiled thread is suspended, i.e. it dates the
+sample, not the moment the stream buffer was written. Symbol-table events
+(`LJP_SYMTAB_*`) and the epilogue carry no time.
 
 `func-off` is what makes the Lua/host merge work without symbols; the trace
 sample's host chain is what gives JIT samples their native callers.
@@ -416,7 +435,7 @@ same thread; on Windows the sampler is a different thread, hence:
 | `tools/utils/symtab.lua` | ljs 3..5, module base entries, VM markers, trace ranges, `trace_at()`, exact-start name lookup (`cfunc_name`, `lfunc_name`) |
 | `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; frames are records (see below), so one parse feeds both the text report and `--format=json`; `TRACE [N]` for mcode addresses; `module+offset` for frames without an exact symbol |
 | `tools/utils/symresolver.lua` | C name sources: PDB through DbgHelp (in-process, extent check), PDB without its image through `llvm-pdbutil`, addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; a name is accepted only for the function that contains the frame |
-| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--pdbutil=`, `--debug=`, `--addr2line=`, `--format=text\|json` (two-pass collection + batched resolution) |
+| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--pdbutil=`, `--debug=`, `--addr2line=`, `--format=text\|json\|samples` (two-pass collection + batched resolution); `json` aggregates chains with their `first_us`/`last_us`, `samples` prints every sample with its `time_us` |
 | `doc/ext_profiler.html` | `h` mode, `profile.hoststack`, `profile.mixedstack`, `profile.symtab`, C APIs |
 
 The parser builds one record per frame and aggregates samples by the text
@@ -535,6 +554,8 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 | `jit.mixprof` (C-only sampling) | `start(24, 1)`, workload, `stop()`, `report()`: the counts sum to the reported ticks, chains contain Lua frames (`file.lua:line`) and host frames (`@0x...`); 180 start/stop sessions on MSVC + MinGW without a crash |
 | trace intervals (`SYMTAB_TRACE` v6) | a loop compiled into one trace reports several lines (`file:6 [TRACE 1]`, `file:3 [TRACE 1]`) instead of the trace start only; every interval is inside its trace, increasing, and points at a proto present in the symbol table with `line >= linedefined` |
 | soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
+| sample times (`ljp` v5) | a profile taken at `interval = 1` reports monotonic `time_us` per sample (deltas 1.5-2.5 ms, the Sleep granularity), the first sample is within the file's lifetime, the chain aggregate carries `first_us`/`last_us`; profiles of format 2..4 still parse and simply have no times |
+| `jit.mixprof` timeline | `report()` returns `chains, spans, ticks`; `spans` are in `tick` order, `sum(count)` equals `ticks` and the `chains` sum; `info()` gives `start_us`/`interval_us`, so `start_us + tick * interval_us` places every record on the wall clock |
 | `--format=json` | every aggregated chain is one JSON object; `count` matches the text report line by line, `frames` keep `kind/module/symbol/offset/addr/entry/chunk/line/traceno`; the text report is byte-identical to the one before the frame records were introduced |
 | module-qualified frames (`ljs` v7) | every host frame of a parsed profile reads `module!function` or `module+offset`; image sizes come from the symbol table, so JIT machine code and heap addresses are never attributed to the image before them |
 | `--pdb=` naming | the symbol file is read standalone: `luajit.exe!main`, `luajit.exe!pmain`, `luajit.exe!handle_script`, `lua51.dll!lj_str_new` from the same profile that shows `luajit.exe+0x457e` without it; a PDB of another build names nothing (extent check) |

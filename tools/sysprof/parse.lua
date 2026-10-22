@@ -8,7 +8,7 @@ local string_format = string.format
 
 local LJP_MAGIC = "ljp"
 local LJP_MIN_VERSION = 2
-local LJP_CURRENT_VERSION = 4
+local LJP_CURRENT_VERSION = 5
 
 local M = {}
 
@@ -39,6 +39,40 @@ local STREAM_END = 0x80
 local SYMTAB_LFUNC_EVENT = 10
 local SYMTAB_CFUNC_EVENT = 11
 local SYMTAB_TRACE_EVENT = 12
+
+-- The stream dates every sample: the prologue carries the wall clock of the
+-- start (100ns since 1601) and each sample the time since the previous one.
+-- `clock` turns those deltas into absolute times.
+--
+-- The base is kept as two 32-bit halves: a 64-bit count of 100ns units does
+-- not fit a double, and splitting keeps the arithmetic exact to the unit the
+-- stream actually has (100ns). Times are reported in microseconds since
+-- 1970-01-01 UTC, which a double holds exactly.
+local TWO32 = 4294967296
+-- 116444736000000000 (100ns) = seconds from 1601 to 1970.
+local EPOCH_HI, EPOCH_LO = 0x019DB1DE, 0xD53E8000
+
+local function new_clock(hi, lo)
+  return { hi = hi, lo = lo, elapsed = 0 }
+end
+
+local function clock_advance(clock, delta)
+  clock.elapsed = clock.elapsed + delta
+  return clock.elapsed
+end
+
+local function clock_unix_us(clock, elapsed)
+  local carry = math.floor(elapsed / TWO32)
+  local lo = clock.lo + elapsed % TWO32
+  local hi = clock.hi + carry + math.floor(lo / TWO32)
+  lo = lo % TWO32
+  lo = lo - EPOCH_LO
+  if lo < 0 then
+    lo = lo + TWO32
+    hi = hi - 1
+  end
+  return math.floor(((hi - EPOCH_HI) * TWO32 + lo) / 10)
+end
 
 local function new_event()
   return {
@@ -418,7 +452,21 @@ end
 function M.event_json(entry)
   local frames = {}
   for k = 1, #entry.frames do frames[k] = json_frame(entry.frames[k]) end
-  return string_format('{"count":%d,"frames":[%s]}', entry.count,
+  local time = ""
+  if entry.first then
+    time = string_format(',"first_us":%d,"last_us":%d', entry.first,
+                         entry.last)
+  end
+  return string_format('{"count":%d%s,"frames":[%s]}', entry.count, time,
+                       table.concat(frames, ","))
+end
+
+-- One sample, with the time it was taken at (microseconds since 1970).
+function M.sample_json(sample)
+  local frames = {}
+  for k = 1, #sample.frames do frames[k] = json_frame(sample.frames[k]) end
+  local time = sample.time and string_format(',"time_us":%d', sample.time) or ""
+  return string_format('{"vmstate":%d%s,"frames":[%s]}', sample.vmstate, time,
                        table.concat(frames, ","))
 end
 
@@ -431,20 +479,28 @@ function M.frames_text(frames)
   return frames_text(frames)
 end
 
-local function parse_event(reader, events, symbols, version, resolver)
+local function parse_event(reader, state, symbols, version, resolver)
   local event = new_event()
+  local events = state.events
 
   local vmstate = reader:read_octet()
   if vmstate == STREAM_END then
     -- TODO: samples & overruns
     return false
   elseif SYMTAB_LFUNC_EVENT <= vmstate and vmstate <= SYMTAB_TRACE_EVENT then
+    -- A symbol event extends the table: it carries no time.
     parse_symtab(reader, symbols, vmstate, version)
     return true
   end
 
   assert(0 <= vmstate and vmstate <= 9, "Vmstate "..vmstate.." is not valid")
   event.lua.vmstate = vmstate
+
+  local time
+  if state.clock then
+    local elapsed = clock_advance(state.clock, reader:read_uleb128())
+    time = clock_unix_us(state.clock, elapsed)
+  end
 
   event_parsers[vmstate](reader, event, symbols, version, resolver)
   local frames = merge(event, symbols)
@@ -455,6 +511,14 @@ local function parse_event(reader, events, symbols, version, resolver)
     events[chain] = entry
   end
   entry.count = entry.count + 1
+  if time then
+    entry.first = entry.first or time
+    entry.last = time
+  end
+  -- Every sample, in order: the aggregate drops the timeline. A profile of
+  -- format 4 and older has no times, the record is then without `time`.
+  state.samples[#state.samples + 1] =
+    { time = time, vmstate = vmstate, frames = frames }
   return true
 end
 
@@ -480,11 +544,23 @@ function M.parse(reader, symbols, resolver)
     ))
   end
 
-  while parse_event(reader, events, symbols, version, resolver) do
+  local state = { events = events, samples = {} }
+  if version >= 5 then
+    -- The wall clock of the start: a fixed 8-byte little endian value, kept
+    -- as two 32-bit halves (see new_clock).
+    local raw = reader:read_octets(8)
+    local lo = string.byte(raw, 1) + string.byte(raw, 2) * 256 +
+               string.byte(raw, 3) * 65536 + string.byte(raw, 4) * 16777216
+    local hi = string.byte(raw, 5) + string.byte(raw, 6) * 256 +
+               string.byte(raw, 7) * 65536 + string.byte(raw, 8) * 16777216
+    state.clock = new_clock(hi, lo)
+  end
+
+  while parse_event(reader, state, symbols, version, resolver) do
     -- Empty body.
   end
 
-  return events
+  return events, state.samples
 end
 
 return M

@@ -39,12 +39,18 @@ LJLIB_CF(mixprof_stop)
   return 0;
 }
 
-/* chains, ticks = mixprof.report() */
+/* chains, spans, ticks = mixprof.report() */
 LJLIB_CF(mixprof_report)
 {
   int ticks = lj_mixprof_report(L);
   lua_pushinteger(L, ticks);
-  return 2;
+  return 3;
+}
+
+/* info = mixprof.info() */
+LJLIB_CF(mixprof_info)
+{
+  return lj_mixprof_info(L);
 }
 
 /* mixprof.active() */

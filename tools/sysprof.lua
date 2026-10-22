@@ -28,11 +28,14 @@ Supported options are:
                                     matched to the image by its name
   --pdbutil=<tool>                   Reader for a symbol file without the
                                     image (default: llvm-pdbutil)
-  --format=<fmt>                    Output format: text (default) or json.
-                                    json prints one object per aggregated
-                                    chain: {"count":N,"frames":[{"kind":..,
-                                    "module":..,"symbol":..,"offset":..,
-                                    "addr":..,"chunk":..,"line":..}]}
+  --format=<fmt>                    Output format: text (default), json or
+                                    samples. json prints one object per
+                                    aggregated chain
+                                    {"count":N,"first_us":..,"last_us":..,
+                                    "frames":[{"kind":..,"module":..,
+                                    "symbol":..,"addr":..}]}; samples
+                                    prints every sample in order
+                                    {"time_us":..,"vmstate":..,"frames":[..]}
 ]]
   os.exit(0)
 end
@@ -95,8 +98,8 @@ local out_format = "text"
 
 function opt_map.format(v, args)
   local fmt = opt_value(v, args)
-  if fmt ~= "text" and fmt ~= "json" then
-    opterror("--format needs text or json")
+  if fmt ~= "text" and fmt ~= "json" and fmt ~= "samples" then
+    opterror("--format needs text, json or samples")
   end
   out_format = fmt
 end
@@ -169,14 +172,13 @@ end
 -- First pass: collect the addresses that will need a name, so that the
 -- debug source can be queried in batches instead of once per address.
 local function collect_addresses(inputfile)
-  local addrs, symbols = {}, nil
+  local addrs = {}
   local collector = {}
   function collector:resolve(addr)
     addrs[addr] = true
     return nil
   end
-  evread(function(reader, syms)
-    symbols = syms
+  local _, _, symbols = evread(function(reader, syms)
     return sysprof.parse(reader, syms, collector)
   end, inputfile)
   return addrs, symbols
@@ -194,7 +196,7 @@ local function dump(inputfile)
       resolver:preload(addrs)
     end
   end
-  local events = evread(function(reader, symbols)
+  local events, samples = evread(function(reader, symbols)
     return sysprof.parse(reader, symbols, resolver)
   end, inputfile)
 
@@ -205,11 +207,23 @@ local function dump(inputfile)
     resolver:close()
   end
 
-  for _, entry in pairs(events) do
-    if out_format == "json" then
-      print(sysprof.event_json(entry))
-    else
-      print(sysprof.event_text(entry), entry.count)
+  if out_format == "samples" then
+    -- Every sample with the time it was taken at: the aggregate below loses
+    -- the timeline.
+    if samples and samples[1] and not samples[1].time then
+      stderr:write("luajit-parse-sysprof: warning: the profile has no ",
+                   "sample times (format version older than 5)\n")
+    end
+    for _, sample in ipairs(samples or {}) do
+      print(sysprof.sample_json(sample))
+    end
+  else
+    for _, entry in pairs(events) do
+      if out_format == "json" then
+        print(sysprof.event_json(entry))
+      else
+        print(sysprof.event_text(entry), entry.count)
+      end
     end
   end
   -- XXX: The second argument is required to properly close Lua
