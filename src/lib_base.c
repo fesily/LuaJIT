@@ -445,80 +445,193 @@ LJLIB_CF(load)
 }
 
 #if LJ_DS_BIG_UPVAL_PATCH
+/* Growable source buffer: the rewrite can expand the source text. */
+typedef struct ds_srcbuf {
+	char *buf;
+	long len;
+	long cap;
+} ds_srcbuf;
+
+static int ds_srcbuf_reserve(ds_srcbuf *b, long extra)
+{
+	if (b->len + extra <= b->cap) return 1;
+	while (b->len + extra > b->cap) {
+		long ncap = b->cap * 2 + 64;
+		char *nbuf = (char *)realloc(b->buf, (size_t)ncap + 1);
+		if (!nbuf) return 0;
+		b->buf = nbuf;
+		b->cap = ncap;
+	}
+	return 1;
+}
+
+static int ds_srcbuf_put(ds_srcbuf *b, const char *s, long n)
+{
+	if (!ds_srcbuf_reserve(b, n)) return 0;
+	memcpy(b->buf + b->len, s, (size_t)n);
+	b->len += n;
+	return 1;
+}
+
+/* Parse a long-bracket opener "[=*[" at src[i]; returns its equal count or -1. */
+static int ds_long_open(const char *src, long len, long i, long *after)
+{
+	long k;
+	int eq = 0;
+	if (i >= len || src[i] != '[') return -1;
+	k = i + 1;
+	while (k < len && src[k] == '=') { eq++; k++; }
+	if (k >= len || src[k] != '[') return -1;
+	*after = k + 1;
+	return eq;
+}
+
+/* Rewrite "{{...}}" table constructors into "(function () return {{...}}end)()".
+** Only code is rewritten. Double/single-quoted strings, long-bracket strings
+** and comments (both "--..." and "--[=*[...]=*]") are copied verbatim, so
+** string payloads containing braces are never corrupted. */
 void filter(lua_State* L) {
-	char ch, check = 0;
-	int level = 0;
-	int t = lua_type(L, 1);
-	int happen = 0;
-	int quote = 0;
-  int slash = 0;
-	const char* p = lua_tostring(L, 1);
-	long size = lua_objlen(L, 1);
+	ds_srcbuf out;
+	const char *p;
+	long size;
+	long i = 0;
+	int level = 0, check = 0, happen = 0;
+	int quote = 0, slash = 0;
+	int long_eq = -1; /* >= 0 while inside a long bracket (string or comment) */
+	int in_line_comment = 0;
 	char levelMasks[1024];
+
+	if (lua_type(L, 1) != LUA_TSTRING) return;
+	p = lua_tostring(L, 1);
+	size = (long)lua_objlen(L, 1);
 	memset(levelMasks, 0, sizeof(levelMasks));
-	if (t == LUA_TSTRING) {
-		char* target = (char*)malloc(size * 2);
-		char* q = target;
-		while (size-- > 0) {
-			ch = *p++;
-			if (ch == '"' && !slash) {
-				quote = !quote;
-			}
+	out.buf = NULL;
+	out.len = 0;
+	out.cap = 0;
+	if (!ds_srcbuf_reserve(&out, 1)) return;
 
-			if (!quote) {
-				if (ch == '{') {
-
-					level++;
-					if (check) {
-						const char* ts = "(function () return {";
-						--q;
-						memcpy(q, ts, strlen(ts));
-						q += strlen(ts);
-						levelMasks[level - 2] = 1;
-						check = 0;
-						happen = 1;
-					}
-
-					check = 1;
-					*q++ = (char)ch;
-				} else {
-					*q++ = (char)ch;
-					if (level > 0 && ch == '}') {
-						level--;
-						
-						if (levelMasks[level] != 0) {
-							const char* ts = "end)()";
-							memcpy(q, ts, strlen(ts));
-							q += strlen(ts);
-							levelMasks[level] = 0;
-						}
-					}
+	while (i < size) {
+		char ch = p[i];
+		if (long_eq >= 0) {
+			/* Inside a long bracket: copy verbatim up to the matching close. */
+			if (ch == ']') {
+				long k = i + 1;
+				int eq = 0;
+				while (k < size && p[k] == '=') { eq++; k++; }
+				if (eq == long_eq && k < size && p[k] == ']') {
+					if (!ds_srcbuf_put(&out, p + i, k - i + 1)) goto fail;
+					i = k + 1;
+					long_eq = -1;
 					check = 0;
+					continue;
 				}
-			} else {
-        if (ch == '\\') {
-          slash = !slash;
-        } else {
-          slash = 0;
-        }
-				*q++ = (char)ch;
+			}
+			if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+			i++;
+			check = 0;
+			continue;
+		}
+		if (in_line_comment) {
+			if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+			i++;
+			if (ch == '\n') { in_line_comment = 0; check = 0; }
+			continue;
+		}
+		if (quote) {
+			if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+			i++;
+			if (slash) {
+				slash = 0;
+			} else if (ch == '\\') {
+				slash = 1;
+			} else if (ch == quote) {
+				quote = 0;
+			}
+			check = 0;
+			continue;
+		}
+		if (ch == '"' || ch == '\'') {
+			quote = ch;
+			slash = 0;
+			if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+			i++;
+			check = 0;
+			continue;
+		}
+		if (ch == '-' && i + 1 < size && p[i + 1] == '-') {
+			long after;
+			int eq = ds_long_open(p, size, i + 2, &after);
+			if (eq >= 0) { /* long comment "--[=*[" */
+				if (!ds_srcbuf_put(&out, p + i, after - i)) goto fail;
+				i = after;
+				long_eq = eq;
+				check = 0;
+			} else { /* line comment "--..." */
+				if (!ds_srcbuf_put(&out, p + i, 2)) goto fail;
+				i += 2;
+				in_line_comment = 1;
 				check = 0;
 			}
+			continue;
 		}
-
-		if (happen) {
-			*q = 0;
-      /* printf("TARGET: %s\n", target); */
-/*
-      FILE* tg = fopen("modified.lua", "wb");
-      fwrite(target, q-target, 1, tg);
-      fclose(tg);*/
-			lua_pushlstring(L, target, q - target);
-			lua_replace(L, 1);
+		if (ch == '[') {
+			long after;
+			int eq = ds_long_open(p, size, i, &after);
+			if (eq >= 0) { /* long string "[=*[" */
+				if (!ds_srcbuf_put(&out, p + i, after - i)) goto fail;
+				i = after;
+				long_eq = eq;
+				check = 0;
+				continue;
+			}
+			if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+			i++;
+			check = 0;
+			continue;
 		}
-
-		free(target);
+		if (ch == '{') {
+			level++;
+			if (check && level - 2 >= 0 && level - 2 < (int)sizeof(levelMasks)) {
+				static const char ts[] = "(function () return {";
+				out.len--; /* the previous '{' becomes the wrapper opener */
+				if (!ds_srcbuf_put(&out, ts, (long)sizeof(ts) - 1)) goto fail;
+				levelMasks[level - 2] = 1;
+				happen = 1;
+			}
+			check = 1;
+			if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+			i++;
+			continue;
+		}
+		if (ch == '}') {
+			if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+			i++;
+			if (level > 0) {
+				level--;
+				if (level < (int)sizeof(levelMasks) && levelMasks[level]) {
+					static const char te[] = "end)()";
+					if (!ds_srcbuf_put(&out, te, (long)sizeof(te) - 1)) goto fail;
+					levelMasks[level] = 0;
+				}
+			}
+			check = 0;
+			continue;
+		}
+		if (!ds_srcbuf_put(&out, &ch, 1)) goto fail;
+		i++;
+		check = 0;
 	}
+
+	if (happen) {
+		out.buf[out.len] = 0;
+		lua_pushlstring(L, out.buf, (size_t)out.len);
+		lua_replace(L, 1);
+	}
+	free(out.buf);
+	return;
+
+fail:
+	free(out.buf);
 }
 #endif
 
