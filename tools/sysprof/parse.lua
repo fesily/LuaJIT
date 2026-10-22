@@ -461,6 +461,16 @@ function M.event_json(entry)
                        table.concat(frames, ","))
 end
 
+-- One aggregated chain as a folded stack, the input of the flame graph
+-- tools (flamegraph.pl, inferno, flamegraph-rs): frames separated by ';',
+-- then a space and the number of samples. A ';' inside a frame name (a Lua
+-- chunk name may contain one) cannot be represented in this format.
+function M.event_folded(entry)
+  local text = {}
+  for k = 1, #entry.frames do text[k] = frame_text(entry.frames[k]) end
+  return table.concat(text, ";") .. " " .. entry.count
+end
+
 -- One sample, with the time it was taken at (microseconds since 1970).
 function M.sample_json(sample)
   local frames = {}

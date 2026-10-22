@@ -435,7 +435,7 @@ same thread; on Windows the sampler is a different thread, hence:
 | `tools/utils/symtab.lua` | ljs 3..5, module base entries, VM markers, trace ranges, `trace_at()`, exact-start name lookup (`cfunc_name`, `lfunc_name`) |
 | `tools/sysprof/parse.lua` | ljp 2..4; deterministic merge by `func-off`; frames are records (see below), so one parse feeds both the text report and `--format=json`; `TRACE [N]` for mcode addresses; `module+offset` for frames without an exact symbol |
 | `tools/utils/symresolver.lua` | C name sources: PDB through DbgHelp (in-process, extent check), PDB without its image through `llvm-pdbutil`, addr2line/DWARF (batched), linker map (GNU/MSVC), embedded table; 64-bit-safe address parsing; a name is accepted only for the function that contains the frame |
-| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--pdbutil=`, `--debug=`, `--addr2line=`, `--format=text\|json\|samples` (two-pass collection + batched resolution); `json` aggregates chains with their `first_us`/`last_us`, `samples` prints every sample with its `time_us` |
+| `tools/sysprof.lua` | `-ts` entry point, `--map=`, `--pdb=`, `--pdbutil=`, `--debug=`, `--addr2line=`, `--format=text\|json\|samples\|folded` (two-pass collection + batched resolution); `json` aggregates chains with their `first_us`/`last_us`, `samples` prints every sample with its `time_us`, `folded` prints flame graph input |
 | `doc/ext_profiler.html` | `h` mode, `profile.hoststack`, `profile.mixedstack`, `profile.symtab`, C APIs |
 
 The parser builds one record per frame and aggregates samples by the text
@@ -460,6 +460,22 @@ the Lua stack), `vm` (a VM handler such as a fast function). A frame carries
 `module`+`symbol`, or `module`+`offset`, or only `addr` when the address is
 outside every image; addresses are hex strings so that no consumer loses
 them to a float.
+
+Flame graphs: `--format=folded` prints one folded stack per aggregated
+chain — frames separated by `;`, then a space and the sample count — which is
+what `flamegraph.pl`, `inferno` and `flamegraph-rs` read:
+
+```console
+$ luajit -ts --format=folded --pdb=luajit.pdb p.bin > p.folded
+$ flamegraph.pl p.folded > p.svg
+```
+
+Frame names are the same `module!function` / `module+offset` / `@chunk:line`
+strings as the text report; a `;` inside one (a Lua chunk name may hold one)
+cannot be represented in this format. The tool also switches stdout to binary
+mode on Windows (`_setmode(1, O_BINARY)` through the executable's own C
+runtime): without it every line ends in `CR LF`, and `flamegraph.pl` chomps
+only the `LF`, so it rejects the whole file as "invalid format".
 
 `-ts` needs `luajit.c`'s `-t<cmd>` support (tarantool extension): it does
 `require("sysprof")` and calls the returned function with `arg`. A v2.1
@@ -554,6 +570,7 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 | `jit.mixprof` (C-only sampling) | `start(24, 1)`, workload, `stop()`, `report()`: the counts sum to the reported ticks, chains contain Lua frames (`file.lua:line`) and host frames (`@0x...`); 180 start/stop sessions on MSVC + MinGW without a crash |
 | trace intervals (`SYMTAB_TRACE` v6) | a loop compiled into one trace reports several lines (`file:6 [TRACE 1]`, `file:3 [TRACE 1]`) instead of the trace start only; every interval is inside its trace, increasing, and points at a proto present in the symbol table with `line >= linedefined` |
 | soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
+| flame graph data source (`--format=folded`) | every line matches `^(.*) (\d+)$`, the counts sum to `report().samples` and to the text report, and `flamegraph.pl` accepts the file and renders the frames (`RtlUserThreadStart` → `main` → `pmain` → `handle_script` → `lua_pcall` → `@f.lua:5 [TRACE 5]` → `ffi.meta.__call` → `Sleep`); output is LF-only on MSVC and MinGW builds, so the `CR` that made `flamegraph.pl` ignore every line is gone |
 | sample times (`ljp` v5) | a profile taken at `interval = 1` reports monotonic `time_us` per sample (deltas 1.5-2.5 ms, the Sleep granularity), the first sample is within the file's lifetime, the chain aggregate carries `first_us`/`last_us`; profiles of format 2..4 still parse and simply have no times |
 | `jit.mixprof` timeline | `report()` returns `chains, spans, ticks`; `spans` are in `tick` order, `sum(count)` equals `ticks` and the `chains` sum; `info()` gives `start_us`/`interval_us`, so `start_us + tick * interval_us` places every record on the wall clock |
 | `--format=json` | every aggregated chain is one JSON object; `count` matches the text report line by line, `frames` keep `kind/module/symbol/offset/addr/entry/chunk/line/traceno`; the text report is byte-identical to the one before the frame records were introduced |
