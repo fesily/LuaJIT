@@ -360,6 +360,9 @@ GCproto *lj_bcread_proto(LexState *ls)
   pt->flags = (uint8_t)flags;
   pt->trace = 0;
   setgcref(pt->chunkname, obj2gco(ls->chunkname));
+#if LJ_DS_CHUNKNAME_MARKER
+  setgcrefnull(pt->dschunkname);  /* DS: bytecode reload is never trusted. */
+#endif
 
   /* Close potentially uninitialized gap between bc and kgc. */
   *(uint32_t *)((char *)pt + ofsk - sizeof(GCRef)*(sizekgc+1)) = 0;

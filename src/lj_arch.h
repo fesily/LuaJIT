@@ -991,6 +991,22 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_PCALL_ERRSTATUS	LJ_DS
 #endif
 
+/* Engine-loaded chunkname marker for the item-server call-stack guard.
+** The game's file loaders register the raw path in a proto field that plain
+** Lua code cannot forge (loadstring only changes proto->chunkname), so a
+** forged frame can be told apart from a genuinely loaded file.
+** Entry points (declared in lua.h when enabled, implemented in lj_api.c):
+**   lua_setfuncchunkname(L, idx, name)   -> game loaders only
+**   lua_getfuncchunkname(L, idx)     -> NULL when the frame is untrusted
+** Stores a GCRef, so gc_traverse_proto marks it and string.dump never
+** serializes it (reloaded bytecode is untrusted by construction).
+** Default: on with LJ_DS; override -DLJ_DS_CHUNKNAME_MARKER=0 to drop the
+** field and both entry points entirely (restores the upstream GCproto
+** layout/behaviour). */
+#ifndef LJ_DS_CHUNKNAME_MARKER
+#define LJ_DS_CHUNKNAME_MARKER	LJ_DS
+#endif
+
 #if LJ_DS
 #undef LUAJIT_ENABLE_FIN_UDATA_COMPAT
 #define LUAJIT_ENABLE_FIN_UDATA_COMPAT	1

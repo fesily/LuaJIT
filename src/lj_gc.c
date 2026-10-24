@@ -274,6 +274,12 @@ static void gc_traverse_proto(global_State *g, GCproto *pt)
 {
   ptrdiff_t i;
   gc_mark_str(g, proto_chunkname(pt));
+#if LJ_DS_CHUNKNAME_MARKER
+  {  /* DS: keep the engine-loaded chunkname marker alive. */
+    GCstr *dsname = strref(pt->dschunkname);
+    if (dsname) gc_mark_str(g, dsname);
+  }
+#endif
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT

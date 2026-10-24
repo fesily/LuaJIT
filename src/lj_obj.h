@@ -401,6 +401,13 @@ typedef struct GCproto {
   uint16_t trace;	/* Anchor for chain of root traces. */
   /* ------ The following fields are for debugging/tracebacks only ------ */
   GCRef chunkname;	/* Name of the chunk this function was defined in. */
+#if LJ_DS_CHUNKNAME_MARKER
+  GCRef dschunkname;	/* DS: engine-loaded chunk marker. Only the game's file
+			** loaders may set it (lua_setfuncchunkname); plain Lua code can
+			** only forge chunkname above, so this is what makes a stack frame
+			** "trusted" for the item-server call-stack guard. Never serialized
+			** by string.dump/load: reloaded chunks have it NULL. */
+#endif
   BCLine firstline;	/* First line of the function definition. */
   BCLine numline;	/* Number of lines for the function definition. */
   MRef lineinfo;	/* Compressed map from bytecode ins. to source line. */

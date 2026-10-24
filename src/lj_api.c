@@ -1467,3 +1467,57 @@ LUA_API void lua_setallocf(lua_State *L, lua_Alloc f, void *ud)
   g->allocf = f;
 }
 
+
+#if LJ_DS_CHUNKNAME_MARKER
+
+/* -- DS: engine-loaded chunkname marker ---------------------------------- */
+
+/* Apply the marker to one prototype and its whole subtree, mirroring the
+** game Lua's recursive semantics.
+*/
+static void ds_proto_setchunkname(lua_State *L, GCproto *pt, GCstr *s)
+{
+  setgcref(pt->dschunkname, obj2gco(s));
+  lj_gc_objbarrier(L, pt, s);
+  if (pt->flags & PROTO_CHILD) {
+    ptrdiff_t i;
+    for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++) {
+      GCobj *o = proto_kgc(pt, i);
+      if (o && o->gch.gct == ~LJ_TPROTO)
+	ds_proto_setchunkname(L, gco2pt(o), s);
+    }
+  }
+}
+
+/* lua_setfuncchunkname(L, idx, name)
+**
+** Game-only entry point. The engine calls this right after loading a chunk
+** from disk, passing the raw file path. The value is stored in a field that
+** plain Lua code cannot reach (loadstring only changes pt->chunkname), which
+** is what distinguishes a genuinely loaded file from a forged chunkname in
+** the item-server call-stack guard. Not serialized by string.dump.
+*/
+LUA_API void lua_setfuncchunkname(lua_State *L, int idx, const char *name)
+{
+  TValue *o = index2adr(L, idx);
+  if (!tvisfunc(o) || !isluafunc(funcV(o)) || name == NULL)
+    return;
+  ds_proto_setchunkname(L, funcproto(funcV(o)), lj_str_newz(L, name));
+}
+
+/* lua_getfuncchunkname(L, idx)
+**
+** Returns the marker string of the Lua closure at idx, or NULL when the
+** closure did not come from the game's file loaders (C closures included).
+*/
+LUA_API const char *lua_getfuncchunkname(lua_State *L, int idx)
+{
+  TValue *o = index2adr(L, idx);
+  GCstr *s;
+  if (!tvisfunc(o) || !isluafunc(funcV(o)))
+    return NULL;
+  s = strref(funcproto(funcV(o))->dschunkname);
+  return s ? strdata(s) : NULL;
+}
+
+#endif /* LJ_DS_CHUNKNAME_MARKER */

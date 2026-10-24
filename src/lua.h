@@ -204,6 +204,19 @@ LUA_API void        (lua_clearexecutionerror) (void);
 LUA_API char       *extern_error_message_buffer;
 LUA_API const char **extern_had_execution_error;
 #endif
+#if LJ_DS_CHUNKNAME_MARKER
+/* DST: engine-loaded chunkname marker, used by the item-server call-stack
+** guard.  Switch: LJ_DS_CHUNKNAME_MARKER (lj_arch.h, default = LJ_DS).
+** The game's file loaders register the raw path in a GCproto field that plain
+** Lua code cannot forge (loadstring only changes proto->chunkname), so a
+** forged frame is distinguishable from a file the engine actually loaded.
+** Setter is for the engine's loaders only; getter returns NULL when the frame
+** is untrusted (C closures included), and string.dump never carries it.
+** Declared unconditionally: lua.h is included before lj_arch.h, so the switch
+** macro is not visible here; the symbols exist in DS builds (default). */
+LUA_API void        (lua_setfuncchunkname) (lua_State *L, int idx, const char *name);
+LUA_API const char *(lua_getfuncchunkname) (lua_State *L, int idx);
+#endif
 LUA_API int   (lua_getmetatable) (lua_State *L, int objindex);
 LUA_API void  (lua_getfenv) (lua_State *L, int idx);
 
