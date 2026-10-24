@@ -42,6 +42,11 @@ LJ_IO_PATCH_STORAGE int (*lj_fseeki64)(
     __int64 _Offset,
     int _Origin) LJ_IO_PATCH_DATA(_fseeki64);
 LJ_IO_PATCH_STORAGE __int64 (*lj_ftelli64)(FILE *_Stream) LJ_IO_PATCH_DATA(_ftelli64);
+#elif defined(__MINGW32__)
+/* lib_io.c calls the *64 names on MinGW; declare/define them here too. */
+LJ_IO_PATCH_STORAGE int (*lj_fseeko64)(FILE *_Stream,
+    __int64 _Offset, int _Origin) LJ_IO_PATCH_DATA(_fseeki64);
+LJ_IO_PATCH_STORAGE __int64 (*lj_ftello64)(FILE *_Stream) LJ_IO_PATCH_DATA(_ftelli64);
 #endif
 LJ_IO_PATCH_STORAGE void (*lj_clearerr)(FILE* fp) LJ_IO_PATCH_DATA(clearerr);
 #undef LJ_IO_PATCH_STORAGE
@@ -58,6 +63,8 @@ LJ_IO_PATCH_STORAGE void (*lj_clearerr)(FILE* fp) LJ_IO_PATCH_DATA(clearerr);
 #define lj_fseeko fseeko
 #define lj_fseeki64 fseeki64
 #define lj_ftelli64 ftelli64
+#define lj_fseeko64 _fseeki64
+#define lj_ftello64 _ftelli64
 #define lj_clearerr clearerr
 #define lj_feof feof
 #endif

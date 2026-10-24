@@ -678,10 +678,10 @@ LUA_API int lua_getinfo_game(lua_State *L, const char *what, lua_Debug *ar)
 {
   lj_Debug iar;
   iar.i_ci = ar->i_ci;
+  iar.source = NULL;
   int res = lj_debug_getinfo(L, what, &iar, 0);
-  if (res) {
-      ar->source = iar.source[0] == '@' ? iar.source + 1 : iar.source;
-  }
+  if (res && iar.source != NULL && iar.source[0] == '@')
+      iar.source++;  /* the api skips the @ path */
   memcpy(ar, &iar, sizeof(lua_Debug));
   return res;
 }
