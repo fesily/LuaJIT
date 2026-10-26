@@ -160,7 +160,7 @@ static void profile_handler(int sig, siginfo_t *info, void *ctx)
 
 #else
 
-static void profile_handler()
+static void profile_handler(void)
 {
   profile_trigger(&profile_state);
 }

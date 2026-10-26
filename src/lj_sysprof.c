@@ -195,19 +195,15 @@ static const uint8_t ljp_header[] = {'l', 'j', 'p', LJP_FORMAT_VERSION,
 ** stepped), the wall clock only dates the start: a profile is compared with
 ** other logs by the time of its samples, not by the drift of the clock.
 */
+#if !LJ_TARGET_WINDOWS
 /* Monotonic clock in 100ns units (the epoch is private to the process). */
 static uint64_t sysprof_mono(void)
 {
-#if LJ_TARGET_WINDOWS
-  LARGE_INTEGER now;
-  QueryPerformanceCounter(&now);
-  return (uint64_t)now.QuadPart;
-#else
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 10000000 + (uint64_t)ts.tv_nsec / 100;
-#endif
 }
+#endif
 
 static uint64_t sysprof_now(struct sysprof *sp)
 {
@@ -380,7 +376,7 @@ static void stream_ffunc(struct lj_wbuf *buf, const GCfunc *func)
   stream_ffunc_impl(buf, func->c.ffid);
 }
 
-static void stream_frame_lua(struct lj_wbuf *buf, const cTValue *frame)
+static void stream_frame_lua(struct lj_wbuf *buf, cTValue *frame)
 {
   const GCfunc *func = frame_func(frame);
   lj_assertX(func != NULL, "bad function in sysprof stream");
@@ -732,7 +728,8 @@ static int sysprof_is_vm_func(const struct sysprof *sp, uintptr_t addr)
   return 0;
 }
 
-static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
+static void default_backtrace_host(
+    void *(*writer)(int frame_no, void *addr))
 {
   struct sysprof *sp = &sysprof;
   CONTEXT ctx = sysprof_sample_ctx;
@@ -823,7 +820,8 @@ static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
   }
 }
 #else
-static void default_backtrace_host(void *(writer)(int frame_no, void *addr))
+static void default_backtrace_host(
+    void *(*writer)(int frame_no, void *addr))
 {
   static void *backtrace_buf[SYSPROF_BACKTRACE_FRAME_MAX] = {};
 
@@ -1376,7 +1374,7 @@ int lj_sysprof_start(lua_State *L, const struct luam_Sysprof_Options *opt)
 #endif
 #endif
 
-  sp->timer.opt.interval_msec = opt->interval;
+  sp->timer.opt.interval_msec = (int)opt->interval;
   sp->timer.opt.handler = sysprof_signal_handler;
 #if LJ_TARGET_WINDOWS
   sp->timer.opt.startup = sysprof_startup;
