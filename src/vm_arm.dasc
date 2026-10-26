@@ -224,6 +224,31 @@
 |// Set current VM state.
 |.macro mv_vmstate, reg, st; mvn reg, #LJ_VMST_..st; .endmacro
 |.macro st_vmstate, reg; str reg, [DISPATCH, #DISPATCH_GL(vmstate)]; .endmacro
+|.macro set_vmstate, st, tmp; mv_vmstate tmp, st; st_vmstate tmp; .endmacro
+|
+|// Stash the interpreter's base and set the current VM state.
+|// A profiler that samples LFUNC, CFUNC or FFUNC dumps the Lua call stack, so
+|// it needs a stack base pointer. The base kept in lua_State is only synced
+|// when control is passed to user code, hence it is stashed on every vmstate
+|// change. Fast functions are the exception: their internal BASE is not
+|// always consistent, so their ffid is stashed instead.
+|.macro set_vmstate_sync_base, st, tmp
+|.if LJ_HASSYSPROF
+|  set_vmstate INTERP, tmp	// Guard for non-atomic VM context restoration
+|  str BASE, [DISPATCH, #DISPATCH_GL(top_frame_info.top_frame)]
+|.endif
+|  set_vmstate st, tmp
+|.endmacro
+|
+|.macro set_vmstate_ffunc, tmp, ptmp
+|.if LJ_HASSYSPROF
+|  set_vmstate INTERP, tmp
+|  ldr ptmp, [BASE, FRAME_FUNC]
+|  ldrb ptmp, LFUNC:ptmp->ffid
+|  strb ptmp, [DISPATCH, #DISPATCH_GL(top_frame_info.ffid)]
+|.endif
+|  set_vmstate FFUNC, tmp
+|.endmacro
 |
 |// Move table write barrier back. Overwrites mark and tmp.
 |.macro barrierback, tab, mark, tmp
@@ -287,11 +312,10 @@ static void build_subroutines(BuildCtx *ctx)
   |
   |  str RB, L->base
   |   ldr KBASE, SAVE_NRES
-  |    mv_vmstate CARG4, C
+  |  set_vmstate_sync_base CFUNC, CARG4	// CFUNC before returning to C.
   |   sub BASE, BASE, #8
   |  subs CARG3, RC, #8
   |   lsl KBASE, KBASE, #3		// KBASE = (nresults_wanted+1)*8
-  |    st_vmstate CARG4
   |  beq >2
   |1:
   |  subs CARG3, CARG3, #8
@@ -348,7 +372,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  mov CRET1, CARG2
   |->vm_unwind_c_eh:			// Landing pad for external unwinder.
   |  ldr L, SAVE_L
-  |   mv_vmstate CARG4, C
+  |   mv_vmstate CARG4, CFUNC
   |  ldr GL:CARG3, L->glref
   |   str CARG4, GL:CARG3->vmstate
   |  b ->vm_leave_unw
@@ -547,6 +571,7 @@ static void build_subroutines(BuildCtx *ctx)
   |.endif
   |  ldr CARG3, LFUNC:CARG3->field_pc
   |  ldr KBASE, [CARG3, #PC2PROTO(k)]
+  |  set_vmstate_sync_base LFUNC, CARG3	// LFUNC after KBASE restoration.
   |  // BASE = base, RA = resultptr, CARG4 = meta base
   |    bx CARG1
   |
@@ -928,6 +953,7 @@ static void build_subroutines(BuildCtx *ctx)
   |
   |.macro .ffunc, name
   |->ff_ .. name:
+  |  set_vmstate_ffunc CARG1, CARG2
   |.endmacro
   |
   |.macro .ffunc_1, name
@@ -1479,6 +1505,7 @@ static void build_subroutines(BuildCtx *ctx)
   |   ins_next2
   |  // Adjust BASE. KBASE is assumed to be set for the calling frame.
   |  sub BASE, RA, CARG1
+  |  set_vmstate_sync_base LFUNC, CARG4	// LFUNC state after BASE restoration.
   |   ins_next3
   |
   |6:  // Fill up results with nil.
@@ -2243,14 +2270,13 @@ static void build_subroutines(BuildCtx *ctx)
   |   str BASE, L->base
   |  ldr CARG2, LFUNC:CARG2->field_pc
   |   str CARG3, [DISPATCH, #DISPATCH_GL(jit_base)]
-  |    mv_vmstate CARG4, INTERP
   |  ldr KBASE, [CARG2, #PC2PROTO(k)]
+  |  set_vmstate_sync_base LFUNC, CARG4	// LFUNC after BASE & KBASE restoration.
   |  // Modified copy of ins_next which handles function header dispatch, too.
   |  ldrb OP, [PC]
   |     mov MASKR8, #255
   |   ldr INS, [PC], #4
   |     lsl MASKR8, MASKR8, #3		// MASKR8 = 255*8.
-  |    st_vmstate CARG4
   |  cmn CARG1, #17			// Static dispatch?
   |  beq >5
   |  cmp OP, #BC_FUNCC+2		// Fast function?
@@ -2680,14 +2706,13 @@ static void build_subroutines(BuildCtx *ctx)
   |  bl extern lj_ccallback_enter	// (CTState *cts, void *cf)
   |  // Returns lua_State *.
   |  ldr BASE, L:CRET1->base
-  |    mv_vmstate CARG2, INTERP
+  |  set_vmstate_sync_base LFUNC, CARG2	// LFUNC after BASE restoration.
   |  ldr RC, L:CRET1->top
   |    mov MASKR8, #255
   |   ldr LFUNC:CARG3, [BASE, FRAME_FUNC]
   |    mov L, CRET1
   |  sub RC, RC, BASE
   |    lsl MASKR8, MASKR8, #3		// MASKR8 = 255*8.
-  |    st_vmstate CARG2
   |  ins_callt
   |.endif
   |
@@ -4108,6 +4133,8 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  decode_RC8 NARGS8:RC, INS
     |  // RA = base*8, (RB = nresults+1,) RC = (nargs+1)*8
     |->BC_CALL_Z:
+    |  // INTERP until *FUNC* bytecode sets up a new BASE.
+    |  set_vmstate INTERP, CARG1
     |  mov RB, BASE			// Save old BASE for vmeta_call.
     |  ldrd CARG34, [BASE, RA]!
     |   sub NARGS8:RC, NARGS8:RC, #8
@@ -4401,6 +4428,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   ins_next1
     |   ins_next2
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
+    |  set_vmstate_sync_base LFUNC, CARG3	// LFUNC after the old BASE & KBASE restoration.
     |   ins_next3
     |
     |6:  // Fill up results with nil.
@@ -4448,6 +4476,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   ins_next1
     |   ins_next2
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
+    |  set_vmstate_sync_base LFUNC, CARG3	// LFUNC after the old BASE & KBASE restoration.
     |   ins_next3
     |
     |6:  // Fill up results with nil.
@@ -4699,6 +4728,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ldr CARG1, L->maxstack
     |   ldrb CARG2, [PC, #-4+PC2PROTO(numparams)]
     |    ldr KBASE, [PC, #-4+PC2PROTO(k)]
+    |  set_vmstate_sync_base LFUNC, CARG4	// LFUNC after KBASE restoration.
     |  cmp RA, CARG1
     |  bhi ->vm_growstack_l
     if (op != BC_JFUNCF) {
@@ -4737,6 +4767,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   str LFUNC:CARG3, [CARG4]	// Store copy of LFUNC.
     |   add CARG2, RC, #8+FRAME_VARG
     |    ldr KBASE, [PC, #-4+PC2PROTO(k)]
+    |  set_vmstate_sync_base LFUNC, CARG3	// LFUNC after KBASE restoration.
     |  cmp RA, CARG1
     |   str CARG2, [CARG4, #4]		// Store delta + FRAME_VARG.
     |  bhs ->vm_growstack_l
@@ -4777,10 +4808,9 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     if (op == BC_FUNCCW) {
       |  ldr CARG2, CFUNC:CARG3->f
     }
-    |    mv_vmstate CARG3, C
+    |  set_vmstate_sync_base CFUNC, CARG3	// CFUNC before entering C function.
     |  mov CARG1, L
     |   bhi ->vm_growstack_c		// Need to grow stack.
-    |    st_vmstate CARG3
     |  blx CARG4			// (lua_State *L [, lua_CFunction f])
     |  // Returns nresults.
     |  ldr BASE, L->base
