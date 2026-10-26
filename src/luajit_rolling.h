@@ -73,6 +73,28 @@ LUA_API void luaJIT_profile_stop(lua_State *L);
 LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 					     int depth, size_t *len);
 
+/* One-shot interpreter interrupt API.
+**
+** While an interrupt session is active, the interpreter runs exclusively
+** (JIT off and flushed) and a single bytecode instruction may be replaced
+** by BC_INT3. The callback is a read-only native observer: it must not run
+** Lua code or change any interpreter/JIT/hook state.
+*/
+typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
+				     const void *proto, unsigned int bcpos);
+enum {
+  LUAJIT_INT3_OK = 0,
+  LUAJIT_INT3_BUSY = 1,		/* Unsafe context or conflicting owner. */
+  LUAJIT_INT3_INVALID = 2,	/* Bad callback or function/index. */
+  LUAJIT_INT3_DISABLED = 3,	/* No session owned by this VM. */
+  LUAJIT_INT3_UNAVAILABLE = 4	/* Profiling support compiled out. */
+};
+LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
+			      void *data);
+LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos);
+LUA_API int luaJIT_int3_cancel(lua_State *L);
+LUA_API int luaJIT_int3_stop(lua_State *L);
+
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);
 
