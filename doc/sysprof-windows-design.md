@@ -524,10 +524,17 @@ corrupts the first symbol with a newline in it.
 
 ## 11. v2.1 port status
 
-Branch `sysprof-v2.1` (worktree of `fesily/LuaJIT` at `dd3b2436`, LuaJIT 2.1
-with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
-(`msvcbuild.bat`, VS 18 / v145 toolset) and MinGW-w64 gcc 16.2
-(`src/Makefile`, MSYS shell).
+Branch `sysprof-v2.1` (worktree of `fesily/LuaJIT`, rebased onto
+`a4c06453` = `v2.1` of LuaJIT/LuaJIT, with GC64 and LJ_FR2). Built and
+exercised on Windows x64 with MSVC (`msvcbuild.bat`, VS 18 / v145 toolset)
+and MinGW-w64 gcc 16.2 (`src/Makefile`, MSYS shell).
+
+The rebase from the original base `dd3b2436` needed one adjustment: the
+baseline moved `fs_finish()` from `(LexState *ls, BCLine line)` to
+`(LexState *ls)` ("Add line number directive", `c41d727d`), and the profiler
+hook that registers the new prototype goes into that function. Everything
+else applied unchanged (`git range-diff`: 11 of the 12 commits identical, the
+port commit re-applied to the new signature).
 
 ### 11.1 What the port needed beyond the tarantool tree
 
@@ -570,6 +577,7 @@ with GC64, LJ_FR2). Built and exercised on Windows x64 with MSVC
 | `jit.mixprof` (C-only sampling) | `start(24, 1)`, workload, `stop()`, `report()`: the counts sum to the reported ticks, chains contain Lua frames (`file.lua:line`) and host frames (`@0x...`); 180 start/stop sessions on MSVC + MinGW without a crash |
 | trace intervals (`SYMTAB_TRACE` v6) | a loop compiled into one trace reports several lines (`file:6 [TRACE 1]`, `file:3 [TRACE 1]`) instead of the trace start only; every interval is inside its trace, increasing, and points at a proto present in the symbol table with `line >= linedefined` |
 | soak: `misc.sysprof.start`/`stop` in a loop, `jit.off()`, `mode="C"`/`"L"` | ~1500 sessions on MSVC + MinGW, no crash |
+| baseline rebase (`dd3b2436` -> `a4c06453`) | MSVC and MinGW build; counters, `jit.mixprof`, sample times, all four output formats, PDB naming, `flamegraph.pl` and the line-directive chunks behave as before; upstream test suite (`LuaJIT-test-cleanup/test/test.lua`): 532 passed / 4 failed, byte-identical to a stock `a4c06453` build modulo ASLR addresses (`lib/contents.lua` x2, `trace/exit_pargc.lua`, `opt/loop/unroll.lua` — Windows-environment failures) |
 | flame graph data source (`--format=folded`) | every line matches `^(.*) (\d+)$`, the counts sum to `report().samples` and to the text report, and `flamegraph.pl` accepts the file and renders the frames (`RtlUserThreadStart` → `main` → `pmain` → `handle_script` → `lua_pcall` → `@f.lua:5 [TRACE 5]` → `ffi.meta.__call` → `Sleep`); output is LF-only on MSVC and MinGW builds, so the `CR` that made `flamegraph.pl` ignore every line is gone |
 | sample times (`ljp` v5) | a profile taken at `interval = 1` reports monotonic `time_us` per sample (deltas 1.5-2.5 ms, the Sleep granularity), the first sample is within the file's lifetime, the chain aggregate carries `first_us`/`last_us`; profiles of format 2..4 still parse and simply have no times |
 | `jit.mixprof` timeline | `report()` returns `chains, spans, ticks`; `spans` are in `tick` order, `sum(count)` equals `ticks` and the `chains` sum; `info()` gives `start_us`/`interval_us`, so `start_us + tick * interval_us` places every record on the wall clock |
