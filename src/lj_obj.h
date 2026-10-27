@@ -870,9 +870,6 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
-#if LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
-  uint8_t parser_disable_tailcall;
-#endif
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)

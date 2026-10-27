@@ -2765,10 +2765,6 @@ static void parse_return(LexState *ls, int eflags)
 	BCIns *ip = bcptr(fs, &e);
 	/* It doesn't pay off to add BC_VARGT just for 'return ...'. */
 	if (bc_op(*ip) == BC_VARG) goto notailcall;
-#if LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
-	if (G(ls->L)->parser_disable_tailcall)
-	  goto notailcall;
-#endif
 	fs->pc--;
 	ins = BCINS_AD(bc_op(*ip)-BC_CALL+BC_CALLT, bc_a(*ip), bc_c(*ip));
 #if LUA_COMPAT_TAILCALL_CFRAME

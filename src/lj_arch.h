@@ -1031,10 +1031,6 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DST_LUA_STATE_USERDATA	192	/* 0xc0 */
 #endif
 
-#ifndef LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL
-#define LUA_COMPAT_DYNAMIC_DISABLE_TAILCALL LUAJIT_ENABLE_LUA51COMPAT
-#endif
-
 /* Tail-call compatibility is interpreter-only. Compiled code does not keep
 ** virtual tail counts or provide Lua 5.1 tail-frame/debug-hook semantics.
 ** Disable JIT for the functions whose call chains need these guarantees.
