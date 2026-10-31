@@ -852,8 +852,8 @@ LUA_API void *lua_getuserdata(lua_State *L)
 ** lua_getexecutionerror read that flag), so a swapped-in VM must publish both.
 ** While either pointer is NULL the storage is not wired yet and the entry points
 ** degrade to no-ops. */
-LUA_API char       *extern_error_message_buffer = NULL;
-LUA_API const char **extern_had_execution_error = NULL;
+LUA_DATA_API char       *extern_error_message_buffer = NULL;
+LUA_DATA_API const char **extern_had_execution_error = NULL;
 
 /* Armed predicate: the flag slot is wired and holds the block pointer. */
 static int execerror_armed(void)

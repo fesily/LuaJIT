@@ -141,8 +141,22 @@
 
 #define LUALIB_API	LUA_API
 
+/* Data symbols the DS build keeps in the export table (host-patched hook slots)
+** must stay exported but must not be preemptible in the ELF dynamic scope: a
+** default-visibility data symbol's own references go through a GLOB_DAT slot, so
+** any RTLD_GLOBAL module exporting the same name takes them over
+** (DontStarveLuaJIT2#51: plugin_debug_profiler exported a *function* named
+** `lj_gc_fullgc_external`, hijacked LuaJIT's same-named hook variable, and every
+** LUA_GCCOLLECT `call`ed the first 8 bytes of that function -> SIGSEGV).
+** PROTECTED keeps the symbol in .dynsym (gum_module_find_export_by_name still
+** finds it) while binding the VM's own references locally - the same treatment
+** -Wl,-Bsymbolic-functions already gives functions.  PE has no such preemption
+** and Mach-O binds two-level, so both keep plain linkage.
+*/
 #ifdef _WIN32
 #define LUA_DATA_API LUA_API
+#elif defined(__ELF__) && defined(__GNUC__)
+#define LUA_DATA_API __attribute__((visibility("protected")))
 #else
 #define LUA_DATA_API
 #endif

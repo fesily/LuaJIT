@@ -758,7 +758,7 @@ LJLIB_CF(newproxy)
 }
 
 #if LJ_DS_NEW_PROXY_PATCH
-lua_CFunction lua_newproxy = lj_cf_newproxy;
+LUA_DATA_API lua_CFunction lua_newproxy = lj_cf_newproxy;
 #endif
 
 LJLIB_PUSH("tostring")
