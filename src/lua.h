@@ -201,8 +201,8 @@ LUA_API void        (lua_clearexecutionerror) (void);
 ** buffer): extern_error_message_buffer is the 0x1000-byte message block, and
 ** extern_had_execution_error is the engine flag slot that stores the block
 ** pointer.  NULL means "not wired": the entry points degrade to no-ops. */
-extern LUA_DATA_API char       *extern_error_message_buffer;
-extern LUA_DATA_API const char **extern_had_execution_error;
+LUA_DATA_API char       *extern_error_message_buffer;
+LUA_DATA_API const char **extern_had_execution_error;
 #endif
 #if LJ_DS_CHUNKNAME_MARKER
 /* DST: engine-loaded chunkname marker, used by the item-server call-stack
