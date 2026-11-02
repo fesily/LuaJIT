@@ -156,7 +156,7 @@
 #ifdef _WIN32
 #define LUA_DATA_API LUA_API
 #elif defined(__ELF__) && defined(__GNUC__)
-#define LUA_DATA_API LUA_API __attribute__((visibility("protected")))
+#define LUA_DATA_API __attribute__((visibility("protected")))
 #else
 #define LUA_DATA_API
 #endif

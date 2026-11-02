@@ -207,7 +207,7 @@ LJLIB_CF(debug_setlocal)
 }
 
 #if LJ_DS_NEW_PROXY_PATCH
-LUA_DATA_API lua_CFunction lua_newproxy;
+extern LUA_DATA_API lua_CFunction lua_newproxy;
 #endif
 
 static int debug_getupvalue(lua_State *L, int get)
