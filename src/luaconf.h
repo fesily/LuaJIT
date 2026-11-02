@@ -152,9 +152,24 @@
 ** finds it) while binding the VM's own references locally - the same treatment
 ** -Wl,-Bsymbolic-functions already gives functions.  PE has no such preemption
 ** and Mach-O binds two-level, so both keep plain linkage.
+**
+** LUA_DATA_API is a qualifier only - it never carries the `extern` storage
+** class.  Every declaration spells `extern LUA_DATA_API ...` on its own: a bare
+** file-scope declaration would become a tentative definition in every TU that
+** includes lua.h.  LUA_API cannot be reused on PE because there it *does* carry
+** `extern` (`extern LUA_API` -> `extern extern`, rejected by MSVC with C2159),
+** so the PE branch mirrors LUA_API's export attribute without the linkage.
 */
 #ifdef _WIN32
-#define LUA_DATA_API LUA_API
+#if defined(LUA_BUILD_AS_DLL)
+#if defined(LUA_CORE) || defined(LUA_LIB)
+#define LUA_DATA_API __declspec(dllexport)
+#else
+#define LUA_DATA_API __declspec(dllimport)
+#endif
+#else
+#define LUA_DATA_API
+#endif
 #elif defined(__ELF__) && defined(__GNUC__)
 #define LUA_DATA_API __attribute__((visibility("protected")))
 #else
