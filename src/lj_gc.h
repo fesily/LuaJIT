@@ -179,11 +179,19 @@ static LJ_AINLINE int gc_obj_inarena(global_State *g, GCobj *o)
 /* Every huge object (string and non-string) carries white/black in its
 ** hugeset slot (bit 1), not the header. mainthread/strempty are dlmalloc, not
 ** huge. Huge strings are still unlinked from the intern table by gc_sweepstr,
-** but their color authority is the slot. */
+** but their color authority is the slot.
+**
+** Alignment alone cannot classify the two SFIXED roots: they are single
+** allocf() blocks, and a hosted allocator (lua_newstate's, e.g. the raw mmap
+** allocator in test/stack_oom.c) can hand back a 1MB-aligned address by
+** accident. Such a root would then be looked up in the hugeset, which is
+** NULL/empty until a real huge block exists -> SIGSEGV in hugeset_find from
+** gc_obj_iswhite(mainthread) inside the atomic assert. Only lj_hugeblock_alloc
+** output is arena-aligned *and* hugeset-registered, so exclude SFIXED here. */
 static LJ_AINLINE int gc_obj_inhugeset(global_State *g, GCobj *o)
 {
   UNUSED(g);
-  return lj_arena_ishuge(gc_obj_key(o));
+  return !(o->gch.marked & LJ_GC_SFIXED) && lj_arena_ishuge(gc_obj_key(o));
 }
 
 static LJ_AINLINE int gc_obj_iswhite(global_State *g, GCobj *o)

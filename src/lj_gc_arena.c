@@ -221,7 +221,10 @@ static void gc_mark(global_State *g, GCobj *o)
   ** and the mark site; o=cd carries the GCcdata header used below. */
   void *key = gc_obj_key(o);
   int inarena = !lj_arena_ishuge(key) && !(o->gch.marked & LJ_GC_SFIXED);
-  int inhuge = !inarena && lj_arena_ishuge(key);
+  /* A SFIXED root is never huge even when its allocf() block is coincidentally
+  ** arena-aligned: it has no hugeset slot (see gc_obj_inhugeset). */
+  int inhuge = !inarena && !(o->gch.marked & LJ_GC_SFIXED) &&
+	       lj_arena_ishuge(key);
   GCArena *a;
   GCCellID c;
   if (inarena) {
