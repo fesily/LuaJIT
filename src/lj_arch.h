@@ -891,6 +891,14 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LUA_COMPAT_LEX_UNICODE !LUAJIT_ENABLE_LUA51COMPAT
 #endif
 
+/* Lua 5.1 tolerates an unknown escape: the backslash is dropped and the
+** character is kept ("\q" -> "q", "\x41" -> "x41").  LuaJIT and Lua 5.2
+** reject it ("invalid escape sequence").  Gated separately from
+** LUA_COMPAT_LEX_UNICODE, so a stock-LuaJIT build rejects it too. */
+#ifndef LUA_COMPAT_LEX_XESC
+#define LUA_COMPAT_LEX_XESC LUAJIT_ENABLE_LUA51COMPAT
+#endif
+
 #ifndef LUA_COMPAT_STRFMT
 #define LUA_COMPAT_STRFMT LUAJIT_ENABLE_LUA51COMPAT
 #endif

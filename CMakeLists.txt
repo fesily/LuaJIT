@@ -593,9 +593,13 @@ add_luajit_variant(
 # levels: tailcall_debug raises the traceback that luaL_traceback() renders, so
 # it also trips the assertion VM when the walk touches a tail level's nil
 # function (hot-path review item C).
+# str_escapes pins Lua 5.1 escape lexing: unknown escapes keep the character
+# (LUA_COMPAT_LEX_XESC), '\x'/'\u'/'\z' stay literal (LUA_COMPAT_LEX_UNICODE
+# off), and an out-of-range decimal escape reports the 5.1 wording.
 foreach(_lj_compat51_case arg_bug function_args function_args_alloc
         function_args_closure function_args_debug function_args_main_chunk
-        getlocal_tail_frame str_order51 str_intern_collide tailcall_debug)
+        getlocal_tail_frame str_escapes str_order51 str_intern_collide
+        tailcall_debug)
   if(LUAJIT_DISABLE_JIT AND
       _lj_compat51_case MATCHES "^(function_args_alloc|str_order51)$")
     continue() # These unrelated scripts explicitly enable the JIT engine.

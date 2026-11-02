@@ -261,23 +261,28 @@ static void lex_string(LexState *ls, TValue *tv, LexChar delim)
       case LEX_EOF: continue;
       default:
 	if (!lj_char_isdigit(c)) {
-    break;
+#if LUA_COMPAT_LEX_XESC
+	  break;  /* Lua 5.1: drop the '\' and keep the character. */
+#else
 	  goto err_xesc;
-  }
+#endif
+	}
 	c -= '0';  /* Decimal escape '\ddd'. */
 	if (lj_char_isdigit(lex_next(ls))) {
 	  c = c*10 + (ls->c - '0');
 	  if (lj_char_isdigit(lex_next(ls))) {
 	    c = c*10 + (ls->c - '0');
-	    if (c > 255) {
-	    err_xesc:
-	      lj_lex_error(ls, TK_string, LJ_ERR_XESC);
-	    }
+	    if (c > 255)  /* Lua 5.1 wording, not LuaJIT's "invalid". */
+	      lj_lex_error(ls, TK_string, LJ_ERR_XESCL);
 	    lex_next(ls);
 	  }
 	}
 	lex_save(ls, c);
 	continue;
+#if LUA_COMPAT_LEX_UNICODE || !LUA_COMPAT_LEX_XESC
+      err_xesc:
+	lj_lex_error(ls, TK_string, LJ_ERR_XESC);
+#endif
       }
       lex_save(ls, c);
       lex_next(ls);
