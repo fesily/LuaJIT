@@ -892,9 +892,11 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #endif
 
 /* Lua 5.1 tolerates an unknown escape: the backslash is dropped and the
-** character is kept ("\q" -> "q", "\x41" -> "x41").  LuaJIT and Lua 5.2
-** reject it ("invalid escape sequence").  Gated separately from
-** LUA_COMPAT_LEX_UNICODE, so a stock-LuaJIT build rejects it too. */
+** character is kept ("\q" -> "q", "\x41" -> "x41"), and an out-of-range
+** decimal escape is reported as "escape sequence too large".  LuaJIT and
+** Lua 5.2 reject unknown escapes ("invalid escape sequence") and keep that
+** wording for the decimal overflow.  Gated separately from
+** LUA_COMPAT_LEX_UNICODE, so a stock-LuaJIT build keeps stock behaviour. */
 #ifndef LUA_COMPAT_LEX_XESC
 #define LUA_COMPAT_LEX_XESC LUAJIT_ENABLE_LUA51COMPAT
 #endif

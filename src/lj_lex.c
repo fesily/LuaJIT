@@ -272,8 +272,13 @@ static void lex_string(LexState *ls, TValue *tv, LexChar delim)
 	  c = c*10 + (ls->c - '0');
 	  if (lj_char_isdigit(lex_next(ls))) {
 	    c = c*10 + (ls->c - '0');
-	    if (c > 255)  /* Lua 5.1 wording, not LuaJIT's "invalid". */
+	    if (c > 255) {  /* 5.1 wording; LuaJIT keeps "invalid escape". */
+#if LUA_COMPAT_LEX_XESC
 	      lj_lex_error(ls, TK_string, LJ_ERR_XESCL);
+#else
+	      lj_lex_error(ls, TK_string, LJ_ERR_XESC);
+#endif
+	    }
 	    lex_next(ls);
 	  }
 	}
