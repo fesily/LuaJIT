@@ -128,6 +128,11 @@ typedef struct GG_State {
 #define hotcount_set(gg, pc, val) \
   (hotcount_get((gg), (pc)) = (HotCount)(val))
 
+#if LJ_HASCOROHOOK
+/* Coroutine hook. */
+LJ_FUNC int lj_dispatch_resume(lua_State *co, lua_State *parent, int nargs);
+#endif
+
 /* Dispatch table management. */
 LJ_FUNC void lj_dispatch_init(GG_State *GG);
 #if LJ_HASJIT

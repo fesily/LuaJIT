@@ -169,6 +169,83 @@ Note that you can only define <b>a single global wrapper function</b>,
 so be careful when using this mechanism from multiple C++ modules.
 Also note that this mechanism is not without overhead.
 </p>
+<h2 id="luaJIT_setcoroutinehook"><tt>luaJIT_setcoroutinehook(L, cb, data)</tt>
+&mdash; Coroutine Hook</h2>
+<p>
+This is a C API extension which notifies native C code about successful
+coroutine switches in the current Lua universe. The full prototype is:
+</p>
+<pre class="code">
+enum {
+  LUAJIT_CORO_ENTER,  /* Entering a coroutine. */
+  LUAJIT_CORO_LEAVE   /* Leaving a coroutine. */
+};
+
+typedef void (*luaJIT_coroutine_callback)(void *data,
+  lua_State *from, lua_State *to, int event, int status);
+
+LUA_API void luaJIT_setcoroutinehook(lua_State *L,
+  luaJIT_coroutine_callback cb, void *data);
+</pre>
+<p>
+The registration is per Lua universe and may be done with any thread of
+that universe. Passing <tt>NULL</tt> as <tt>cb</tt> disables the hook
+immediately and discards <tt>data</tt>.
+</p>
+<p>
+The callback receives the direction of the switch in <tt>from</tt> and
+<tt>to</tt>: <tt>LUAJIT_CORO_ENTER</tt> reports
+<tt>ENTER(parent, coroutine)</tt> with <tt>status</tt> set to
+<tt>LUA_OK</tt>, <tt>LUAJIT_CORO_LEAVE</tt> reports
+<tt>LEAVE(coroutine, parent)</tt> with <tt>status</tt> set to the result
+of the resume (<tt>LUA_YIELD</tt>, <tt>LUA_OK</tt> or an error code).
+Rejected resume attempts are not reported. Coroutine switches initiated
+with <tt>lua_resume()</tt> have no known parent, so <tt>from</tt> or
+<tt>to</tt> is <tt>NULL</tt> for them.
+</p>
+<p>
+The registration is re-read immediately before each notification, so a
+hook installed or removed by ordinary C code while a coroutine runs takes
+effect at the next switch boundary. There is no pairing guarantee across
+registration changes: it is possible to observe a <tt>LEAVE</tt> without
+a matching <tt>ENTER</tt> and vice versa. With an unchanged registration,
+nested coroutine switches are reported in last-in-first-out order. A
+<tt>coroutine.resume()</tt> or <tt>coroutine.wrap()</tt> that entered the
+uninstrumented fast path while no hook was registered has no exit
+boundary, so registering a hook during that activation reports nothing
+for it and takes effect at the next instrumented resume; the C
+<tt>lua_resume()</tt> path, in contrast, checks for a registration after
+the coroutine finished.
+</p>
+<p>
+The callback runs synchronously and must return normally. It must not run
+Lua code, resume or yield, raise errors, allocate memory, trigger a
+garbage collection, change the registration or modify either stack.
+Non-allocating stack inspection is allowed: <tt>lua_getstack()</tt>,
+<tt>lua_getinfo()</tt> with <tt>S</tt>, <tt>l</tt>, <tt>u</tt> or
+<tt>n</tt>, and balanced <tt>lua_getlocal()</tt> calls, as far as the
+available stack space goes. Line and name information is only meaningful
+for Lua frames: the topmost suspended frame can be a C function frame
+(<tt>coroutine.yield</tt> is one), and neither its current line nor its
+name is guaranteed.
+</p>
+<p>
+The whole extension is compiled out when the VM is built with
+<tt>-DLUAJIT_DISABLE_COROHOOK</tt> (<tt>LJ_HASCOROHOOK</tt> in
+<tt>lj_arch.h</tt>): the <tt>global_State</tt> fields, the entry check in
+the coroutine fast path and the resume helper disappear, and the
+<tt>luaJIT_setcoroutinehook</tt> symbol is not linked.
+</p>
+<p>
+Each coroutine resume pays a single check on the fast path while the
+extension is compiled in. Unregistering the hook does not remove that
+check, it only makes it fall through again; building with
+<tt>-DLUAJIT_DISABLE_COROHOOK</tt> restores the original unchecked path.
+The resume path from a C function always checks for a registration after
+the coroutine finished, so a <tt>LEAVE</tt> notification can arrive
+without a preceding <tt>ENTER</tt> notification.
+</p>
+
 <br class="flush">
 </div>
 <div id="foot">

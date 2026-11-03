@@ -73,6 +73,16 @@ LUA_API void luaJIT_profile_stop(lua_State *L);
 LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 					     int depth, size_t *len);
 
+/* Coroutine hook: called on successful coroutine entry and exit. */
+enum {
+  LUAJIT_CORO_ENTER,		/* ENTER(parent, co), status = LUA_OK. */
+  LUAJIT_CORO_LEAVE		/* LEAVE(co, parent), status = resume result. */
+};
+typedef void (*luaJIT_coroutine_callback)(void *data,
+  lua_State *from, lua_State *to, int event, int status);
+LUA_API void luaJIT_setcoroutinehook(lua_State *L,
+				     luaJIT_coroutine_callback cb, void *data);
+
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);
 

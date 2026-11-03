@@ -1569,6 +1569,9 @@ static void build_subroutines(BuildCtx *ctx)
   |  mov L:RB, CFUNC:RB->upvalue[0].gcr
   |  cleartp L:RB
   |.endif
+  |.if COROHOOK
+  |  cmp byte [DISPATCH+DISPATCH_GL(corohookon)], 0; jne ->fff_fallback
+  |.endif
   |  mov PC, [BASE-8]
   |  mov SAVE_PC, PC
   |  mov TMP1, L:RB

@@ -162,6 +162,11 @@ uninstall:
 
 ##############################################################################
 
+test:
+	@echo "==== Running LuaJIT tests ===="
+	$(MAKE) -C tests
+	@echo "==== Successfully ran LuaJIT tests ===="
+
 amalg:
 	@echo "==== Building LuaJIT $(MMVERSION) (amalgamation) ===="
 	$(MAKE) -C src amalg
@@ -169,7 +174,8 @@ amalg:
 
 clean:
 	$(MAKE) -C src clean
+	$(MAKE) -C tests clean
 
-.PHONY: all install amalg clean
+.PHONY: all install amalg test clean
 
 ##############################################################################
