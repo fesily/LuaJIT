@@ -287,7 +287,7 @@ LJ_FUNCA void LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   vmstate = g->vmstate;
   g->hookmask = HOOK_VMEVENT;
   lj_dispatch_update(g, 0);
-  setvmstate(g, CFUNC);  /* The callback is native code, not the interpreter. */
+  setvmstate(g, C);  /* The callback is native code, not the interpreter. */
   st->cb(st->data, L, pt, (unsigned int)bcpos);
   g->vmstate = vmstate;
   g->hookmask = mask;
