@@ -75,10 +75,12 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 
 /* One-shot interpreter interrupt API.
 **
-** While an interrupt session is active, the interpreter runs exclusively
-** (JIT off and flushed) and a single bytecode instruction may be replaced
-** by BC_INT3. The callback is a read-only native observer: it must not run
-** Lua code or change any interpreter/JIT/hook state.
+** While an interrupt session is active, a single bytecode instruction may be
+** replaced by BC_INT3. The JIT stays enabled: arming flushes only the traces
+** that can reach the armed instruction and excludes its prototype from
+** compilation until the request is consumed or cancelled. The callback is a
+** read-only native observer: it must not run Lua code or change any
+** interpreter/JIT/hook state.
 */
 typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
 				     const void *proto, unsigned int bcpos);

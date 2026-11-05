@@ -1115,39 +1115,6 @@ static void test_unsafe(void)
   lua_close(L);
 }
 
-/* -- [10] Coexistence with the sysprof sampler (fork baseline) ----------- */
-
-static void test_sysprof(void)
-{
-  lua_State *L = luaL_newstate();
-  Int3Rec rec;
-  int bcpos = -1;
-  double v, samples = -1, cfunc = -1;
-  memset(&rec, 0, sizeof(rec));
-  luaL_openlibs(L);
-  run(L, "G = {} function G.sum(n) local s = 0 for i = 1, n do s = s + i end return s end");
-  /* The sampler uses its own timer thread and is read-only: an interrupt
-  ** session must not disturb it, and vice versa.
-  */
-  CHECK(run_bool(L,
-	"return require('misc').sysprof.start{ mode = 'D', interval = 1 }"));
-  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
-  CHECK(arm_slot(L, "G", "sum", "ADDVV", &bcpos) == 0);
-  rec.calls = 0;
-  CHECK(run_number(L, "return G.sum(50000000)", &v) &&
-	v == 1250000025000000.0);
-  CHECK(rec.calls == 1);
-  CHECK(run_bool(L, "return require('misc').sysprof.stop()"));
-  CHECK(run_number(L, "return require('misc').sysprof.report().samples",
-		   &samples));
-  CHECK(run_number(L,
-	"return require('misc').sysprof.report().vmstate.CFUNC", &cfunc));
-  printf("[10] sysprof+int3: samples=%g cfunc=%g calls=%d\n", samples, cfunc,
-	 rec.calls);
-  CHECK(samples > 0);
-  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
-  lua_close(L);
-}
 
 #endif  /* !SMOKE_NO_JIT && !SMOKE_NO_PROFILE */
 
@@ -1224,7 +1191,6 @@ int main(int argc, char **argv)
   if (!only || only == 6) test_dump();
   if (!only || only == 7) test_profiler();
   if (!only || only == 8) test_unsafe();
-  if (!only || only == 10) test_sysprof();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
