@@ -42,6 +42,7 @@
 #include "lj_serialize.c"
 #include "lj_api.c"
 #include "lj_profile.c"
+#include "lj_mixprof.c"
 #include "lj_lex.c"
 #include "lj_parse.c"
 #include "lj_bcread.c"
@@ -73,6 +74,12 @@
 #include "lj_trace.c"
 #include "lj_gdbjit.c"
 #include "lj_alloc.c"
+#include "lj_sysprof.c"
+#include "lj_profile_timer.c"
+#include "lj_symtab.c"
+#include "lj_mapi.c"
+#include "lj_wbuf.c"
+#include "lj_utils_leb128.c"
 
 #include "lib_aux.c"
 #include "lib_base.c"
@@ -87,5 +94,7 @@
 #include "lib_jit.c"
 #include "lib_ffi.c"
 #include "lib_buffer.c"
+#include "lib_misc.c"
+#include "lib_mixprof.c"
 #include "lib_init.c"
 
