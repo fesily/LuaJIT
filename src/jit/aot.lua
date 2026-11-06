@@ -88,6 +88,7 @@ local ARITH = {
 
 -- Reasons for rejecting an opcode. Anything not whitelisted is rejected.
 local NOSUPPORT = {
+  ISEQS = "string comparison", ISNES = "string comparison",
   MODVN = "modulo operator", MODNV = "modulo operator", MODVV = "modulo operator",
   POW = "power operator", CAT = "string concatenation", LEN = "length operator",
   BNOT = "bitwise operator", BAND = "bitwise operator", BOR = "bitwise operator",
@@ -110,8 +111,8 @@ local NOSUPPORT = {
   TSETB = "table access", TSETM = "table access", TSETR = "table access",
   ISTYPE = "type assertion", ISNUM = "type assertion",
   FUNCF = "function header", IFUNCF = "patched bytecode",
-  JFUNCFF = "patched bytecode", FUNCV = "function header",
-  IFUNCV = "patched bytecode", JFUNCVF = "patched bytecode",
+  JFUNCF = "patched bytecode", FUNCV = "function header",
+  IFUNCV = "patched bytecode", JFUNCV = "patched bytecode",
   FUNCC = "C function", FUNCCW = "C function",
   JFORI = "patched bytecode", JFORL = "patched bytecode",
   JLOOP = "patched bytecode",
