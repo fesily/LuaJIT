@@ -85,12 +85,13 @@ local ARITH = {
   SUBVN = {"aot_sub", "VN"}, SUBNV = {"aot_sub", "NV"}, SUBVV = {"aot_sub", "VV"},
   MULVN = {"aot_mul", "VN"}, MULNV = {"aot_mul", "NV"}, MULVV = {"aot_mul", "VV"},
   DIVVN = {"aot_div", "VN"}, DIVNV = {"aot_div", "NV"}, DIVVV = {"aot_div", "VV"},
+  MODVN = {"aot_mod", "VN"}, MODNV = {"aot_mod", "NV"}, MODVV = {"aot_mod", "VV"},
+  POW = {"aot_pow", "VV"},
 }
 
 -- Reasons for rejecting an opcode. Anything not whitelisted is rejected.
 local NOSUPPORT = {
-  MODVN = "modulo operator", MODNV = "modulo operator", MODVV = "modulo operator",
-  POW = "power operator", CAT = "string concatenation", LEN = "length operator",
+  CAT = "string concatenation", LEN = "length operator",
   BNOT = "bitwise operator", BAND = "bitwise operator", BOR = "bitwise operator",
   BXOR = "bitwise operator", BSHL = "bitwise operator", BSHR = "bitwise operator",
   BSAR = "bitwise operator",
@@ -140,6 +141,7 @@ for name in pairs(ARITH) do SUPPORTED[name] = true end
 local CHELPERS = [==[
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "lua.h"
 #include "lauxlib.h"
@@ -287,6 +289,56 @@ AOT_INLINE void aot_div(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
     return;
   }
   aot_div_slow(L, dst, x, y, pc, op, itype(x), itype(y));
+}
+
+/* Number value with the representation already known to be a number. */
+AOT_INLINE lua_Number aot_num(cTValue *v)
+{
+  return tvisint(v) ? (lua_Number)intV(v) : numV(v);
+}
+
+/* Modulo: floor-modulus semantics of the VM (a - floor(a/b)*b), never fmod.
+** An int pair keeps an int result unless the divisor is zero; a zero divisor
+** falls through to the float path, which produces NaN like the VM does.
+*/
+AOT_INLINE void aot_mod(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			int pc, const char *op)
+{
+#if LJ_DUALNUM
+  if (tvisint(x) && tvisint(y)) {
+    int64_t a = intV(x), b = intV(y);
+    if (AOT_LIKELY(b != 0)) {
+      int64_t r = a % b;		/* int64: no INT32_MIN % -1 overflow */
+      if (r != 0 && ((r < 0) != (b < 0))) r += b;
+      setintV(dst, (int32_t)r);
+      return;
+    }
+  }
+#endif
+  if (AOT_UNLIKELY(!tvisnumber(x) || !tvisnumber(y))) {
+    aot_errnum(L, pc, op);
+    return;
+  }
+  {
+    lua_Number a = aot_num(x), b = aot_num(y);
+    setnumV(dst, a - floor(a / b) * b);
+  }
+}
+
+/* Power: always a double, built-in pow(), no integer fast path. */
+AOT_INLINE void aot_pow(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			int pc, const char *op)
+{
+  lua_Number a = x->n, b = y->n;
+  if (AOT_LIKELY(a == a && b == b)) {
+    setnumV(dst, pow(a, b));
+    return;
+  }
+  if (AOT_UNLIKELY(!tvisnumber(x) || !tvisnumber(y))) {
+    aot_errnum(L, pc, op);
+    return;
+  }
+  setnumV(dst, pow(aot_num(x), aot_num(y)));
 }
 
 AOT_INLINE void aot_unm(lua_State *L, TValue *dst, cTValue *src,

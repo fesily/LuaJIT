@@ -75,7 +75,7 @@ local function build(func)
   else
     fatal("this test runner has no link command for "..tostring(jit.os))
   end
-  local cmd = format("%s -O2 -std=c99 -fPIC -ffp-contract=off -I%s %s %s -o %s 2>%s",
+  local cmd = format("%s -O2 -std=c99 -fPIC -ffp-contract=off -I%s %s %s -o %s -lm 2>%s",
 		     CC, INC, link, shellquote(cfile), shellquote(sofile),
 		     shellquote(errfile))
   if not run(cmd) then
@@ -442,6 +442,87 @@ do
 end
 
 ------------------------------------------------------------------------------
+-- 3b. Modulo and power.
+
+local function t_mod(a) return a % 2 end
+local function t_pow(a) return a ^ 2 end
+local function t_modvn(x) return x % 3 end
+local function t_modnv(x) return 3 % x end
+local function t_modvv(x, y) return x % y end
+local function t_powvv(x, y) return x ^ y end
+local function t_modip(x, y) x = x % y return x end
+local function t_powip(x, y) x = x ^ y return x end
+
+def(t_mod) def(t_pow)
+def(t_modvn) def(t_modnv) def(t_modvv) def(t_powvv)
+def(t_modip) def(t_powip)
+
+local mod_ints = {A(5, 3), A(-5, 3), A(5, -3), A(-5, -3), A(0, 3), A(0, -3),
+		  A(MAX, 3), A(MIN, 3), A(MIN, -1), A(MAX, MIN), A(1, 0), A(0, 0)}
+local mod_reals = {A(5.5, 2), A(5, 2.5), A(-5.5, 2), A(5.5, -2),
+		   A(-0.0, 3), A(0.0, 3), A(1, 0.0), A(1, -0.0), A(1, 1/0),
+		   A(3, 1/0), A(-3, 1/0), A(1/0, 3), A(0/0, 3), A(1, 0/0)}
+check("mod ints", t_modvv, mod_ints)
+check("mod reals", t_modvv, mod_reals)
+check("modvn", t_modvn, {A(5), A(-5), A(0), A(MAX), A(MIN), A(-0.0), A(5.5)})
+check("modnv", t_modnv, {A(5), A(-5), A(2.5), A(0), A(-0.0)})
+check("mod alias", t_modip, {A(7, 3), A(-7, 3), A(7.5, 2), A(-7.5, -2)})
+
+local pow_args = {A(2, 3), A(2, -2), A(-2, 3), A(-2, 0.5), A(0, 0), A(0, 1),
+		  A(-0.0, 3), A(0.0, -1), A(-0.0, -1), A(2.5, 2), A(2, 0.5),
+		  A(1, 1/0), A(1, -1/0), A(0/0, 0), A(1/0, 0), A(10, 3)}
+check("pow", t_powvv, pow_args)
+check("pow alias", t_powip, {A(2, 3), A(2.5, 2), A(-2, 3)})
+check("pow const", t_pow, {A(2), A(3), A(-2), A(1.5)})
+check("mod const", t_mod, {A(5), A(-5), A(0), A(-0.0), A(5.5)})
+
+do
+  local fvn, fnv, fvv = build(t_modvn), build(t_modnv), build(t_modvv)
+  expect(fvv(5, 3) == 2, "5%3")
+  expect(fvv(-5, 3) == 1, "-5%3")
+  expect(fvv(5, -3) == -1, "5%-3")
+  expect(fvv(-5, -3) == -2, "-5%-3")
+  expect(fvv(MIN, -1) == 0, "INT32_MIN%-1")
+  expect(fvn(-0.0) == 0 and 1/fvn(-0.0) > 0, "(-0)%3 is not +0")
+  local z = fvv(1, 0)
+  expect(z ~= z, "1%0 is not NaN")
+  local z2 = fvv(1, 1/0)
+  expect(z2 ~= z2, "1%inf is not NaN")
+  local z3 = fvv(1/0, 3)
+  expect(z3 ~= z3, "inf%3 is not NaN")
+  local nz = fnv(-0.0)
+  expect(nz ~= nz, "3%-0 is not NaN")
+  ok()
+end
+
+do
+  local fp = build(t_powvv)
+  expect(fp(2, 3) == 8, "2^3")
+  expect(fp(2, -2) == 0.25, "2^-2")
+  expect(fp(-2, 3) == -8, "(-2)^3")
+  local q = fp(-2, 0.5)
+  expect(q ~= q, "(-2)^0.5 is not NaN")
+  expect(fp(0, 0) == 1, "0^0")
+  local mz = fp(-0.0, 3)
+  expect(mz == 0 and 1/mz < 0, "(-0)^3 is not -0")
+  ok()
+end
+
+-- Type errors stay number-only and never call metamethods.
+do
+  local called = false
+  local mt = {__mod = function() called = true return 1 end,
+	      __pow = function() called = true return 1 end}
+  local t = setmetatable({}, mt)
+  expectfail("mod nil", A(nil, 1), t_modvv, {"number expected"})
+  expectfail("mod string", A("2", 1), t_modvv, {"number expected"})
+  expectfail("mod table", A(t, 1), t_modvv, {"number expected"})
+  expectfail("pow boolean", A(true, 1), t_powvv, {"number expected"})
+  expectfail("pow table", A(t, 1), t_powvv, {"number expected"})
+  expect(not called, "a metamethod was called for mod/pow")
+end
+
+------------------------------------------------------------------------------
 -- 4. Branch boundaries.
 
 local function t_lt(a, b) if a < b then return 1 end return 0 end
@@ -536,8 +617,6 @@ local function t_call(a) return a(1) end
 local function t_tabnew() local t = {} return t end
 local function t_tabget(a) return a.x end
 local function t_glob() return math.pi end
-local function t_mod(a) return a % 2 end
-local function t_pow(a) return a ^ 2 end
 local function t_concat(a) return "x"..a end
 local function t_len(a) return #a end
 local function t_bit(a) return a | 1 end
@@ -568,7 +647,7 @@ end
 local reject = {
   {"call", t_call}, {"table constructor", t_tabnew},
   {"table access", t_tabget}, {"global access", t_glob},
-  {"modulo", t_mod}, {"power", t_pow}, {"concatenation", t_concat},
+  {"concatenation", t_concat},
   {"length", t_len}, {"bitwise", t_bit}, {"vararg", t_vararg},
   {"child prototype", t_child}, {"upvalue", t_upval},
   {"table access 2", t_typed}, {"nested function", t_closure},
@@ -589,10 +668,6 @@ for i = 1, #reject do
 end
 -- Compile errors for rejected opcodes carry pc and opcode.
 do
-  local _, msg = pcall(aot.compile, t_mod, "rejmod")
-  msg = tostring(msg)
-  expect(find(msg, "pc=", 1, true) and find(msg, "MOD", 1, true),
-	 "rejected opcode error lacks pc/opcode: "..msg)
   local _, msg2 = pcall(aot.compile, t_call, "rejcall")
   msg2 = tostring(msg2)
   expect(find(msg2, "CALL", 1, true) != nil,
@@ -722,7 +797,7 @@ end
 
 local function ccompile(cfile, sofile)
   local link = jit.os == "OSX" and "-bundle -undefined dynamic_lookup" or "-shared"
-  local cmd = format("%s -O2 -std=c99 -fPIC -ffp-contract=off -I%s %s %s -o %s",
+  local cmd = format("%s -O2 -std=c99 -fPIC -ffp-contract=off -I%s %s %s -o %s -lm",
 		     CC, INC, link, shellquote(cfile), shellquote(sofile))
   local okc, out = runcapture(cmd)
   return okc, out, cmd
