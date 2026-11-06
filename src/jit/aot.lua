@@ -350,13 +350,14 @@ AOT_INLINE void aot_pow(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
   setnumV(dst, pow(aot_num(x), aot_num(y)));
 }
 
-/* Bit operations take numbers only. A double is converted with the same
-** 2^52 + 2^51 bias algorithm as the VM's lj_vm_tobit (round to nearest
-** even of the biased value), which is not a truncation: tobit(1.5) == 2.
-** Anything else is a type error.
+/* Bit operations take numbers only. The int fast path stays inline and per
+** opcode; the double conversion (the VM's 2^52 + 2^51 tobit bias, i.e.
+** round to nearest even of the biased value, not a truncation) and the type
+** error live in a cold out-of-line helper, so the hot path has no shared
+** sequence that the compiler could outline into a call.
 */
-AOT_INLINE uint32_t aot_bitvalue(lua_State *L, cTValue *src, int pc,
-				 const char *op)
+static AOT_COLD AOT_UNUSED uint32_t aot_bitvalue(lua_State *L, cTValue *src,
+						 int pc, const char *op)
 {
   TValue t;
   if (tvisint(src)) return (uint32_t)intV(src);
@@ -371,51 +372,81 @@ AOT_INLINE uint32_t aot_bitvalue(lua_State *L, cTValue *src, int pc,
 AOT_INLINE void aot_bnot(lua_State *L, TValue *dst, cTValue *src,
 			 int pc, const char *op)
 {
-  uint32_t v = aot_bitvalue(L, src, pc, op);
-  setintV(dst, (int32_t)~v);
+  if (AOT_LIKELY(tvisint(src))) {
+    setintV(dst, (int32_t)~(uint32_t)intV(src));
+    return;
+  }
+  setintV(dst, (int32_t)~aot_bitvalue(L, src, pc, op));
 }
 
 AOT_INLINE void aot_band(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
 			 int pc, const char *op)
 {
-  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
-  setintV(dst, (int32_t)(a & b));
+  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+    setintV(dst, (int32_t)((uint32_t)intV(x) & (uint32_t)intV(y)));
+    return;
+  }
+  setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) &
+			 aot_bitvalue(L, y, pc, op)));
 }
 
 AOT_INLINE void aot_bor(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
 			int pc, const char *op)
 {
-  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
-  setintV(dst, (int32_t)(a | b));
+  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+    setintV(dst, (int32_t)((uint32_t)intV(x) | (uint32_t)intV(y)));
+    return;
+  }
+  setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) |
+			 aot_bitvalue(L, y, pc, op)));
 }
 
 AOT_INLINE void aot_bxor(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
 			 int pc, const char *op)
 {
-  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
-  setintV(dst, (int32_t)(a ^ b));
+  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+    setintV(dst, (int32_t)((uint32_t)intV(x) ^ (uint32_t)intV(y)));
+    return;
+  }
+  setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) ^
+			 aot_bitvalue(L, y, pc, op)));
 }
 
 AOT_INLINE void aot_bshl(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
 			 int pc, const char *op)
 {
-  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
-  setintV(dst, (int32_t)(a << (b & 31u)));
+  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+    setintV(dst, (int32_t)((uint32_t)intV(x) << ((uint32_t)intV(y) & 31u)));
+    return;
+  }
+  setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) <<
+			 (aot_bitvalue(L, y, pc, op) & 31u)));
 }
 
 AOT_INLINE void aot_bshr(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
 			 int pc, const char *op)
 {
-  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
-  setintV(dst, (int32_t)(a >> (b & 31u)));
+  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+    setintV(dst, (int32_t)((uint32_t)intV(x) >> ((uint32_t)intV(y) & 31u)));
+    return;
+  }
+  setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) >>
+			 (aot_bitvalue(L, y, pc, op) & 31u)));
 }
 
 /* Arithmetic shift right without relying on C's shifting of negatives. */
 AOT_INLINE void aot_bsar(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
 			 int pc, const char *op)
 {
-  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
-  uint32_t n = b & 31u, r = a >> n;
+  uint32_t a, n, r;
+  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+    a = (uint32_t)intV(x);
+    n = (uint32_t)intV(y) & 31u;
+  } else {
+    a = aot_bitvalue(L, x, pc, op);
+    n = aot_bitvalue(L, y, pc, op) & 31u;
+  }
+  r = a >> n;
   if (n != 0 && (a & 0x80000000u)) r |= 0xffffffffu << (32u - n);
   setintV(dst, (int32_t)r);
 }

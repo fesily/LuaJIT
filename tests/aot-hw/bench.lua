@@ -75,7 +75,10 @@ end
 
 print(string.format("%-5s %9s %9s %9s %10s  %s",
   "case", "interp", "jit", "aot", "aot/interp", "value"))
-for _, name in ipairs({"int1", "int2", "fp1"}) do
+local names = {}
+for name in pairs(CASES) do names[#names+1] = name end
+table.sort(names)
+for _, name in ipairs(names) do
   local body, n, reps = CASES[name][1], CASES[name][2], CASES[name][3]
   jit.on()
   local interp = mkcfunc(body); jit.off(interp, true)
@@ -85,6 +88,9 @@ for _, name in ipairs({"int1", "int2", "fp1"}) do
   assert(ri == rj and ri == ra, "result mismatch in "..name)
   if name == "int2" and ri ~= 800020000 then
     error("int2 left the int32 range: "..tostring(ri))
+  end
+  if name == "modi" and not (ri >= 0 and ri <= 6) then
+    error("modi left its expected range: "..tostring(ri))
   end
   local ns = 1e9 / (n * reps)
   local ti, tj, ta = best(interp, n, reps)*ns, best(jitf, n, reps)*ns, best(aotf, n, reps)*ns

@@ -25,6 +25,12 @@ into `+inf`), so it no longer measures the integer path at all.
 | `int1` | `s = s + 1`, n = 1e6 | yes |
 | `int2` | `s = s + i`, n = 40000 (max 8.0e8) | yes, asserted |
 | `fp1`  | `x = x * 0.999999 + 0.5` | n/a, all doubles |
+| `modi` | `s = (s + i) % 7`, s stays in [0, 6] | yes, asserted |
+| `modf` | `x = (x + 0.25) % 1.5` | n/a, all doubles |
+| `powr` | `a = x ^ y`, general operands | n/a |
+| `bits` | band/bxor/bsar/bshl chain | yes, int results |
+| `chain` | six dependent int adds | yes |
+| `streq` | `s == "needle"` per iteration | n/a |
 
 Cases live in `cases.lua` (shared with `workload.lua`).
 
@@ -105,20 +111,37 @@ the numbers are per-build and must be regenerated after rebuilding LuaJIT.
 
 ## Numbers measured on this machine
 
-arm64 Apple M4, Apple clang -O2, `-ffp-contract=off`, 1e8 iterations/case,
-generated modules built from this tree:
+arm64 Apple M4, Apple clang -O2, `-ffp-contract=off`, 1e8 iterations per
+case, min of 5 runs, generated modules built from this tree:
 
 | case | interpreter | JIT | AOT | AOT/interp |
 |---|---|---|---|---|
-| `int1` | 2.13 ns | 0.23 ns | 2.04 ns | 0.96 |
-| `int2` | 2.26 ns | 0.23 ns | 2.11 ns | 0.93 |
-| `fp1`  | 2.29 ns | 1.22 ns | 1.92 ns | 0.84 |
+| `modi` (int `%`) | 5.89 ns | 4.90 ns | 3.55 ns | **0.60** |
+| `streq` (`ISEQS`) | 2.64 ns | 0.25 ns | 2.31 ns | **0.87** |
+| `fp1` (double mul+add) | 2.31 ns | 1.23 ns | 2.06 ns | **0.89** |
+| `int2` (int add) | 2.35 ns | 0.23 ns | 2.18 ns | **0.93** |
+| `int1` (int add) | 2.23 ns | 0.24 ns | 2.10 ns | **0.94** |
+| `modf` (double `%`) | 5.11 ns | 4.81 ns | 4.98 ns | 0.97 |
+| `powr` (`^`, general operands) | 5.00 ns | 0.22 ns | 5.00 ns | 1.00 |
+| `chain` (six dependent int ops) | 8.51 ns | 1.53 ns | 14.19 ns | **1.67** |
+| `bits` (six dependent bit ops) | 4.71 ns | 0.93 ns | 9.22 ns | **1.96** |
+
+The two slow cases are both **six dependent ops per iteration**, not a
+property of the new opcodes: an one-op-per-iteration bit case measures
+0.74-0.90x of the interpreter (see the per-op numbers below), and a six-op
+*add-only* chain is just as slow (`chain` 1.67x) as the six-op bit chain
+(`bits` 1.96x). With a longer dependent chain the generated straight-line
+code exposes the slot round-trip latency per op, while the interpreter's
+handlers are decoupled by its dispatch. The JIT is faster everywhere.
+
+Per-op helpers measured separately (n = 1e6 x 100, AOT/interp):
+`band1` 0.90, `bor1` 0.74, `add2` 0.93, `addi1` 0.83.
 
 `fp1` with CPU Counters (per loop iteration): 9.6 cycles for the AOT vs 10.2
 for the interpreter; `useful` 0.563 vs 0.726, `processing` 0.437 vs 0.238,
 `delivery` and `discarded` 0.000 for the AOT (no front-end or mispredict
-loss). `singlestep.py` counts 46 instructions and one taken branch per iteration
-for the AOT loop (interpreter: 63 instructions, 13 branches, 7 taken).
+loss). `singlestep.py` counts 47 instructions and 2 taken branches per
+iteration for the AOT loop (interpreter: 63 instructions, 7 taken).
 
 All numbers are specific to this tree, architecture, compiler and build
 configuration; the generated modules are bound to the same configuration.

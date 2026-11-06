@@ -64,17 +64,27 @@ def _walk(target, thread, start, cap, dump):
         print("  hot pc 0x%x x%d" % (pc, cnt))
     if not counts:
         return
-    hot = counts.most_common(1)[0][0]
-    idx = [i for i, (pc, _) in enumerate(path) if pc == hot]
-    if len(idx) < 3:
-        print("no cycle found (PC 0x%x seen %d times)" % (hot, len(idx)))
+    # One iteration = the widest backward branch in the traced path: a
+    # forward single-step trace of a loop contains at least one taken branch
+    # to an earlier PC, and the loop back edge has the largest span.
+    best = None
+    last_seen = {}
+    for i, (pc, mn) in enumerate(path):
+        seen = last_seen.get(pc)
+        if seen is not None and mn[:1] == "b":
+            if best is None or i - seen > best[1] - best[0]:
+                best = (seen, i)
+        last_seen[pc] = i
+    if best is None:
+        print("no backward branch found in the traced path")
         return
-    seg = path[idx[1]:idx[2]]
+    seg = path[best[0]:best[1] + 1]
+    hot = seg[0][0]
     branches = taken = 0
     for i, (pc, mn) in enumerate(seg):
         if mn[0] == "b" or mn in ("br", "blr", "ret", "cbz", "cbnz"):
             branches += 1
-            nxt = seg[i + 1][0] if i + 1 < len(seg) else hot
+            nxt = seg[i + 1][0] if i + 1 < len(seg) else seg[0][0]
             if nxt != pc + 4:
                 taken += 1
     print("one iteration: %d instructions, %d branches (%d taken)"
