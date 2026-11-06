@@ -172,6 +172,64 @@ It's no longer necessary to run <tt>require("jit.opt").start()</tt>,
 which was one of the ways to enable optimization.
 </p>
 
+<h2 id="jit_aot"><tt>jit.aot</tt> &mdash; Simple ahead-of-time compiler</h2>
+<p>
+This experimental submodule translates a small numeric subset of the Lua
+bytecode to C source code, which can be compiled offline and loaded as a
+normal C module. Fixed bytecode with fixed operands is translated
+one-to-one, so the generated code contains no opcode dispatch loop.
+Values still use the internal <tt>TValue</tt> representation and numeric
+operations keep their runtime type checks. This is not a statically
+typed compiler and no speedup is claimed.
+</p>
+<p>
+Compile a function from Lua code:
+</p>
+<pre class="code">
+local aot = require("jit.aot")
+local csrc = aot.compile(func, "mymod")  -- returns the C source text
+</pre>
+<p>
+Or from the command line, where the input file is a trusted Lua factory
+which is executed once and must return exactly one function:
+</p>
+<pre class="code">
+return function(n) local s = 0; for i=1,n do s=s+i end; return s end
+</pre>
+<pre class="code">
+luajit -jaot=mymod,input.lua,output.c
+cc -O2 -std=c99 -fPIC -ffp-contract=off -Isrc -shared output.c -o mymod.so
+</pre>
+<p>
+Loading the module returns a C function with the same fixed parameters
+and results:
+</p>
+<pre class="code">
+local f = package.loadlib("./mymod.so", "luaopen_mymod")()
+</pre>
+<p>
+Only functions without varargs, upvalues, nested prototypes or
+non-numeric constants are accepted, and only these bytecodes are
+translated: moves and numeric constants, <tt>NOT</tt>, <tt>UNM</tt>,
+numeric <tt>ADD</tt>/<tt>SUB</tt>/<tt>MUL</tt>/<tt>DIV</tt>, ordered and
+primitive comparisons, truth tests, <tt>JMP</tt> and <tt>LOOP</tt>,
+numeric <tt>for</tt> loops and fixed-result returns. Everything else
+&mdash; calls, tables, globals, upvalues, varargs, string constants, bit
+operators, <tt>%</tt>, <tt>^</tt>, generic <tt>for</tt> loops &mdash; is
+rejected with an <tt>AOT:</tt> error instead of being emulated.
+</p>
+<p>
+Boundaries worth knowing: the result is a C function, so it has no Lua
+stack frame, no line or count hooks and no coroutine resumption, and a
+generated loop cannot be interrupted by the debug hook. Type errors name
+the bytecode position and opcode, but not the Lua line. Operands are not
+coerced from strings and no metamethods are called. The generated code
+is tied to the source tree, architecture and build configuration it was
+generated with (<tt>LJ_GC64</tt>, <tt>LJ_FR2</tt>, <tt>LJ_DUALNUM</tt>,
+&hellip;) and must be linked against the same LuaJIT build.
+</p>
+<br class="flush">
+
 <h2 id="jit_util"><tt>jit.util.*</tt> &mdash; JIT compiler introspection</h2>
 <p>
 This submodule holds functions to introspect the bytecode, generated
