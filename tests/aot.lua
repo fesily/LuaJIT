@@ -523,6 +523,86 @@ do
 end
 
 ------------------------------------------------------------------------------
+-- 3c. Bit operations (BNOT/BAND/BOR/BXOR/BSHL/BSHR/BSAR).
+
+local function t_bit(a) return a | 1 end
+local function t_bnot(x) return ~x end
+local function t_band(x, y) return x & y end
+local function t_bor(x, y) return x | y end
+local function t_bxor(x, y) return x ~ y end
+local function t_bshl(x, y) return x << y end
+local function t_bshr(x, y) return x >> y end
+local function t_bsar(x, y) return x ~>> y end
+local function t_bxorip(x, y) x = x ~ y return x end
+local function t_bsarip(x, y) x = x ~>> y return x end
+
+def(t_bit) def(t_bnot) def(t_band) def(t_bor) def(t_bxor) def(t_bshl) def(t_bshr)
+def(t_bsar) def(t_bxorip) def(t_bsarip)
+
+-- BitOp conversion applies to doubles as well; nothing here is truncated.
+local bit_one = {A(0), A(1), A(-1), A(MAX), A(MIN), A(1.5), A(2.5), A(-1.5),
+		 A(2^31), A(2^32), A(-0.0), A(1e300), A(1/0), A(-1/0), A(0/0)}
+check("bnot", t_bnot, bit_one)
+check("bit const", t_bit, {A(0), A(1), A(-1), A(1.5), A(MAX)})
+
+local shifts = {-33, -32, -1, 0, 1, 31, 32, 33, 63, 1.5, -1.5}
+local function pairs_with(vals, counts)
+  local out = {}
+  for _, v in ipairs(vals) do
+    for _, c in ipairs(counts) do out[#out+1] = A(v, c) end
+  end
+  return out
+end
+local bit_vals = {0, 1, -1, MAX, MIN, 2^31, 2^32, 1.5, -1.5, 1/0, 0/0}
+local bit_pairs = pairs_with(bit_vals, {-1, 0, 1, 31, 32})
+
+check("band", t_band, bit_pairs)
+check("bor", t_bor, bit_pairs)
+check("bxor", t_bxor, bit_pairs)
+check("bshl", t_bshl, pairs_with(bit_vals, shifts))
+check("bshr", t_bshr, pairs_with(bit_vals, shifts))
+check("bsar", t_bsar, pairs_with(bit_vals, shifts))
+check("bxor alias", t_bxorip, {A(5, 3), A(-1, 1), A(1.5, 2)})
+check("bsar alias", t_bsarip, {A(-1, 1), A(-1, 33), A(MAX, 4)})
+
+do
+  local fbnot = build(t_bnot)
+  expect(fbnot(1.5) == -3, "~1.5 is not -3")
+  expect(fbnot(2.5) == -3, "~2.5 is not -3")
+  expect(fbnot(-1.5) == 1, "~(-1.5) is not 1")
+  expect(fbnot(0) == -1, "~0 is not -1")
+  expect(fbnot(-1) == 0, "~(-1) is not 0")
+  local fshr, fsar, fshl = build(t_bshr), build(t_bsar), build(t_bshl)
+  expect(fshr(-1, 1) == 2147483647, "-1 >> 1")
+  expect(fsar(-1, 1) == -1, "-1 ~>> 1")
+  expect(fsar(-1, 0) == -1, "-1 ~>> 0")
+  expect(fsar(MIN, 31) == -1, "INT32_MIN ~>> 31")
+  expect(fshr(-1, 32) == -1, "-1 >> 32 (count & 31 == 0)")
+  expect(fshr(-1, 33) == 2147483647, "-1 >> 33 (count & 31 == 1)")
+  expect(fshl(1, 31) == MIN, "1 << 31 wraps to INT32_MIN")
+  expect(fshl(1, 32) == 1, "1 << 32 (count & 31 == 0)")
+  expect(fshl(1, -1) == MIN, "1 << -1 (count & 31 == 31)")
+  local fband = build(t_band)
+  expect(fband(0xff, 0x0f) == 0x0f, "0xff & 0x0f")
+  expect(fband(-1, 0x7fffffff) == 0x7fffffff, "-1 & INT32_MAX")
+  ok()
+end
+
+-- Numbers only: no string coercion, no metamethods, no cdata bit operations.
+do
+  local called = false
+  local t = setmetatable({}, {__band = function() called = true return 1 end,
+			      __bor = function() called = true return 1 end})
+  local ffi = require("ffi")
+  expectfail("band nil", A(nil, 1), t_band, {"number expected"})
+  expectfail("band string", A("2", 1), t_band, {"number expected"})
+  expectfail("band table", A(t, 1), t_band, {"number expected"})
+  expectfail("bor cdata", A(ffi.new("int", 3), 1), t_bor, {"number expected"})
+  expectfail("bnot boolean", A(true), t_bnot, {"number expected"})
+  expect(not called, "a metamethod was called for a bit operation")
+end
+
+------------------------------------------------------------------------------
 -- 4. Branch boundaries.
 
 local function t_lt(a, b) if a < b then return 1 end return 0 end
@@ -619,7 +699,6 @@ local function t_tabget(a) return a.x end
 local function t_glob() return math.pi end
 local function t_concat(a) return "x"..a end
 local function t_len(a) return #a end
-local function t_bit(a) return a | 1 end
 local function t_vararg(...) return ... end
 local function t_child()
   local x = 1
@@ -648,7 +727,7 @@ local reject = {
   {"call", t_call}, {"table constructor", t_tabnew},
   {"table access", t_tabget}, {"global access", t_glob},
   {"concatenation", t_concat},
-  {"length", t_len}, {"bitwise", t_bit}, {"vararg", t_vararg},
+  {"length", t_len}, {"vararg", t_vararg},
   {"child prototype", t_child}, {"upvalue", t_upval},
   {"table access 2", t_typed}, {"nested function", t_closure},
   {"iterator", t_iter},

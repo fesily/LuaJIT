@@ -89,12 +89,17 @@ local ARITH = {
   POW = {"aot_pow", "VV"},
 }
 
+-- Pure number bit operations: {helper, "unary"|"binary"}.
+local BITOP = {
+  BNOT = {"aot_bnot", "unary"},
+  BAND = {"aot_band", "binary"}, BOR = {"aot_bor", "binary"},
+  BXOR = {"aot_bxor", "binary"}, BSHL = {"aot_bshl", "binary"},
+  BSHR = {"aot_bshr", "binary"}, BSAR = {"aot_bsar", "binary"},
+}
+
 -- Reasons for rejecting an opcode. Anything not whitelisted is rejected.
 local NOSUPPORT = {
   CAT = "string concatenation", LEN = "length operator",
-  BNOT = "bitwise operator", BAND = "bitwise operator", BOR = "bitwise operator",
-  BXOR = "bitwise operator", BSHL = "bitwise operator", BSHR = "bitwise operator",
-  BSAR = "bitwise operator",
   TNEW = "table constructor", TDUP = "table constructor",
   GGET = "global access", GSET = "global access",
   UGET = "upvalue access", USETV = "upvalue access", USETS = "upvalue access",
@@ -133,6 +138,7 @@ local SUPPORTED = {
 }
 for name in pairs(COND) do SUPPORTED[name] = true end
 for name in pairs(ARITH) do SUPPORTED[name] = true end
+for name in pairs(BITOP) do SUPPORTED[name] = true end
 
 ------------------------------------------------------------------------------
 
@@ -339,6 +345,76 @@ AOT_INLINE void aot_pow(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
     return;
   }
   setnumV(dst, pow(aot_num(x), aot_num(y)));
+}
+
+/* Bit operations take numbers only. A double is converted with the same
+** 2^52 + 2^51 bias algorithm as the VM's lj_vm_tobit (round to nearest
+** even of the biased value), which is not a truncation: tobit(1.5) == 2.
+** Anything else is a type error.
+*/
+AOT_INLINE uint32_t aot_bitvalue(lua_State *L, cTValue *src, int pc,
+				 const char *op)
+{
+  TValue t;
+  if (tvisint(src)) return (uint32_t)intV(src);
+  if (tvisnum(src)) {
+    t.n = numV(src) + 6755399441055744.0;
+    return t.u32.lo;
+  }
+  aot_errnum(L, pc, op);
+  return 0;
+}
+
+AOT_INLINE void aot_bnot(lua_State *L, TValue *dst, cTValue *src,
+			 int pc, const char *op)
+{
+  uint32_t v = aot_bitvalue(L, src, pc, op);
+  setintV(dst, (int32_t)~v);
+}
+
+AOT_INLINE void aot_band(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			 int pc, const char *op)
+{
+  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
+  setintV(dst, (int32_t)(a & b));
+}
+
+AOT_INLINE void aot_bor(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			int pc, const char *op)
+{
+  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
+  setintV(dst, (int32_t)(a | b));
+}
+
+AOT_INLINE void aot_bxor(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			 int pc, const char *op)
+{
+  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
+  setintV(dst, (int32_t)(a ^ b));
+}
+
+AOT_INLINE void aot_bshl(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			 int pc, const char *op)
+{
+  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
+  setintV(dst, (int32_t)(a << (b & 31u)));
+}
+
+AOT_INLINE void aot_bshr(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			 int pc, const char *op)
+{
+  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
+  setintV(dst, (int32_t)(a >> (b & 31u)));
+}
+
+/* Arithmetic shift right without relying on C's shifting of negatives. */
+AOT_INLINE void aot_bsar(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
+			 int pc, const char *op)
+{
+  uint32_t a = aot_bitvalue(L, x, pc, op), b = aot_bitvalue(L, y, pc, op);
+  uint32_t n = b & 31u, r = a >> n;
+  if (n != 0 && (a & 0x80000000u)) r |= 0xffffffffu << (32u - n);
+  setintV(dst, (int32_t)r);
 }
 
 AOT_INLINE void aot_unm(lua_State *L, TValue *dst, cTValue *src,
@@ -726,6 +802,20 @@ local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
 	x, y = format("base+%d", b), format("base+%d", c)
       end
       w(format("%s(L, base+%d, %s, %s, %d, \"%s\");", fn, a, x, y, pc, name))
+      w(G(pc+1))
+    elseif BITOP[name] then
+      local fn, kind = BITOP[name][1], BITOP[name][2]
+      slotok(a, pc, name)
+      if kind == "unary" then
+	slotok(d, pc, name)
+	w(format("%s(L, base+%d, base+%d, %d, \"%s\");",
+		 fn, a, d, pc, name))
+      else
+	slotok(b, pc, name)
+	slotok(c, pc, name)
+	w(format("%s(L, base+%d, base+%d, base+%d, %d, \"%s\");",
+		 fn, a, b, c, pc, name))
+      end
       w(G(pc+1))
     elseif name == "FORI" then
       slotok(a+3, pc, name)
