@@ -370,79 +370,101 @@ static AOT_COLD AOT_UNUSED uint32_t aot_bitvalue(lua_State *L, cTValue *src,
 }
 
 AOT_INLINE void aot_bnot(lua_State *L, TValue *dst, cTValue *src,
-			 int pc, const char *op)
+			 int pc, const char *op, int km)
 {
-  if (AOT_LIKELY(tvisint(src))) {
+#if LJ_DUALNUM
+  if (AOT_LIKELY(km || tvisint(src))) {
     setintV(dst, (int32_t)~(uint32_t)intV(src));
     return;
   }
+#endif
+  (void)km;
   setintV(dst, (int32_t)~aot_bitvalue(L, src, pc, op));
 }
 
 AOT_INLINE void aot_band(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
-			 int pc, const char *op)
+			 int pc, const char *op, int km)
 {
-  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+#if LJ_DUALNUM
+  if (AOT_LIKELY(((km & 1) || tvisint(x)) && ((km & 2) || tvisint(y)))) {
     setintV(dst, (int32_t)((uint32_t)intV(x) & (uint32_t)intV(y)));
     return;
   }
+#endif
+  (void)km;
   setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) &
 			 aot_bitvalue(L, y, pc, op)));
 }
 
 AOT_INLINE void aot_bor(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
-			int pc, const char *op)
+			 int pc, const char *op, int km)
 {
-  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+#if LJ_DUALNUM
+  if (AOT_LIKELY(((km & 1) || tvisint(x)) && ((km & 2) || tvisint(y)))) {
     setintV(dst, (int32_t)((uint32_t)intV(x) | (uint32_t)intV(y)));
     return;
   }
+#endif
+  (void)km;
   setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) |
 			 aot_bitvalue(L, y, pc, op)));
 }
 
 AOT_INLINE void aot_bxor(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
-			 int pc, const char *op)
+			 int pc, const char *op, int km)
 {
-  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+#if LJ_DUALNUM
+  if (AOT_LIKELY(((km & 1) || tvisint(x)) && ((km & 2) || tvisint(y)))) {
     setintV(dst, (int32_t)((uint32_t)intV(x) ^ (uint32_t)intV(y)));
     return;
   }
+#endif
+  (void)km;
   setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) ^
 			 aot_bitvalue(L, y, pc, op)));
 }
 
 AOT_INLINE void aot_bshl(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
-			 int pc, const char *op)
+			 int pc, const char *op, int km)
 {
-  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+#if LJ_DUALNUM
+  if (AOT_LIKELY(((km & 1) || tvisint(x)) && ((km & 2) || tvisint(y)))) {
     setintV(dst, (int32_t)((uint32_t)intV(x) << ((uint32_t)intV(y) & 31u)));
     return;
   }
+#endif
+  (void)km;
   setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) <<
 			 (aot_bitvalue(L, y, pc, op) & 31u)));
 }
 
 AOT_INLINE void aot_bshr(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
-			 int pc, const char *op)
+			 int pc, const char *op, int km)
 {
-  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+#if LJ_DUALNUM
+  if (AOT_LIKELY(((km & 1) || tvisint(x)) && ((km & 2) || tvisint(y)))) {
     setintV(dst, (int32_t)((uint32_t)intV(x) >> ((uint32_t)intV(y) & 31u)));
     return;
   }
+#endif
+  (void)km;
   setintV(dst, (int32_t)(aot_bitvalue(L, x, pc, op) >>
 			 (aot_bitvalue(L, y, pc, op) & 31u)));
 }
 
 /* Arithmetic shift right without relying on C's shifting of negatives. */
 AOT_INLINE void aot_bsar(lua_State *L, TValue *dst, cTValue *x, cTValue *y,
-			 int pc, const char *op)
+			 int pc, const char *op, int km)
 {
   uint32_t a, n, r;
-  if (AOT_LIKELY(tvisint(x) && tvisint(y))) {
+#if LJ_DUALNUM
+  if (AOT_LIKELY(((km & 1) || tvisint(x)) && ((km & 2) || tvisint(y)))) {
     a = (uint32_t)intV(x);
     n = (uint32_t)intV(y) & 31u;
-  } else {
+  } else
+#endif
+  {
+    (void)km;
     a = aot_bitvalue(L, x, pc, op);
     n = aot_bitvalue(L, y, pc, op) & 31u;
   }
@@ -667,7 +689,7 @@ end
 ------------------------------------------------------------------------------
 
 -- Emit the C body: one braced block and label per bytecode instruction.
-local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
+local function gen_body(ins, nbc, fi, usekb, fcopy, kgc, targets)
   local framesize, sizekn = fi.stackslots, fi.nconsts
   local out = {}
   local function w(s) out[#out+1] = s end
@@ -715,9 +737,19 @@ local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
     return format("goto bc_%d;", nbc)
   end
 
+  -- A bit operation and KSHORT always produce an int TValue (in a dual-number
+  -- build), so a later bit operation in the same straight-line run does not
+  -- have to re-check that operand. The state is dropped at every label that
+  -- another branch can enter.
+  local WRITES_A = {KPRI = true, KNUM = true, NOT = true, UNM = true,
+		    ISTC = true, ISFC = true}
+  for name in pairs(ARITH) do WRITES_A[name] = true end
+  local known = {}
+
   for pc = 1, nbc-1 do
     local t = ins[pc]
     local name, a, b, c, d = t.name, t.a, t.b, t.c, t.d
+    if pc == 1 or targets[pc] then known = {} end
     w(format("bc_%d: { /* %d %s */", pc, pc, name))
     if COND[name] then
       local jt = G(t.jt)
@@ -772,6 +804,7 @@ local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
     elseif name == "MOV" then
       slotok(a, pc, name)
       slotok(d, pc, name)
+      known[a] = known[d]
       w(format("base[%d] = base[%d];", a, d))
       w(G(pc+1))
     elseif name == "KSTR" then
@@ -786,6 +819,7 @@ local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
       w(G(pc+1))
     elseif name == "KSHORT" then
       slotok(a, pc, name)
+      known[a] = true
       w(format("setintV(base+%d, %d);", a, t.sd))
       w(G(pc+1))
     elseif name == "KNUM" then
@@ -806,6 +840,7 @@ local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
     elseif name == "KNIL" then
       if d < a then fail(format("pc=%d KNIL: bad range %d..%d", pc, a, d)) end
       for i = a, d do
+	known[i] = nil
 	slotok(i, pc, name)
 	w(format("setnilV(base+%d);", i))
       end
@@ -842,20 +877,25 @@ local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
       slotok(a, pc, name)
       if kind == "unary" then
 	slotok(d, pc, name)
-	w(format("%s(L, base+%d, base+%d, %d, \"%s\");",
-		 fn, a, d, pc, name))
+	local km = known[d] and 1 or 0
+	w(format("%s(L, base+%d, base+%d, %d, \"%s\", %d);",
+		 fn, a, d, pc, name, km))
       else
 	slotok(b, pc, name)
 	slotok(c, pc, name)
-	w(format("%s(L, base+%d, base+%d, base+%d, %d, \"%s\");",
-		 fn, a, b, c, pc, name))
+	local km = (known[b] and 1 or 0) | (known[c] and 2 or 0)
+	w(format("%s(L, base+%d, base+%d, base+%d, %d, \"%s\", %d);",
+		 fn, a, b, c, pc, name, km))
       end
+      known[a] = true
       w(G(pc+1))
     elseif name == "FORI" then
+      known[a], known[a+1], known[a+2], known[a+3] = nil, nil, nil, nil
       slotok(a+3, pc, name)
       w(format("if (aot_fori(L, base+%d, %d, \"FORI\")) %s", a, pc, G(pc+1)))
       w(G(t.target))
     elseif name == "FORL" or name == "IFORL" then
+      known[a], known[a+3] = nil, nil
       slotok(a+3, pc, name)
       w(format("if (aot_forl(L, base+%d, %d, \"%s\")) %s",
 	       a, pc, name, G(t.target)))
@@ -872,6 +912,7 @@ local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
     else
       fail(format("pc=%d %s: unsupported opcode (%s)", pc, name, reason(name)))
     end
+    if WRITES_A[name] then known[a] = nil end
     w("}")
   end
 
@@ -958,7 +999,13 @@ local function compile(func, modname)
   check_reachable(ins, nbc)
   local usekb = fi2.nconsts > 0
   local kgc = {}
-  local body = gen_body(ins, nbc, fi2, usekb, fcopy, kgc)
+  local targets = {}
+  for pc = 1, nbc-1 do
+    local t = ins[pc]
+    if t.target then targets[t.target] = true end
+    if t.jt then targets[t.jt] = true end
+  end
+  local body = gen_body(ins, nbc, fi2, usekb, fcopy, kgc, targets)
 
   local out = {}
   local function w(s) out[#out+1] = s end

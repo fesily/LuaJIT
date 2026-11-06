@@ -537,10 +537,19 @@ local function t_bshl(x, y) return x << y end
 local function t_bshr(x, y) return x >> y end
 local function t_bsar(x, y) return x ~>> y end
 local function t_bxorip(x, y) x = x ~ y return x end
+-- The producer of the first operands is provably int32 (KSHORT and a bit
+-- operation), so the second operand's runtime type must still be checked.
+local function t_bitknown(a)
+  local h = 7
+  h = h & 0xff
+  h = h ~ a
+  h = h ~>> 1
+  return h
+end
 local function t_bsarip(x, y) x = x ~>> y return x end
 
 def(t_bit) def(t_bnot) def(t_band) def(t_bor) def(t_bxor) def(t_bshl) def(t_bshr)
-def(t_bsar) def(t_bxorip) def(t_bsarip)
+def(t_bsar) def(t_bxorip) def(t_bsarip) def(t_bitknown)
 
 -- BitOp conversion applies to doubles as well; nothing here is truncated.
 local bit_one = {A(0), A(1), A(-1), A(MAX), A(MIN), A(1.5), A(2.5), A(-1.5),
@@ -566,6 +575,8 @@ check("bshl", t_bshl, pairs_with(bit_vals, shifts))
 check("bshr", t_bshr, pairs_with(bit_vals, shifts))
 check("bsar", t_bsar, pairs_with(bit_vals, shifts))
 check("bxor alias", t_bxorip, {A(5, 3), A(-1, 1), A(1.5, 2)})
+check("bit known+var", t_bitknown,
+      {A(2), A(-1), A(0), A(2.5), A(-1.5), A(1/0), A(0/0), A(2^31)})
 check("bsar alias", t_bsarip, {A(-1, 1), A(-1, 33), A(MAX, 4)})
 
 do
@@ -602,6 +613,8 @@ do
   expectfail("band table", A(t, 1), t_band, {"number expected"})
   expectfail("bor cdata", A(ffi.new("int", 3), 1), t_bor, {"number expected"})
   expectfail("bnot boolean", A(true), t_bnot, {"number expected"})
+  expectfail("bit known+string", A("2"), t_bitknown, {"number expected"})
+  expectfail("bit known+table", A(t), t_bitknown, {"number expected"})
   expect(not called, "a metamethod was called for a bit operation")
 end
 

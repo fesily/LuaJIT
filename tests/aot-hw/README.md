@@ -123,16 +123,22 @@ case, min of 5 runs, generated modules built from this tree:
 | `int1` (int add) | 2.23 ns | 0.24 ns | 2.10 ns | **0.94** |
 | `modf` (double `%`) | 5.11 ns | 4.81 ns | 4.98 ns | 0.97 |
 | `powr` (`^`, general operands) | 5.00 ns | 0.22 ns | 5.00 ns | 1.00 |
-| `chain` (six dependent int ops) | 8.51 ns | 1.53 ns | 14.19 ns | **1.67** |
-| `bits` (six dependent bit ops) | 4.71 ns | 0.93 ns | 9.22 ns | **1.96** |
+| `chain` (six dependent int ops) | 8.13 ns | 1.14 ns | 13.17 ns | **1.62** |
+| `bits` (six dependent bit ops) | 4.71 ns | 0.92 ns | 4.09 ns | **0.87** |
 
-The two slow cases are both **six dependent ops per iteration**, not a
-property of the new opcodes: an one-op-per-iteration bit case measures
-0.74-0.90x of the interpreter (see the per-op numbers below), and a six-op
-*add-only* chain is just as slow (`chain` 1.67x) as the six-op bit chain
-(`bits` 1.96x). With a longer dependent chain the generated straight-line
-code exposes the slot round-trip latency per op, while the interpreter's
-handlers are decoupled by its dispatch. The JIT is faster everywhere.
+`chain` (six dependent *int additions*) is the one slow case. Its operands
+are integers while the arithmetic helpers are shaped for doubles (the double
+fast path is inline, integer pairs go through a cold out-of-line call), so a
+multi-op integer chain pays one cold call per op. Single-op integer loops
+hide that (the per-op numbers below).
+
+`bits` used to be the second slow case and is now faster than the
+interpreter: the generator tracks slots that provably hold an int32 TValue
+(the result of a bit operation or of KSHORT) inside a straight-line run and
+lets the next bit operation skip their tag checks. That is an
+inter-instruction invariant, not an assumption about the inputs; the state is
+dropped at every label another branch can enter, and the non-provable
+operand keeps its runtime check. The JIT is faster everywhere.
 
 Per-op helpers measured separately (n = 1e6 x 100, AOT/interp):
 `band1` 0.90, `bor1` 0.74, `add2` 0.93, `addi1` 0.83.
