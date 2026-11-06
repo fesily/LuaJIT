@@ -7,7 +7,10 @@
 --
 -- Each case generates C, compiles it with the system C compiler, loads the
 -- shared module and compares the result against the interpreter (reference
--- functions have the JIT disabled). Generated files live in a unique
+-- functions have the JIT disabled). Groups: control flow, types/parameters,
+-- string and cdata constants, string equality, arithmetic boundaries,
+-- modulo/power, bit operations, branch and numeric-for boundaries, the
+-- rejection contract, slots/GC/upvalue hardening, and a real CLI run. Generated files live in a unique
 -- temporary directory which is removed on success and on failure.
 ----------------------------------------------------------------------------
 

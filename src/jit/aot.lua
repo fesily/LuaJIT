@@ -1,5 +1,5 @@
 ----------------------------------------------------------------------------
--- LuaJIT simple ahead-of-time compiler for a numeric subset.
+-- LuaJIT simple ahead-of-time compiler for a straight-line subset.
 --
 -- Copyright (C) 2005-2026 Mike Pall. All rights reserved.
 -- Released under the MIT license. See Copyright Notice in luajit.h
@@ -11,9 +11,12 @@
 -- opcode dispatch loop. All values still use the LuaJIT TValue
 -- representation and numeric operations keep their runtime type checks.
 --
--- Only a small numeric subset is supported (see the opcode whitelist in
--- this file). Anything else is rejected with an "AOT:" error instead of
--- being emulated approximately.
+-- Supported: moves, numeric/string/cdata constants, NOT/UNM, the numeric
+-- operators ADD/SUB/MUL/DIV/MOD/POW, the 32-bit bit operations, ordered,
+-- primitive and string comparisons, truth tests, JMP/LOOP, numeric for
+-- loops and fixed-result returns (see the opcode whitelist in this file).
+-- Calls, closures, tables, globals, varargs, concatenation and length are
+-- rejected with an "AOT:" error instead of being emulated approximately.
 --
 -- The generated module is tied to the source tree, architecture and
 -- configuration it was generated for (LJ_GC64/LJ_FR2/LJ_DUALNUM and
