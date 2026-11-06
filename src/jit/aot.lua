@@ -42,7 +42,7 @@ local vmdef = require("jit.vmdef")
 local format, sub, match = string.format, string.sub, string.match
 local byte = string.byte
 
-local funcinfo, funcbc = jutil.funcinfo, jutil.funcbc
+local funcinfo, funcbc, funck = jutil.funcinfo, jutil.funcbc, jutil.funck
 local bcnames = vmdef.bcnames
 
 ------------------------------------------------------------------------------
@@ -64,7 +64,7 @@ end
 local COND = {
   ISLT = true, ISGE = true, ISLE = true, ISGT = true,
   ISEQV = true, ISNEV = true, ISEQN = true, ISNEN = true,
-  ISEQP = true, ISNEP = true,
+  ISEQP = true, ISNEP = true, ISEQS = true, ISNES = true,
   ISTC = true, ISFC = true, IST = true, ISF = true,
 }
 
@@ -76,6 +76,7 @@ local CMP = {
   ISEQV = {"aot_eqv", false}, ISNEV = {"aot_eqv", true},
   ISEQN = {"aot_eqn", false}, ISNEN = {"aot_eqn", true},
   ISEQP = {"aot_eqp", false}, ISNEP = {"aot_eqp", true},
+  ISEQS = {"aot_eqs", false}, ISNES = {"aot_eqs", true},
 }
 
 -- Arithmetic opcodes: {helper, operand layout}.
@@ -88,13 +89,11 @@ local ARITH = {
 
 -- Reasons for rejecting an opcode. Anything not whitelisted is rejected.
 local NOSUPPORT = {
-  ISEQS = "string comparison", ISNES = "string comparison",
   MODVN = "modulo operator", MODNV = "modulo operator", MODVV = "modulo operator",
   POW = "power operator", CAT = "string concatenation", LEN = "length operator",
   BNOT = "bitwise operator", BAND = "bitwise operator", BOR = "bitwise operator",
   BXOR = "bitwise operator", BSHL = "bitwise operator", BSHR = "bitwise operator",
   BSAR = "bitwise operator",
-  KSTR = "string constant", KCDATA = "cdata constant",
   TNEW = "table constructor", TDUP = "table constructor",
   GGET = "global access", GSET = "global access",
   UGET = "upvalue access", USETV = "upvalue access", USETS = "upvalue access",
@@ -126,6 +125,7 @@ end
 local SUPPORTED = {
   JMP = true, LOOP = true, ILOOP = true,
   MOV = true, KSHORT = true, KNUM = true, KPRI = true, KNIL = true,
+  KSTR = true, KCDATA = true,
   NOT = true, UNM = true,
   FORI = true, FORL = true, IFORL = true,
   RET = true, RET0 = true, RET1 = true,
@@ -355,6 +355,12 @@ AOT_INLINE int aot_eqv(cTValue *x, cTValue *y)
   return x->u64 == y->u64;
 }
 
+/* String equality against an interned constant (no strcmp, no metamethods). */
+AOT_INLINE int aot_eqs(cTValue *x, GCstr *s)
+{
+  return tvisstr(x) && strV(x) == s;
+}
+
 AOT_INLINE int aot_eqp(cTValue *x, int p)
 {
   return p == 0 ? (int)tvisnil(x) : p == 1 ? (int)tvisfalse(x) :
@@ -499,7 +505,7 @@ end
 ------------------------------------------------------------------------------
 
 -- Emit the C body: one braced block and label per bytecode instruction.
-local function gen_body(ins, nbc, fi, usekb)
+local function gen_body(ins, nbc, fi, usekb, fcopy, kgc)
   local framesize, sizekn = fi.stackslots, fi.nconsts
   local out = {}
   local function w(s) out[#out+1] = s end
@@ -516,6 +522,21 @@ local function gen_body(ins, nbc, fi, usekb)
   local function K(i)
     if usekb then return format("(kb+%d)", i) end
     return format("proto_knumtv(pt, %d)", i)
+  end
+
+  -- GC constant operands: validate the reflected constant before emitting
+  -- anything that dereferences it.
+  local function kgcok(index, pc, op, expected)
+    if index < 0 or index >= fi.gcconsts then
+      fail(format("pc=%d %s: constant index %d out of range (gcconsts=%d)",
+		  pc, op, index, fi.gcconsts))
+    end
+    local v = funck(fcopy, -1-index)
+    if type(v) ~= expected then
+      fail(format("pc=%d %s: constant %d is %s, expected %s",
+		  pc, op, index, type(v), expected))
+    end
+    kgc[index] = expected
   end
 
   local function knok(x, pc, what)
@@ -562,6 +583,11 @@ local function gen_body(ins, nbc, fi, usekb)
 	    fail(format("pc=%d %s: bad primitive %d", pc, name, d))
 	  end
 	  expr = format("aot_eqp(base+%d, %d)", a, d)
+	elseif cmp[1] == "aot_eqs" then
+	  slotok(a, pc, name)
+	  kgcok(d, pc, name, "string")
+	  expr = format("aot_eqs(base+%d, gco2str(proto_kgc(pt, %d)))",
+			a, -1-d)
 	elseif cmp[1] == "aot_eqv" then
 	  slotok(a, pc, name)
 	  slotok(c, pc, name)
@@ -585,6 +611,16 @@ local function gen_body(ins, nbc, fi, usekb)
       slotok(a, pc, name)
       slotok(d, pc, name)
       w(format("base[%d] = base[%d];", a, d))
+      w(G(pc+1))
+    elseif name == "KSTR" then
+      slotok(a, pc, name)
+      kgcok(d, pc, name, "string")
+      w(format("setstrV(L, base+%d, gco2str(proto_kgc(pt, %d)));", a, -1-d))
+      w(G(pc+1))
+    elseif name == "KCDATA" then
+      slotok(a, pc, name)
+      kgcok(d, pc, name, "cdata")
+      w(format("setcdataV(L, base+%d, gco2cd(proto_kgc(pt, %d)));", a, -1-d))
       w(G(pc+1))
     elseif name == "KSHORT" then
       slotok(a, pc, name)
@@ -743,15 +779,10 @@ local function compile(func, modname)
   end
 
   local ins, nbc = decode(fcopy, fi2)
-  -- Non-numeric constants are rejected even if they are only referenced
-  -- from unreachable code: the generated module only copies numbers.
-  if fi2.gcconsts ~= 0 then
-    fail(format("rejected: %d non-numeric constants (gcconsts=%d)",
-		fi2.gcconsts, fi2.gcconsts))
-  end
   check_reachable(ins, nbc)
   local usekb = fi2.nconsts > 0
-  local body = gen_body(ins, nbc, fi2, usekb)
+  local kgc = {}
+  local body = gen_body(ins, nbc, fi2, usekb, fcopy, kgc)
 
   local out = {}
   local function w(s) out[#out+1] = s end
@@ -764,6 +795,7 @@ local function compile(func, modname)
   w(format("#define AOT_NPARAMS %d", fi2.params))
   w(format("#define AOT_SIZEBC %d", nbc))
   w(format("#define AOT_SIZEKN %d", fi2.nconsts))
+  w(format("#define AOT_SIZEKGC %d", fi2.gcconsts))
   w("")
   w(format("static const char aot_bc[%d] = {", #dump))
   local bytes = {}
@@ -789,8 +821,25 @@ local function compile(func, modname)
   w("      pt->numparams != AOT_NPARAMS ||")
   w("      pt->sizebc != AOT_SIZEBC ||")
   w("      pt->sizekn != AOT_SIZEKN ||")
-  w("      pt->sizekgc != 0 || pt->sizeuv != 0)")
+  w("      pt->sizekgc != AOT_SIZEKGC || pt->sizeuv != 0)")
   w("    return luaL_error(L, \"AOT: prototype mismatch\");")
+  do
+    -- Referenced GC constants must still have the expected type: a replaced
+    -- upvalue can be a prototype of the same shape with different constants.
+    local tagof = {string = "LJ_TSTR", cdata = "LJ_TCDATA"}
+    local idx = {}
+    for i in pairs(kgc) do idx[#idx+1] = i end
+    table.sort(idx)
+    local conds = {}
+    for _, i in ipairs(idx) do
+      conds[#conds+1] = format("proto_kgc(pt, %d)->gch.gct != ~%s",
+			       -1-i, tagof[kgc[i]])
+    end
+    if #conds > 0 then
+      w("  if ("..table.concat(conds, " ||\n      ")..")")
+      w("    return luaL_error(L, \"AOT: prototype mismatch\");")
+    end
+  end
   w("  if (!lua_checkstack(L, AOT_FRAMESIZE))")
   w("    return luaL_error(L, \"AOT: stack overflow\");")
   w("  lua_settop(L, AOT_NPARAMS);")

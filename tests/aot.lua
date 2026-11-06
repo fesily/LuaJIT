@@ -317,6 +317,90 @@ do
 end
 
 ------------------------------------------------------------------------------
+-- 2b. Anchored string and cdata constants (KSTR/KCDATA, ISEQS/ISNES).
+
+local function t_str_x() return "x" end
+local function t_str_empty() return "" end
+local function t_str_nul() return "a\0b" end
+local function t_str_esc() return "q\"b\\s\255\128\1z" end
+local function t_str_eq(x) return x == "x" end
+local function t_str_ne(x) return x ~= "x" end
+local function t_str_eqif(x)
+  if x == "x" then return "hit", "a\0b" end
+  return "miss", ""
+end
+
+def(t_str_x) def(t_str_empty) def(t_str_nul) def(t_str_esc)
+def(t_str_eq) def(t_str_ne) def(t_str_eqif)
+
+check("kstr", t_str_x, {A()})
+check("kstr empty", t_str_empty, {A()})
+check("kstr nul", t_str_nul, {A()})
+check("kstr escapes", t_str_esc, {A()})
+check("iseqs", t_str_eq,
+      {A("x"), A("y"), A("a\0b"), A(nil), A(false), A(0), A(0/0), A({})})
+check("isnes", t_str_ne,
+      {A("x"), A("y"), A("a\0b"), A(nil), A(false), A(0), A(0/0), A({})})
+check("iseqs if", t_str_eqif, {A("x"), A("y"), A(nil), A(1)})
+
+-- A long string constant must be copied byte for byte.
+do
+  local long = string.rep("abcdefghij", 512)		-- 5120 bytes
+  local f = assert(load("return function() return "..
+			format("%q", long).." end"))()
+  jit.off(f, true)
+  local fa = build(f)
+  local r = fa()
+  expect(type(r) == "string" and #r == #long and r == long,
+	 "long string constant differs")
+  ok()
+end
+
+-- cdata constants: loaded, stored and returned without conversion. Complex
+-- values are not comparable across dumps, so check the parts instead.
+do
+  local ffi = require("ffi")
+  local function c_i64() return 9223372036854775807LL end
+  local function c_u64() return 18446744073709551615ULL end
+  local function c_cpx() return 2i end
+  def(c_i64) def(c_u64) def(c_cpx)
+  local f_i64, f_u64, f_cpx = build(c_i64), build(c_u64), build(c_cpx)
+  local v_i64, v_u64, v_cpx = f_i64(), f_u64(), f_cpx()
+  expect(ffi.istype("int64_t", v_i64) and v_i64 == 9223372036854775807LL,
+	 "int64 cdata constant")
+  expect(ffi.istype("uint64_t", v_u64) and v_u64 == 18446744073709551615ULL,
+	 "uint64 cdata constant")
+  expect(ffi.istype("complex", v_cpx) and v_cpx.re == 0 and v_cpx.im == 2,
+	 "complex cdata constant")
+  collectgarbage("collect")
+  collectgarbage("collect")
+  expect(f_i64() == 9223372036854775807LL, "int64 constant after a full GC")
+  expect(f_u64() == 18446744073709551615ULL, "uint64 constant after a full GC")
+  local again = f_cpx()
+  expect(again.re == 0 and again.im == 2, "complex constant after a full GC")
+  ok()
+end
+
+-- A replaced upvalue with the same prototype shape but different constant
+-- types must be reported, never dereferenced.
+do
+  local function retstr() return "x" end
+  local other = function() return 2i end
+  def(retstr)
+  local fa = build(retstr)
+  local a, b = jutil.funcinfo(retstr), jutil.funcinfo(other)
+  for _, k in ipairs({"stackslots", "params", "bytecodes", "nconsts",
+		      "gcconsts", "upvalues"}) do
+    expect(a[k] == b[k], "prototype shapes differ in "..k)
+  end
+  expect(debug.setupvalue(fa, 1, other) ~= nil, "cannot replace the upvalue")
+  local okc, msg = pcall(fa)
+  expect(not okc and find(tostring(msg), "prototype mismatch", 1, true),
+	 "wrong constant type did not fail cleanly: "..tostring(msg))
+  ok()
+end
+
+------------------------------------------------------------------------------
 -- 3. Arithmetic boundaries.
 
 local function t_sub(a, b) return a - b end
