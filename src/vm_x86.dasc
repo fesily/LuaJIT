@@ -2670,7 +2670,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  // Decrement the hookcount for consistency, but always do the call.
   |  test RDL, HOOK_ACTIVE
   |  jnz >1
-  |  test RDL, LUA_MASKLINE|LUA_MASKCOUNT
+  |  test RDL, LUA_MASKLINE|LUA_MASKCOUNT|HOOK_INT3
   |  jz >1
   |  dec dword [DISPATCH+DISPATCH_GL(hookcount)]
   |  jmp >1
@@ -2691,7 +2691,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  jz >5
   |  dec dword [DISPATCH+DISPATCH_GL(hookcount)]
   |  jz >1
-  |  test RDL, LUA_MASKLINE
+  |  test RDL, LUA_MASKLINE|HOOK_INT3
   |  jz >5
   |1:
   |  mov L:RB, SAVE_L

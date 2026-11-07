@@ -53,6 +53,8 @@ typedef struct Int3Entry {
   BCPos bcpos;			/* Bytecode index of the trapped slot. */
   BCIns ins;			/* Latest original instruction of that slot. */
   int nojit;			/* We set PROTO_NOJIT for this request. */
+  int planted;			/* The slot holds BC_INT3. */
+  int skipped;			/* Boundary skipped once (self-referencing slot). */
 } Int3Entry;
 
 typedef struct Int3State {
@@ -77,9 +79,39 @@ static int int3_find(global_State *g, const BCIns *pc)
   if (st->g != g || st->count == 0) return -1;
   for (i = 0; i < LJ_INT3_MAX; i++) {
     GCproto *pt = st->entry[i].pt;
+    if (pt != NULL && st->entry[i].planted &&
+	pc == &proto_bc(pt)[st->entry[i].bcpos]) return i;
+  }
+  return -1;
+}
+
+/* Index of a pending request for this slot, planted or not, or -1. */
+static int int3_find_any(global_State *g, const BCIns *pc)
+{
+  Int3State *st = &int3_state;
+  int i;
+  if (st->g != g || st->count == 0) return -1;
+  for (i = 0; i < LJ_INT3_MAX; i++) {
+    GCproto *pt = st->entry[i].pt;
     if (pt != NULL && pc == &proto_bc(pt)[st->entry[i].bcpos]) return i;
   }
   return -1;
+}
+
+/* Non-zero while a request waits for the next instruction boundary. */
+static int int3_has_suspended(Int3State *st)
+{
+  int i;
+  for (i = 0; i < LJ_INT3_MAX; i++)
+    if (st->entry[i].pt != NULL && !st->entry[i].planted) return 1;
+  return 0;
+}
+
+/* Non-zero while a request waits for the next instruction boundary. */
+int lj_int3_stepping(void)
+{
+  Int3State *st = &int3_state;
+  return st->g != NULL && int3_has_suspended(st);
 }
 
 /* Index of a pending request for this prototype, or -1. */
@@ -132,8 +164,12 @@ static int int3_mutable_op(BCOp op)
 */
 static int int3_unsafe(global_State *g)
 {
+  Int3State *st = &int3_state;
   uint32_t hooks = g->hookmask & (HOOK_ACTIVE|HOOK_GC|HOOK_VMEVENT|HOOK_PROFILE);
-  if (hooks & ~(int3_delivering(g) ? (uint32_t)HOOK_VMEVENT : 0))
+  if (int3_delivering(g)) hooks &= ~(uint32_t)HOOK_VMEVENT;
+  /* HOOK_INT3 borrows HOOK_PROFILE; the profiler cannot own it here. */
+  if (st->g == g && int3_has_suspended(st)) hooks &= ~(uint32_t)HOOK_PROFILE;
+  if (hooks)
     return 1;
 #if LJ_HASJIT
   {
@@ -226,13 +262,17 @@ static void int3_cancel_entry(global_State *g, int i)
   Int3Entry *e = &st->entry[i];
   GCproto *pt = e->pt;
   if (pt != NULL) {
-    BCIns *slot = &proto_bc(pt)[e->bcpos];
     int nojit = e->nojit;
-    *slot = e->ins;  /* Restore the latest original instruction. */
+    if (e->planted) {  /* A suspended slot still holds the original ins. */
+      BCIns *slot = &proto_bc(pt)[e->bcpos];
+      *slot = e->ins;  /* Restore the latest original instruction. */
+    }
     e->pt = NULL;
     e->bcpos = 0;
     e->ins = 0;
     e->nojit = 0;
+    e->planted = 0;
+    e->skipped = 0;
     st->count--;
     setgcrefnull(g->gcroot[GCROOT_INT3+i]);
     if (nojit) {
@@ -258,19 +298,68 @@ static void int3_cancel_all(global_State *g)
   int i;
   for (i = 0; i < LJ_INT3_MAX; i++)
     int3_cancel_entry(g, i);
+  if (g->hookmask & HOOK_INT3) {  /* Deferred planting is done. */
+    g->hookmask &= ~HOOK_INT3;
+    lj_dispatch_update(g, 0);
+  }
+}
+
+/* Write BC_INT3 into a pending slot (the arm-time work is already done). */
+static void int3_plant_entry(global_State *g, int i)
+{
+  Int3Entry *e = &int3_state.entry[i];
+  UNUSED(g);
+  setbc_op(&proto_bc(e->pt)[e->bcpos], BC_INT3);
+  e->planted = 1;
+  e->skipped = 0;
+}
+
+/* Plant the requests that a callback suspended, at this instruction boundary.
+**
+** Planting them from the callback would put BC_INT3 back into the slot while
+** the instruction that delivered the interrupt is still being dispatched and
+** executed: the hook trampolines and the metamethod/global slow paths read the
+** physical opcode of that slot. While a request is suspended, HOOK_INT3 keeps
+** instruction dispatch in lj_vm_inshook(), which calls this function through
+** lj_dispatch_ins() before every instruction. The slot of the instruction that
+** is about to run is skipped once (a slot that references itself); it is
+** planted at the next boundary.
+*/
+void lj_int3_step(global_State *g, const BCIns *pc)
+{
+  Int3State *st = &int3_state;
+  int i, pending = 0;
+  if (st->g != g || st->count == 0) return;
+  for (i = 0; i < LJ_INT3_MAX; i++) {
+    Int3Entry *e = &st->entry[i];
+    if (e->pt == NULL || e->planted) continue;
+    if (&proto_bc(e->pt)[e->bcpos] == pc && !e->skipped) {
+      e->skipped = 1;  /* The instruction about to run: plant after it. */
+      pending = 1;
+      continue;
+    }
+    int3_plant_entry(g, i);
+  }
+  for (i = 0; i < LJ_INT3_MAX; i++)
+    if (st->entry[i].pt != NULL && !st->entry[i].planted) pending = 1;
+  if (!pending && (g->hookmask & HOOK_INT3)) {
+    g->hookmask &= ~HOOK_INT3;
+    lj_dispatch_update(g, 0);
+  }
 }
 
 /* Plant the trap for (pt, bcpos) and capture the shadowed instruction.
 ** The caller has validated the session, the context and the prototype.
 */
-static int int3_plant(global_State *g, GCproto *pt, BCPos bcpos)
+static int int3_arm_request(global_State *g, GCproto *pt, BCPos bcpos,
+			    int defer)
 {
   Int3State *st = &int3_state;
   BCIns *slot = &proto_bc(pt)[bcpos];
   Int3Entry *e;
   int i;
-  /* Arming a slot that is already trapped is a no-op. */
-  if (int3_find(g, slot) >= 0) return LUAJIT_INT3_OK;
+  /* Arming a slot that is already pending is a no-op. */
+  if (int3_find_any(g, slot) >= 0) return LUAJIT_INT3_OK;
   for (i = 0; i < LJ_INT3_MAX; i++)
     if (st->entry[i].pt == NULL) break;
   if (i == LJ_INT3_MAX) return LUAJIT_INT3_FULL;
@@ -298,9 +387,12 @@ static int int3_plant(global_State *g, GCproto *pt, BCPos bcpos)
   e->bcpos = bcpos;
   e->ins = *slot;  /* Capture the complete original instruction. */
   e->nojit = !(pt->flags & PROTO_NOJIT);
+  e->planted = 0;
+  e->skipped = 0;
   pt->flags |= PROTO_NOJIT;
   st->count++;
-  setbc_op(slot, BC_INT3);
+  if (defer) return LUAJIT_INT3_OK;  /* Planted at the next boundary. */
+  int3_plant_entry(g, i);
   return LUAJIT_INT3_OK;
 }
 
@@ -329,7 +421,7 @@ void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc)
   /* bc[] is a copy of proto_bc(pt)+1, so index bcpos-1 omits the header. */
   for (i = 0; i < LJ_INT3_MAX; i++) {
     Int3Entry *e = &st->entry[i];
-    if (e->pt == pt && e->bcpos != 0) bc[e->bcpos-1] = e->ins;
+    if (e->pt == pt && e->planted && e->bcpos != 0) bc[e->bcpos-1] = e->ins;
   }
 }
 
@@ -377,6 +469,10 @@ void lj_int3_close(global_State *g)
   st->cb = NULL;
   st->data = NULL;
   st->delivering = 0;
+  if (g->hookmask & HOOK_INT3) {
+    g->hookmask &= ~HOOK_INT3;
+    lj_dispatch_update(g, 0);
+  }
   st->last_pt = NULL;
   st->last_bcpos = 0;
   st->state = INT3_NONE;
@@ -434,6 +530,7 @@ LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   setvmstate(g, C);  /* The callback is native code, not the interpreter. */
   st->cb(st->data, L, pt, (unsigned int)bcpos);
   g->vmstate = vmstate;
+  if (int3_has_suspended(st)) mask |= HOOK_INT3;
   g->hookmask = mask;
   lj_dispatch_update(g, 0);
   st->delivering = 0;
@@ -488,7 +585,7 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos)
   if (bcpos >= pt->sizebc) return LUAJIT_INT3_INVALID;
   if (int3_mutable_op(bc_op(lj_int3_bcins(g, &proto_bc(pt)[bcpos]))))
     return LUAJIT_INT3_UNARMABLE;
-  return int3_plant(g, pt, (BCPos)bcpos);
+  return int3_arm_request(g, pt, (BCPos)bcpos, 0);
 }
 
 /* Re-arm the request that is being delivered, i.e. keep trapping the same
@@ -502,7 +599,7 @@ LUA_API int luaJIT_int3_rearm(lua_State *L)
   global_State *g = G(L);
   if (!int3_delivering(g)) return LUAJIT_INT3_DISABLED;
   if (st->last_pt == NULL) return LUAJIT_INT3_INVALID;
-  return int3_plant(g, st->last_pt, st->last_bcpos);
+  return int3_arm_request(g, st->last_pt, st->last_bcpos, 1);
 }
 
 LUA_API int luaJIT_int3_cancel(lua_State *L)
@@ -558,6 +655,16 @@ int lj_int3_jit_on_blocked(global_State *g, GCproto *pt)
 {
   UNUSED(g); UNUSED(pt);
   return 0;
+}
+
+int lj_int3_stepping(void)
+{
+  return 0;
+}
+
+void lj_int3_step(global_State *g, const BCIns *pc)
+{
+  UNUSED(g); UNUSED(pc);
 }
 
 int lj_int3_active(void)

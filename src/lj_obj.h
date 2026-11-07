@@ -680,6 +680,13 @@ typedef struct global_State {
 #define HOOK_VMEVENT		0x20
 #define HOOK_GC			0x40
 #define HOOK_PROFILE		0x80
+/* Deferred INT3 planting marker. It borrows HOOK_PROFILE because a profiler
+** session and an interrupt session exclude each other: the bit cannot be set
+** by anyone else while an interrupt request is suspended. While it is set the
+** instruction dispatch stays in lj_vm_inshook() and lj_dispatch_ins() plants
+** the requests that a callback suspended.
+*/
+#define HOOK_INT3		HOOK_PROFILE
 #define hook_active(g)		((g)->hookmask & HOOK_ACTIVE)
 #define hook_enter(g)		((g)->hookmask |= HOOK_ACTIVE)
 #define hook_entergc(g) \

@@ -2291,11 +2291,11 @@ static void build_subroutines(BuildCtx *ctx)
   |  test RDL, HOOK_ACTIVE		// Hook already active?
   |  jnz >5
   |
-  |  test RDL, LUA_MASKLINE|LUA_MASKCOUNT
+  |  test RDL, LUA_MASKLINE|LUA_MASKCOUNT|HOOK_INT3
   |  jz >5
   |  dec dword [DISPATCH+DISPATCH_GL(hookcount)]
   |  jz >1
-  |  test RDL, LUA_MASKLINE
+  |  test RDL, LUA_MASKLINE|HOOK_INT3	// Deferred INT3 planting?
   |  jz >5
   |1:
   |  mov L:RB, SAVE_L

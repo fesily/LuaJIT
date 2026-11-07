@@ -1568,6 +1568,62 @@ static void test_nojit_ownership(void)
 }
 #endif  /* !SMOKE_NO_PROFILE && !SMOKE_NO_JIT */
 
+/* -- [14] Deferred planting: hooks and slow paths with re-arm ---------- */
+#if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
+static void deferred_cb(void *data, lua_State *L, const void *proto,
+		     unsigned int bcpos)
+{
+  RearmRec *r = (RearmRec *)data;
+  (void)proto; (void)bcpos;
+  r->calls++;
+  if (r->rearms > 0) { r->rearms--; r->res_rearm = luaJIT_int3_rearm(L); }
+}
+static void test_deferred(void)
+{
+  lua_State *L = luaL_newstate();
+  RearmRec rec;
+  int bcpos = -1;
+  double v, n;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L,
+    "G = {}\n"
+    "N = 0\n"
+    "function G.count() N = N + 1 return 1 end\n"
+    "function G.drive(n)\n"
+    "  local s = 0\n"
+    "  for i = 1, n do s = s + G.count() end\n"
+    "  return s\n"
+    "end\n"
+    "OBJ = setmetatable({v = 7}, {__add = function(a, b) return a.v + b end})\n"
+    "function G.mm(n)\n"
+    "  local s = 0\n"
+    "  for i = 1, n do s = s + (OBJ + i) end\n"
+    "  return s\n"
+    "end\n");
+  CHECK(luaJIT_int3_start(L, deferred_cb, &rec) == LUAJIT_INT3_OK);
+  /* 1. hook mode (line|count, count=1) + unbounded rearm: one delivery per
+  ** execution, no hang. */
+  CHECK(arm_slot(L, "G", "drive", "CALL", &bcpos) == 0);
+  rec.rearms = 100000;
+  lua_sethook(L, line_count_hook, LUA_MASKLINE|LUA_MASKCOUNT, 1);
+  CHECK(run_number(L, "return G.drive(100)", &v) && v == 100);
+  lua_sethook(L, NULL, 0, 0);
+  CHECK(run_number(L, "return N", &n) && n == 100);
+  printf("[14] hook+rearm: hits=%d executions=%g\n", rec.calls, n);
+  CHECK(rec.calls == 100);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  /* 2. slow path (metamethod __add) with unbounded rearm: correct result. */
+  memset(&rec, 0, sizeof(rec));
+  rec.rearms = 100000;
+  CHECK(arm_slot(L, "G", "mm", "ADDVV", &bcpos) == 0);
+  CHECK(run_number(L, "return G.mm(100)", &v) && v == 5750);
+  printf("[14] mm+rearm: hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 100);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif
 /* -- [9] Conditional builds ---------------------------------------------- */
 
 #if defined(SMOKE_NO_PROFILE)
@@ -1649,6 +1705,7 @@ int main(int argc, char **argv)
   if (!only || only == 11) test_hook_and_hotcount();
   if (!only || only == 12) test_hotcount_params();
   if (!only || only == 13) test_nojit_ownership();
+  if (!only || only == 14) test_deferred();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

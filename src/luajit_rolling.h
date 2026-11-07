@@ -85,7 +85,9 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** is consumed or cancelled. The callback is a read-only native observer: it
 ** must not run Lua code or change any interpreter/JIT/hook state, but it may
 ** re-arm, cancel or stop the session (luaJIT_int3_rearm turns a request into
-** a per-execution breakpoint).
+** a per-execution breakpoint). A request armed from the callback is planted
+** at the next instruction boundary, so the instruction that delivered the
+** interrupt still runs with its own opcode.
 */
 typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
 				     const void *proto, unsigned int bcpos);

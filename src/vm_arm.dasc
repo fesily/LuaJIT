@@ -2031,7 +2031,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  tst CARG1, #HOOK_ACTIVE
   |  bne >1
   |   sub CARG2, CARG2, #1
-  |  tst CARG1, #LUA_MASKLINE|LUA_MASKCOUNT
+  |  tst CARG1, #LUA_MASKLINE|LUA_MASKCOUNT|HOOK_INT3
   |   strne CARG2, [DISPATCH, #DISPATCH_GL(hookcount)]
   |  b >1
   |.endif
@@ -2055,7 +2055,7 @@ static void build_subroutines(BuildCtx *ctx)
   |   subs CARG2, CARG2, #1
   |   str CARG2, [DISPATCH, #DISPATCH_GL(hookcount)]
   |   beq >1
-  |  tst CARG1, #LUA_MASKLINE
+  |  tst CARG1, #LUA_MASKLINE|HOOK_INT3
   |  beq <5
   |1:
   |  mov CARG1, L

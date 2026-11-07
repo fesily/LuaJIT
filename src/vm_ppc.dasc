@@ -2823,6 +2823,8 @@ static void build_subroutines(BuildCtx *ctx)
   |   rlwinm TMP0, TMP3, 31-LUA_HOOKLINE, 31, 0
   |  bne <5
   |
+  |  andix. TMP1, TMP3, HOOK_INT3	// Deferred INT3 planting?
+  |  bne >1
   |   cmpwi cr1, TMP0, 0
   |  addic. TMP2, TMP2, -1
   |   beq cr1, <5

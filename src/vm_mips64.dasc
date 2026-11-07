@@ -2358,12 +2358,12 @@ static void build_subroutines(BuildCtx *ctx)
   |  lw TMP2, DISPATCH_GL(hookcount)(DISPATCH)
   |  andi AT, TMP3, HOOK_ACTIVE		// Hook already active?
   |  bnez AT, <5
-  |.  andi AT, TMP3, LUA_MASKLINE|LUA_MASKCOUNT
+  |.  andi AT, TMP3, LUA_MASKLINE|LUA_MASKCOUNT|HOOK_INT3
   |  beqz AT, <5
   |.  addiu TMP2, TMP2, -1
   |  beqz TMP2, >1
   |.  sw TMP2, DISPATCH_GL(hookcount)(DISPATCH)
-  |  andi AT, TMP3, LUA_MASKLINE
+  |  andi AT, TMP3, LUA_MASKLINE|HOOK_INT3
   |  beqz AT, <5
   |1:
   |.  load_got lj_dispatch_ins

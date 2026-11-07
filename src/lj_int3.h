@@ -18,6 +18,13 @@ LJ_FUNC void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins);
 ** of every pending slot (the dump path must not leak BC_INT3).
 */
 LJ_FUNC void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc);
+/* Non-zero while a callback-suspended request waits for the next boundary. */
+LJ_FUNC int lj_int3_stepping(void);
+/* Plant the requests suspended by a callback at this instruction boundary.
+** Called from lj_dispatch_ins() while HOOK_INT3 keeps instruction dispatch in
+** lj_vm_inshook().
+*/
+LJ_FUNC void lj_int3_step(global_State *g, const BCIns *pc);
 /* Non-zero if JIT compilation must not be enabled for this prototype. */
 LJ_FUNC int lj_int3_jit_on_blocked(global_State *g, GCproto *pt);
 /* Non-zero if any VM owns an INT3 session. */

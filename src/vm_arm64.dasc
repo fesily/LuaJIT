@@ -1884,6 +1884,9 @@ static void build_subroutines(BuildCtx *ctx)
   |  ldrb TMP2w, GL->hookmask
   |   ldr TMP3w, GL->hookcount
   |  tbnz TMP2w, #HOOK_ACTIVE_SHIFT, <5	// Hook already active?
+  |  // Deferred INT3 planting? (HOOK_INT3 borrows HOOK_PROFILE, bit 7: the
+  |  // combined masks would not be AArch64 logical immediates.)
+  |  tbnz TMP2w, #7, >1
   |  tst TMP2w, #LUA_MASKLINE|LUA_MASKCOUNT
   |  beq <5
   |   sub TMP3w, TMP3w, #1

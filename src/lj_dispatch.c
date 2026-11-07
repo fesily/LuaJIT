@@ -117,9 +117,12 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
 	    (DISPMODE_REC|DISPMODE_INS|DISPMODE_CALL) : 0;
 #endif
 #if LJ_HASPROFILE
-  mode |= (g->hookmask & HOOK_PROFILE) ? (DISPMODE_PROF|DISPMODE_INS) : 0;
+  mode |= (g->hookmask & HOOK_PROFILE) ?
+	    (lj_int3_stepping() ? DISPMODE_INS
+				: (DISPMODE_PROF|DISPMODE_INS)) : 0;
 #endif
-  mode |= (g->hookmask & (LUA_MASKLINE|LUA_MASKCOUNT)) ? DISPMODE_INS : 0;
+  mode |= (g->hookmask & (LUA_MASKLINE|LUA_MASKCOUNT|HOOK_INT3)) ?
+	    DISPMODE_INS : 0;
   mode |= (g->hookmask & LUA_MASKCALL) ? DISPMODE_CALL : 0;
   mode |= (g->hookmask & LUA_MASKRET) ? DISPMODE_RET : 0;
   if (oldmode != mode) {  /* Mode changed? */
@@ -442,6 +445,8 @@ void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc)
   const BCIns *oldpc = cframe_pc(cf);
   global_State *g = G(L);
   BCReg slots;
+  /* Plant deferred requests at this instruction boundary (no-op when none). */
+  lj_int3_step(g, pc-1);  /* pc points past the instruction. */
   setcframe_pc(cf, pc);
   slots = lj_dispatch_topslot(g, pt, pc, cframe_multres_n(cf));
   L->top = L->base + slots;  /* Fix top. */
