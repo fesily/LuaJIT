@@ -49,7 +49,7 @@ extern double __divdf3(double a, double b);
   _(lj_dispatch_profile) _(lj_err_throw) \
   _(lj_ffh_coroutine_wrap_err) _(lj_func_closeuv) _(lj_func_newL_gc) \
   _(lj_gc_barrieruv) _(lj_gc_step) _(lj_gc_step_fixtop) \
-  _(lj_int3_hit) _(lj_int3_setbc_op) _(lj_meta_arith) \
+  _(lj_int3_hit) _(lj_meta_arith) \
   _(lj_meta_bitop) \
   _(lj_meta_call) _(lj_meta_cat) _(lj_meta_comp) _(lj_meta_equal) \
   _(lj_meta_for) _(lj_meta_istype) _(lj_meta_len) _(lj_meta_tget) \

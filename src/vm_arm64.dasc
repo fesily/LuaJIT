@@ -3710,19 +3710,11 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov TMP0, #BC_JMP
     |   mov TMP1, #BC_ITERC
     |  strb TMP0w, [PC, #-4+OFS_OP]
-    |  cmp TMP2w, #BC_INT3
-    |  beq >7
     |.if JIT
     |  cmp TMP2w, #BC_ITERN
     |  bne >6
     |.endif
     |   strb TMP1w, [RC, # OFS_OP]
-    |  b <1
-    |7:  // Pending INT3 at the target slot: update the shadowed opcode only.
-    |  mov CARG1, GL
-    |   mov CARG2, RC
-    |  mov CARG3, #BC_ITERC
-    |  bl extern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
     |  b <1
     |.if JIT
     |6:  // Unpatch JLOOP.

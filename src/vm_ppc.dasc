@@ -5568,19 +5568,8 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   li TMP1, BC_ITERC
     |  stb TMP0, -1(PC)
     |    addis PC, TMP3, -(BCBIAS_J*4 >> 16)
-    |  // A pending INT3 at the target slot needs a coordinated write.
-    |  lwz TMP2, 0(PC)
-    |   decode_OP1 TMP2, TMP2
-    |  cmpwi TMP2, BC_INT3
-    |   beq >7
     |  // NYI on big-endian: unpatch JLOOP.
     |   stb TMP1, 3(PC)
-    |  b <1
-    |7:  // Update the shadowed opcode only, keep the trap in place.
-    |  addi CARG1, DISPATCH, GG_DISP2G
-    |   li CARG3, BC_ITERC
-    |  mr CARG2, PC
-    |  bl extern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
     |  b <1
     break;
 

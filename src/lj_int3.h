@@ -14,7 +14,6 @@
 */
 LJ_FUNC BCIns lj_int3_bcins(global_State *g, const BCIns *pc);
 LJ_FUNC void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins);
-LJ_FUNCA void lj_int3_setbc_op(global_State *g, const BCIns *pc, BCOp op);
 /* Patch a copy of the bytecode of a prototype with the logical instruction
 ** of every pending slot (the dump path must not leak BC_INT3).
 */

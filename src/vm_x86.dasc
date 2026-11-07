@@ -5245,28 +5245,11 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |5:  // Despecialize bytecode if any of the checks fail.
     |  mov PC_OP, BC_JMP
     |  branchPC RD
-    |  cmp byte [PC], BC_INT3
-    |  je >7
     |.if JIT
     |  cmp byte [PC], BC_ITERN
     |  jne >6
     |.endif
     |  mov byte [PC], BC_ITERC
-    |  jmp <1
-    |7:  // Pending INT3 at the target slot: update the shadowed opcode only.
-    |  mov L:RB, SAVE_L
-    |  mov L:RB->base, BASE		// C arg registers may alias BASE.
-    |  lea GL:FCARG1, [DISPATCH+GG_DISP2G]
-    |.if X64
-    |  mov CARG2d, PC
-    |  mov CARG3d, BC_ITERC
-    |.else
-    |  mov ARG1, FCARG1
-    |  mov ARG2, PC
-    |  mov ARG3, BC_ITERC
-    |.endif
-    |  call extern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
-    |  mov BASE, L:RB->base
     |  jmp <1
     |.if JIT
     |6:  // Unpatch JLOOP.

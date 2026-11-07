@@ -321,16 +321,6 @@ void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins)
     *(BCIns *)(void *)pc = ins;
 }
 
-void lj_int3_setbc_op(global_State *g, const BCIns *pc, BCOp op)
-{
-  /* Read-modify-write through the logical view, so a pending trap keeps its
-  ** physical opcode and only the shadowed instruction changes.
-  */
-  BCIns ins = lj_int3_bcins(g, pc);
-  setbc_op(&ins, op);
-  lj_int3_setbc(g, pc, ins);
-}
-
 void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc)
 {
   Int3State *st = &int3_state;
@@ -557,12 +547,6 @@ void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins)
 {
   UNUSED(g);
   *(BCIns *)(void *)pc = ins;
-}
-
-void lj_int3_setbc_op(global_State *g, const BCIns *pc, BCOp op)
-{
-  UNUSED(g);
-  setbc_op((BCIns *)(void *)pc, op);
 }
 
 void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc)
