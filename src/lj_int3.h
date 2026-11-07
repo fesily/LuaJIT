@@ -13,7 +13,8 @@
 ** original instruction, everything else reads and writes the real slot.
 */
 LJ_FUNC BCIns lj_int3_bcins(global_State *g, const BCIns *pc);
-LJ_FUNC void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins);
+/* Non-zero if the slot currently holds a planted BC_INT3 trap. */
+LJ_FUNC int lj_int3_pending(global_State *g, const BCIns *pc);
 /* Patch a copy of the bytecode of a prototype with the logical instruction
 ** of every pending slot (the dump path must not leak BC_INT3).
 */

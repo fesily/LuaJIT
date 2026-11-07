@@ -422,12 +422,19 @@ static void trace_start(jit_State *J)
   TraceNo traceno;
 
   if ((J->pt->flags & PROTO_NOJIT)) {  /* JIT disabled for this proto? */
-    if (J->parent == 0 && J->exitno == 0 && bc_op(*J->pc) != BC_ITERN) {
-      /* Lazy bytecode patching to disable hotcount events. */
-      lj_assertJ(bc_op(*J->pc) == BC_FORL || bc_op(*J->pc) == BC_ITERL ||
-		 bc_op(*J->pc) == BC_LOOP || bc_op(*J->pc) == BC_FUNCF,
-		 "bad hot bytecode %d", bc_op(*J->pc));
-      setbc_op(J->pc, (int)bc_op(*J->pc)+(int)BC_ILOOP-(int)BC_LOOP);
+    if (J->parent == 0 && J->exitno == 0 &&
+	bc_op(lj_int3_bcins(J2G(J), J->pc)) != BC_ITERN &&
+	!lj_int3_pending(J2G(J), J->pc)) {
+      /* Lazy bytecode patching to disable hotcount events. Never touch a
+      ** slot carrying an interrupt: the write would destroy the trap, and
+      ** the opcode arithmetic is only valid for the real instruction
+      ** (BC_INT3 + BC_ILOOP-BC_LOOP is not a hot bytecode op).
+      */
+      BCIns ins = lj_int3_bcins(J2G(J), J->pc);
+      lj_assertJ(bc_op(ins) == BC_FORL || bc_op(ins) == BC_ITERL ||
+		 bc_op(ins) == BC_LOOP || bc_op(ins) == BC_FUNCF,
+		 "bad hot bytecode %d", bc_op(ins));
+      setbc_op(J->pc, (int)bc_op(ins)+(int)BC_ILOOP-(int)BC_LOOP);
       J->pt->flags |= PROTO_ILOOP;
     }
     J->state = LJ_TRACE_IDLE;  /* Silently ignored. */

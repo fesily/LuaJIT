@@ -404,13 +404,9 @@ BCIns lj_int3_bcins(global_State *g, const BCIns *pc)
   return i >= 0 ? int3_state.entry[i].ins : *pc;
 }
 
-void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins)
+int lj_int3_pending(global_State *g, const BCIns *pc)
 {
-  int i = int3_find(g, pc);
-  if (i >= 0)
-    int3_state.entry[i].ins = ins;  /* Keep the trap, update the shadow. */
-  else
-    *(BCIns *)(void *)pc = ins;
+  return int3_find(g, pc) >= 0;
 }
 
 void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc)
@@ -640,10 +636,10 @@ BCIns lj_int3_bcins(global_State *g, const BCIns *pc)
   return *pc;
 }
 
-void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins)
+int lj_int3_pending(global_State *g, const BCIns *pc)
 {
-  UNUSED(g);
-  *(BCIns *)(void *)pc = ins;
+  UNUSED(g); UNUSED(pc);
+  return 0;
 }
 
 void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc)

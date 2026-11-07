@@ -2687,7 +2687,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  test RDL, HOOK_ACTIVE		// Hook already active?
   |  jnz >5
   |
-  |  test RDL, LUA_MASKLINE|LUA_MASKCOUNT
+  |  test RDL, LUA_MASKLINE|LUA_MASKCOUNT|HOOK_INT3
   |  jz >5
   |  dec dword [DISPATCH+DISPATCH_GL(hookcount)]
   |  jz >1
@@ -4274,7 +4274,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // PC points past the trapped slot. Restore the original instruction,
     |  // run the read-only callback, then re-dispatch the original opcode
     |  // through the dynamic table (hooks observe it exactly once).
-    |  mov TMP1, NARGS:RD		// nargs+1, live for FUNC* headers.
     |  mov L:RB, SAVE_L
     |  mov L:RB->base, BASE
     |  mov FCARG2, PC			// Caveat: FCARG2 == BASE
@@ -4287,13 +4286,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  movzx RA, RCH
     |  movzx OP, RCL
     |  shr RC, 16
-    |  cmp OP, BC_FUNCF			// Headers need nargs+1, not operands.
-    |  je >8
-    |  cmp OP, BC_FUNCV
-    |  jne >9
-    |8:
-    |  mov NARGS:RD, TMP1
-    |9:
     |.if X64
     |  jmp aword [DISPATCH+OP*8]
     |.else

@@ -1308,6 +1308,13 @@ static void test_rearm(void)
   run(L, "function G.wloop(n) local i = 0 while i < n do i = i + 1 end "
 	 "return i end");
   CHECK(arm_code(L, "G", "wloop", "LOOP", 0) == LUAJIT_INT3_UNARMABLE);
+  /* The tracer rewrites the whole return instruction and the function header
+  ** wholesale, so a trap there would race with the rewrite.
+  */
+  run(L, "function G.ret1(i) return i * 2 end\n");
+  CHECK(arm_code(L, "G", "ret1", "RET1", 0) == LUAJIT_INT3_UNARMABLE);
+  run(L, "function G.va(...) local a = ... return a end\n");
+  CHECK(arm_pos(L, "G", "va", 0) == LUAJIT_INT3_UNARMABLE);  /* FUNCV */
   /* Re-arm a slot inside a called function instead: one interrupt per call. */
   run(L, "function G.f(i) return i * 2 end\n");
   memset(&rec, 0, sizeof(rec));
@@ -1380,11 +1387,18 @@ static void test_multi(void)
   CHECK(i < 200);			/* Hit the limit, not the end. */
   CHECK(res == LUAJIT_INT3_FULL);
   CHECK(narmed > 0);
+  /* PROTO_NOJIT ownership is a JIT-only mechanism: without the engine
+  ** luaJIT_setmode() refuses every request, so neither check applies.
+  */
+#if !defined(SMOKE_NO_JIT)
   CHECK(set_jit_on(L, "G", "big") == 0);		/* Excluded. */
+#endif
   /* The full table does not leak into a dump or a later session, and every
   ** request released its JIT exclusion. */
   CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+#if !defined(SMOKE_NO_JIT)
   CHECK(set_jit_on(L, "G", "big") == 1);		/* Every request released. */
+#endif
   lua_getglobal(L, "G");
   lua_getfield(L, -1, "big");
   CHECK(luaJIT_int3_arm(L, -1, 1) == LUAJIT_INT3_OK);
@@ -1624,6 +1638,213 @@ static void test_deferred(void)
   lua_close(L);
 }
 #endif
+/* -- [15] Win64 callee-saved registers across an interrupt -------------- */
+
+#if !defined(SMOKE_NO_PROFILE)
+
+#if defined(_WIN32) && defined(__x86_64__) && defined(__GNUC__)
+typedef int (*PcallRef)(lua_State *L, int nargs, int nresults, int errfunc);
+
+/* Call fn(L, nargs, nresults, 0) and return a bitmask of the Win64
+** non-volatile registers the call failed to preserve: bit 0 = rbx, 1 = rsi,
+** 2 = rdi, 3 = r12, 4 = r13, 5 = r14, 6 = r15.
+**
+** The interpreter runs on this C stack, so a BC_INT3 handler that writes a
+** non-volatile register without saving it leaks the write into the caller's
+** frame. Registers that lua_pcall itself saves and restores are covered by
+** the abi_sample_*() checkpoints below, which sample them from inside the
+** call. lua_pcall's own return value is deliberately not preserved: the
+** mask overwrites eax after the call. The arguments arrive in rcx = fn,
+** rdx = L, r8 = nargs, r9 = nresults.
+*/
+__attribute__((naked)) static int pcall_reg_probe(PcallRef fn, lua_State *L,
+						  int nargs, int nresults)
+{
+  __asm__ __volatile__(
+    ".intel_syntax noprefix\n\t"
+    "push rbp\n\t"
+    "push rbx\n\t"
+    "push rsi\n\t"
+    "push rdi\n\t"
+    "push r12\n\t"
+    "push r13\n\t"
+    "push r14\n\t"
+    "push r15\n\t"
+    "sub rsp, 40\n\t"		/* 32-byte shadow space, 16-byte aligned. */
+    "mov rbx, 0x1122334455667788\n\t"
+    "mov rsi, 0x2122334455667788\n\t"
+    "mov rdi, 0x3122334455667788\n\t"
+    "mov r12, 0x4122334455667788\n\t"
+    "mov r13, 0x5122334455667788\n\t"
+    "mov r14, 0x6122334455667788\n\t"
+    "mov r15, 0x7122334455667788\n\t"
+    "mov r11, rcx\n\t"		/* fn */
+    "mov rcx, rdx\n\t"		/* L */
+    "mov rdx, r8\n\t"		/* nargs */
+    "mov r8, r9\n\t"		/* nresults */
+    "xor r9d, r9d\n\t"		/* errfunc = 0 */
+    "call r11\n\t"
+    "xor eax, eax\n\t"
+    "mov r10, 0x1122334455667788\n\t"
+    "cmp rbx, r10\n\t"
+    "setne r10b\n\t"
+    "movzx r10d, r10b\n\t"
+    "or eax, r10d\n\t"
+    "mov r10, 0x2122334455667788\n\t"
+    "cmp rsi, r10\n\t"
+    "setne r10b\n\t"
+    "movzx r10d, r10b\n\t"
+    "shl r10d, 1\n\t"
+    "or eax, r10d\n\t"
+    "mov r10, 0x3122334455667788\n\t"
+    "cmp rdi, r10\n\t"
+    "setne r10b\n\t"
+    "movzx r10d, r10b\n\t"
+    "shl r10d, 2\n\t"
+    "or eax, r10d\n\t"
+    "mov r10, 0x4122334455667788\n\t"
+    "cmp r12, r10\n\t"
+    "setne r10b\n\t"
+    "movzx r10d, r10b\n\t"
+    "shl r10d, 3\n\t"
+    "or eax, r10d\n\t"
+    "mov r10, 0x5122334455667788\n\t"
+    "cmp r13, r10\n\t"
+    "setne r10b\n\t"
+    "movzx r10d, r10b\n\t"
+    "shl r10d, 4\n\t"
+    "or eax, r10d\n\t"
+    "mov r10, 0x6122334455667788\n\t"
+    "cmp r14, r10\n\t"
+    "setne r10b\n\t"
+    "movzx r10d, r10b\n\t"
+    "shl r10d, 5\n\t"
+    "or eax, r10d\n\t"
+    "mov r10, 0x7122334455667788\n\t"
+    "cmp r15, r10\n\t"
+    "setne r10b\n\t"
+    "movzx r10d, r10b\n\t"
+    "shl r10d, 6\n\t"
+    "or eax, r10d\n\t"
+    "add rsp, 40\n\t"
+    "pop r15\n\t"
+    "pop r14\n\t"
+    "pop r13\n\t"
+    "pop r12\n\t"
+    "pop rdi\n\t"
+    "pop rsi\n\t"
+    "pop rbx\n\t"
+    "pop rbp\n\t"
+    "ret\n\t"
+    ".att_syntax prefix\n\t");
+}
+
+static unsigned long long abi_regs_before[4], abi_regs_after[4];
+static int abi_samples;
+
+/* Snapshot r12-r15 at a C call made from Lua. lua_pcall() saves and restores
+** r12-r14 itself, so a handler write to them is undone before the probe
+** above can see it. These checkpoints run while the interpreter frames are
+** still on the stack; the test compares the samples taken before and after
+** the trapped instruction. Only r12-r15 are sampled: rbx/rsi/rdi hold
+** KBASE/PC/DISPATCH in the Win64 interpreter, so they legitimately change
+** between two instruction boundaries. The functions are naked, so their own
+** prologues cannot hide the incoming values.
+*/
+#define ABI_SAMPLE(regs) \
+  __asm__ __volatile__( \
+    ".intel_syntax noprefix\n\t" \
+    "mov qword ptr " regs "[rip], r12\n\t" \
+    "mov qword ptr " regs "+8[rip], r13\n\t" \
+    "mov qword ptr " regs "+16[rip], r14\n\t" \
+    "mov qword ptr " regs "+24[rip], r15\n\t" \
+    "inc dword ptr abi_samples[rip]\n\t" \
+    "xor eax, eax\n\t" \
+    "ret\n\t" \
+    ".att_syntax prefix\n\t")
+
+__attribute__((naked)) static int abi_sample_before(lua_State *L)
+{
+  ABI_SAMPLE("abi_regs_before");
+}
+
+__attribute__((naked)) static int abi_sample_after(lua_State *L)
+{
+  ABI_SAMPLE("abi_regs_after");
+}
+#undef ABI_SAMPLE
+#endif
+
+static void test_abi_probe(void)
+{
+#if defined(_WIN32) && defined(__x86_64__) && defined(__GNUC__)
+  lua_State *L = luaL_newstate();
+  RearmRec rec;
+  int bcpos = -1, i, mask = 0;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  /* Only a GC64 build runs the x64 interpreter; a non-GC64 x64 build uses
+  ** the x86 backend, so there is no x64 handler to probe. GC64 sets the
+  ** frame-info flag in the bytecode dump header.
+  */
+  if (!run_bool(L,
+	"local b = string.dump(function() end):byte(5)\n"
+	"return b ~= nil and math.floor(b / 8) % 2 == 1")) {
+    printf("[15] abi probe: skipped\n");
+    lua_close(L);
+    return;
+  }
+  lua_pushcfunction(L, abi_sample_before);
+  lua_setglobal(L, "sample_before");
+  lua_pushcfunction(L, abi_sample_after);
+  lua_setglobal(L, "sample_after");
+  run(L,
+    "G = {}\n"
+    "function G.f(i)\n"
+    "  sample_before()\n"
+    "  local r = i * 2\n"
+    "  sample_after()\n"
+    "  return r\n"
+    "end\n");
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  rec.rearms = 100000;			/* Trap the slot on every call. */
+  CHECK(arm_slot(L, "G", "f", "MULVN", &bcpos) == 0);
+  for (i = 1; i <= 8; i++) {
+    int b;
+    lua_getglobal(L, "G");
+    lua_getfield(L, -1, "f");
+    lua_remove(L, -2);
+    lua_pushinteger(L, i);
+    for (b = 0; b < 4; b++) abi_regs_before[b] = abi_regs_after[b] = 0;
+    /* The mask replaces lua_pcall's status, so assert on the result. */
+    mask |= pcall_reg_probe(lua_pcall, L, 1, 1);
+    for (b = 0; b < 4; b++)		/* Sampled inside the call. */
+      if (abi_regs_before[b] != abi_regs_after[b]) mask |= 1 << (b + 3);
+    CHECK(lua_isnumber(L, -1) && lua_tonumber(L, -1) == i * 2);
+    lua_pop(L, 1);
+  }
+  printf("[15] abi probe: mask=0x%x hits=%d\n", mask, rec.calls);
+  if (mask) {
+    static const char *const regs[7] =
+      { "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15" };
+    int b;
+    printf("[15] abi probe: clobbered");
+    for (b = 0; b < 7; b++)
+      if (mask & (1 << b)) printf(" %s", regs[b]);
+    printf("\n");
+  }
+  CHECK(rec.calls >= 8);		/* The trap fired: the mask means it. */
+  CHECK(abi_samples == 16);		/* Both samples ran on every call. */
+  CHECK(mask == 0);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+#else
+  printf("[15] abi probe: skipped\n");
+#endif
+}
+
+#endif  /* !SMOKE_NO_PROFILE */
 /* -- [9] Conditional builds ---------------------------------------------- */
 
 #if defined(SMOKE_NO_PROFILE)
@@ -1644,8 +1865,12 @@ static void test_no_profile_api(void)
   run(L, "G = {} function G.sum(n) local s=0 for i=1,n do s=s+i end return s end");
   CHECK(run_number(L, "return G.sum(1000)", &v) && v == 500500);
   CHECK(run_number(L, "return G.sum(1000)", &v) && v == 500500);
-  printf("[9] no-profile: calls=%d jit=%d traces=%d\n", rec.calls,
-	 run_bool(L, "return jit.status()"), trace_count(L));
+  printf("[9] no-profile: calls=%d jit=%d", rec.calls,
+	 run_bool(L, "return jit.status()"));
+#if !defined(SMOKE_NO_JIT)
+  printf(" traces=%d", trace_count(L));
+#endif
+  printf("\n");
 #if !defined(SMOKE_NO_JIT)
   CHECK(run_bool(L, "return jit.status()"));
   CHECK(trace_count(L) > 0);
@@ -1687,6 +1912,7 @@ int main(int argc, char **argv)
   if (!only || only == 9) test_rearm();
   if (!only || only == 10) test_multi();
   if (!only || only == 11) test_hook_and_hotcount();
+  if (!only || only == 15) test_abi_probe();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -1706,6 +1932,7 @@ int main(int argc, char **argv)
   if (!only || only == 12) test_hotcount_params();
   if (!only || only == 13) test_nojit_ownership();
   if (!only || only == 14) test_deferred();
+  if (!only || only == 15) test_abi_probe();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

@@ -3605,7 +3605,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // PC points past the trapped slot. Restore the original instruction,
     |  // run the read-only callback, then re-dispatch the original opcode
     |  // through the dynamic table (hooks observe it exactly once).
-    |  mov r12, RD			// nargs+1, live for FUNC* headers.
     |  mov L:RB, SAVE_L
     |  mov L:RB->base, BASE
     |  mov CARG2, PC
@@ -3618,13 +3617,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  movzx RAd, RCH
     |  movzx OP, RCL
     |  shr RCd, 16
-    |  cmp OP, BC_FUNCF			// Headers need nargs+1, not operands.
-    |  je >8
-    |  cmp OP, BC_FUNCV
-    |  jne >9
-    |8:
-    |  mov RD, r12
-    |9:
     |  jmp aword [DISPATCH+OP*8]
     break;
 

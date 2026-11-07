@@ -2958,24 +2958,12 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
     |  ldr BASE, L->base
     |  // Re-decode the returned original instruction, like ins_NEXT does. The
-    |  // callback may have re-armed this slot, so it must not be re-read. RC
-    |  // is C callee-save and still holds nargs*8 for the FUNC* headers.
+    |  // callback may have re-armed this slot, so it must not be re-read.
     |  mov INSw, CARG1w
     |  add TMP1, GL, INS, uxtb #3
     |   decode_RA RA, INS
     |  ldr TMP0, [TMP1, #GG_G2DISP]
-    |   and TMP2w, INSw, #0xff
-    |  cmp TMP2w, #BC_FUNCF
-    |  beq >8
-    |  cmp TMP2w, #BC_FUNCV
-    |  beq >8
     |   decode_RD RC, INS
-    |  br_auth TMP0
-    |8:  // Function headers need nargs*8, the tagged function and an
-    |  // absolute RA, not the operands.
-    |   add RA, BASE, RA, lsl #3
-    |   ldr LFUNC:CARG3, [BASE, FRAME_FUNC]
-    |   and LFUNC:CARG3, CARG3, #LJ_GCVMASK
     |  br_auth TMP0
     break;
 

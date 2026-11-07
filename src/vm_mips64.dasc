@@ -4198,7 +4198,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // through the dynamic table (hooks observe it exactly once).
     |  move CARG2, PC
     |   sd BASE, L->base
-    |  sd RC, TMPX			// Save nargs*8, live for FUNC* headers.
     |   sw MULTRES, SAVE_MULTRES		// For the top-slot computation.
     |  load_got lj_int3_hit
     |  move CARG1, L
@@ -4206,25 +4205,14 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |.  sd PC, SAVE_PC
     |  ld BASE, L->base
     |  // Re-decode the restored instruction, like ins_NEXT does. RA is C
-    |  // callee-save and still holds ins_NEXT/ins_callt's value (A*8 resp.
-    |  // BASE+A*8), so it must not be re-decoded here.
+    |  // callee-save and still holds ins_NEXT's A*8, so it must not be
+    |  // re-decoded here.
     |  move INS, CRET1			// Re-decode the returned instruction.
     |  decode_OP8a TMP1, INS
     |   decode_RD8a RD, INS
     |  decode_OP8b TMP1
     |   decode_RD8b RD
     |  daddu TMP0, DISPATCH, TMP1
-    |  decode_OP1 AT, INS
-    |   li TMP2, BC_FUNCF
-    |  beq AT, TMP2, >8
-    |.  li TMP3, BC_FUNCV
-    |  bne AT, TMP3, >9
-    |.  nop
-    |8:  // Headers need nargs*8 and the function, not the operands.
-    |  ld NARGS8:RC, TMPX
-    |  ld LFUNC:RB, FRAME_FUNC(BASE)
-    |  cleartp LFUNC:RB
-    |9:
     |  ld AT, 0(TMP0)			// Dynamic entry for the original opcode.
     |  jr AT
     |.  nop

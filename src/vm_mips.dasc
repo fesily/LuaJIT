@@ -3967,7 +3967,6 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // PC points past the trapped slot. Restore the original instruction,
     |  // run the read-only callback, then re-dispatch the original opcode
     |  // through the dynamic table (hooks observe it exactly once).
-    |  move RA, RC			// NARGS8:RC, live for FUNC* headers.
     |   sw MULTRES, SAVE_MULTRES	// Read back as cframe MULTRES by C.
     |  load_got lj_int3_hit
     |   sw BASE, L->base
@@ -3978,23 +3977,12 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  lw BASE, L->base
     |  move INS, CRET1			// Re-decode the returned instruction.
     |  decode_OP4a TMP1, INS
-    |   move RC, RA			// Restore nargs*8 after the C call.
     |  decode_OP4b TMP1
     |   decode_RD8a RD, INS
     |  addu TMP0, DISPATCH, TMP1
     |   decode_RA8a RA, INS
     |  decode_RD8b RD
     |   decode_RA8b RA
-    |  li AT, BC_FUNCF*4		// Headers take nargs, not the operands.
-    |  beq TMP1, AT, >8
-    |.  nop
-    |  li AT, BC_FUNCV*4
-    |  bne TMP1, AT, >9
-    |.  nop
-    |8:  // Function header: ins_callt passes an absolute RA and nargs in RC.
-    |  lw LFUNC:RB, FRAME_FUNC(BASE)	// RB is not C callee-save.
-    |  addu RA, RA, BASE
-    |9:
     |  lw AT, 0(TMP0)
     |  jr AT
     |.  nop
