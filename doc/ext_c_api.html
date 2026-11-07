@@ -169,6 +169,93 @@ Note that you can only define <b>a single global wrapper function</b>,
 so be careful when using this mechanism from multiple C++ modules.
 Also note that this mechanism is not without overhead.
 </p>
+
+<h2 id="luaJIT_int3"><tt>luaJIT_int3_*</tt> &mdash; One-shot interpreter interrupt</h2>
+<p>
+This C API extension arms a single, one-shot interrupt on one bytecode
+instruction of a Lua function and delivers a read-only native callback when
+that instruction is about to be executed. The full prototypes are:
+</p>
+<pre class="code">
+typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
+                                     const void *proto, unsigned int bcpos);
+LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
+                              void *data);
+LUA_API int luaJIT_int3_arm(lua_State *L, int func_index,
+                            unsigned int bcpos);
+LUA_API int luaJIT_int3_cancel(lua_State *L);
+LUA_API int luaJIT_int3_stop(lua_State *L);
+</pre>
+<p>
+All calls must be made by the thread that owns the VM. At most one interrupt
+session can be active in the process and at most one request can be pending
+per VM.
+</p>
+<p>
+<b><tt>luaJIT_int3_start</tt></b> starts a session for the VM of <tt>L</tt>.
+The JIT engine is left running and no trace is flushed; the session only
+records the callback and claims the process-wide profiler/interrupt slot. The
+function returns <tt>LUAJIT_INT3_UNAVAILABLE</tt> if profiling support is
+compiled out, <tt>LUAJIT_INT3_INVALID</tt> if <tt>cb</tt> is <tt>NULL</tt>,
+and <tt>LUAJIT_INT3_BUSY</tt> if machine code is executing, a GC, hook or VM
+event is active, or this or another VM already owns a profiler or interrupt
+session. Nothing is changed when the call is refused.
+</p>
+<p>
+<b><tt>luaJIT_int3_arm</tt></b> replaces the opcode of the instruction at
+<tt>bcpos</tt> (a 0-based bytecode index, <tt>bcpos &lt; sizebc</tt>) in the
+prototype of the Lua function at stack index <tt>func_index</tt> by
+<tt>BC_INT3</tt>. The other operand fields, PC, jump offsets and line numbers
+stay intact, and the prototype is kept alive.
+</p>
+<p>
+Only the traces that can reach this bytecode are dropped: a trace is flushed
+if it starts in the prototype, if it inlined it (the recorder specializes
+every recorded Lua call on a GC constant for the prototype or for one of its
+closures), or if one of its snapshots points into the prototype. All other
+traces keep running, and the JIT stays enabled. To keep the bytecode
+interpreted for the duration of the request, the prototype is excluded from
+JIT compilation: no new trace may start in it or inline it, so callers that
+call it fall back to the interpreter (their recording is aborted, exactly like
+<tt>jit.off(func)</tt>). Enabling JIT compilation for that prototype (or for a
+subtree containing it) through <tt>luaJIT_setmode</tt> is refused until the
+request is gone.
+</p>
+<p>
+The function returns <tt>LUAJIT_INT3_OK</tt>, <tt>LUAJIT_INT3_DISABLED</tt>
+if no session is owned by this VM, <tt>LUAJIT_INT3_BUSY</tt> if a request is
+already pending, the recorder is active, machine code is executing or the
+context is unsafe, or <tt>LUAJIT_INT3_INVALID</tt> for a non-Lua function or
+an out-of-range <tt>bcpos</tt>.
+</p>
+<p>
+The callback is invoked exactly once, when the interpreter dispatches the
+trapped instruction. The request is consumed before the callback runs, the
+original instruction is restored, and it then executes normally. Repeating
+the call site does not invoke the callback again until
+<tt>luaJIT_int3_arm</tt> is called again. The callback receives the prototype
+as an opaque identity pointer that is only valid for the duration of the
+call, and <tt>bcpos</tt> as the index of the original instruction in that
+prototype. The interpreter state (<tt>lua_State</tt>, current frame, PC, top)
+is consistent and read-only.
+</p>
+<p>
+The callback <b>must not</b> run Lua code, yield, raise or catch errors,
+call <tt>luaJIT_int3_*</tt>, flush traces, change hook or JIT state, or
+trigger a GC. It may only inspect the VM.
+</p>
+<p>
+<b><tt>luaJIT_int3_cancel</tt></b> restores the original instruction and
+drops a pending request, which also makes the prototype compilable again.
+The session itself stays open. It returns <tt>LUAJIT_INT3_OK</tt> if nothing
+is pending.
+</p>
+<p>
+<b><tt>luaJIT_int3_stop</tt></b> cancels a pending request and releases the
+session. The engine on/off state is <i>not</i> touched: if the JIT was
+enabled it stays enabled, and traces recorded earlier keep running. A VM that
+is closed while a request is pending drops it without invoking the callback.
+</p>
 <br class="flush">
 </div>
 <div id="foot">

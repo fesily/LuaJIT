@@ -3451,6 +3451,38 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop asr, 1
     break;
 
+  /* -- One-shot interpreter interrupt ------------------------------------ */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. Restore the original instruction,
+    |  // run the read-only callback, then re-dispatch the original opcode
+    |  // through the dynamic table (hooks observe it exactly once).
+    |  // NARGS8:RC is callee-save, so it survives the C calls below.
+    |  mov CARG1, L
+    |   str BASE, L->base
+    |  mov CARG2, PC
+    |   str PC, SAVE_PC
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  ldr BASE, L->base
+    |  // Re-decode the restored instruction like ins_NEXT does.
+    |  ldr INS, [PC, #-4]
+    |   decode_OP OP, INS
+    |  cmp OP, #BC_FUNCF			// Headers need nargs, not operands.
+    |  beq >8
+    |  cmp OP, #BC_FUNCV
+    |  beq >8
+    |  decode_RA8 RA, INS
+    |   decode_RD RC, INS
+    |    b >9
+    |8:  // Headers keep the call context: RA = BASE+framesize*8, CARG3 = LFUNC.
+    |  decode_RA8 RA, INS
+    |   add RA, RA, BASE
+    |  ldr LFUNC:CARG3, [BASE, FRAME_FUNC]
+    |9:
+    |  ldr OP, [DISPATCH, OP, lsl #2]
+    |  bx OP
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -4272,12 +4304,24 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   mov OP, #BC_ITERC
     |  strb CARG1, [PC, #-4]
     |   sub PC, RC, #0x20000
+    |  ldrb CARG1, [PC]
+    |  cmp CARG1, #BC_INT3
+    |  beq >7
     |.if JIT
-    |   ldrb CARG1, [PC]
     |   cmp CARG1, #BC_ITERN
     |   bne >6
     |.endif
     |   strb OP, [PC]			// Subsumes ins_next1.
+    |   ins_next2
+    |  b <1
+    |7:  // Pending INT3 at the target slot: update the shadowed opcode only.
+    |  sub CARG1, DISPATCH, #-GG_DISP2G
+    |   str BASE, L->base
+    |  mov CARG2, PC
+    |   mov CARG3, #BC_ITERC
+    |  bl extern lj_int3_setbc_op	// (global_State *g, BCIns *pc, BCOp op)
+    |  ldr BASE, L->base
+    |   ins_next1			// Physical BC_INT3 still in the slot.
     |   ins_next2
     |  b <1
     |.if JIT
