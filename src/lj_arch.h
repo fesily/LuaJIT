@@ -643,6 +643,13 @@
 #define LJ_HASPROFILE		0
 #endif
 
+/* Disable or enable the coroutine hook extension. */
+#if defined(LUAJIT_DISABLE_COROHOOK)
+#define LJ_HASCOROHOOK		0
+#else
+#define LJ_HASCOROHOOK		1
+#endif
+
 #ifndef LJ_ARCH_HASFPU
 #define LJ_ARCH_HASFPU		1
 #endif

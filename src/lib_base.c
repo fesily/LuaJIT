@@ -616,6 +616,65 @@ LJLIB_ASM(coroutine_yield)
   return FFH_UNREACHABLE;
 }
 
+/* Error handler, called from assembler VM. */
+LJ_FUNCA_NORET void LJ_FASTCALL lj_ffh_coroutine_wrap_err(lua_State *L,
+							  lua_State *co);
+
+#if LJ_HASCOROHOOK
+/* Grow the coroutine stack only if the arguments do not fit. Growing it
+** unconditionally would double it on every resume.
+*/
+static void ffh_coro_checkstack(lua_State *L, lua_State *co, int nargs)
+{
+  if ((MSize)(tvref(co->maxstack) - co->top) <= (MSize)nargs + LJ_FR2) {
+    if (lj_state_cpgrowstack(co, (MSize)nargs + 1 + LJ_FR2) != LUA_OK) {
+      cTValue *msg = --co->top;
+      lj_err_callermsg(L, strVdata(msg));
+    }
+  }
+}
+
+/* Instrumented resume: the coroutine hook observes the switch boundaries. */
+static int ffh_resume_hooked(lua_State *L, lua_State *co, int nargs, int wrap)
+{
+  global_State *g = G(L);
+  TValue *src = L->base + (wrap ? 0 : 1);  /* Skip the thread argument. */
+  TValue *rbase, *dst;
+  MSize nres, total;
+  int i, status;
+  /* Copy the arguments to the coroutine. co->top roots them below. */
+  ffh_coro_checkstack(L, co, nargs);
+  for (i = 0; i < nargs; i++)
+    copyTV(L, co->top+i, src+i);
+  co->top += nargs;
+  status = lj_dispatch_resume(co, L, nargs);
+  setgcref(g->cur_L, obj2gco(L));
+  setvmstate(g, INTERP);
+  rbase = co->base;
+  nres = (MSize)(co->top - rbase);
+  if (status > LUA_YIELD) {  /* Coroutine raised an error. */
+    if (wrap) lj_ffh_coroutine_wrap_err(L, co);  /* Never returns. */
+    rbase = co->top-1; nres = 1;
+    total = 2;  /* false + error object. */
+  } else {
+    total = nres + (wrap ? 0 : 1);
+  }
+  /* Grow the caller stack while co->top still roots the results. */
+  if (L->base + total > tvref(L->maxstack))
+    lj_state_growstack(L, total);
+  dst = L->base - 1 - LJ_FR2;
+  if (!wrap)  /* Prepend the success flag to the results. */
+    setboolV(dst++, status <= LUA_YIELD);
+  for (i = 0; i < (int)nres; i++)
+    copyTV(L, dst+i, rbase+i);
+  if (status > LUA_YIELD)
+    co->top = rbase;  /* Remove the error object from the coroutine stack. */
+  else
+    co->top = co->base;  /* Clear the coroutine stack. */
+  return FFH_RES((int)total);
+}
+#endif
+
 static int ffh_resume(lua_State *L, lua_State *co, int wrap)
 {
   if (co->cframe != NULL || co->status > LUA_YIELD ||
@@ -626,11 +685,17 @@ static int ffh_resume(lua_State *L, lua_State *co, int wrap)
     setstrV(L, L->base-LJ_FR2, lj_err_str(L, em));
     return FFH_RES(2);
   }
+#if LJ_HASCOROHOOK
+  if (G(L)->corohookon) {  /* Instrumented: complete the resume here. */
+    int nargs = (int)(L->top - L->base) - (wrap ? 0 : 1);
+    return ffh_resume_hooked(L, co, nargs, wrap);
+  }
+#endif
   if (lj_state_cpgrowstack(co, (MSize)(L->top - L->base)) != LUA_OK) {
     cTValue *msg = --co->top;
     lj_err_callermsg(L, strVdata(msg));
   }
-  return FFH_RETRY;
+  return FFH_RETRY;  /* Retry the fast path as before. */
 }
 
 LJLIB_ASM(coroutine_resume)
@@ -647,10 +712,6 @@ LJLIB_NOREG LJLIB_ASM(coroutine_wrap_aux)
 
 /* Inline declarations. */
 LJ_ASMF void lj_ff_coroutine_wrap_aux(void);
-#if !(LJ_TARGET_MIPS && defined(ljamalg_c))
-LJ_FUNCA_NORET void LJ_FASTCALL lj_ffh_coroutine_wrap_err(lua_State *L,
-							  lua_State *co);
-#endif
 
 /* Error handler, called from assembler VM. */
 void LJ_FASTCALL lj_ffh_coroutine_wrap_err(lua_State *L, lua_State *co)

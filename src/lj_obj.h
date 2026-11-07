@@ -632,6 +632,12 @@ typedef struct StrInternState {
   LJ_ALIGN(8) uint64_t seed;	/* Random string seed. */
 } StrInternState;
 
+#if LJ_HASCOROHOOK
+/* Coroutine hook callback. The public type is luaJIT_coroutine_callback. */
+typedef void (*lj_corohookf)(void *data, struct lua_State *from,
+			     struct lua_State *to, int event, int status);
+#endif
+
 /* Global state, shared by all threads of a Lua universe. */
 typedef struct global_State {
   lua_Alloc allocf;	/* Memory allocator. */
@@ -661,6 +667,12 @@ typedef struct global_State {
   GCRef cur_L;		/* Currently executing lua_State. */
   MRef jit_base;	/* Current JIT code L->base or NULL. */
   MRef ctype_state;	/* Pointer to C type state. */
+#if LJ_HASCOROHOOK
+  lj_corohookf corohookf;  /* Coroutine hook function or NULL. */
+  void *corohookd;	/* Coroutine hook user data. */
+  uint8_t corohookon;	/* Coroutine hook enabled (mirrors corohookf). */
+  uint8_t corohookactive;  /* Coroutine hook callback is active. */
+#endif
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
 } global_State;

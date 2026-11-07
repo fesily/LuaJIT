@@ -11,6 +11,20 @@
 #define incr_top(L) \
   (++L->top >= tvref(L->maxstack) && (lj_state_growstack1(L), 0))
 
+/* Base of a pending call frame. Makes room for the 2-slot frame info. */
+#if LJ_FR2
+static LJ_AINLINE TValue *lj_state_callbase(lua_State *L, int nargs)
+{
+  TValue *o = L->top, *base = o - nargs;
+  L->top = o+1;
+  for (; o > base; o--) copyTV(L, o, o-1);
+  setnilV(o);
+  return o+1;
+}
+#else
+#define lj_state_callbase(L, nargs)	((L)->top - (nargs))
+#endif
+
 #define savestack(L, p)		((char *)(p) - mref(L->stack, char))
 #define restorestack(L, n)	((TValue *)(mref(L->stack, char) + (n)))
 

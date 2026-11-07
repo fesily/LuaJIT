@@ -384,6 +384,61 @@ LUA_API int lua_gethookcount(lua_State *L)
   return (int)G(L)->hookcstart;
 }
 
+#if LJ_HASCOROHOOK
+LUA_API void luaJIT_setcoroutinehook(lua_State *L,
+				     luaJIT_coroutine_callback cb, void *data)
+{
+  global_State *g = G(L);
+  lj_assertG(!g->corohookactive, "coroutine hook change from callback");
+  lj_trace_abort(g);  /* Abort recording on any hook change. */
+  g->corohookf = cb;
+  g->corohookd = cb != NULL ? data : NULL;
+  g->corohookon = (uint8_t)(cb != NULL);
+}
+
+/* Notify the coroutine hook, if any. The registration is re-read for every
+** notification, so changes made by ordinary C code while the coroutine runs
+** take effect at the next boundary.
+*/
+static void coro_notify(lua_State *co, lua_State *parent, int event, int status)
+{
+  global_State *g = G(co);
+  lj_corohookf cb = g->corohookf;
+  if (cb != NULL) {
+    void *data = g->corohookd;
+    lua_State *from = event == LUAJIT_CORO_ENTER ? parent : co;
+    lua_State *to = event == LUAJIT_CORO_ENTER ? co : parent;
+    /* Stack offsets. Only used by the debug assertions below. */
+    ptrdiff_t cotop = savestack(co, co->top);
+    ptrdiff_t ptop = parent != NULL ? savestack(parent, parent->top) : 0;
+    UNUSED(cotop); UNUSED(ptop);
+    lj_assertG(!g->corohookactive, "coroutine hook re-entry");
+    g->corohookactive = 1;
+    cb(data, from, to, event, status);
+    g->corohookactive = 0;
+    /* Compare stack offsets: the callback may have grown either stack. */
+    lj_assertG(cotop == savestack(co, co->top),
+	       "coroutine hook changed coroutine stack");
+    lj_assertG(parent == NULL || ptop == savestack(parent, parent->top),
+	       "coroutine hook changed caller stack");
+  }
+}
+
+/* Resume coroutine co from C and report the switch to the coroutine hook.
+** The arguments are already on the co stack. Returns the status of
+** lj_vm_resume unchanged.
+*/
+int lj_dispatch_resume(lua_State *co, lua_State *parent, int nargs)
+{
+  int status;
+  coro_notify(co, parent, LUAJIT_CORO_ENTER, LUA_OK);
+  status = lj_vm_resume(co, co->status == LUA_OK ?
+			lj_state_callbase(co, nargs) : co->top - nargs, 0, 0);
+  coro_notify(co, parent, LUAJIT_CORO_LEAVE, status);
+  return status;
+}
+#endif
+
 /* Call a hook. */
 static void callhook(lua_State *L, int event, BCLine line)
 {

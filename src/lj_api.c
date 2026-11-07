@@ -25,6 +25,7 @@
 #include "lj_vm.h"
 #include "lj_strscan.h"
 #include "lj_strfmt.h"
+#include "lj_dispatch.h"
 
 /* -- Common helper functions --------------------------------------------- */
 
@@ -1096,25 +1097,12 @@ LUA_API const char *lua_setupvalue(lua_State *L, int idx, int n)
 
 /* -- Calls --------------------------------------------------------------- */
 
-#if LJ_FR2
-static TValue *api_call_base(lua_State *L, int nargs)
-{
-  TValue *o = L->top, *base = o - nargs;
-  L->top = o+1;
-  for (; o > base; o--) copyTV(L, o, o-1);
-  setnilV(o);
-  return o+1;
-}
-#else
-#define api_call_base(L, nargs)	(L->top - (nargs))
-#endif
-
 LUA_API void lua_call(lua_State *L, int nargs, int nresults)
 {
   lj_checkapi(L->status == LUA_OK || L->status == LUA_ERRERR,
 	      "thread called in wrong state %d", L->status);
   lj_checkapi_slot(nargs+1);
-  lj_vm_call(L, api_call_base(L, nargs), nresults+1);
+  lj_vm_call(L, lj_state_callbase(L, nargs), nresults+1);
 }
 
 LUA_API int lua_pcall(lua_State *L, int nargs, int nresults, int errfunc)
@@ -1132,7 +1120,7 @@ LUA_API int lua_pcall(lua_State *L, int nargs, int nresults, int errfunc)
     cTValue *o = index2adr_stack(L, errfunc);
     ef = savestack(L, o);
   }
-  status = lj_vm_pcall(L, api_call_base(L, nargs), nresults+1, ef);
+  status = lj_vm_pcall(L, lj_state_callbase(L, nargs), nresults+1, ef);
   if (status) hook_restore(g, oldh);
   return status;
 }
@@ -1228,10 +1216,14 @@ LUA_API int lua_yield(lua_State *L, int nresults)
 
 LUA_API int lua_resume(lua_State *L, int nargs)
 {
-  if (L->cframe == NULL && L->status <= LUA_YIELD)
-    return lj_vm_resume(L,
-      L->status == LUA_OK ? api_call_base(L, nargs) : L->top - nargs,
-      0, 0);
+  if (L->cframe == NULL && L->status <= LUA_YIELD) {
+#if LJ_HASCOROHOOK
+    return lj_dispatch_resume(L, NULL, nargs);
+#else
+    return lj_vm_resume(L, L->status == LUA_OK ?
+			lj_state_callbase(L, nargs) : L->top - nargs, 0, 0);
+#endif
+  }
   L->top = L->base;
   setstrV(L, L->top, lj_err_str(L, LJ_ERR_COSUSP));
   incr_top(L);

@@ -1307,6 +1307,10 @@ static void build_subroutines(BuildCtx *ctx)
   |  ldr L:CARG1, CFUNC:CARG3->upvalue[0].gcr
   |  and L:CARG1, CARG1, #LJ_GCVMASK
   |.endif
+  |.if COROHOOK
+  |   ldrb TMP0w, GL->corohookon		// Coroutine hook active?
+  |    cbnz TMP0w, ->fff_fallback
+  |.endif
   |   ldr PC, [BASE, FRAME_PC]
   |     str BASE, L->base
   |  ldp RB, CARG2, L:CARG1->base

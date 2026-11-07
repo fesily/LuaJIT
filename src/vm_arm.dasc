@@ -1257,6 +1257,11 @@ static void build_subroutines(BuildCtx *ctx)
   |.ffunc coroutine_wrap_aux
   |  ldr L:CARG1, CFUNC:CARG3->upvalue[0].gcr
   |.endif
+  |.if COROHOOK
+  |  ldrb RA, [DISPATCH, #DISPATCH_GL(corohookon)]	// Coroutine hook active?
+  |   cmp RA, #0
+  |  bne ->fff_fallback
+  |.endif
   |   ldr PC, [BASE, FRAME_PC]
   |     str BASE, L->base
   |  ldr CARG2, L:CARG1->top

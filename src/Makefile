@@ -112,6 +112,9 @@ XCFLAGS=
 # Disable LJ_GC64 mode for x64.
 #XCFLAGS+= -DLUAJIT_DISABLE_GC64
 #
+# Disable the coroutine hook extension (luaJIT_setcoroutinehook).
+#XCFLAGS+= -DLUAJIT_DISABLE_COROHOOK
+#
 ##############################################################################
 
 ##############################################################################
@@ -419,6 +422,9 @@ ifneq (,$(findstring LJ_HASJIT 1,$(TARGET_TESTARCH)))
 endif
 ifneq (,$(findstring LJ_HASFFI 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D FFI
+endif
+ifneq (,$(findstring LJ_HASCOROHOOK 1,$(TARGET_TESTARCH)))
+  DASM_AFLAGS+= -D COROHOOK
 endif
 ifneq (,$(findstring LJ_DUALNUM 1,$(TARGET_TESTARCH)))
   DASM_AFLAGS+= -D DUALNUM
