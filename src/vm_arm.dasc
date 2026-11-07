@@ -3464,8 +3464,9 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   str PC, SAVE_PC
     |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
     |  ldr BASE, L->base
-    |  // Re-decode the restored instruction like ins_NEXT does.
-    |  ldr INS, [PC, #-4]
+    |  // Re-decode the returned original instruction. The callback may have
+    |  // re-armed this slot, so it must not be re-read.
+    |  mov INS, CARG1
     |   decode_OP OP, INS
     |  cmp OP, #BC_FUNCF			// Headers need nargs, not operands.
     |  beq >8

@@ -4208,7 +4208,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // Re-decode the restored instruction, like ins_NEXT does. RA is C
     |  // callee-save and still holds ins_NEXT/ins_callt's value (A*8 resp.
     |  // BASE+A*8), so it must not be re-decoded here.
-    |  lw INS, -4(PC)
+    |  move INS, CRET1			// Re-decode the returned instruction.
     |  decode_OP8a TMP1, INS
     |   decode_RD8a RD, INS
     |  decode_OP8b TMP1

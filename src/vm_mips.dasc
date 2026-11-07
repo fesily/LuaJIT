@@ -3976,7 +3976,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  call_intern lj_int3_hit		// (lua_State *L, const BCIns *pc)
     |.  move CARG1, L
     |  lw BASE, L->base
-    |  lw INS, -4(PC)			// Re-decode the restored instruction.
+    |  move INS, CRET1			// Re-decode the returned instruction.
     |  decode_OP4a TMP1, INS
     |   move RC, RA			// Restore nargs*8 after the C call.
     |  decode_OP4b TMP1

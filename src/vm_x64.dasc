@@ -3613,8 +3613,8 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov SAVE_PC, PC
     |  call extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
     |  mov BASE, L:RB->base
-    |  // Re-decode the restored instruction like ins_NEXT does.
-    |  mov RCd, [PC-4]
+    |  // Re-decode the returned original instruction like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read.
     |  movzx RAd, RCH
     |  movzx OP, RCL
     |  shr RCd, 16

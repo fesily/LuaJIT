@@ -80,7 +80,8 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** that can reach the armed instruction and excludes its prototype from
 ** compilation until the request is consumed or cancelled. The callback is a
 ** read-only native observer: it must not run Lua code or change any
-** interpreter/JIT/hook state.
+** interpreter/JIT/hook state, but it may re-arm, cancel or stop the session
+** (luaJIT_int3_rearm turns a request into a per-execution breakpoint).
 */
 typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
 				     const void *proto, unsigned int bcpos);
@@ -94,6 +95,10 @@ enum {
 LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 			      void *data);
 LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos);
+/* Re-arm the request being delivered (callback only), i.e. keep trapping the
+** same instruction on every execution, like a per-iteration loop breakpoint.
+*/
+LUA_API int luaJIT_int3_rearm(lua_State *L);
 LUA_API int luaJIT_int3_cancel(lua_State *L);
 LUA_API int luaJIT_int3_stop(lua_State *L);
 

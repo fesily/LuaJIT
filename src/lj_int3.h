@@ -24,7 +24,10 @@ LJ_FUNC int lj_int3_jit_on_blocked(global_State *g, GCproto *pt);
 LJ_FUNC int lj_int3_active(void);
 /* Force-cancel any request and release the session (VM teardown). */
 LJ_FUNC void lj_int3_close(global_State *g);
-/* Interpreter dispatch target for a BC_INT3 hit. Called from the VM. */
-LJ_FUNCA void LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc);
+/* Interpreter dispatch target for a BC_INT3 hit. Called from the VM, which
+** re-dispatches the returned original instruction (the callback may re-arm
+** the same slot, so the bytecode must not be re-read after the call).
+*/
+LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc);
 
 #endif

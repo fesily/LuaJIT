@@ -4472,8 +4472,9 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  stw MULTRES, SAVE_MULTRES		// cframe_multres_n() reads this.
     |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
     |  lp BASE, L->base
-    |  // Re-decode the restored instruction like ins_NEXT does.
-    |  lwz INS, -4(PC)
+    |  // Re-decode the returned original instruction like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read.
+    |  mr INS, CARG1
     |  decode_OPP TMP1, INS
     |   decode_RB8 RB, INS
     |  lpx TMP0, DISPATCH, TMP1

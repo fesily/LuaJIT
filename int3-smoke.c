@@ -1118,6 +1118,130 @@ static void test_unsafe(void)
 
 #endif  /* !SMOKE_NO_JIT && !SMOKE_NO_PROFILE */
 
+/* -- [9] Re-arming from the callback: per-iteration loop breakpoint ------ */
+
+#if !defined(SMOKE_NO_PROFILE)
+typedef struct RearmRec {
+  int calls;
+  int rearms;			/* Remaining automatic re-arms. */
+  int res_arm;			/* arm() from the callback. */
+  int res_rearm;		/* rearm() from the callback. */
+  int res_cancel;		/* cancel() from the callback. */
+  int res_stop;			/* stop() from the callback. */
+  int cancel_after;		/* Re-arm, then cancel. */
+  int stop_after;		/* Re-arm, then stop. */
+  unsigned int bcpos;
+  const void *proto;
+} RearmRec;
+
+static void rearm_cb(void *data, lua_State *L, const void *proto,
+		     unsigned int bcpos)
+{
+  RearmRec *r = (RearmRec *)data;
+  r->calls++;
+  r->proto = proto;
+  r->bcpos = bcpos;
+  /* The callback context accepts interrupt operations: an out-of-range index
+  ** must fail with INVALID, not with the unsafe-context error.
+  */
+  r->res_arm = luaJIT_int3_arm(L, 4096, 0);
+  if (r->stop_after) {
+    r->res_rearm = luaJIT_int3_rearm(L);
+    r->res_stop = luaJIT_int3_stop(L);
+  } else if (r->cancel_after) {
+    r->res_rearm = luaJIT_int3_rearm(L);
+    r->res_cancel = luaJIT_int3_cancel(L);
+  } else if (r->rearms > 0) {
+    r->rearms--;
+    r->res_rearm = luaJIT_int3_rearm(L);
+  }
+}
+
+static void test_rearm(void)
+{
+  lua_State *L = luaL_newstate();
+  RearmRec rec;
+  int bcpos = -1;
+  double v;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L,
+    "G = {}\n"
+    "function G.loop(n)\n"
+    "  local s = 0\n"
+    "  for i = 1, n do s = s + i end\n"
+    "  return s\n"
+    "end\n");
+  /* Five re-arms keep the trap in place on the same slot, then the request
+  ** is single-shot again.
+  */
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  rec.rearms = 5;
+  CHECK(arm_slot(L, "G", "loop", "ADDVV", &bcpos) == 0);
+  CHECK(run_number(L, "return G.loop(100)", &v) && v == 5050);
+  printf("[9] rearm: calls=%d bcpos=%d/%d arm=%d rearm=%d\n", rec.calls,
+	 (int)rec.bcpos, bcpos, rec.res_arm, rec.res_rearm);
+  CHECK(rec.calls == 6);			/* First hit plus five re-arms. */
+  CHECK(rec.res_arm == LUAJIT_INT3_INVALID);	/* Context was accepted. */
+  CHECK(rec.res_rearm == LUAJIT_INT3_OK);
+  /* Outside the callback there is nothing to repeat. */
+  CHECK(luaJIT_int3_rearm(L) == LUAJIT_INT3_DISABLED);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+
+  /* cancel() from the callback drops the re-armed request. */
+  memset(&rec, 0, sizeof(rec));
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  rec.cancel_after = 1;
+  CHECK(arm_slot(L, "G", "loop", "ADDVV", &bcpos) == 0);
+  CHECK(run_number(L, "return G.loop(100)", &v) && v == 5050);
+  printf("[9] cancel in cb: calls=%d rearm=%d cancel=%d\n", rec.calls,
+	 rec.res_rearm, rec.res_cancel);
+  CHECK(rec.calls == 1);
+  CHECK(rec.res_rearm == LUAJIT_INT3_OK);
+  CHECK(rec.res_cancel == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+
+  /* stop() from the callback releases the session. */
+  memset(&rec, 0, sizeof(rec));
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  rec.stop_after = 1;
+  CHECK(arm_slot(L, "G", "loop", "ADDVV", &bcpos) == 0);
+  CHECK(run_number(L, "return G.loop(100)", &v) && v == 5050);
+  printf("[9] stop in cb: calls=%d rearm=%d stop=%d\n", rec.calls,
+	 rec.res_rearm, rec.res_stop);
+  CHECK(rec.calls == 1);
+  CHECK(rec.res_rearm == LUAJIT_INT3_OK);
+  CHECK(rec.res_stop == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_arm(L, 1, 0) == LUAJIT_INT3_DISABLED);
+
+  /* The same with a loop-back and with a function header: the re-dispatched
+  ** opcode must be the returned one, with the call state the header needs.
+  */
+  run(L, "function G.f(i) return i * 2 end\n");
+  memset(&rec, 0, sizeof(rec));
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  rec.rearms = 3;
+  CHECK(arm_slot(L, "G", "loop", "FORL", &bcpos) == 0);
+  CHECK(run_number(L, "return G.loop(100)", &v) && v == 5050);
+  printf("[9] rearm FORL: calls=%d bcpos=%d/%d\n", rec.calls, (int)rec.bcpos,
+	 bcpos);
+  CHECK(rec.calls == 4);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+
+  memset(&rec, 0, sizeof(rec));
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  rec.rearms = 3;
+  CHECK(arm_slot(L, "G", "f", "FUNCF", &bcpos) == 0);
+  run(L, "local s = 0 for i = 1, 100 do s = s + G.f(i) end\n"
+	 "assert(s == 10100, s)");
+  printf("[9] rearm FUNCF: calls=%d bcpos=%d/%d\n", rec.calls, (int)rec.bcpos,
+	 bcpos);
+  CHECK(rec.calls == 4);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
 /* -- [9] Conditional builds ---------------------------------------------- */
 
 #if defined(SMOKE_NO_PROFILE)
@@ -1178,6 +1302,7 @@ int main(int argc, char **argv)
   if (!only || only == 4) test_isnext_and_hooks();
   if (!only || only == 5) test_gc_and_teardown();
   if (!only || only == 6) test_dump();
+  if (!only || only == 9) test_rearm();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -1191,6 +1316,7 @@ int main(int argc, char **argv)
   if (!only || only == 6) test_dump();
   if (!only || only == 7) test_profiler();
   if (!only || only == 8) test_unsafe();
+  if (!only || only == 9) test_rearm();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

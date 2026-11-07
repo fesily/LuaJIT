@@ -46,6 +46,8 @@ typedef struct Int3State {
   GCproto *pt;			/* Prototype of the pending request. */
   BCPos bcpos;			/* Bytecode index of the pending slot. */
   BCIns ins;			/* Latest original instruction of that slot. */
+  GCproto *last_pt;		/* Prototype of the request being delivered. */
+  BCPos last_bcpos;		/* Bytecode index of the request being delivered. */
 } Int3State;
 
 static Int3State int3_state;
@@ -60,10 +62,25 @@ static LJ_AINLINE int int3_pending(Int3State *st, global_State *g,
 	 pc == &proto_bc(st->pt)[st->bcpos];
 }
 
-/* Reject unsafe contexts: GC, any hook, VM event or profiler callback. */
+/* Non-zero if lj_int3_hit() is delivering a callback for this VM. The
+** delivery is masked as a VM event and switches the VM state to C, so those
+** two are self-inflicted and must not be rejected by the checks below.
+*/
+static LJ_AINLINE int int3_delivering(global_State *g)
+{
+  Int3State *st = &int3_state;
+  return st->delivering && st->g == g;
+}
+
+/* Reject unsafe contexts: GC, a foreign hook or VM event, a profiler
+** callback, the recorder, the compiler or running machine code. Our own
+** callback delivery is a safe context: it only allows one operation at a
+** time and lj_int3_hit() re-establishes the VM context around it.
+*/
 static int int3_unsafe(global_State *g)
 {
-  if ((g->hookmask & (HOOK_ACTIVE|HOOK_GC|HOOK_VMEVENT|HOOK_PROFILE)))
+  uint32_t hooks = g->hookmask & (HOOK_ACTIVE|HOOK_GC|HOOK_VMEVENT|HOOK_PROFILE);
+  if (hooks & ~(int3_delivering(g) ? (uint32_t)HOOK_VMEVENT : 0))
     return 1;
 #if LJ_HASJIT
   {
@@ -170,6 +187,41 @@ static void int3_cancel_pending(global_State *g)
   }
 }
 
+/* Plant the trap for (pt, bcpos) and capture the shadowed instruction.
+** The caller has validated the session, the context and the prototype.
+*/
+static int int3_plant(global_State *g, GCproto *pt, BCPos bcpos)
+{
+  Int3State *st = &int3_state;
+  BCIns *slot = proto_bc(pt) + bcpos;
+#if LJ_HASJIT
+  {
+    jit_State *J = G2J(g);
+    if (J->state != LJ_TRACE_IDLE || tvref(g->jit_base) != NULL)
+      return LUAJIT_INT3_BUSY;  /* Never flush while recording or on-trace. */
+    /* Flush before planting: unpatching a flushed trace must not overwrite
+    ** the trap. Then keep the prototype out of the JIT for the duration of
+    ** the request, so no trace can inline or cover its bytecode.
+    **
+    ** Re-arming the request that is being delivered needs no flush: it was
+    ** flushed on the way in and no Lua code ran in between, so nothing can
+    ** have been recorded. This keeps a per-iteration breakpoint cheap.
+    */
+    if (!(int3_delivering(g) && st->last_pt == pt))
+      int3_flush_traces(J, pt);
+    st->nojit = !(pt->flags & PROTO_NOJIT);
+    pt->flags |= PROTO_NOJIT;
+  }
+#endif
+  /* Root the prototype before mutating its bytecode. */
+  setgcref(g->gcroot[GCROOT_INT3], obj2gco(pt));
+  st->pt = pt;
+  st->bcpos = bcpos;
+  st->ins = *slot;  /* Capture the complete original instruction. */
+  setbc_op(slot, BC_INT3);
+  return LUAJIT_INT3_OK;
+}
+
 /* -- Logical bytecode view ----------------------------------------------- */
 
 BCIns lj_int3_bcins(global_State *g, const BCIns *pc)
@@ -243,6 +295,8 @@ void lj_int3_close(global_State *g)
   st->cb = NULL;
   st->data = NULL;
   st->delivering = 0;
+  st->last_pt = NULL;
+  st->last_bcpos = 0;
   st->state = INT3_NONE;
   st->g = NULL;
 }
@@ -252,8 +306,10 @@ void lj_int3_close(global_State *g)
 /* Called from the VM when a physical BC_INT3 is executed. PC points past the
 ** trapped slot. The original instruction is restored, the request consumed
 ** and the callback invoked, then the VM re-dispatches the original opcode.
+** Returns that instruction: the callback may re-arm the same slot, so the
+** re-dispatched opcode must not be re-read from the bytecode.
 */
-LJ_FUNCA void LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
+LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
 {
   Int3State *st = &int3_state;
   global_State *g = G(L);
@@ -268,7 +324,11 @@ LJ_FUNCA void LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   pt = st->pt;
   bcpos = st->bcpos;
   ins = st->ins;
-  /* Restore the original instruction and consume the request first. */
+  /* Publish the delivery target for luaJIT_int3_rearm(), then restore the
+  ** original instruction and consume the request.
+  */
+  st->last_pt = pt;
+  st->last_bcpos = bcpos;
   int3_cancel_pending(g);
   /* Establish a consistent read-only view of the original instruction. */
   cf = cframe_raw(L->cframe);
@@ -293,6 +353,9 @@ LJ_FUNCA void LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   g->hookmask = mask;
   lj_dispatch_update(g, 0);
   st->delivering = 0;
+  st->last_pt = NULL;
+  st->last_bcpos = 0;
+  return ins;
 }
 
 /* -- Public interrupt API ------------------------------------------------ */
@@ -325,39 +388,30 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos)
   global_State *g = G(L);
   GCfunc *fn;
   GCproto *pt;
-  BCIns *slot;
   if (st->g != g) return LUAJIT_INT3_DISABLED;
   if (st->state != INT3_ENABLED) return LUAJIT_INT3_DISABLED;
-  if (st->delivering || st->pt != NULL || int3_unsafe(g))
-    return LUAJIT_INT3_BUSY;
+  if (st->pt != NULL || int3_unsafe(g)) return LUAJIT_INT3_BUSY;
   if (lua_type(L, func_index) != LUA_TFUNCTION)
     return LUAJIT_INT3_INVALID;
   fn = (GCfunc *)lua_topointer(L, func_index);  /* GCfunc sits at GCobj. */
   if (fn == NULL || !isluafunc(fn)) return LUAJIT_INT3_INVALID;
   pt = funcproto(fn);
   if (bcpos >= pt->sizebc) return LUAJIT_INT3_INVALID;
-#if LJ_HASJIT
-  {
-    jit_State *J = G2J(g);
-    if (J->state != LJ_TRACE_IDLE || tvref(g->jit_base) != NULL)
-      return LUAJIT_INT3_BUSY;  /* Never flush while recording or on-trace. */
-    /* Flush before planting: unpatching a flushed trace must not overwrite
-    ** the trap. Then keep the prototype out of the JIT for the duration of
-    ** the request, so no trace can inline or cover its bytecode.
-    */
-    int3_flush_traces(J, pt);
-    st->nojit = !(pt->flags & PROTO_NOJIT);
-    pt->flags |= PROTO_NOJIT;
-  }
-#endif
-  slot = proto_bc(pt) + bcpos;
-  /* Root the prototype before mutating its bytecode. */
-  setgcref(g->gcroot[GCROOT_INT3], obj2gco(pt));
-  st->pt = pt;
-  st->bcpos = (BCPos)bcpos;
-  st->ins = *slot;  /* Capture the complete original instruction. */
-  setbc_op(slot, BC_INT3);
-  return LUAJIT_INT3_OK;
+  return int3_plant(g, pt, (BCPos)bcpos);
+}
+
+/* Re-arm the request that is being delivered, i.e. keep trapping the same
+** instruction. This is only valid inside the callback: it is what turns a
+** single interrupt into a per-iteration breakpoint of a loop.
+*/
+LUA_API int luaJIT_int3_rearm(lua_State *L)
+{
+  Int3State *st = &int3_state;
+  global_State *g = G(L);
+  if (!int3_delivering(g)) return LUAJIT_INT3_DISABLED;
+  if (st->pt != NULL) return LUAJIT_INT3_BUSY;  /* Another request is pending. */
+  if (st->last_pt == NULL) return LUAJIT_INT3_INVALID;
+  return int3_plant(g, st->last_pt, st->last_bcpos);
 }
 
 LUA_API int luaJIT_int3_cancel(lua_State *L)
@@ -366,7 +420,6 @@ LUA_API int luaJIT_int3_cancel(lua_State *L)
   global_State *g = G(L);
   if (st->g == NULL) return LUAJIT_INT3_OK;  /* Nothing to cancel. */
   if (st->g != g) return LUAJIT_INT3_DISABLED;
-  if (st->delivering) return LUAJIT_INT3_BUSY;
   if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
   int3_cancel_pending(g);  /* The prototype becomes compilable again. */
   return LUAJIT_INT3_OK;
@@ -378,7 +431,6 @@ LUA_API int luaJIT_int3_stop(lua_State *L)
   global_State *g = G(L);
   if (st->g == NULL) return LUAJIT_INT3_OK;
   if (st->g != g) return LUAJIT_INT3_DISABLED;
-  if (st->delivering) return LUAJIT_INT3_BUSY;
   if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
   int3_cancel_pending(g);
   st->cb = NULL;
@@ -434,10 +486,11 @@ void lj_int3_close(global_State *g)
   UNUSED(g);
 }
 
-LJ_FUNCA void LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
+LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
 {
   UNUSED(pc);
   lj_err_throw(L, LJ_ERR_BCFMT);
+  return 0;
 }
 
 LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
@@ -450,6 +503,12 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos)
 {
   UNUSED(L); UNUSED(func_index); UNUSED(bcpos);
+  return LUAJIT_INT3_UNAVAILABLE;
+}
+
+LUA_API int luaJIT_int3_rearm(lua_State *L)
+{
+  UNUSED(L);
   return LUAJIT_INT3_UNAVAILABLE;
 }
 

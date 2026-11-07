@@ -2954,9 +2954,10 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   str PC, SAVE_PC
     |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
     |  ldr BASE, L->base
-    |  // Re-decode the restored instruction like ins_NEXT does. RC is C
-    |  // callee-save and still holds nargs*8 for the FUNC* headers.
-    |  ldr INSw, [PC, #-4]
+    |  // Re-decode the returned original instruction, like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read. RC
+    |  // is C callee-save and still holds nargs*8 for the FUNC* headers.
+    |  mov INSw, CARG1w
     |  add TMP1, GL, INS, uxtb #3
     |   decode_RA RA, INS
     |  ldr TMP0, [TMP1, #GG_G2DISP]
