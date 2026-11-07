@@ -295,7 +295,6 @@ static char *bcwrite_bytecode(BCWriteCtx *ctx, char *p, GCproto *pt)
   MSize nbc = pt->sizebc-1;  /* Omit the [JI]FUNC* header. */
   lua_State *L = sbufL(&ctx->sb);
   global_State *g = G(L);
-  BCPos int3bcpos = lj_int3_bcpos(g, pt);  /* Pending slot or LJ_INT3_NOBCPOS. */
   BCIns *bc = (BCIns *)(void *)p;
 #if LJ_HASJIT
   uint8_t *q = (uint8_t *)p;
@@ -304,8 +303,7 @@ static char *bcwrite_bytecode(BCWriteCtx *ctx, char *p, GCproto *pt)
   /* Never let a pending BC_INT3 leak into a dump: restore the logical
   ** original instruction in the output copy before normalizing I/J ops.
   */
-  if (int3bcpos != LJ_INT3_NOBCPOS && int3bcpos != 0)
-    bc[int3bcpos-1] = lj_int3_bcins(g, &proto_bc(pt)[int3bcpos]);
+  lj_int3_bcwrite_view(g, pt, bc);
 #if LJ_HASJIT
   /* Unpatch modified bytecode containing ILOOP/JLOOP etc. */
   if ((pt->flags & PROTO_ILOOP) || pt->trace) {

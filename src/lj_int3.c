@@ -29,6 +29,18 @@
 ** prototype from JIT compilation, so every later execution of its bytecode
 ** is an interpreter dispatch. No bytecode other than the armed slot is
 ** touched and no other trace is dropped.
+**
+** Up to LJ_INT3_MAX requests can be pending at the same time, in any mix of
+** prototypes and bytecode slots (one entry per slot), so a debugger can keep
+** breakpoints in several functions.
+**
+** Every pending prototype is a GC root (GCROOT_INT3+i), so a prototype that
+** carries a trap can never be collected: the root is taken before the opcode
+** is replaced and dropped only after it was restored, and lj_int3_close()
+** does the same before the finalizer run and lj_gc_freeall() of a VM
+** teardown. That is why no prototype-free hook is needed: apart from the
+** pending requests (rooted) and the delivery in progress (the executing
+** function's prototype), this module holds no prototype pointer.
 **/
 
 #if LJ_HASPROFILE
@@ -36,30 +48,47 @@
 #define INT3_NONE	0	/* No session. */
 #define INT3_ENABLED	1	/* Session accepts requests. */
 
+typedef struct Int3Entry {
+  GCproto *pt;			/* Prototype of the request. */
+  BCPos bcpos;			/* Bytecode index of the trapped slot. */
+  BCIns ins;			/* Latest original instruction of that slot. */
+  int nojit;			/* We set PROTO_NOJIT for this request. */
+} Int3Entry;
+
 typedef struct Int3State {
   global_State *g;		/* VM that owns the session. */
   luaJIT_int3_callback cb;	/* Native read-only callback. */
   void *data;			/* Callback data. */
   int state;			/* INT3_NONE/INT3_ENABLED. */
-  int nojit;			/* We set PROTO_NOJIT on the pending proto. */
+  int count;			/* Number of pending requests. */
   int delivering;		/* Callback delivery in progress. */
-  GCproto *pt;			/* Prototype of the pending request. */
-  BCPos bcpos;			/* Bytecode index of the pending slot. */
-  BCIns ins;			/* Latest original instruction of that slot. */
   GCproto *last_pt;		/* Prototype of the request being delivered. */
   BCPos last_bcpos;		/* Bytecode index of the request being delivered. */
+  Int3Entry entry[LJ_INT3_MAX];	/* Pending requests. */
 } Int3State;
 
 static Int3State int3_state;
 
-#define INT3_SLOT(st)	(&proto_bc((st)->pt)[(st)->bcpos])
-
-/* Match a bytecode slot against the pending request of a VM. */
-static LJ_AINLINE int int3_pending(Int3State *st, global_State *g,
-				   const BCIns *pc)
+/* Index of the request that traps this slot, or -1. */
+static int int3_find(global_State *g, const BCIns *pc)
 {
-  return st->pt != NULL && st->g == g &&
-	 pc == &proto_bc(st->pt)[st->bcpos];
+  Int3State *st = &int3_state;
+  int i;
+  if (st->g != g || st->count == 0) return -1;
+  for (i = 0; i < LJ_INT3_MAX; i++) {
+    GCproto *pt = st->entry[i].pt;
+    if (pt != NULL && pc == &proto_bc(pt)[st->entry[i].bcpos]) return i;
+  }
+  return -1;
+}
+
+/* Index of a pending request for this prototype, or -1. */
+static int int3_find_proto(Int3State *st, GCproto *pt)
+{
+  int i;
+  for (i = 0; i < LJ_INT3_MAX; i++)
+    if (st->entry[i].pt == pt) return i;
+  return -1;
 }
 
 /* Non-zero if lj_int3_hit() is delivering a callback for this VM. The
@@ -70,6 +99,30 @@ static LJ_AINLINE int int3_delivering(global_State *g)
 {
   Int3State *st = &int3_state;
   return st->delivering && st->g == g;
+}
+
+/* Non-zero for a bytecode slot that the JIT or the VM rewrites at run time:
+** lazy I/J patches (FORL/ITERL/LOOP/FUNCF), root-trace start patches
+** (FORL/ITERL/LOOP/ITERN/FUNCF and the whole instruction for RET), the
+** despecialization of ITERN and ISNEXT and the FORI companion of a JFORL.
+** A trap on such a slot would race with the patch, so these slots are never
+** armed.
+*/
+static int int3_mutable_op(BCOp op)
+{
+  switch (op) {
+  case BC_ISNEXT: case BC_ITERN: case BC_ITERL: case BC_LOOP:
+  case BC_FORI: case BC_FORL: case BC_FUNCF: case BC_FUNCV:
+  case BC_RET: case BC_RET0: case BC_RET1:
+  /* Already patched variants, e.g. when arming after a jit.off/on cycle. */
+  case BC_JFORI: case BC_JFORL: case BC_JITERL: case BC_JLOOP:
+  case BC_JFUNCF:
+  case BC_IFORL: case BC_IITERL: case BC_ILOOP: case BC_IFUNCF:
+  case BC_IFUNCV:
+    return 1;
+  default:
+    return 0;
+  }
 }
 
 /* Reject unsafe contexts: GC, a foreign hook or VM event, a profiler
@@ -160,31 +213,51 @@ static void int3_flush_traces(jit_State *J, GCproto *pt)
 
 #endif
 
-/* Drop the pending request: restore the bytecode and undo the JIT exclusion.
+/* Drop one pending request: restore the bytecode and undo the JIT exclusion.
 **
 ** Marking the prototype PROTO_NOJIT makes the recorder lazily blacklist its
 ** hot spots (IFUNCF/ILOOP patches). That blacklisting must not outlive the
-** request, so re-enable compilation the same way jit.on(func) does.
+** requests for that prototype, so re-enable compilation the same way
+** jit.on(func) does once the last request for it is gone.
 */
-static void int3_cancel_pending(global_State *g)
+static void int3_cancel_entry(global_State *g, int i)
 {
   Int3State *st = &int3_state;
-  if (st->pt != NULL) {
-    GCproto *pt = st->pt;
-    int nojit = st->nojit;
-    *INT3_SLOT(st) = st->ins;  /* Restore the latest original instruction. */
-    st->pt = NULL;
-    st->bcpos = 0;
-    st->ins = 0;
-    st->nojit = 0;
-    setgcrefnull(g->gcroot[GCROOT_INT3]);
+  Int3Entry *e = &st->entry[i];
+  GCproto *pt = e->pt;
+  if (pt != NULL) {
+    BCIns *slot = &proto_bc(pt)[e->bcpos];
+    int nojit = e->nojit;
+    *slot = e->ins;  /* Restore the latest original instruction. */
+    e->pt = NULL;
+    e->bcpos = 0;
+    e->ins = 0;
+    e->nojit = 0;
+    st->count--;
+    setgcrefnull(g->gcroot[GCROOT_INT3+i]);
     if (nojit) {
+      int j = int3_find_proto(st, pt);
+      if (j >= 0) {
+	/* Pass the PROTO_NOJIT ownership to a surviving request, so the last
+	** one releases the flag we set.
+	*/
+	st->entry[j].nojit = 1;
+      } else {
 #if LJ_HASJIT
-      lj_trace_reenableproto(pt);  /* Unpatch lazy blacklisting. */
+	lj_trace_reenableproto(pt);  /* Unpatch lazy blacklisting. */
 #endif
-      pt->flags &= ~PROTO_NOJIT;
+	pt->flags &= ~PROTO_NOJIT;
+      }
     }
   }
+}
+
+/* Drop every pending request. */
+static void int3_cancel_all(global_State *g)
+{
+  int i;
+  for (i = 0; i < LJ_INT3_MAX; i++)
+    int3_cancel_entry(g, i);
 }
 
 /* Plant the trap for (pt, bcpos) and capture the shadowed instruction.
@@ -193,7 +266,15 @@ static void int3_cancel_pending(global_State *g)
 static int int3_plant(global_State *g, GCproto *pt, BCPos bcpos)
 {
   Int3State *st = &int3_state;
-  BCIns *slot = proto_bc(pt) + bcpos;
+  BCIns *slot = &proto_bc(pt)[bcpos];
+  Int3Entry *e;
+  int i;
+  /* Arming a slot that is already trapped is a no-op. */
+  if (int3_find(g, slot) >= 0) return LUAJIT_INT3_OK;
+  for (i = 0; i < LJ_INT3_MAX; i++)
+    if (st->entry[i].pt == NULL) break;
+  if (i == LJ_INT3_MAX) return LUAJIT_INT3_FULL;
+  e = &st->entry[i];
 #if LJ_HASJIT
   {
     jit_State *J = G2J(g);
@@ -209,15 +290,16 @@ static int int3_plant(global_State *g, GCproto *pt, BCPos bcpos)
     */
     if (!(int3_delivering(g) && st->last_pt == pt))
       int3_flush_traces(J, pt);
-    st->nojit = !(pt->flags & PROTO_NOJIT);
-    pt->flags |= PROTO_NOJIT;
   }
 #endif
   /* Root the prototype before mutating its bytecode. */
-  setgcref(g->gcroot[GCROOT_INT3], obj2gco(pt));
-  st->pt = pt;
-  st->bcpos = bcpos;
-  st->ins = *slot;  /* Capture the complete original instruction. */
+  setgcref(g->gcroot[GCROOT_INT3+i], obj2gco(pt));
+  e->pt = pt;
+  e->bcpos = bcpos;
+  e->ins = *slot;  /* Capture the complete original instruction. */
+  e->nojit = !(pt->flags & PROTO_NOJIT);
+  pt->flags |= PROTO_NOJIT;
+  st->count++;
   setbc_op(slot, BC_INT3);
   return LUAJIT_INT3_OK;
 }
@@ -226,16 +308,15 @@ static int int3_plant(global_State *g, GCproto *pt, BCPos bcpos)
 
 BCIns lj_int3_bcins(global_State *g, const BCIns *pc)
 {
-  Int3State *st = &int3_state;
-  if (int3_pending(st, g, pc)) return st->ins;
-  return *pc;
+  int i = int3_find(g, pc);
+  return i >= 0 ? int3_state.entry[i].ins : *pc;
 }
 
 void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins)
 {
-  Int3State *st = &int3_state;
-  if (int3_pending(st, g, pc))
-    st->ins = ins;  /* Keep the trap, update the shadowed instruction. */
+  int i = int3_find(g, pc);
+  if (i >= 0)
+    int3_state.entry[i].ins = ins;  /* Keep the trap, update the shadow. */
   else
     *(BCIns *)(void *)pc = ins;
 }
@@ -250,11 +331,16 @@ void lj_int3_setbc_op(global_State *g, const BCIns *pc, BCOp op)
   lj_int3_setbc(g, pc, ins);
 }
 
-BCPos lj_int3_bcpos(global_State *g, const GCproto *pt)
+void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc)
 {
   Int3State *st = &int3_state;
-  if (st->pt != NULL && st->g == g && st->pt == pt) return st->bcpos;
-  return LJ_INT3_NOBCPOS;
+  int i;
+  if (st->g != g || st->count == 0) return;
+  /* bc[] is a copy of proto_bc(pt)+1, so index bcpos-1 omits the header. */
+  for (i = 0; i < LJ_INT3_MAX; i++) {
+    Int3Entry *e = &st->entry[i];
+    if (e->pt == pt && e->bcpos != 0) bc[e->bcpos-1] = e->ins;
+  }
 }
 
 int lj_int3_active(void)
@@ -283,15 +369,21 @@ static int int3_proto_contains(GCproto *pt, GCproto *target)
 int lj_int3_jit_on_blocked(global_State *g, GCproto *pt)
 {
   Int3State *st = &int3_state;
-  if (st->pt == NULL || st->g != g) return 0;
-  return pt == st->pt || int3_proto_contains(pt, st->pt);
+  int i;
+  if (st->g != g || st->count == 0) return 0;
+  for (i = 0; i < LJ_INT3_MAX; i++) {
+    GCproto *armed = st->entry[i].pt;
+    if (armed != NULL && (pt == armed || int3_proto_contains(pt, armed)))
+      return 1;
+  }
+  return 0;
 }
 
 void lj_int3_close(global_State *g)
 {
   Int3State *st = &int3_state;
   if (st->g != g) return;
-  int3_cancel_pending(g);  /* No callback, no JIT state changes on teardown. */
+  int3_cancel_all(g);  /* No callback, no JIT state changes on teardown. */
   st->cb = NULL;
   st->data = NULL;
   st->delivering = 0;
@@ -317,19 +409,21 @@ LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   BCIns ins;
   BCPos bcpos;
   uint8_t mask;
-  int vmstate;
+  int vmstate, i;
   void *cf;
-  if (!int3_pending(st, g, pc-1) || st->state != INT3_ENABLED)
+  i = int3_find(g, pc-1);
+  if (i < 0 || st->state != INT3_ENABLED)
     lj_err_throw(L, LJ_ERR_BCFMT);  /* Stray trap: not a valid bytecode. */
-  pt = st->pt;
-  bcpos = st->bcpos;
-  ins = st->ins;
+  pt = st->entry[i].pt;
+  bcpos = st->entry[i].bcpos;
+  ins = st->entry[i].ins;
   /* Publish the delivery target for luaJIT_int3_rearm(), then restore the
-  ** original instruction and consume the request.
+  ** original instruction and consume that request. Other requests stay
+  ** armed.
   */
   st->last_pt = pt;
   st->last_bcpos = bcpos;
-  int3_cancel_pending(g);
+  int3_cancel_entry(g, i);
   /* Establish a consistent read-only view of the original instruction. */
   cf = cframe_raw(L->cframe);
   setcframe_pc(cf, pc);
@@ -355,6 +449,11 @@ LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   st->delivering = 0;
   st->last_pt = NULL;
   st->last_bcpos = 0;
+  /* When the VM handler delivered a function header and call hooks are on,
+  ** the header is re-dispatched through lj_dispatch_call(). That dispatch has
+  ** already run the call hook for this call, so the slot is marked and the
+  ** request must not be delivered a second time there.
+  */
   return ins;
 }
 
@@ -374,11 +473,11 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
   st->cb = cb;
   st->data = data;
   st->state = INT3_ENABLED;
+  st->count = 0;
   st->delivering = 0;
-  st->pt = NULL;
-  st->bcpos = 0;
-  st->ins = 0;
-  st->nojit = 0;
+  st->last_pt = NULL;
+  st->last_bcpos = 0;
+  memset(st->entry, 0, sizeof(st->entry));
   return LUAJIT_INT3_OK;
 }
 
@@ -390,26 +489,28 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos)
   GCproto *pt;
   if (st->g != g) return LUAJIT_INT3_DISABLED;
   if (st->state != INT3_ENABLED) return LUAJIT_INT3_DISABLED;
-  if (st->pt != NULL || int3_unsafe(g)) return LUAJIT_INT3_BUSY;
+  if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
   if (lua_type(L, func_index) != LUA_TFUNCTION)
     return LUAJIT_INT3_INVALID;
   fn = (GCfunc *)lua_topointer(L, func_index);  /* GCfunc sits at GCobj. */
   if (fn == NULL || !isluafunc(fn)) return LUAJIT_INT3_INVALID;
   pt = funcproto(fn);
   if (bcpos >= pt->sizebc) return LUAJIT_INT3_INVALID;
+  if (int3_mutable_op(bc_op(lj_int3_bcins(g, &proto_bc(pt)[bcpos]))))
+    return LUAJIT_INT3_UNARMABLE;
   return int3_plant(g, pt, (BCPos)bcpos);
 }
 
 /* Re-arm the request that is being delivered, i.e. keep trapping the same
 ** instruction. This is only valid inside the callback: it is what turns a
-** single interrupt into a per-iteration breakpoint of a loop.
+** single interrupt into a per-iteration breakpoint of a loop. It never
+** disturbs the other pending requests.
 */
 LUA_API int luaJIT_int3_rearm(lua_State *L)
 {
   Int3State *st = &int3_state;
   global_State *g = G(L);
   if (!int3_delivering(g)) return LUAJIT_INT3_DISABLED;
-  if (st->pt != NULL) return LUAJIT_INT3_BUSY;  /* Another request is pending. */
   if (st->last_pt == NULL) return LUAJIT_INT3_INVALID;
   return int3_plant(g, st->last_pt, st->last_bcpos);
 }
@@ -421,7 +522,7 @@ LUA_API int luaJIT_int3_cancel(lua_State *L)
   if (st->g == NULL) return LUAJIT_INT3_OK;  /* Nothing to cancel. */
   if (st->g != g) return LUAJIT_INT3_DISABLED;
   if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
-  int3_cancel_pending(g);  /* The prototype becomes compilable again. */
+  int3_cancel_all(g);  /* The prototypes become compilable again. */
   return LUAJIT_INT3_OK;
 }
 
@@ -432,7 +533,7 @@ LUA_API int luaJIT_int3_stop(lua_State *L)
   if (st->g == NULL) return LUAJIT_INT3_OK;
   if (st->g != g) return LUAJIT_INT3_DISABLED;
   if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
-  int3_cancel_pending(g);
+  int3_cancel_all(g);
   st->cb = NULL;
   st->data = NULL;
   st->state = INT3_NONE;
@@ -464,10 +565,9 @@ void lj_int3_setbc_op(global_State *g, const BCIns *pc, BCOp op)
   setbc_op((BCIns *)(void *)pc, op);
 }
 
-BCPos lj_int3_bcpos(global_State *g, const GCproto *pt)
+void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc)
 {
-  UNUSED(g); UNUSED(pt);
-  return LJ_INT3_NOBCPOS;
+  UNUSED(g); UNUSED(pt); UNUSED(bc);
 }
 
 int lj_int3_jit_on_blocked(global_State *g, GCproto *pt)

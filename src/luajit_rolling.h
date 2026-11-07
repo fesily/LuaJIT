@@ -75,13 +75,17 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 
 /* One-shot interpreter interrupt API.
 **
-** While an interrupt session is active, a single bytecode instruction may be
-** replaced by BC_INT3. The JIT stays enabled: arming flushes only the traces
-** that can reach the armed instruction and excludes its prototype from
-** compilation until the request is consumed or cancelled. The callback is a
-** read-only native observer: it must not run Lua code or change any
-** interpreter/JIT/hook state, but it may re-arm, cancel or stop the session
-** (luaJIT_int3_rearm turns a request into a per-execution breakpoint).
+** While an interrupt session is active, up to LJ_INT3_MAX bytecode
+** instructions (in any mix of prototypes) may be replaced by BC_INT3. Slots
+** the JIT rewrites at run time (function headers, loop instructions,
+** ITERN/ISNEXT and returns) cannot be armed. An armed prototype never traces:
+** the JIT is excluded from it as soon as a request is armed. The JIT
+** stays enabled: arming flushes only the traces that can reach the armed
+** instruction and excludes its prototype from compilation until the request
+** is consumed or cancelled. The callback is a read-only native observer: it
+** must not run Lua code or change any interpreter/JIT/hook state, but it may
+** re-arm, cancel or stop the session (luaJIT_int3_rearm turns a request into
+** a per-execution breakpoint).
 */
 typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
 				     const void *proto, unsigned int bcpos);
@@ -90,7 +94,9 @@ enum {
   LUAJIT_INT3_BUSY = 1,		/* Unsafe context or conflicting owner. */
   LUAJIT_INT3_INVALID = 2,	/* Bad callback or function/index. */
   LUAJIT_INT3_DISABLED = 3,	/* No session owned by this VM. */
-  LUAJIT_INT3_UNAVAILABLE = 4	/* Profiling support compiled out. */
+  LUAJIT_INT3_UNAVAILABLE = 4,	/* Profiling support compiled out. */
+  LUAJIT_INT3_FULL = 5,		/* All request slots are in use. */
+  LUAJIT_INT3_UNARMABLE = 6	/* Slot is rewritten by the JIT or the VM. */
 };
 LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 			      void *data);

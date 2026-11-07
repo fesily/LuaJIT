@@ -542,18 +542,10 @@ ASMFunction LJ_FASTCALL lj_dispatch_call(lua_State *L, const BCIns *pc)
 #if LJ_HASJIT
 out:
 #endif
+  /* No trapped header can reach this point: function headers are not
+  ** armable, see int3_mutable_op().
+  */
   op = bc_op(pc[-1]);  /* Get FUNC* op. */
-  if (op == BC_INT3) {
-    /* A trapped function header is only dispatched after the call hook ran.
-    ** Deliver the interrupt here and dispatch the restored header, so the
-    ** hook and call_init are not repeated. lj_int3_hit() fixes up L->top for
-    ** its read-only view, so restore the argument top afterwards.
-    */
-    TValue *top = L->top;
-    lj_int3_hit(L, pc);
-    L->top = top;
-    op = bc_op(pc[-1]);
-  }
 #if LJ_HASJIT
   /* Use the non-hotcounting variants if JIT is off or while recording. */
   if ((!(J->flags & JIT_F_ON) || J->state != LJ_TRACE_IDLE) &&

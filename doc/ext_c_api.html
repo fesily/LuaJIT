@@ -172,8 +172,8 @@ Also note that this mechanism is not without overhead.
 
 <h2 id="luaJIT_int3"><tt>luaJIT_int3_*</tt> &mdash; One-shot interpreter interrupt</h2>
 <p>
-This C API extension arms a single interrupt on one bytecode instruction of
-a Lua function and delivers a read-only native callback when that instruction
+This C API extension arms interrupts on bytecode instructions of Lua
+functions and delivers a read-only native callback when such an instruction
 is about to be executed. A request is one-shot by default; the callback may
 re-arm it, which turns the instruction into a breakpoint that fires on every
 execution. The full prototypes are:
@@ -191,8 +191,11 @@ LUA_API int luaJIT_int3_stop(lua_State *L);
 </pre>
 <p>
 All calls must be made by the thread that owns the VM. At most one interrupt
-session can be active in the process and at most one request can be pending
-per VM.
+session can be active in the process, and at most <tt>LJ_INT3_MAX</tt> (32)
+requests can be pending at the same time, each on one bytecode slot and in
+any mix of prototypes: several slots of one prototype and slots of different
+prototypes can be armed together. Arming a slot that is already trapped is a
+no-op and returns <tt>LUAJIT_INT3_OK</tt>.
 </p>
 <p>
 <b><tt>luaJIT_int3_start</tt></b> starts a session for the VM of <tt>L</tt>.
@@ -220,16 +223,30 @@ traces keep running, and the JIT stays enabled. To keep the bytecode
 interpreted for the duration of the request, the prototype is excluded from
 JIT compilation: no new trace may start in it or inline it, so callers that
 call it fall back to the interpreter (their recording is aborted, exactly like
-<tt>jit.off(func)</tt>). Enabling JIT compilation for that prototype (or for a
+<tt>jit.off(func)</tt>). Tracing stops right away, not lazily: the hot counters
+of the prototype keep running, but the recorder is never entered for it (or
+for a caller that could inline it), so no bytecode patch is ever applied to
+it while a request exists. Enabling JIT compilation for that prototype (or for a
 subtree containing it) through <tt>luaJIT_setmode</tt> is refused until the
 request is gone.
 </p>
 <p>
+Only slots that the JIT does not rewrite at run time can be armed: function
+headers (<tt>FUNCF</tt>/<tt>FUNCV</tt>), the loop instructions
+(<tt>FORI</tt>, <tt>FORL</tt>, <tt>ITERL</tt>, <tt>LOOP</tt>), the generic-for
+slots (<tt>ITERN</tt>/<tt>ISNEXT</tt>) and the return instructions are refused
+with <tt>LUAJIT_INT3_UNARMABLE</tt>. Arm the first instruction of the function
+body or of the loop body instead: it delivers the same events and cannot race
+with a bytecode patch.
+</p>
+<p>
 The function returns <tt>LUAJIT_INT3_OK</tt>, <tt>LUAJIT_INT3_DISABLED</tt>
 if no session is owned by this VM, <tt>LUAJIT_INT3_BUSY</tt> if a request is
-already pending, the recorder is active, machine code is executing or the
-context is unsafe, or <tt>LUAJIT_INT3_INVALID</tt> for a non-Lua function or
-an out-of-range <tt>bcpos</tt>. It may also be called from the interrupt
+the recorder is active, machine code is executing or the context is unsafe,
+<tt>LUAJIT_INT3_FULL</tt> if all <tt>LJ_INT3_MAX</tt> request slots are in
+use, <tt>LUAJIT_INT3_UNARMABLE</tt> for a slot the JIT rewrites at run time,
+or <tt>LUAJIT_INT3_INVALID</tt> for a non-Lua function or an out-of-range
+<tt>bcpos</tt>. It may also be called from the interrupt
 callback, which then queues the next request while the current one is being
 delivered.
 </p>
@@ -255,11 +272,11 @@ context is safe for these calls, and every other context rule still applies.
 </p>
 <p>
 <b><tt>luaJIT_int3_rearm</tt></b> re-arms the request that is being
-delivered, i.e. it traps the same instruction again. It is only valid inside
-the callback, returns <tt>LUAJIT_INT3_DISABLED</tt> anywhere else, and
-<tt>LUAJIT_INT3_BUSY</tt> if another request is already pending. The
-prototype stays excluded from JIT compilation for the lifetime of the new
-request. A per-iteration breakpoint of a loop is therefore:
+delivered, i.e. it traps the same instruction again, without disturbing the
+other pending requests. It is only valid inside the callback and returns
+<tt>LUAJIT_INT3_DISABLED</tt> anywhere else. The prototype stays excluded
+from JIT compilation for the lifetime of the new request. A per-iteration
+breakpoint of a loop is therefore:
 </p>
 <pre class="code">
 static void on_hit(void *data, lua_State *L, const void *proto,
@@ -269,14 +286,14 @@ static void on_hit(void *data, lua_State *L, const void *proto,
 }
 </pre>
 <p>
-<b><tt>luaJIT_int3_cancel</tt></b> restores the original instruction and
-drops a pending request, which also makes the prototype compilable again.
-The session itself stays open. It returns <tt>LUAJIT_INT3_OK</tt> if nothing
-is pending.
+<b><tt>luaJIT_int3_cancel</tt></b> restores the original instructions and
+drops <i>all</i> pending requests, which also makes the prototypes compilable
+again. The session itself stays open. It returns <tt>LUAJIT_INT3_OK</tt> if
+nothing is pending.
 </p>
 <p>
-<b><tt>luaJIT_int3_stop</tt></b> cancels a pending request and releases the
-session. The engine on/off state is <i>not</i> touched: if the JIT was
+<b><tt>luaJIT_int3_stop</tt></b> cancels all pending requests and releases
+the session. The engine on/off state is <i>not</i> touched: if the JIT was
 enabled it stays enabled, and traces recorded earlier keep running. A VM that
 is closed while a request is pending drops it without invoking the callback.
 </p>

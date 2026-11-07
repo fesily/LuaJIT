@@ -338,6 +338,49 @@ static int arm_slot(lua_State *L, const char *tbl, const char *fname,
   return arm_slot_n(L, tbl, fname, opname, 0, bcposp);
 }
 
+/* luaJIT_setmode(ON) for a global function: 0 means "refused", e.g. while an
+** interrupt request excludes the prototype.
+*/
+static int set_jit_on(lua_State *L, const char *tbl, const char *fname)
+{
+  int res;
+  lua_getglobal(L, tbl);
+  lua_getfield(L, -1, fname);
+  res = luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_ON);
+  lua_pop(L, 2);
+  return res;
+}
+
+/* Arm a slot by index and return the status code. */
+static int arm_pos(lua_State *L, const char *tbl, const char *fname,
+		   int bcpos)
+{
+  int res;
+  lua_getglobal(L, tbl);
+  lua_getfield(L, -1, fname);
+  res = luaJIT_int3_arm(L, -1, (unsigned int)bcpos);
+  lua_pop(L, 2);
+  return res;
+}
+
+/* Arm the nth slot with this opcode and return the status code. */
+static int arm_code(lua_State *L, const char *tbl, const char *fname,
+		    const char *opname, int nth)
+{
+  char path[128];
+  int bcpos;
+  snprintf(path, sizeof(path), "%s.%s", tbl, fname);
+  bcpos = find_bcpos_n(L, path, opname, nth);
+  if (bcpos < 0) return -100;
+  lua_getglobal(L, tbl);
+  lua_getfield(L, -1, fname);
+  {
+    int res = luaJIT_int3_arm(L, -1, (unsigned int)bcpos);
+    lua_pop(L, 2);
+    return res;
+  }
+}
+
 /* -- [1] Live JIT, selective trace flush and one-shot delivery ----------- */
 #if !defined(SMOKE_NO_JIT)
 static void test_live_jit(void)
@@ -493,7 +536,7 @@ static void test_nested_proto_gate(void)
   lua_pop(L, 1);
   lua_getfield(L, -1, "plain");
   CHECK(luaJIT_setmode(L, -1, LUAJIT_MODE_ALLFUNC|LUAJIT_MODE_ON) == 1);
-  lua_pop(L, 3);
+  lua_pop(L, 2);
   rec.calls = 0;
   CHECK(run_number(L, "return G.inner(3)", &v) && v == 15);
   printf("[1b] nested gate: calls=%d value=%g\n", rec.calls, v);
@@ -606,12 +649,12 @@ static void test_variants(void)
   Int3Rec rec;
   size_t i;
   static const Variant vars[] = {
-    { "fixf", "FUNCF", 0, "return G.fixf(1,2,3)", 123 },
-    { "vsum", "FUNCV", 0, "return G.vsum(1,2,3,4)", 10 },
+    { "fixf", "MULVN", 0, "return G.fixf(1,2,3)", 123 },
+    { "vsum", "ADDVV", 0, "return G.vsum(1,2,3,4)", 10 },
     { "usecallm", "CALLM", 0, "return G.usecallm(1,2,3)", 123 },
     { "usecallm2", "RETM", 0, "return G.usecallm2(42)", 42 },
     { "mktab", "TSETM", 0, "return G.mktab(7,8,9)", 3 },
-    { "loop", "FORL", 0, "return G.loop(100)", 5050 },
+    { "loop", "ADDVV", 0, "return G.loop(100)", 5050 },
     { "jloop", "JMP", 1, "return G.jloop(3)", 3 },
     { "cfunc", "CALL", 0, "return G.cfunc(3.7)", 3 }
   };
@@ -676,7 +719,7 @@ static void test_isnext_and_hooks(void)
 {
   lua_State *L = luaL_newstate();
   Int3Rec rec;
-  int bcpos = -1, iterc;
+  int bcpos = -1, iterc, itern;
   long ins;
   double v;
   memset(&rec, 0, sizeof(rec));
@@ -701,13 +744,19 @@ static void test_isnext_and_hooks(void)
     "  return s\n"
     "end\n"
     "HOOKS = 0\n"
-    "function G.fixf(a, b, c) return a*100 + b*10 + c end\n");
+    "function G.fixf(a, b, c) return a*100 + b*10 + c end\n"
+    "function G.caller(a, b, c) local r = G.fixf(a, b, c) return r end\n");
   iterc = opcode_of(L, "ITERC");
   CHECK(iterc >= 0);
   CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
-  /* The generic-for target slot is trapped; ISNEXT must despecialize ITERN
-  ** to ITERC without dropping the trap or restoring a stale instruction. */
-  CHECK(arm_slot(L, "G", "genfor", "ITERN", &bcpos) == 0);
+  /* The generic-for target slot is rewritten by ISNEXT/ITERN, so it cannot
+  ** be armed at all. */
+  CHECK(arm_code(L, "G", "genfor", "ITERN", 0) == LUAJIT_INT3_UNARMABLE);
+  CHECK(arm_code(L, "G", "genfor", "ISNEXT", 0) == LUAJIT_INT3_UNARMABLE);
+  itern = find_bcpos_n(L, "G.genfor", "ITERN", 0);
+  CHECK(itern >= 0);
+  /* Arm the loop body instead: the despecialization must leave it alone. */
+  CHECK(arm_slot(L, "G", "genfor", "ADDVV", &bcpos) == 0);
   rec.calls = 0;
   CHECK(run_number(L,
 	"local n = next\n"
@@ -715,7 +764,7 @@ static void test_isnext_and_hooks(void)
 	"local r = G.genfor({a=1,b=2,c=3})\n"
 	"next = n\n"
 	"return r\n", &v) && v == 6);
-  ins = funcbc(L, "G.genfor", bcpos);
+  ins = funcbc(L, "G.genfor", itern);
   printf("[4] isnext: calls=%d value=%g shadow-op=%ld want=%d\n",
 	 rec.calls, v, ins >= 0 ? ins % 256 : -1, iterc);
   CHECK(rec.calls == 1);
@@ -734,24 +783,25 @@ static void test_isnext_and_hooks(void)
   CHECK(run_number(L, "return G.hooksum(100)", &v) && v == 10100);
   CHECK(rec.calls == 1);
 
-  /* A trapped function header with a call hook: the hook must observe the
-  ** call exactly as often as without the trap (no duplicate delivery from
-  ** the re-dispatch after the interrupt).
+  /* A trapped call site with a call hook: the hook must observe the call
+  ** exactly as often as without the trap. Function headers themselves are
+  ** not armable (the JIT rewrites them).
   */
+  CHECK(arm_code(L, "G", "fixf", "FUNCF", 0) == LUAJIT_INT3_UNARMABLE);
   {
     int base_events;
     call_events = 0;
     lua_sethook(L, count_call_hook, LUA_MASKCALL, 0);
-    CHECK(run_number(L, "return G.fixf(4,5,6)", &v) && v == 456);
+    CHECK(run_number(L, "return G.caller(4,5,6)", &v) && v == 456);
     lua_sethook(L, NULL, 0, 0);
     base_events = call_events;
-    CHECK(arm_slot_n(L, "G", "fixf", "FUNCF", 0, &bcpos) == 0);
+    CHECK(arm_slot(L, "G", "caller", "CALL", &bcpos) == 0);
     rec.calls = 0;
     call_events = 0;
     lua_sethook(L, count_call_hook, LUA_MASKCALL, 0);
-    CHECK(run_number(L, "return G.fixf(4,5,6)", &v) && v == 456);
+    CHECK(run_number(L, "return G.caller(4,5,6)", &v) && v == 456);
     lua_sethook(L, NULL, 0, 0);
-    printf("[4] header+call hook: calls=%d events=%d base=%d value=%g\n",
+    printf("[4] call+call hook: calls=%d events=%d base=%d value=%g\n",
 	   rec.calls, call_events, base_events, v);
     CHECK(rec.calls == 1);
     CHECK(call_events == base_events);
@@ -767,6 +817,7 @@ static void test_gc_and_teardown(void)
   lua_State *L = luaL_newstate();
   Int3Rec rec;
   int bcpos = -1;
+  double v, alive;
   memset(&rec, 0, sizeof(rec));
   luaL_openlibs(L);
   run(L, "G = {} function G.sum(n) local s=0 for i=1,n do s=s+i end return s end");
@@ -797,6 +848,42 @@ static void test_gc_and_teardown(void)
   lua_close(L);
   CHECK(rec.calls == 0);
   printf("[5] close with pending: calls=%d\n", rec.calls);
+
+  /* The request keeps the prototype alive: its memory must be released only
+  ** after the request is gone.
+  */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {} function G.probe() return 1 end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "probe");
+  CHECK(luaJIT_int3_arm(L, -1, 1) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  /* Drop the last Lua reference and collect: only the request holds it. */
+  run(L, "G.probe = nil; collectgarbage('collect'); collectgarbage('collect')");
+  CHECK(run_number(L, "return collectgarbage('count')", &v) && v > 0);
+  alive = v;
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  run(L, "collectgarbage('collect'); collectgarbage('collect')");
+  CHECK(run_number(L, "return collectgarbage('count')", &v) && v > 0);
+  printf("[5] proto held by the request: %.2f KB, after cancel %.2f KB\n",
+	 alive, v);
+  CHECK(v < alive);			/* The prototype was released. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+
+  /* A pending request survives a full GC and still fires. */
+  memset(&rec, 0, sizeof(rec));
+  run(L, "G = {} function G.sum(n) local s=0 for i=1,n do s=s+i end return s end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "sum", "ADDVV", &bcpos) == 0);
+  run(L, "collectgarbage('collect'); collectgarbage('collect')");
+  CHECK(run_number(L, "return G.sum(10)", &v) && v == 55);
+  printf("[5] pending after GC: calls=%d\n", rec.calls);
+  CHECK(rec.calls == 1);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
 }
 
 /* -- [6] Bytecode dump and reload --------------------------------------- */
@@ -1214,33 +1301,272 @@ static void test_rearm(void)
   CHECK(rec.res_stop == LUAJIT_INT3_OK);
   CHECK(luaJIT_int3_arm(L, 1, 0) == LUAJIT_INT3_DISABLED);
 
-  /* The same with a loop-back and with a function header: the re-dispatched
-  ** opcode must be the returned one, with the call state the header needs.
-  */
+  /* Loop-back and header slots belong to the JIT: they must be refused. */
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_UNARMABLE);
+  CHECK(arm_pos(L, "G", "loop", 0) == LUAJIT_INT3_UNARMABLE);  /* FUNCF */
+  run(L, "function G.wloop(n) local i = 0 while i < n do i = i + 1 end "
+	 "return i end");
+  CHECK(arm_code(L, "G", "wloop", "LOOP", 0) == LUAJIT_INT3_UNARMABLE);
+  /* Re-arm a slot inside a called function instead: one interrupt per call. */
   run(L, "function G.f(i) return i * 2 end\n");
   memset(&rec, 0, sizeof(rec));
-  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
   rec.rearms = 3;
-  CHECK(arm_slot(L, "G", "loop", "FORL", &bcpos) == 0);
-  CHECK(run_number(L, "return G.loop(100)", &v) && v == 5050);
-  printf("[9] rearm FORL: calls=%d bcpos=%d/%d\n", rec.calls, (int)rec.bcpos,
-	 bcpos);
-  CHECK(rec.calls == 4);
-  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
-
-  memset(&rec, 0, sizeof(rec));
-  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
-  rec.rearms = 3;
-  CHECK(arm_slot(L, "G", "f", "FUNCF", &bcpos) == 0);
+  CHECK(arm_slot(L, "G", "f", "MULVN", &bcpos) == 0);
   run(L, "local s = 0 for i = 1, 100 do s = s + G.f(i) end\n"
 	 "assert(s == 10100, s)");
-  printf("[9] rearm FUNCF: calls=%d bcpos=%d/%d\n", rec.calls, (int)rec.bcpos,
+  printf("[9] rearm MULVN: calls=%d bcpos=%d/%d\n", rec.calls, (int)rec.bcpos,
 	 bcpos);
   CHECK(rec.calls == 4);
   CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
   lua_close(L);
 }
 #endif  /* !SMOKE_NO_PROFILE */
+
+/* -- [10] Breakpoints in several prototypes at once ---------------------- */
+
+#if !defined(SMOKE_NO_PROFILE)
+static void test_multi(void)
+{
+  lua_State *L = luaL_newstate();
+  Int3Rec rec;
+  int bc_a = -1, bc_b = -1, bc_c = -1, i, res, narmed;
+  double v;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L,
+    "G = {}\n"
+    "function G.a(n) local s=0 for i=1,n do s=s+i end return s end\n"
+    "function G.b(n) local s=0 for i=1,n do s=s+i*2 end return s end\n"
+    "function G.c(n) local s=0 for i=1,n do s=s+i*3 end return s end\n");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  /* Three prototypes, three slots, all armed at the same time. */
+  CHECK(arm_slot(L, "G", "a", "ADDVV", &bc_a) == 0);
+  CHECK(arm_slot(L, "G", "b", "ADDVV", &bc_b) == 0);
+  CHECK(arm_slot(L, "G", "c", "ADDVV", &bc_c) == 0);
+  /* Arming an already trapped slot again is a no-op. */
+  CHECK(arm_slot(L, "G", "a", "ADDVV", &i) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.a(10) + G.b(10) + G.c(10)", &v) && v == 330);
+  printf("[10] three protos: calls=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 3);
+  /* cancel() drops every pending request. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.a(10) + G.b(10) + G.c(10)", &v) && v == 330);
+  CHECK(rec.calls == 0);
+
+  /* The table is bounded: keep arming fresh slots until it is full. */
+  run(L, "function G.big(n)\n  local s = 0\n"
+	 "  s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n\n"
+	 "  s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n\n"
+	 "  s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n\n"
+	 "  s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n\n"
+	 "  s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n s=s+n\n"
+	 "  return s\n"
+	 "end\n");
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "big");
+  narmed = 0;
+  for (i = 0; i < 200; i++) {
+    res = luaJIT_int3_arm(L, -1, (unsigned int)i);
+    if (res == LUAJIT_INT3_FULL) break;
+    if (res == LUAJIT_INT3_OK) narmed++;
+    else if (res != LUAJIT_INT3_UNARMABLE)	/* Header slot. */
+      CHECK(res == LUAJIT_INT3_INVALID);	/* Past the last bytecode. */
+  }
+  lua_pop(L, 2);
+  printf("[10] full table: armed=%d stopped_at=%d res=%d\n", narmed, i, res);
+  CHECK(i < 200);			/* Hit the limit, not the end. */
+  CHECK(res == LUAJIT_INT3_FULL);
+  CHECK(narmed > 0);
+  CHECK(set_jit_on(L, "G", "big") == 0);		/* Excluded. */
+  /* The full table does not leak into a dump or a later session, and every
+  ** request released its JIT exclusion. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  CHECK(set_jit_on(L, "G", "big") == 1);		/* Every request released. */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "big");
+  CHECK(luaJIT_int3_arm(L, -1, 1) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
+/* -- [11] Call hook and hot-count paths with a trapped slot -------------- */
+
+#if !defined(SMOKE_NO_PROFILE)
+static void test_hook_and_hotcount(void)
+{
+  lua_State *L = luaL_newstate();
+  RearmRec rec;
+  int bcpos = -1;
+  double v;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {} function G.f(n) return n * 2 end");
+  /* A call hook dispatches the call through lj_dispatch_call. After the
+  ** callback re-armed the call site, one call must still deliver exactly one
+  ** interrupt.
+  */
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  rec.rearms = 10;
+  CHECK(arm_slot(L, "G", "f", "MULVN", &bcpos) == 0);
+  call_events = 0;
+  lua_sethook(L, count_call_hook, LUA_MASKCALL, 0);
+  CHECK(run_number(L, "return G.f(21)", &v) && v == 42);
+  lua_sethook(L, NULL, 0, 0);
+  printf("[11] call hook: hits=%d events=%d value=%g\n", rec.calls,
+	 call_events, v);
+  CHECK(rec.calls == 1);		/* One call, one delivery. */
+  CHECK(call_events >= 1);		/* The hook itself ran. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* An armed prototype must not trace at all: the hot counters keep tripping,
+  ** but the recorder is never entered and trace_start() never patches the
+  ** bytecode, so the trapped body instruction fires exactly once per
+  ** iteration however the JIT parameters are set.
+  */
+#if !defined(SMOKE_NO_JIT)
+  attach_trace_counters(L);
+#endif
+  memset(&rec, 0, sizeof(rec));
+  rec.rearms = 100000;
+  run(L, "function G.loop(n) local s = 0 for i = 1, n do s = s + i end "
+	 "return s end");
+  CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_UNARMABLE);
+  CHECK(arm_slot(L, "G", "loop", "ADDVV", &bcpos) == 0);
+#if !defined(SMOKE_NO_JIT)
+  run(L, "TR.start = 0");
+#endif
+  CHECK(run_number(L, "return G.loop(5000)", &v) && v == 12502500);
+  printf("[11] hot loop: hits=%d value=%g\n", rec.calls, v);
+  /* One interrupt per iteration, no duplicate delivery. */
+  CHECK(rec.calls == 5000);
+#if !defined(SMOKE_NO_JIT)
+  printf("[11] armed proto trace starts=%d\n", counter(L, "start"));
+  CHECK(counter(L, "start") == 0);
+#endif
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  /* Nothing is pending any more, so the loop no longer traps. */
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.loop(100)", &v) && v == 5050);
+  CHECK(rec.calls == 0);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
+/* -- [12] Hot-count parameters: the trap reset must never underflow -------- */
+
+#if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
+static void test_hotcount_params(void)
+{
+  static const char *params[] = { "hotloop=0", "hotloop=1", "hotloop=32768",
+				  "hotloop=56" };
+  lua_State *L = luaL_newstate();
+  RearmRec rec;
+  size_t i;
+  int bcpos = -1;
+  double v;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  attach_trace_counters(L);
+  run(L, "G = {} function G.loop(n) local s = 0 for i = 1, n do s = s + i end "
+	 "return s end");
+  CHECK(luaJIT_int3_start(L, rearm_cb, &rec) == LUAJIT_INT3_OK);
+  for (i = 0; i < sizeof(params)/sizeof(params[0]); i++) {
+    char code[64];
+    int hits;
+    snprintf(code, sizeof(code), "jit.opt.start('%s')", params[i]);
+    run(L, code);
+    memset(&rec, 0, sizeof(rec));
+    rec.rearms = 100000;
+    CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_UNARMABLE);
+    CHECK(arm_slot(L, "G", "loop", "ADDVV", &bcpos) == 0);
+    snprintf(code, sizeof(code), "TR.start = 0");
+    run(L, code);
+    snprintf(code, sizeof(code), "return G.loop(200)");
+    CHECK(run_number(L, code, &v) && v == 20100);
+    hits = rec.calls;
+    printf("[12] %-15s hits=%d starts=%d\n", params[i], hits,
+	   counter(L, "start"));
+    /* One interrupt per iteration, no endless re-dispatch, no trace start. */
+    CHECK(hits == 200);
+    CHECK(counter(L, "start") == 0);
+    CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  }
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE && !SMOKE_NO_JIT */
+
+/* -- [13] PROTO_NOJIT ownership across several requests ------------------- */
+
+#if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
+static void test_nojit_ownership(void)
+{
+  lua_State *L = luaL_newstate();
+  Int3Rec rec;
+  int bc1 = -1, bc2 = -1;
+  double v;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  attach_trace_counters(L);
+  run(L,
+    "G = {}\n"
+    "function G.f(n) local s = 0 for i = 1, n do s = s + i * 2 end "
+    "return s end\n"
+    "function G.h(x)\n"
+    "  if x > 1000 then return x + 5 end\n"
+    "  local s = 0 for i = 1, x do s = s + i * 3 end return s\n"
+    "end\n");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+
+  /* Two requests for one prototype: the first owns PROTO_NOJIT. Cancelling
+  ** both, owner first, must resume compilation (a trace has to start).
+  */
+  CHECK(arm_slot(L, "G", "f", "MULVN", &bc1) == 0);
+  CHECK(arm_slot(L, "G", "f", "ADDVV", &bc2) == 0);
+  CHECK(set_jit_on(L, "G", "f") == 0);		/* Refused while armed. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  run(L, "TR.start = 0");
+  CHECK(run_number(L, "return G.f(2000)", &v) && v == 4002000);
+  printf("[13] owner-first cancel: starts=%d\n", counter(L, "start"));
+  CHECK(counter(L, "start") > 0);		/* Compiles again. */
+
+  /* The owner is consumed first (only its branch runs) and must hand the
+  ** ownership to the surviving request, which then releases it.
+  */
+  CHECK(arm_slot(L, "G", "h", "MULVN", &bc1) == 0);	/* Owner. */
+  CHECK(arm_slot(L, "G", "h", "ADDVN", &bc2) == 0);	/* Untaken branch. */
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.h(10)", &v) && v == 165);
+  printf("[13] owner consumed: calls=%d\n", rec.calls);
+  CHECK(rec.calls == 1);			/* Only the taken branch. */
+  CHECK(set_jit_on(L, "G", "h") == 0);		/* Survivor still owns. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  run(L, "TR.start = 0");
+  CHECK(run_number(L, "return G.h(1000)", &v) && v == 1501500);
+  printf("[13] owner consumed, released: starts=%d\n", counter(L, "start"));
+  CHECK(counter(L, "start") > 0);		/* Compiles again. */
+
+  /* A pre-existing jit.off() is not ours: cancelling must not re-enable it. */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "f");
+  CHECK(luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_OFF) == 1);
+  lua_pop(L, 2);
+  CHECK(arm_slot(L, "G", "f", "ADDVV", &bc2) == 0);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  run(L, "TR.start = 0");
+  CHECK(run_number(L, "return G.f(2000)", &v) && v == 4002000);
+  printf("[13] jit.off preserved: starts=%d\n", counter(L, "start"));
+  CHECK(counter(L, "start") == 0);		/* Still disabled. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE && !SMOKE_NO_JIT */
 
 /* -- [9] Conditional builds ---------------------------------------------- */
 
@@ -1303,6 +1629,8 @@ int main(int argc, char **argv)
   if (!only || only == 5) test_gc_and_teardown();
   if (!only || only == 6) test_dump();
   if (!only || only == 9) test_rearm();
+  if (!only || only == 10) test_multi();
+  if (!only || only == 11) test_hook_and_hotcount();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -1317,6 +1645,10 @@ int main(int argc, char **argv)
   if (!only || only == 7) test_profiler();
   if (!only || only == 8) test_unsafe();
   if (!only || only == 9) test_rearm();
+  if (!only || only == 10) test_multi();
+  if (!only || only == 11) test_hook_and_hotcount();
+  if (!only || only == 12) test_hotcount_params();
+  if (!only || only == 13) test_nojit_ownership();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

@@ -15,9 +15,10 @@
 LJ_FUNC BCIns lj_int3_bcins(global_State *g, const BCIns *pc);
 LJ_FUNC void lj_int3_setbc(global_State *g, const BCIns *pc, BCIns ins);
 LJ_FUNCA void lj_int3_setbc_op(global_State *g, const BCIns *pc, BCOp op);
-/* BCPos of the pending slot of this prototype or LJ_INT3_NOBCPOS. */
-#define LJ_INT3_NOBCPOS		(~(BCPos)0)
-LJ_FUNC BCPos lj_int3_bcpos(global_State *g, const GCproto *pt);
+/* Patch a copy of the bytecode of a prototype with the logical instruction
+** of every pending slot (the dump path must not leak BC_INT3).
+*/
+LJ_FUNC void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc);
 /* Non-zero if JIT compilation must not be enabled for this prototype. */
 LJ_FUNC int lj_int3_jit_on_blocked(global_State *g, GCproto *pt);
 /* Non-zero if any VM owns an INT3 session. */
