@@ -73,6 +73,57 @@ LUA_API void luaJIT_profile_stop(lua_State *L);
 LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 					     int depth, size_t *len);
 
+/* Interpreter breakpoint API.
+**
+** While a breakpoint session is active, up to LJ_INT3_MAX bytecode
+** instructions (in any mix of prototypes) may be replaced by BC_INT3. Slots
+** the JIT rewrites at run time (function headers, loop instructions,
+** ITERN/ISNEXT and RET/RET0/RET1) cannot be armed. An armed prototype never
+** traces: the JIT is excluded from it as soon as a breakpoint is armed. The
+** JIT stays enabled: arming flushes only the traces that can reach the armed
+** instruction and excludes its prototype from compilation until the last
+** breakpoint of that prototype is cancelled.
+**
+** A breakpoint is permanent: every execution of the slot delivers the
+** callback once and then executes the original instruction, until the
+** breakpoint is cancelled, the session is stopped or the VM is closed. The
+** callback is a read-only native observer: it must not run Lua code or change
+** any interpreter/JIT/hook state, but it may arm (re-arming the slot that is
+** being delivered is a no-op), cancel or stop the session. Arming from a Lua
+** debug hook is allowed and takes effect immediately: the instruction the
+** hook belongs to still executes with its own opcode exactly once, and the
+** breakpoint fires from the next dispatch of that slot on. The other calls
+** (start, cancel, stop) are still refused inside a hook, as are the GC, VM
+** event, profiler, recorder and machine-code contexts.
+**
+** A breakpoint keeps its slot, its prototype GC root and the JIT exclusion
+** until it is explicitly disarmed: luaJIT_int3_cancel() disarms every
+** breakpoint but keeps the session, luaJIT_int3_stop() disarms them and
+** releases the session. There is no single-slot disarm call.
+**
+** The session belongs to the VM that started it: it is allocated from that
+** VM's allocator and released by luaJIT_int3_stop() or, at the latest, when
+** the VM is closed (which disarms the remaining breakpoints first, without
+** invoking the callback). At most one session may exist per process, because
+** it shares the profiler's process-wide exclusivity.
+*/
+typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
+				     const void *proto, unsigned int bcpos);
+enum {
+  LUAJIT_INT3_OK = 0,
+  LUAJIT_INT3_BUSY = 1,		/* Unsafe context or conflicting owner. */
+  LUAJIT_INT3_INVALID = 2,	/* Bad callback or function/index. */
+  LUAJIT_INT3_DISABLED = 3,	/* No session owned by this VM. */
+  LUAJIT_INT3_UNAVAILABLE = 4,	/* Profiling support compiled out. */
+  LUAJIT_INT3_FULL = 5,		/* All breakpoint slots are in use. */
+  LUAJIT_INT3_UNARMABLE = 6	/* Slot is rewritten by the JIT or the VM. */
+};
+LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
+			      void *data);
+LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos);
+LUA_API int luaJIT_int3_cancel(lua_State *L);
+LUA_API int luaJIT_int3_stop(lua_State *L);
+
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);
 

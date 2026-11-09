@@ -24,6 +24,7 @@
 #endif
 #include "lj_trace.h"
 #include "lj_dispatch.h"
+#include "lj_int3.h"
 #include "lj_vm.h"
 #include "lj_prng.h"
 #include "lj_lex.h"
@@ -336,6 +337,14 @@ LUA_API void lua_close(lua_State *L)
 #if LJ_HASPROFILE
   luaJIT_profile_stop(L);
 #endif
+  /* Release the breakpoint session and restore its slots before the finalizer
+  ** loop below runs any user code: a callback into a VM that is being torn
+  ** down is not supported, and the session must not outlive its VM (it owns a
+  ** process-wide slot, so a stale session would also keep the profiler
+  ** disabled for every later VM). The prototypes and the JIT state are still
+  ** alive here, so the restore and the JIT re-enable are safe.
+  */
+  lj_int3_close(g);
   setgcrefnull(g->cur_L);
   lj_func_closeuv(L, tvref(L->stack));
   lj_gc_separateudata(g, 1);  /* Separate udata which have GC metamethods. */

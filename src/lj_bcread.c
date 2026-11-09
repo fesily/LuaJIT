@@ -294,6 +294,16 @@ static void bcread_bytecode(LexState *ls, GCproto *pt, MSize sizebc)
     MSize i;
     for (i = 1; i < sizebc; i++) bc[i] = lj_bswap(bc[i]);
   }
+  /* BC_INT3 is a runtime-only trap: a dumped prototype never carries one
+  ** (the dump path substitutes the shadowed instruction), so a serialized
+  ** BC_INT3 is a format error.
+  */
+  {
+    MSize i;
+    for (i = 1; i < sizebc; i++)
+      if (bc_op(bc[i]) == BC_INT3)
+	lj_lex_error(ls, 0, LJ_ERR_BCFMT);
+  }
 }
 
 /* Read upvalue refs. */

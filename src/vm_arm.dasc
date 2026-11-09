@@ -798,11 +798,11 @@ static void build_subroutines(BuildCtx *ctx)
   |  b >1
   |
   |->vmeta_unm:
-  |  ldr INS, [PC, #-8]
-  |   sub PC, PC, #4
+  |  sub PC, PC, #4		// PC must point past the trapped slot.
+  |   mov OP, #BC_UNM		// The slot may hold a trap: never re-read it.
   |  add CARG3, BASE, RC
   |  add CARG4, BASE, RC
-  |  b >1
+  |  b ->vmeta_arith_op
   |
   |->vmeta_arith_vv:
   |  decode_RB8 RB, INS
@@ -811,6 +811,7 @@ static void build_subroutines(BuildCtx *ctx)
   |   add CARG4, BASE, RC
   |1:
   |  decode_OP OP, INS
+  |->vmeta_arith_op:
   |   add CARG2, BASE, RA
   |    str BASE, L->base
   |   mov CARG1, L
@@ -2068,9 +2069,26 @@ static void build_subroutines(BuildCtx *ctx)
   |4:  // Re-dispatch to static ins.
   |  ldrb OP, [PC, #-4]
   |   ldr INS, [PC, #-4]
+  |  cmp OP, #BC_INT3
+  |   beq ->vm_int3_cont		// Still trapped: use the shadowed ins.
   |  add OP, DISPATCH, OP, lsl #2
   |  ldr OP, [OP, #GG_DISP2STATIC]
   |   decode_RA8 RA, INS
+  |   decode_RD RC, INS
+  |  bx OP
+  |
+  |->vm_int3_cont:			// The slot still carries a breakpoint.
+  |  mov CARG1, L
+  |   str BASE, L->base
+  |  mov CARG2, PC
+  |   str PC, SAVE_PC
+  |  bl extern lj_int3_ins		// (lua_State *L, const BCIns *pc)
+  |  ldr BASE, L->base
+  |  mov INS, CARG1
+  |   decode_OP OP, INS
+  |  add OP, DISPATCH, OP, lsl #2
+  |   decode_RA8 RA, INS
+  |  ldr OP, [OP, #GG_DISP2STATIC]
   |   decode_RD RC, INS
   |  bx OP
   |
@@ -3451,6 +3469,29 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop asr, 1
     break;
 
+  /* -- Interpreter breakpoint trap -------------------------------------- */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. The breakpoint stays armed: run the
+    |  // read-only callback, then re-dispatch the shadowed instruction through
+    |  // the dynamic table (hooks observe the instruction exactly once).
+    |  mov CARG1, L
+    |   str BASE, L->base
+    |  mov CARG2, PC
+    |  // Do not write SAVE_PC: it is the C frame pc, i.e. the previous PC that
+    |  // lj_int3_hit() saves and restores. The callee publishes the current PC.
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  ldr BASE, L->base
+    |  // Re-decode the returned original instruction. The callback may have
+    |  // re-armed this slot, so it must not be re-read.
+    |  mov INS, CARG1
+    |   decode_OP OP, INS
+    |  decode_RA8 RA, INS
+    |   decode_RD RC, INS
+    |  ldr OP, [DISPATCH, OP, lsl #2]
+    |  bx OP
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -4272,8 +4313,8 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   mov OP, #BC_ITERC
     |  strb CARG1, [PC, #-4]
     |   sub PC, RC, #0x20000
+    |  ldrb CARG1, [PC]
     |.if JIT
-    |   ldrb CARG1, [PC]
     |   cmp CARG1, #BC_ITERN
     |   bne >6
     |.endif

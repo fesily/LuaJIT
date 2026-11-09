@@ -22,6 +22,7 @@
 #include "lj_iropt.h"
 #include "lj_mcode.h"
 #include "lj_trace.h"
+#include "lj_int3.h"
 #include "lj_snap.h"
 #include "lj_gdbjit.h"
 #include "lj_record.h"
@@ -421,12 +422,19 @@ static void trace_start(jit_State *J)
   TraceNo traceno;
 
   if ((J->pt->flags & PROTO_NOJIT)) {  /* JIT disabled for this proto? */
-    if (J->parent == 0 && J->exitno == 0 && bc_op(*J->pc) != BC_ITERN) {
-      /* Lazy bytecode patching to disable hotcount events. */
-      lj_assertJ(bc_op(*J->pc) == BC_FORL || bc_op(*J->pc) == BC_ITERL ||
-		 bc_op(*J->pc) == BC_LOOP || bc_op(*J->pc) == BC_FUNCF,
-		 "bad hot bytecode %d", bc_op(*J->pc));
-      setbc_op(J->pc, (int)bc_op(*J->pc)+(int)BC_ILOOP-(int)BC_LOOP);
+    if (J->parent == 0 && J->exitno == 0 &&
+	bc_op(lj_int3_bcins(J2G(J), J->pc)) != BC_ITERN &&
+	!lj_int3_pending(J2G(J), J->pc)) {
+      /* Lazy bytecode patching to disable hotcount events. Never touch a
+      ** slot carrying an interrupt: the write would destroy the trap, and
+      ** the opcode arithmetic is only valid for the real instruction
+      ** (BC_INT3 + BC_ILOOP-BC_LOOP is not a hot bytecode op).
+      */
+      BCIns ins = lj_int3_bcins(J2G(J), J->pc);
+      lj_assertJ(bc_op(ins) == BC_FORL || bc_op(ins) == BC_ITERL ||
+		 bc_op(ins) == BC_LOOP || bc_op(ins) == BC_FUNCF,
+		 "bad hot bytecode %d", bc_op(ins));
+      setbc_op(J->pc, (int)bc_op(ins)+(int)BC_ILOOP-(int)BC_LOOP);
       J->pt->flags |= PROTO_ILOOP;
     }
     J->state = LJ_TRACE_IDLE;  /* Silently ignored. */
@@ -504,6 +512,11 @@ static void trace_stop(jit_State *J)
   TraceNo traceno = J->cur.traceno;
   GCtrace *T = J->curfinal;
 
+  /* Only RET/RET0/RET1/ITERN are patched here. Keep that set inside
+  ** int3_mutable_op()'s refused opcodes: lj_trace_exit() temporarily
+  ** writes the trace's startins into a JLOOP slot, so a start opcode that
+  ** luaJIT_int3_arm() accepts would make that window trappable.
+  */
   switch (op) {
   case BC_FORL:
     setbc_op(pc+bc_j(J->cur.startins), BC_JFORI);  /* Patch FORI, too. */
@@ -784,6 +797,14 @@ void LJ_FASTCALL lj_trace_hot(jit_State *J, const BCIns *pc)
   ERRNO_SAVE
   /* Reset hotcount. */
   hotcount_set(J2GG(J), pc, J->param[JIT_P_hotloop]*HOTCOUNT_LOOP);
+  /* An armed prototype (or one that may inline an armed one) must not trace at
+  ** all: refuse before the recorder state machine is entered, otherwise
+  ** trace_start() would lazily patch the bytecode of the armed prototype.
+  */
+  if (lj_int3_jit_on_blocked(J2G(J), curr_proto(J->L))) {
+    ERRNO_RESTORE
+    return;
+  }
   /* Only start a new trace if not recording or inside __gc call or vmevent. */
   if (J->state == LJ_TRACE_IDLE &&
       !(J2G(J)->hookmask & (HOOK_GC|HOOK_VMEVENT))) {
@@ -813,6 +834,8 @@ static void trace_hotside(jit_State *J, const BCIns *pc)
 /* Stitch a new trace to the previous trace. */
 void LJ_FASTCALL lj_trace_stitch(jit_State *J, const BCIns *pc)
 {
+  /* Same as lj_trace_hot(): never start a trace for an armed prototype. */
+  if (lj_int3_jit_on_blocked(J2G(J), curr_proto(J->L))) return;
   /* Only start a new trace if not recording or inside __gc call or vmevent. */
   if (J->state == LJ_TRACE_IDLE &&
       !(J2G(J)->hookmask & (HOOK_GC|HOOK_VMEVENT))) {
@@ -963,6 +986,7 @@ int LJ_FASTCALL lj_trace_exit(jit_State *J, void *exptr)
       J->patchins = *pc;
       J->patchpc = (BCIns *)pc;
       *J->patchpc = *retpc;
+      /* *retpc must be an int3_mutable_op() refused op (see trace_stop()). */
       J->bcskip = 1;
     }
     return 0;

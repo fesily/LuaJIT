@@ -2840,6 +2840,28 @@ static void build_subroutines(BuildCtx *ctx)
   |  lp BASE, L->base
   |4:  // Re-dispatch to static ins.
   |  lwz INS, -4(PC)
+  |  andix. TMP1, INS, 255
+  |  cmpwi TMP1, BC_INT3
+  |  beq ->vm_int3_cont		// Still trapped: use the shadowed ins.
+  |  decode_OPP TMP1, INS
+  |   decode_RB8 RB, INS
+  |  addi TMP1, TMP1, GG_DISP2STATIC
+  |   decode_RD8 RD, INS
+  |  lpx TMP0, DISPATCH, TMP1
+  |   decode_RA8 RA, INS
+  |   decode_RC8 RC, INS
+  |  mtctr TMP0
+  |  bctr
+  |
+  |->vm_int3_cont:			// The slot still carries a breakpoint.
+  |  mr CARG1, L
+  |   stw MULTRES, SAVE_MULTRES
+  |  mr CARG2, PC
+  |   stp BASE, L->base
+  |  stw PC, SAVE_PC
+  |  bl extern lj_int3_ins		// (lua_State *L, const BCIns *pc)
+  |  lp BASE, L->base
+  |  mr INS, CARG1
   |  decode_OPP TMP1, INS
   |   decode_RB8 RB, INS
   |  addi TMP1, TMP1, GG_DISP2STATIC
@@ -4455,6 +4477,33 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     break;
   case BC_BSAR:
     |  ins_bitop sraw, 1
+    break;
+
+  /* -- Interpreter breakpoint trap -------------------------------------- */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. The breakpoint stays armed: run the
+    |  // read-only callback, then re-dispatch the shadowed instruction through
+    |  // the dynamic table (hooks observe the instruction exactly once).
+    |  mr CARG1, L
+    |   stp BASE, L->base
+    |  mr CARG2, PC
+    |  // Do not write SAVE_PC: it is the C frame pc, i.e. the previous PC that
+    |  // lj_int3_hit() saves and restores. The callee publishes the current PC.
+    |  stw MULTRES, SAVE_MULTRES		// cframe_multres_n() reads this.
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  lp BASE, L->base
+    |  // Re-decode the returned original instruction like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read.
+    |  mr INS, CARG1
+    |  decode_OPP TMP1, INS
+    |   decode_RB8 RB, INS
+    |  lpx TMP0, DISPATCH, TMP1
+    |   decode_RD8 RD, INS
+    |   decode_RA8 RA, INS
+    |   decode_RC8 RC, INS
+    |  mtctr TMP0
+    |  bctr
     break;
 
   /* -- Constant ops ------------------------------------------------------ */

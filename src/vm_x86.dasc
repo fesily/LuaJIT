@@ -926,17 +926,21 @@ static void build_subroutines(BuildCtx *ctx)
   |
   |//-- Table indexing metamethods -----------------------------------------
   |
-  |->vmeta_tgets:
-  |  mov TMP1, RC			// RC = GCstr *
-  |  mov TMP2, LJ_TSTR
-  |  lea RCa, TMP1			// Store temp. TValue in TMP1/TMP2.
-  |  cmp PC_OP, BC_GGET
-  |  jne >1
+  |->vmeta_tgets:			// RB = GCtab * (global or hash miss).
   |  lea RA, [DISPATCH+DISPATCH_GL(tmptv)]  // Store fn->l.env in g->tmptv.
   |  mov [RA], TAB:RB			// RB = GCtab *
   |  mov dword [RA+4], LJ_TTAB
   |  mov RB, RA
   |  jmp >2
+  |
+  |->vmeta_tgets1:			// RB = the non-table value of the slot.
+  |  movzx RB, PC_RB			// Reload TValue *t from RB.
+  |  lea RB, [BASE+RB*8]
+  |2:
+  |  mov TMP1, RC			// RC = GCstr *
+  |  mov TMP2, LJ_TSTR
+  |  lea RCa, TMP1			// Store temp. TValue in TMP1/TMP2.
+  |  jmp >4
   |
   |->vmeta_tgetb:
   |  movzx RC, PC_RC
@@ -956,7 +960,7 @@ static void build_subroutines(BuildCtx *ctx)
   |1:
   |  movzx RB, PC_RB			// Reload TValue *t from RB.
   |  lea RB, [BASE+RB*8]
-  |2:
+  |4:
   |.if X64
   |  mov L:CARG1d, SAVE_L
   |  mov L:CARG1d->base, BASE		// Caveat: CARG2d/CARG3d may be BASE.
@@ -1014,17 +1018,21 @@ static void build_subroutines(BuildCtx *ctx)
   |
   |//-----------------------------------------------------------------------
   |
-  |->vmeta_tsets:
-  |  mov TMP1, RC			// RC = GCstr *
-  |  mov TMP2, LJ_TSTR
-  |  lea RCa, TMP1			// Store temp. TValue in TMP1/TMP2.
-  |  cmp PC_OP, BC_GSET
-  |  jne >1
+  |->vmeta_tsets:			// RB = GCtab * (global or hash miss).
   |  lea RA, [DISPATCH+DISPATCH_GL(tmptv)]  // Store fn->l.env in g->tmptv.
   |  mov [RA], TAB:RB			// RB = GCtab *
   |  mov dword [RA+4], LJ_TTAB
   |  mov RB, RA
   |  jmp >2
+  |
+  |->vmeta_tsets1:			// RB = the non-table value of the slot.
+  |  movzx RB, PC_RB			// Reload TValue *t from RB.
+  |  lea RB, [BASE+RB*8]
+  |2:
+  |  mov TMP1, RC			// RC = GCstr *
+  |  mov TMP2, LJ_TSTR
+  |  lea RCa, TMP1			// Store temp. TValue in TMP1/TMP2.
+  |  jmp >4
   |
   |->vmeta_tsetb:
   |  movzx RC, PC_RC
@@ -1044,7 +1052,7 @@ static void build_subroutines(BuildCtx *ctx)
   |1:
   |  movzx RB, PC_RB			// Reload TValue *t from RB.
   |  lea RB, [BASE+RB*8]
-  |2:
+  |4:
   |.if X64
   |  mov L:CARG1d, SAVE_L
   |  mov L:CARG1d->base, BASE		// Caveat: CARG2d/CARG3d may be BASE.
@@ -2706,7 +2714,26 @@ static void build_subroutines(BuildCtx *ctx)
   |  movzx RA, PC_RA
   |5:
   |  movzx OP, PC_OP
+  |  cmp OP, BC_INT3
+  |  je ->vm_int3_cont		// Still trapped: use the shadowed ins.
   |  movzx RD, PC_RD
+  |.if X64
+  |  jmp aword [DISPATCH+OP*8+GG_DISP2STATIC]	// Re-dispatch to static ins.
+  |.else
+  |  jmp aword [DISPATCH+OP*4+GG_DISP2STATIC]	// Re-dispatch to static ins.
+  |.endif
+  |
+  |->vm_int3_cont:			// The slot still carries a breakpoint.
+  |  mov L:RB, SAVE_L
+  |  mov L:RB->base, BASE
+  |  mov FCARG2, PC			// Caveat: FCARG2 == BASE
+  |  mov FCARG1, L:RB
+  |  mov SAVE_PC, PC
+  |  call extern lj_int3_ins@8		// (lua_State *L, const BCIns *pc)
+  |  mov BASE, L:RB->base
+  |  movzx RA, RCH
+  |  movzx OP, RCL
+  |  shr RC, 16
   |.if X64
   |  jmp aword [DISPATCH+OP*8+GG_DISP2STATIC]	// Re-dispatch to static ins.
   |.else
@@ -4268,6 +4295,32 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop sar, 1
     break;
 
+  /* -- Interpreter breakpoint trap -------------------------------------- */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. The breakpoint stays armed: run the
+    |  // read-only callback, then re-dispatch the shadowed instruction through
+    |  // the dynamic table (hooks observe the instruction exactly once).
+    |  mov L:RB, SAVE_L
+    |  mov L:RB->base, BASE
+    |  mov FCARG2, PC			// Caveat: FCARG2 == BASE
+    |  mov FCARG1, L:RB
+    |  // Do not write SAVE_PC: it is the C frame pc, i.e. the previous PC that
+    |  // lj_int3_hit() saves and restores. The callee publishes the current PC.
+    |  call extern lj_int3_hit@8		// (lua_State *L, const BCIns *pc)
+    |  mov BASE, L:RB->base
+    |  // Re-decode the returned original instruction like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read.
+    |  movzx RA, RCH
+    |  movzx OP, RCL
+    |  shr RC, 16
+    |.if X64
+    |  jmp aword [DISPATCH+OP*8]
+    |.else
+    |  jmp aword [DISPATCH+OP*4]
+    |.endif
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -4611,7 +4664,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_ABC	// RA = dst, RB = table, RC = str const (~)
     |  not RCa
     |  mov STR:RC, [KBASE+RC*4]
-    |  checktab RB, ->vmeta_tgets
+    |  checktab RB, ->vmeta_tgets1
     |  mov TAB:RB, [BASE+RB*8]
     |->BC_TGETS_Z:	// RB = GCtab *, RC = GCstr *, refetches PC_RA.
     |  mov RA, TAB:RB->hmask
@@ -4782,7 +4835,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_ABC	// RA = src, RB = table, RC = str const (~)
     |  not RCa
     |  mov STR:RC, [KBASE+RC*4]
-    |  checktab RB, ->vmeta_tsets
+    |  checktab RB, ->vmeta_tsets1
     |  mov TAB:RB, [BASE+RB*8]
     |->BC_TSETS_Z:	// RB = GCtab *, RC = GCstr *, refetches PC_RA.
     |  mov RA, TAB:RB->hmask

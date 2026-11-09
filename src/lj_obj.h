@@ -583,6 +583,8 @@ typedef enum {
 #if LJ_HASFFI
   GCROOT_FFI_FIN,	/* FFI finalizer table. */
 #endif
+  GCROOT_INT3,		/* Prototypes of the pending INT3 requests. */
+  GCROOT_INT3_LAST = GCROOT_INT3 + LJ_INT3_MAX-1,
   GCROOT_MAX
 } GCRootID;
 
@@ -631,6 +633,13 @@ typedef struct StrInternState {
   LJ_ALIGN(8) uint64_t seed;	/* Random string seed. */
 } StrInternState;
 
+/* Breakpoint session of a VM. Defined and owned by lj_int3.c, allocated from
+** the VM's allocator on demand, so it lives and dies with its VM.
+*/
+#if LJ_HASPROFILE
+typedef struct Int3State Int3State;
+#endif
+
 /* Global state, shared by all threads of a Lua universe. */
 typedef struct global_State {
   lua_Alloc allocf;	/* Memory allocator. */
@@ -662,6 +671,9 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
+#if LJ_HASPROFILE
+  Int3State *int3;	/* Breakpoint session of this VM, or NULL. */
+#endif
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)

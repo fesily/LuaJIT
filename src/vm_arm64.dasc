@@ -1900,6 +1900,23 @@ static void build_subroutines(BuildCtx *ctx)
   |  ldr BASE, L->base
   |4:  // Re-dispatch to static ins.
   |  ldr INSw, [PC, #-4]
+  |  and TMP0, INS, #255
+  |  cmp TMP0, #BC_INT3
+  |  beq ->vm_int3_cont		// Still trapped: use the shadowed ins.
+  |  add TMP1, GL, INS, uxtb #3
+  |   decode_RA RA, INS
+  |  ldr TMP0, [TMP1, #GG_G2DISP+GG_DISP2STATIC]
+  |   decode_RD RC, INS
+  |  br_auth TMP0
+  |
+  |->vm_int3_cont:			// The slot still carries a breakpoint.
+  |  mov CARG1, L
+  |   str BASE, L->base
+  |  mov CARG2, PC
+  |   str PC, SAVE_PC
+  |  bl extern lj_int3_ins		// (lua_State *L, const BCIns *pc)
+  |  ldr BASE, L->base
+  |  mov INSw, CARG1w
   |  add TMP1, GL, INS, uxtb #3
   |   decode_RA RA, INS
   |  ldr TMP0, [TMP1, #GG_G2DISP+GG_DISP2STATIC]
@@ -2942,6 +2959,29 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop asr
     break;
 
+  /* -- Interpreter breakpoint trap -------------------------------------- */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. The breakpoint stays armed: run the
+    |  // read-only callback, then re-dispatch the shadowed instruction through
+    |  // the dynamic table (hooks observe the instruction exactly once).
+    |  mov CARG1, L
+    |   str BASE, L->base
+    |  mov CARG2, PC
+    |  // Do not write SAVE_PC: it is the C frame pc, i.e. the previous PC that
+    |  // lj_int3_hit() saves and restores. The callee publishes the current PC.
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  ldr BASE, L->base
+    |  // Re-decode the returned original instruction, like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read.
+    |  mov INSw, CARG1w
+    |  add TMP1, GL, INS, uxtb #3
+    |   decode_RA RA, INS
+    |  ldr TMP0, [TMP1, #GG_G2DISP]
+    |   decode_RD RC, INS
+    |  br_auth TMP0
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -3672,9 +3712,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_next
     |
     |5:  // Despecialize bytecode if any of the checks fail.
-    |.if JIT
     |  ldrb TMP2w, [RC, # OFS_OP]
-    |.endif
     |  mov TMP0, #BC_JMP
     |   mov TMP1, #BC_ITERC
     |  strb TMP0w, [PC, #-4+OFS_OP]

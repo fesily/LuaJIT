@@ -18,6 +18,7 @@
 #include "lj_jit.h"
 #endif
 #include "lj_strfmt.h"
+#include "lj_int3.h"
 #include "lj_bcdump.h"
 #include "lj_vm.h"
 
@@ -292,11 +293,17 @@ static void bcwrite_knum(BCWriteCtx *ctx, GCproto *pt)
 static char *bcwrite_bytecode(BCWriteCtx *ctx, char *p, GCproto *pt)
 {
   MSize nbc = pt->sizebc-1;  /* Omit the [JI]FUNC* header. */
+  lua_State *L = sbufL(&ctx->sb);
+  global_State *g = G(L);
+  BCIns *bc = (BCIns *)(void *)p;
 #if LJ_HASJIT
   uint8_t *q = (uint8_t *)p;
 #endif
   p = lj_buf_wmem(p, proto_bc(pt)+1, nbc*(MSize)sizeof(BCIns));
-  UNUSED(ctx);
+  /* Never let a pending BC_INT3 leak into a dump: restore the logical
+  ** original instruction in the output copy before normalizing I/J ops.
+  */
+  lj_int3_bcwrite_view(g, pt, bc);
 #if LJ_HASJIT
   /* Unpatch modified bytecode containing ILOOP/JLOOP etc. */
   if ((pt->flags & PROTO_ILOOP) || pt->trace) {

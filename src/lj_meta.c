@@ -22,6 +22,7 @@
 #include "lj_strscan.h"
 #include "lj_strfmt.h"
 #include "lj_lib.h"
+#include "lj_int3.h"
 #if LJ_HASFFI
 #include "lj_ctype.h"
 #include "lj_cdata.h"
@@ -214,11 +215,29 @@ static cTValue *str2num(cTValue *o, TValue *n)
     return NULL;
 }
 
+/* Logical opcode of the instruction the VM is executing right now.
+**
+** The interpreter loads the opcode of the executing instruction from the
+** bytecode for the arithmetic, bit and comparison slow paths. A slot that
+** carries a breakpoint reads back as BC_INT3 there, so the metamethod lookup
+** must not run on the trap: the delivery of the trap left the logical PC in
+** the frame, which puts the shadowed instruction one slot in front of it.
+**
+** Everything else (recording, fast function calls, op=0 from the C API) passes
+** a real opcode and is returned unchanged.
+*/
+static LJ_AINLINE BCOp meta_opcode(lua_State *L, BCReg op)
+{
+  if (LJ_UNLIKELY(op == BC_INT3))
+    return bc_op(lj_int3_ins(L, cframe_pc(cframe_raw(L->cframe))));
+  return (BCOp)op;
+}
+
 /* Helper for arithmetic instructions. Coercion, metamethod. */
 TValue *lj_meta_arith(lua_State *L, TValue *ra, cTValue *rb, cTValue *rc,
 		      BCReg op)
 {
-  MMS mm = bcmode_mm(op);
+  MMS mm = bcmode_mm(meta_opcode(L, op));
   TValue tempb, tempc;
   cTValue *b, *c;
   if ((b = str2num(rb, &tempb)) != NULL &&
@@ -242,6 +261,7 @@ TValue *lj_meta_arith(lua_State *L, TValue *ra, cTValue *rb, cTValue *rc,
 /* Helper for bit operators. No bitop metamethods in v2.1. */
 void lj_meta_bitop(lua_State *L, TValue *ra, cTValue *rb, cTValue *rc, BCReg op)
 {
+  op = (BCReg)meta_opcode(L, op);
 #if LJ_HASFFI
   CTypeID id = 0, id_ignore = 0;
   uint64_t b = lj_carith_checkbit64(L, rb, &id);
@@ -429,11 +449,16 @@ TValue *lj_meta_equal(lua_State *L, GCobj *o1, GCobj *o2, int ne)
 #if LJ_HASFFI
 TValue * LJ_FASTCALL lj_meta_equal_cd(lua_State *L, BCIns ins)
 {
-  ASMFunction cont = (bc_op(ins) & 1) ? lj_cont_condf : lj_cont_condt;
-  int op = (int)bc_op(ins) & ~1;
+  ASMFunction cont;
+  int op;
   TValue tv;
-  cTValue *mo, *o2, *o1 = &L->base[bc_a(ins)];
-  cTValue *o1mm = o1;
+  cTValue *mo, *o2, *o1, *o1mm;
+  if (LJ_UNLIKELY(bc_op(ins) == BC_INT3))  /* Slot carries a breakpoint. */
+    ins = lj_int3_ins(L, cframe_pc(cframe_raw(L->cframe)));
+  cont = (bc_op(ins) & 1) ? lj_cont_condf : lj_cont_condt;
+  op = (int)bc_op(ins) & ~1;
+  o1 = &L->base[bc_a(ins)];
+  o1mm = o1;
   if (op == BC_ISEQV) {
     o2 = &L->base[bc_d(ins)];
     if (!tviscdata(o1mm)) o1mm = o2;
@@ -458,6 +483,7 @@ TValue * LJ_FASTCALL lj_meta_equal_cd(lua_State *L, BCIns ins)
 /* Helper for ordered comparisons. String compare, __lt/__le metamethods. */
 TValue *lj_meta_comp(lua_State *L, cTValue *o1, cTValue *o2, int op)
 {
+  op = (int)meta_opcode(L, (BCReg)op);
   if (LJ_HASFFI && (tviscdata(o1) || tviscdata(o2))) {
     ASMFunction cont = (op & 1) ? lj_cont_condf : lj_cont_condt;
     MMS mm = (op & 2) ? MM_le : MM_lt;

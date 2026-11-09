@@ -2378,7 +2378,9 @@ static void build_subroutines(BuildCtx *ctx)
   |4:  // Re-dispatch to static ins.
   |  lw INS, -4(PC)
   |  decode_OP8a TMP1, INS
-  |  decode_OP8b TMP1
+  |  li AT, BC_INT3
+  |  beq TMP1, AT, ->vm_int3_cont	// Still trapped: use the shadowed ins.
+  |.  decode_OP8b TMP1
   |  daddu TMP0, DISPATCH, TMP1
   |   decode_RD8a RD, INS
   |  ld AT, GG_DISP2STATIC(TMP0)
@@ -2386,6 +2388,27 @@ static void build_subroutines(BuildCtx *ctx)
   |   decode_RD8b RD
   |  jr AT
   |   decode_RA8b RA
+  |
+  |->vm_int3_cont:			// The slot still carries a breakpoint.
+  |  move CARG2, PC
+  |   sd BASE, L->base
+  |   sw MULTRES, SAVE_MULTRES
+  |  load_got lj_int3_ins
+  |  move CARG1, L
+  |  call_intern lj_int3_ins		// (lua_State *L, const BCIns *pc)
+  |.  sd PC, SAVE_PC
+  |  ld BASE, L->base
+  |  move INS, CRET1
+  |  decode_OP8a TMP1, INS
+  |   decode_RD8a RD, INS
+  |  decode_OP8b TMP1
+  |   decode_RD8b RD
+  |  daddu TMP0, DISPATCH, TMP1
+  |   decode_RA8a RA, INS
+  |  ld AT, GG_DISP2STATIC(TMP0)
+  |   decode_RA8b RA
+  |  jr AT
+  |.  nop
   |
   |->cont_hook:				// Continue from hook yield.
   |  daddiu PC, PC, 4
@@ -4190,6 +4213,36 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop srav
     break;
 
+  /* -- Interpreter breakpoint trap -------------------------------------- */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. The breakpoint stays armed: run the
+    |  // read-only callback, then re-dispatch the shadowed instruction through
+    |  // the dynamic table (hooks observe the instruction exactly once).
+    |  move CARG2, PC
+    |   sd BASE, L->base
+    |   sw MULTRES, SAVE_MULTRES		// For the top-slot computation.
+    |  load_got lj_int3_hit
+    |  move CARG1, L
+    |  // Do not write SAVE_PC: it is the C frame pc, i.e. the previous PC that
+    |  // lj_int3_hit() saves and restores. The callee publishes the current PC.
+    |  call_intern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |.  nop
+    |  ld BASE, L->base
+    |  // Re-decode the restored instruction, like ins_NEXT does. RA is C
+    |  // callee-save and still holds ins_NEXT's A*8, so it must not be
+    |  // re-decoded here.
+    |  move INS, CRET1			// Re-decode the returned instruction.
+    |  decode_OP8a TMP1, INS
+    |   decode_RD8a RD, INS
+    |  decode_OP8b TMP1
+    |   decode_RD8b RD
+    |  daddu TMP0, DISPATCH, TMP1
+    |  ld AT, 0(TMP0)			// Dynamic entry for the original opcode.
+    |  jr AT
+    |.  nop
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -5085,14 +5138,15 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   li TMP1, BC_ITERC
     |  sb TMP3, -4+OFS_OP(PC)
     |   daddu PC, TMP0, TMP2
+    |  lb TMP0, OFS_OP(PC)		// Physical opcode at the target slot.
     |.if JIT
-    |  lb TMP0, OFS_OP(PC)
     |  li AT, BC_ITERN
     |  bne TMP0, AT, >6
     |.  lhu TMP2, OFS_RD(PC)
     |.endif
     |  b <1
     |.  sb TMP1, OFS_OP(PC)
+    |.  nop
     |.if JIT
     |6:  // Unpatch JLOOP.
     |  ld TMP0, DISPATCH_J(trace)(DISPATCH)

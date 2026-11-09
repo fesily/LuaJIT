@@ -14,6 +14,7 @@
 #include "lj_state.h"
 #include "lj_frame.h"
 #include "lj_bc.h"
+#include "lj_int3.h"
 #include "lj_strfmt.h"
 #if LJ_HASJIT
 #include "lj_jit.h"
@@ -251,16 +252,21 @@ const char *lj_debug_uvnamev(cTValue *o, uint32_t idx, TValue **tvp, GCobj **op)
   return NULL;
 }
 
-/* Deduce name of an object from slot number and PC. */
-const char *lj_debug_slotname(GCproto *pt, const BCIns *ip, BCReg slot,
-			      const char **name)
+/* Deduce name of an object from slot number and PC. The backwards scan reads
+** the logical instruction of every slot it visits: an armed slot holds
+** BC_INT3 there, and the definition of the slot (MOV/GGET/TGETS/UGET) would
+** otherwise be invisible, which loses the function name and the operand name
+** of a type error.
+*/
+const char *lj_debug_slotname(global_State *g, GCproto *pt, const BCIns *ip,
+			      BCReg slot, const char **name)
 {
   const char *lname;
 restart:
   lname = debug_varname(pt, proto_bcpos(pt, ip), slot);
   if (lname != NULL) { *name = lname; return "local"; }
   while (--ip > proto_bc(pt)) {
-    BCIns ins = *ip;
+    BCIns ins = lj_int3_bcins(g, ip);
     BCOp op = bc_op(ins);
     BCReg ra = bc_a(ins);
     if (bcmode_a(op) == BCMbase) {
@@ -277,7 +283,7 @@ restart:
       case BC_TGETS:
 	*name = strdata(gco2str(proto_kgc(pt, ~(ptrdiff_t)bc_c(ins))));
 	if (ip > proto_bc(pt)) {
-	  BCIns insp = ip[-1];
+	  BCIns insp = lj_int3_bcins(g, ip-1);
 	  if (bc_op(insp) == BC_MOV && bc_a(insp) == ra+1+LJ_FR2 &&
 	      bc_d(insp) == bc_b(ins))
 	    return "method";
@@ -310,11 +316,12 @@ const char *lj_debug_funcname(lua_State *L, cTValue *frame, const char **name)
   if (pc != NO_BCPOS) {
     GCproto *pt = funcproto(fn);
     const BCIns *ip = &proto_bc(pt)[check_exp(pc < pt->sizebc, pc)];
-    MMS mm = bcmode_mm(bc_op(*ip));
+    BCIns ins = lj_int3_bcins(G(L), ip);
+    MMS mm = bcmode_mm(bc_op(ins));
     if (mm == MM_call) {
-      BCReg slot = bc_a(*ip);
-      if (bc_op(*ip) == BC_ITERC) slot -= 3;
-      return lj_debug_slotname(pt, ip, slot, name);
+      BCReg slot = bc_a(ins);
+      if (bc_op(ins) == BC_ITERC) slot -= 3;
+      return lj_debug_slotname(G(L), pt, ip, slot, name);
     } else if (mm != MM__MAX) {
       *name = strdata(mmname_str(G(L), mm));
       return "metamethod";
