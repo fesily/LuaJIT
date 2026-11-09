@@ -27,7 +27,7 @@ if exist minilua.exe.manifest^
 @minilua
 @if not errorlevel 8 goto :FAIL
 
-@set DASMFLAGS=-D WIN -D FFI -D P64
+@set DASMFLAGS=-D WIN -D FFI -D INT3 -D P64
 minilua %DASM% -LN %DASMFLAGS% -o host\buildvm_arch.h vm_x64.dasc
 @if errorlevel 1 goto :BAD
 

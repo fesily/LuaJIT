@@ -228,7 +228,13 @@
 |
 |// Instruction decode+dispatch.
 |.macro ins_NEXT
+|.if INT3
+|  ldr TMP2, GL->int3bias
+|  ldr INSw, [PC, TMP2]			// New fetches read the INT3 shadow.
+|  add PC, PC, #4			// The canonical PC keeps advancing.
+|.else
 |  ldr INSw, [PC], #4
+|.endif
 |  add TMP1, GL, INS, uxtb #3
 |   decode_RA RA, INS
 |  ldr TMP0, [TMP1, #GG_G2DISP]
@@ -236,6 +242,16 @@
 |  br_auth TMP0
 |.endmacro
 |
+|// Publish the shadow fetch bias of a Lua frame. pcreg holds the canonical
+|// proto_bc(pt) of its function (fn->pc); tmpreg may alias pcreg.
+|.macro int3_bias_pc, pcreg, tmpreg
+|.if INT3
+|  str pcreg, GL->int3pc
+|  ldr tmpreg, [pcreg, #PC2PROTO(int3ofs)]
+|  str tmpreg, GL->int3bias
+|.endif
+|.endmacro
+
 |// Instruction footer.
 |.if 1
 |  // Replicated dispatch. Less unpredictable branches, but higher I-Cache use.
@@ -417,6 +433,12 @@ static void build_subroutines(BuildCtx *ctx)
   |  str RC, L->cframe
   |
   |->vm_leave_unw:
+  |.if INT3
+  |  // Control leaves the interpreter: drop the fetch bias, so a C helper that
+  |  // ran a Lua finalizer can never resume another prototype's shadow.
+  |  str xzr, GL->int3bias
+  |  str xzr, GL->int3pc
+  |.endif
   |  restoreregs
   |  ret_auth
   |
@@ -633,6 +655,7 @@ static void build_subroutines(BuildCtx *ctx)
   |    bls >1
   |.endif
   |  ldr CARG3, LFUNC:CARG3->pc
+  |  int3_bias_pc CARG3, TMP2
   |  ldr KBASE, [CARG3, #PC2PROTO(k)]
   |  // BASE = base, RA = resultptr, CARG4 = meta base
   |    br_auth CARG1
@@ -806,6 +829,12 @@ static void build_subroutines(BuildCtx *ctx)
   |  csel PC, PC, RB, lo
   |->cont_nop:
   |  bti_jump
+  |.if INT3
+  |  ldr LFUNC:CARG1, [BASE, FRAME_FUNC]	// A C helper may have run Lua (GC).
+  |  and LFUNC:CARG1, CARG1, #LJ_GCVMASK
+  |  ldr CARG1, LFUNC:CARG1->pc
+  |  int3_bias_pc CARG1, TMP2
+  |.endif
   |  ins_next
   |
   |->cont_ra:				// RA = resultptr
@@ -1470,6 +1499,12 @@ static void build_subroutines(BuildCtx *ctx)
   |  decode_RA TMP1, INS
   |  // Adjust BASE. KBASE is assumed to be set for the calling frame.
   |  sub BASE, RA, TMP1, lsl #3
+  |.if INT3
+  |  ldr LFUNC:CARG1, [BASE, FRAME_FUNC]	// Back in the Lua caller.
+  |  and LFUNC:CARG1, CARG1, #LJ_GCVMASK
+  |  ldr CARG1, LFUNC:CARG1->pc
+  |  int3_bias_pc CARG1, TMP2
+  |.endif
   |  ins_next
   |
   |6:  // Fill up results with nil.
@@ -1855,7 +1890,7 @@ static void build_subroutines(BuildCtx *ctx)
   |//-----------------------------------------------------------------------
   |
   |->vm_record:				// Dispatch target for recording phase.
-  |.if JIT
+  |.if JIT or INT3
   |  bti_jump
   |  ldrb CARG1w, GL->hookmask
   |  tst CARG1, #HOOK_VMEVENT		// No recording while in vmevent.
@@ -1898,8 +1933,14 @@ static void build_subroutines(BuildCtx *ctx)
   |  bl extern lj_dispatch_ins		// (lua_State *L, const BCIns *pc)
   |3:
   |  ldr BASE, L->base
+  |.if INT3
+  |  ldr LFUNC:CARG1, [BASE, FRAME_FUNC]	// The hook may have run Lua.
+  |  and LFUNC:CARG1, CARG1, #LJ_GCVMASK
+  |  ldr CARG1, LFUNC:CARG1->pc
+  |  int3_bias_pc CARG1, TMP2
+  |.endif
   |4:  // Re-dispatch to static ins.
-  |  ldr INSw, [PC, #-4]
+  |  ldr INSw, [PC, #-4]		// Canonical: a trap only lives in the shadow.
   |  add TMP1, GL, INS, uxtb #3
   |   decode_RA RA, INS
   |  ldr TMP0, [TMP1, #GG_G2DISP+GG_DISP2STATIC]
@@ -2096,13 +2137,31 @@ static void build_subroutines(BuildCtx *ctx)
   |  and LFUNC:CARG2, CARG2, #LJ_GCVMASK
   |   str RCw, SAVE_MULTRES
   |   str BASE, L->base
+  |.if INT3
+  |  ldrb TMP3w, LFUNC:CARG2->ffid	// A C function has a synthetic pc.
+  |.endif
   |  ldr CARG2, LFUNC:CARG2->pc
   |   str xzr, GL->jit_base
   |    mv_vmstate CARG4w, INTERP
+  |.if INT3
+  |  mov TMP2, xzr
+  |  cmp TMP3w, #FF_LUA
+  |  ldr TMP3, [CARG2, #PC2PROTO(int3ofs)]
+  |  csel TMP2, TMP3, xzr, eq
+  |  str CARG2, GL->int3pc
+  |  str TMP2, GL->int3bias
+  |.endif
   |  ldr KBASE, [CARG2, #PC2PROTO(k)]
   |  // Modified copy of ins_next which handles function header dispatch, too.
+  |.if INT3
+  |  add TMP3, PC, TMP2			// Mapped fetch of the resumed frame.
+  |  ldrb RBw, [TMP3, # OFS_OP]
+  |   ldr INSw, [PC, TMP2]
+  |  add PC, PC, #4
+  |.else
   |  ldrb RBw, [PC, # OFS_OP]
   |   ldr INSw, [PC], #4
+  |.endif
   |    st_vmstate CARG4w
   |  cmn CARG1w, #17			// Static dispatch?
   |  beq >5
@@ -2942,6 +3001,28 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop asr
     break;
 
+  /* -- Interpreter breakpoint trap -------------------------------------- */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. The breakpoint stays armed: run the
+    |  // read-only callback, then re-dispatch the shadowed instruction through
+    |  // the dynamic table (hooks observe the instruction exactly once).
+    |  mov CARG1, L
+    |   str BASE, L->base
+    |  mov CARG2, PC
+    |   str PC, SAVE_PC
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  ldr BASE, L->base
+    |  // Re-decode the returned original instruction, like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read.
+    |  mov INSw, CARG1w
+    |  add TMP1, GL, INS, uxtb #3
+    |   decode_RA RA, INS
+    |  ldr TMP0, [TMP1, #GG_G2DISP]
+    |   decode_RD RC, INS
+    |  br_auth TMP0
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -3672,9 +3753,16 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_next
     |
     |5:  // Despecialize bytecode if any of the checks fail.
-    |.if JIT
+    |.if INT3
+    |  mov CARG1, L
+    |   str BASE, L->base
+    |  mov CARG2, PC
+    |  bl extern lj_int3_isnext		// (lua_State *L, const BCIns *pc)
+    |  ldr BASE, L->base
+    |  mov PC, CARG1			// Canonical ITER target.
+    |  b <1
+    |.else
     |  ldrb TMP2w, [RC, # OFS_OP]
-    |.endif
     |  mov TMP0, #BC_JMP
     |   mov TMP1, #BC_ITERC
     |  strb TMP0w, [PC, #-4+OFS_OP]
@@ -3693,6 +3781,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bfxil TMP2w, TMP1w, #0, #8
     |  str TMP2w, [RC]
     |  b <1
+    |.endif
     |.endif
     break;
 
@@ -3796,6 +3885,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  and LFUNC:CARG1, CARG1, #LJ_GCVMASK
     |  mov BASE, CARG4
     |  ldr CARG2, LFUNC:CARG1->pc
+    |  int3_bias_pc CARG2, CARG3
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
     |   ins_next
     |
@@ -3841,6 +3931,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  blo >6
     |  and LFUNC:CARG1, CARG1, #LJ_GCVMASK
     |  ldr CARG2, LFUNC:CARG1->pc
+    |  int3_bias_pc CARG2, TMP2
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
     |  ins_next
     |
@@ -4046,6 +4137,10 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ldr CARG1, L->maxstack
     |   ldrb TMP1w, [PC, #-4+PC2PROTO(numparams)]
     |    ldr KBASE, [PC, #-4+PC2PROTO(k)]
+    |.if INT3
+    |  sub TMP3, PC, #4			// Canonical proto_bc(pt).
+    |  int3_bias_pc TMP3, TMP3
+    |.endif
     |  cmp RA, CARG1
     |  bhi ->vm_growstack_l
     |2:
@@ -4099,6 +4194,10 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   str TMP0, [TMP2], #8
     |  cbnz TMP1, <1
     |2:
+    |.if INT3
+    |  sub TMP0, PC, #4			// Canonical proto_bc(pt).
+    |  int3_bias_pc TMP0, TMP0
+    |.endif
     |  ins_next
     |
     |3:

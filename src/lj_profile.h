@@ -17,6 +17,8 @@ LJ_FUNC void LJ_FASTCALL lj_profile_hook_leave(global_State *g);
 LJ_FUNC int lj_profile_lock(void);
 LJ_FUNC void lj_profile_unlock(void);
 #endif
+/* Non-zero if a profiler session currently owns a VM. */
+LJ_FUNC int lj_profile_active(void);
 
 #endif
 

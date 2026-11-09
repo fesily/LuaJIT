@@ -295,8 +295,8 @@ static char *bcwrite_bytecode(BCWriteCtx *ctx, char *p, GCproto *pt)
 #if LJ_HASJIT
   uint8_t *q = (uint8_t *)p;
 #endif
+  /* The canonical bytecode never carries a trap: a dump is an exact copy. */
   p = lj_buf_wmem(p, proto_bc(pt)+1, nbc*(MSize)sizeof(BCIns));
-  UNUSED(ctx);
 #if LJ_HASJIT
   /* Unpatch modified bytecode containing ILOOP/JLOOP etc. */
   if ((pt->flags & PROTO_ILOOP) || pt->trace) {

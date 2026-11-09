@@ -214,11 +214,19 @@ static cTValue *str2num(cTValue *o, TValue *n)
     return NULL;
 }
 
+/* Logical opcode of the instruction the VM is executing right now.
+**
+** The interpreter loads the opcode of the executing instruction from the
+** canonical bytecode for the arithmetic, bit and comparison slow paths, so it
+** is always the real opcode: only instruction fetches read the INT3 shadow and
+** an armed slot is dispatched to the trap handler instead.
+*/
+
 /* Helper for arithmetic instructions. Coercion, metamethod. */
 TValue *lj_meta_arith(lua_State *L, TValue *ra, cTValue *rb, cTValue *rc,
 		      BCReg op)
 {
-  MMS mm = bcmode_mm(op);
+  MMS mm = bcmode_mm((BCOp)op);
   TValue tempb, tempc;
   cTValue *b, *c;
   if ((b = str2num(rb, &tempb)) != NULL &&
@@ -429,11 +437,14 @@ TValue *lj_meta_equal(lua_State *L, GCobj *o1, GCobj *o2, int ne)
 #if LJ_HASFFI
 TValue * LJ_FASTCALL lj_meta_equal_cd(lua_State *L, BCIns ins)
 {
-  ASMFunction cont = (bc_op(ins) & 1) ? lj_cont_condf : lj_cont_condt;
-  int op = (int)bc_op(ins) & ~1;
+  ASMFunction cont;
+  int op;
   TValue tv;
-  cTValue *mo, *o2, *o1 = &L->base[bc_a(ins)];
-  cTValue *o1mm = o1;
+  cTValue *mo, *o2, *o1, *o1mm;
+  cont = (bc_op(ins) & 1) ? lj_cont_condf : lj_cont_condt;
+  op = (int)bc_op(ins) & ~1;
+  o1 = &L->base[bc_a(ins)];
+  o1mm = o1;
   if (op == BC_ISEQV) {
     o2 = &L->base[bc_d(ins)];
     if (!tviscdata(o1mm)) o1mm = o2;

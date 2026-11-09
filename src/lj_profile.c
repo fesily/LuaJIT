@@ -14,6 +14,7 @@
 #include "lj_frame.h"
 #include "lj_debug.h"
 #include "lj_dispatch.h"
+#include "lj_int3.h"
 #if LJ_HASJIT
 #include "lj_jit.h"
 #include "lj_trace.h"
@@ -91,6 +92,12 @@ static ProfileState profile_state;
 
 /* Default sample interval in milliseconds. */
 #define LJ_PROFILE_INTERVAL_DEFAULT	10
+
+/* Non-zero if a profiler session currently owns a VM. */
+int lj_profile_active(void)
+{
+  return profile_state.g != NULL;
+}
 
 /* -- Profiler/hook interaction ------------------------------------------- */
 
@@ -321,6 +328,8 @@ LUA_API void luaJIT_profile_start(lua_State *L, const char *mode,
 {
   ProfileState *ps = &profile_state;
   int interval = LJ_PROFILE_INTERVAL_DEFAULT;
+  /* Never disturb an interrupt session, in this or in any other VM. */
+  if (lj_int3_active()) return;
   while (*mode) {
     int m = *mode++;
     switch (m) {

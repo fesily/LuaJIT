@@ -24,6 +24,7 @@
 #endif
 #include "lj_trace.h"
 #include "lj_dispatch.h"
+#include "lj_int3.h"
 #include "lj_vm.h"
 #include "lj_prng.h"
 #include "lj_lex.h"
@@ -337,6 +338,7 @@ LUA_API void lua_close(lua_State *L)
   luaJIT_profile_stop(L);
 #endif
   setgcrefnull(g->cur_L);
+  lj_int3_close(g);
   lj_func_closeuv(L, tvref(L->stack));
   lj_gc_separateudata(g, 1);  /* Separate udata which have GC metamethods. */
 #if LJ_HASJIT

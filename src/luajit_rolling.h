@@ -73,6 +73,60 @@ LUA_API void luaJIT_profile_stop(lua_State *L);
 LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 					     int depth, size_t *len);
 
+/* Interpreter breakpoint API.
+**
+** While a breakpoint session is active, up to LJ_INT3_MAX bytecode slots (in
+** any mix of prototypes) deliver a callback. The canonical bytecode array of
+** a prototype is never modified: the VM keeps one shadow copy of it, and only
+** new instruction fetches read that shadow, where the armed slots hold
+** BC_INT3. Every hook, recorder and slow-path re-read keeps reading the
+** canonical array, so jit.util.funcbc, dumps, line numbers and tracebacks
+** always see the real program. Slots the JIT rewrites at run time (function
+** headers, loop instructions, ITERN/ISNEXT and RET/RET0/RET1) cannot be
+** armed.
+**
+** A breakpoint is permanent: every new fetch of the slot delivers the
+** callback once and then executes the original instruction, until the
+** breakpoint is cancelled, the session is stopped or the VM is closed. The
+** callback is a read-only native observer: it must not run Lua code or change
+** any interpreter/JIT/hook state, but it may arm (re-arming the slot that is
+** being delivered is a no-op), cancel or stop the session.
+**
+** A request is mounted automatically at the next safe point: the prototype
+** is kept out of the JIT (the traces that can reach the armed instruction are
+** flushed and the prototype is excluded from compilation) and its shadow is
+** created. luaJIT_int3_arm() returning OK means the request was accepted, not
+** that it is already mounted: a host call and the callback mount it before
+** returning, while a Lua debug hook or the recorder only registers it, and
+** the C dispatch that leads to the next safe point mounts it there. The
+** instruction the hook belongs to still executes with its own opcode exactly
+** once, and the breakpoint fires from the next fetch of that slot on. The
+** other calls (start, cancel, stop) are still refused inside a hook, as are
+** the GC, foreign VM event, profiler and machine-code contexts.
+**
+** A breakpoint keeps its slot, its prototype GC root and the JIT exclusion
+** until it is explicitly disarmed: luaJIT_int3_cancel() disarms every
+** breakpoint but keeps the session, luaJIT_int3_stop() disarms them and
+** releases the session. There is no single-slot disarm call.
+*/
+typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
+				     const void *proto, unsigned int bcpos);
+enum {
+  LUAJIT_INT3_OK = 0,
+  LUAJIT_INT3_BUSY = 1,		/* Unsafe context or conflicting owner. */
+  LUAJIT_INT3_INVALID = 2,	/* Bad callback or function/index. */
+  LUAJIT_INT3_DISABLED = 3,	/* No session owned by this VM. */
+  LUAJIT_INT3_UNAVAILABLE = 4,	/* Profiling support compiled out. */
+  LUAJIT_INT3_FULL = 5,		/* All breakpoint slots are in use. */
+  LUAJIT_INT3_UNARMABLE = 6,	/* Slot is rewritten by the JIT or the VM. */
+  LUAJIT_INT3_NOMEM = 7		/* No memory for the shadow of the prototype. */
+};
+LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
+			      void *data);
+LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos);
+LUA_API int luaJIT_int3_cancel(lua_State *L);
+LUA_API int luaJIT_int3_stop(lua_State *L);
+
 /* Enforce (dynamic) linker error for version mismatches. Call from main. */
 LUA_API void LUAJIT_VERSION_SYM(void);
 

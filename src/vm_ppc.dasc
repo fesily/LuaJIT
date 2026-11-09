@@ -397,10 +397,20 @@
 |.macro decode_OP1, dst, ins; rlwinm dst, ins, 0, 24, 31; .endmacro
 |.macro decode_RD4, dst, ins; rlwinm dst, ins, 18, 14, 29; .endmacro
 |
+|// Shadow bias scratch. These registers are not used by the interpreter.
+|.define INT3TMP,	r26
+|.define INT3SCR,	r27
+
 |// Instruction fetch.
 |.macro ins_NEXT1
+|.if INT3
+|  lwz INT3TMP, DISPATCH_GL(int3bias)(DISPATCH)
+|  lwzx INS, PC, INT3TMP		// New fetches read the INT3 shadow.
+|   addi PC, PC, 4			// The canonical PC keeps advancing.
+|.else
 |  lwz INS, 0(PC)
 |   addi PC, PC, 4
+|.endif
 |.endmacro
 |// Instruction decode+dispatch. Note: optimized for e300!
 |.macro ins_NEXT2
@@ -418,6 +428,25 @@
 |  ins_NEXT2
 |.endmacro
 |
+|// Publish the shadow fetch bias of a Lua frame. pcreg holds the canonical
+|// proto_bc(pt) of its function (fn->pc).
+|.macro int3_bias_pc, pcreg
+|.if INT3
+|  stw pcreg, DISPATCH_GL(int3pc)(DISPATCH)
+|  lwz INT3SCR, PC2PROTO(int3ofs)(pcreg)
+|  stw INT3SCR, DISPATCH_GL(int3bias)(DISPATCH)
+|.endif
+|.endmacro
+
+|// Ditto for the Lua frame at BASE.
+|.macro int3_bias_base
+|.if INT3
+|  lwz LFUNC:INT3SCR, FRAME_FUNC(BASE)
+|  lwz INT3SCR, LFUNC:INT3SCR->pc
+|  int3_bias_pc INT3SCR
+|.endif
+|.endmacro
+
 |// Instruction footer.
 |.if 1
 |  // Replicated dispatch. Less unpredictable branches, but higher I-Cache use.
@@ -594,6 +623,13 @@ static void build_subroutines(BuildCtx *ctx)
   |  stp TMP0, L->cframe
   |
   |->vm_leave_unw:
+  |.if INT3
+  |  // Control leaves the interpreter: drop the fetch bias, so a C helper that
+  |  // ran a Lua finalizer can never resume another prototype's shadow.
+  |  li TMP1, 0
+  |  stw TMP1, DISPATCH_GL(int3bias)(DISPATCH)
+  |  stw TMP1, DISPATCH_GL(int3pc)(DISPATCH)
+  |.endif
   |  restoreregs
   |  blr
   |
@@ -864,6 +900,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  ble >1
   |.endif
   |    lwz TMP1, LFUNC:TMP1->pc
+  |  int3_bias_pc TMP1
   |    lwz KBASE, PC2PROTO(k)(TMP1)
   |  // BASE = base, RA = resultptr, RB = meta base
   |  mtctr TMP0
@@ -1127,6 +1164,7 @@ static void build_subroutines(BuildCtx *ctx)
   |  and TMP2, TMP2, CRET1
   |  add PC, PC, TMP2
   |->cont_nop:
+  |  int3_bias_base			// A C helper may have run Lua (GC).
   |  ins_next
   |
   |->cont_ra:				// RA = resultptr
@@ -2023,9 +2061,10 @@ static void build_subroutines(BuildCtx *ctx)
   |  cmplw RB, RD			// More results expected?
   |   decode_RA8 TMP0, INS
   |  bgt >6
-  |  ins_next1
   |  // Adjust BASE. KBASE is assumed to be set for the calling frame.
   |   sub BASE, RA, TMP0
+  |  int3_bias_base			// Back in the Lua caller.
+  |  ins_next1
   |  ins_next2
   |
   |6:  // Fill up results with nil.
@@ -2791,7 +2830,7 @@ static void build_subroutines(BuildCtx *ctx)
   |//-----------------------------------------------------------------------
   |
   |->vm_record:				// Dispatch target for recording phase.
-  |.if JIT
+  |.if JIT or INT3
   |  lbz TMP3, DISPATCH_GL(hookmask)(DISPATCH)
   |  andix. TMP0, TMP3, HOOK_VMEVENT	// No recording while in vmevent.
   |  bne >5
@@ -2838,8 +2877,9 @@ static void build_subroutines(BuildCtx *ctx)
   |  bl extern lj_dispatch_ins		// (lua_State *L, const BCIns *pc)
   |3:
   |  lp BASE, L->base
+  |  int3_bias_base			// The hook may have run Lua.
   |4:  // Re-dispatch to static ins.
-  |  lwz INS, -4(PC)
+  |  lwz INS, -4(PC)			// Canonical: a trap only lives in the shadow.
   |  decode_OPP TMP1, INS
   |   decode_RB8 RB, INS
   |  addi TMP1, TMP1, GG_DISP2STATIC
@@ -3051,7 +3091,18 @@ static void build_subroutines(BuildCtx *ctx)
   |    li TMP2, 0
   |   stw MULTRES, SAVE_MULTRES
   |  lwz TMP1, LFUNC:RB->pc
+  |  lbz TMP3, LFUNC:RB->ffid		// 0 for a Lua function.
   |    stw TMP2, DISPATCH_GL(jit_base)(DISPATCH)
+  |.if INT3
+  |  // A C or fast function has a synthetic pc, not a prototype: fetch it
+  |  // canonically. TMP3 = 0 or -1 mask (no branch, no isel on e300/e500).
+  |  lwz INT3SCR, PC2PROTO(int3ofs)(TMP1)
+  |  subfic TMP3, TMP3, 0
+  |  srawi TMP3, TMP3, 31
+  |  and INT3SCR, INT3SCR, TMP3
+  |  stw TMP1, DISPATCH_GL(int3pc)(DISPATCH)
+  |  stw INT3SCR, DISPATCH_GL(int3bias)(DISPATCH)
+  |.endif
   |  lwz KBASE, PC2PROTO(k)(TMP1)
   |  // Setup type comparison constants.
   |  li TISNUM, LJ_TISNUM
@@ -3066,8 +3117,14 @@ static void build_subroutines(BuildCtx *ctx)
   |  .FPU stw TMP0, TONUM_HI
   |  .FPU lfs TONUM, TMPD
   |  // Modified copy of ins_next which handles function header dispatch, too.
+  |.if INT3
+  |  lwz INT3TMP, DISPATCH_GL(int3bias)(DISPATCH)
+  |  lwzx INS, PC, INT3TMP		// Mapped fetch of the resumed Lua frame.
+  |   addi PC, PC, 4
+  |.else
   |  lwz INS, 0(PC)
   |   addi PC, PC, 4
+  |.endif
   |    // Assumes TISNIL == ~LJ_VMST_INTERP == -1.
   |    stw TISNIL, DISPATCH_GL(vmstate)(DISPATCH)
   |  cmpwi CARG1, -17			// Static dispatch?
@@ -4457,6 +4514,32 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_bitop sraw, 1
     break;
 
+  /* -- Interpreter breakpoint trap -------------------------------------- */
+
+  case BC_INT3:
+    |  // PC points past the trapped slot. The breakpoint stays armed: run the
+    |  // read-only callback, then re-dispatch the shadowed instruction through
+    |  // the dynamic table (hooks observe the instruction exactly once).
+    |  mr CARG1, L
+    |   stp BASE, L->base
+    |  mr CARG2, PC
+    |   stw PC, SAVE_PC
+    |  stw MULTRES, SAVE_MULTRES		// cframe_multres_n() reads this.
+    |  bl extern lj_int3_hit		// (lua_State *L, const BCIns *pc)
+    |  lp BASE, L->base
+    |  // Re-decode the returned original instruction like ins_NEXT does. The
+    |  // callback may have re-armed this slot, so it must not be re-read.
+    |  mr INS, CARG1
+    |  decode_OPP TMP1, INS
+    |   decode_RB8 RB, INS
+    |  lpx TMP0, DISPATCH, TMP1
+    |   decode_RD8 RD, INS
+    |   decode_RA8 RA, INS
+    |   decode_RC8 RC, INS
+    |  mtctr TMP0
+    |  bctr
+    break;
+
   /* -- Constant ops ------------------------------------------------------ */
 
   case BC_KSTR:
@@ -5525,6 +5608,15 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |1:
     |  ins_next
     |5:  // Despecialize bytecode if any of the checks fail.
+    |.if INT3
+    |  mr CARG1, L
+    |   stp BASE, L->base
+    |  mr CARG2, PC
+    |  bl extern lj_int3_isnext		// (lua_State *L, const BCIns *pc)
+    |  lp BASE, L->base
+    |  mr PC, CARG1			// Canonical ITER target.
+    |  b <1
+    |.else
     |  li TMP0, BC_JMP
     |   li TMP1, BC_ITERC
     |  stb TMP0, -1(PC)
@@ -5532,6 +5624,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  // NYI on big-endian: unpatch JLOOP.
     |   stb TMP1, 3(PC)
     |  b <1
+    |.endif
     break;
 
   case BC_VARG:
@@ -5693,6 +5786,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bgt >6
     |   sub BASE, TMP2, RA
     |  lwz LFUNC:TMP1, FRAME_FUNC(BASE)
+    |  int3_bias_base
     |  ins_next1
     |  lwz TMP1, LFUNC:TMP1->pc
     |  lwz KBASE, PC2PROTO(k)(TMP1)
@@ -5742,6 +5836,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bgt >6
     |   sub BASE, TMP2, RA
     |  lwz LFUNC:TMP1, FRAME_FUNC(BASE)
+    |  int3_bias_base
     |  ins_next1
     |  lwz TMP1, LFUNC:TMP1->pc
     |  lwz KBASE, PC2PROTO(k)(TMP1)
@@ -6052,6 +6147,10 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmplw RA, TMP2
     |   slwi TMP1, TMP1, 3
     |  bgt ->vm_growstack_l
+    |.if INT3
+    |  subi INT3SCR, PC, 4			// Canonical proto_bc(pt).
+    |  int3_bias_pc INT3SCR
+    |.endif
     if (op != BC_JFUNCF) {
       |  ins_next1
     }
@@ -6092,6 +6191,10 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  lbz TMP2, -4+PC2PROTO(numparams)(PC)
     |   mr RA, BASE
     |   mr RC, TMP1
+    |.if INT3
+    |  subi INT3SCR, PC, 4			// Canonical proto_bc(pt).
+    |  int3_bias_pc INT3SCR
+    |.endif
     |  ins_next1
     |  cmpwi TMP2, 0
     |   addi BASE, TMP1, 8

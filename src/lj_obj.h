@@ -386,6 +386,9 @@ typedef struct GCproto {
   uint8_t sizeuv;	/* Number of upvalues. */
   uint8_t flags;	/* Miscellaneous flags (see below). */
   uint16_t trace;	/* Anchor for chain of root traces. */
+#if LJ_HASPROFILE
+  uintptr_t int3ofs;	/* Byte offset from proto_bc(pt) to the INT3 shadow. */
+#endif
   /* ------ The following fields are for debugging/tracebacks only ------ */
   GCRef chunkname;	/* Name of the chunk this function was defined in. */
   BCLine firstline;	/* First line of the function definition. */
@@ -583,6 +586,8 @@ typedef enum {
 #if LJ_HASFFI
   GCROOT_FFI_FIN,	/* FFI finalizer table. */
 #endif
+  GCROOT_INT3,		/* Prototypes of the pending INT3 requests. */
+  GCROOT_INT3_LAST = GCROOT_INT3 + LJ_INT3_MAX-1,
   GCROOT_MAX
 } GCRootID;
 
@@ -660,6 +665,10 @@ typedef struct global_State {
   GCRef cur_L;		/* Currently executing lua_State. */
   MRef jit_base;	/* Current JIT code L->base or NULL. */
   MRef ctype_state;	/* Pointer to C type state. */
+#if LJ_HASPROFILE
+  uintptr_t int3bias;	/* Shadow offset of the current interpreter frame. */
+  MRef int3pc;		/* Canonical entry of that frame's prototype. */
+#endif
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
 } global_State;

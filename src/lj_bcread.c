@@ -294,6 +294,16 @@ static void bcread_bytecode(LexState *ls, GCproto *pt, MSize sizebc)
     MSize i;
     for (i = 1; i < sizebc; i++) bc[i] = lj_bswap(bc[i]);
   }
+  /* BC_INT3 is a runtime-only trap: a dumped prototype never carries one
+  ** (the dump path substitutes the shadowed instruction), so a serialized
+  ** BC_INT3 is a format error.
+  */
+  {
+    MSize i;
+    for (i = 1; i < sizebc; i++)
+      if (bc_op(bc[i]) == BC_INT3)
+	lj_lex_error(ls, 0, LJ_ERR_BCFMT);
+  }
 }
 
 /* Read upvalue refs. */
@@ -359,6 +369,9 @@ GCproto *lj_bcread_proto(LexState *ls)
   pt->sizeuv = (uint8_t)sizeuv;
   pt->flags = (uint8_t)flags;
   pt->trace = 0;
+#if LJ_HASPROFILE
+  pt->int3ofs = 0;  /* A dumped prototype never carries a shadow. */
+#endif
   setgcref(pt->chunkname, obj2gco(ls->chunkname));
 
   /* Close potentially uninitialized gap between bc and kgc. */
