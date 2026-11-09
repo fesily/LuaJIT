@@ -162,6 +162,19 @@
 |.endif
 |.endmacro
 
+|// Ditto for a hot frame transition: while no shadow is published the cache is
+|// already canonical, so skip the stores and the next fetch does not wait for
+|// them (store-to-load forwarding) on every call and return.
+|.macro int3_bias_pc_hot, pcreg, tmpreg
+|.if INT3
+|  ldrb tmpreg, [DISPATCH, #DISPATCH_GL(int3mounted)]
+|  cmp tmpreg, #0
+|  streq pcreg, [DISPATCH, #DISPATCH_GL(int3pc)]
+|  ldreq tmpreg, [pcreg, #PC2PROTO(int3ofs)]
+|  streq tmpreg, [DISPATCH, #DISPATCH_GL(int3bias)]
+|.endif
+|.endmacro
+
 |// Instruction footer.
 |.if 1
 |  // Replicated dispatch. Less unpredictable branches, but higher I-Cache use.
@@ -338,8 +351,10 @@ static void build_subroutines(BuildCtx *ctx)
   |  // Control leaves the interpreter: drop the fetch bias, so a C helper that
   |  // ran a Lua finalizer can never resume another prototype's shadow.
   |  mov CARG2, #0
-  |  str CARG2, [DISPATCH, #DISPATCH_GL(int3bias)]
-  |  str CARG2, [DISPATCH, #DISPATCH_GL(int3pc)]
+  |  ldrb CARG3, [DISPATCH, #DISPATCH_GL(int3mounted)]
+  |  cmp CARG3, #0
+  |  streq CARG2, [DISPATCH, #DISPATCH_GL(int3bias)]
+  |  streq CARG2, [DISPATCH, #DISPATCH_GL(int3pc)]
   |.endif
   |  restoreregs_ret
   |
@@ -4500,7 +4515,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bhi >6
     |  mov BASE, CARG4
     |  ldr CARG2, LFUNC:CARG1->field_pc
-    |  int3_bias_pc CARG2, CARG3
+    |  int3_bias_pc_hot CARG2, CARG3
     |   ins_next1
     |   ins_next2
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
@@ -4548,7 +4563,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cmp RB, RC
     |  bhi >6
     |  ldr CARG2, LFUNC:CARG1->field_pc
-    |  int3_bias_pc CARG2, CARG3
+    |  int3_bias_pc_hot CARG2, CARG3
     |   ins_next1
     |   ins_next2
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
@@ -4805,7 +4820,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |    ldr KBASE, [PC, #-4+PC2PROTO(k)]
     |.if INT3
     |  sub CARG4, PC, #4			// Canonical proto_bc(pt).
-    |  int3_bias_pc CARG4, CARG4
+    |  int3_bias_pc_hot CARG4, CARG4
     |.endif
     |  cmp RA, CARG1
     |  bhi ->vm_growstack_l
@@ -4867,7 +4882,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |3:
     |.if INT3
     |  sub CARG1, PC, #4			// Canonical proto_bc(pt).
-    |  int3_bias_pc CARG1, CARG1
+    |  int3_bias_pc_hot CARG1, CARG1
     |.endif
     |  ins_next
     break;

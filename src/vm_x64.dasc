@@ -336,6 +336,20 @@
 |  mov [DISPATCH+DISPATCH_GL(int3bias)], tmpreg
 |.endif
 |.endmacro
+
+|// Ditto for a hot frame transition. While no shadow is published the cache is
+|// already canonical, so skip the stores: the next fetch would otherwise wait
+|// for them (store-to-load forwarding) on every call and return.
+|.macro int3_bias_pc_hot, pcreg, tmpreg, skipn
+|.if INT3
+|  cmp byte [DISPATCH+DISPATCH_GL(int3mounted)], 0
+|  je >skipn
+|  mov [DISPATCH+DISPATCH_GL(int3pc)], pcreg
+|  mov tmpreg, [pcreg+PC2PROTO(int3ofs)]
+|  mov [DISPATCH+DISPATCH_GL(int3bias)], tmpreg
+|skipn:
+|.endif
+|.endmacro
 |
 |// Assumes DISPATCH is relative to GL.
 #define DISPATCH_GL(field)	(GG_DISP2G + (int)offsetof(global_State, field))
@@ -471,8 +485,11 @@ static void build_subroutines(BuildCtx *ctx)
   |.if INT3
   |  // Control leaves the interpreter: drop the fetch bias, so a C helper that
   |  // ran a Lua finalizer can never resume another prototype's shadow.
+  |  cmp byte [DISPATCH+DISPATCH_GL(int3mounted)], 0
+  |  je >8
   |  mov qword [DISPATCH+DISPATCH_GL(int3bias)], 0
   |  mov dword [DISPATCH+DISPATCH_GL(int3pc)], 0
+  |8:
   |.endif
   |  restoreregs
   |  ret
@@ -4642,7 +4659,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  mov LFUNC:KBASE, [BASE-16]
     |  cleartp LFUNC:KBASE
     |  mov TMPR, LFUNC:KBASE->pc
-    |  int3_bias_pc TMPR, ITYPE
+    |  int3_bias_pc_hot TMPR, ITYPE, 8
     |  mov KBASE, [TMPR+PC2PROTO(k)]
     |  ins_next
     |
@@ -4935,7 +4952,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  ins_AD  // BASE = new base, RA = framesize, RD = nargs+1
     |.if INT3
     |  lea TMPR, [PC-4]			// Canonical proto_bc(pt).
-    |  int3_bias_pc TMPR, ITYPE
+    |  int3_bias_pc_hot TMPR, ITYPE, 6
     |.endif
     |  mov KBASE, [PC-4+PC2PROTO(k)]
     |  mov L:RB, SAVE_L
@@ -5002,7 +5019,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     } else {
       |.if INT3
       |  lea TMPR, [PC-4]
-      |  int3_bias_pc TMPR, ITYPE
+      |  int3_bias_pc_hot TMPR, ITYPE, 7
       |.endif
       |  mov KBASE, [PC-4+PC2PROTO(k)]
       |  ins_next

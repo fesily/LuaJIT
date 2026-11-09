@@ -438,12 +438,34 @@
 |.endif
 |.endmacro
 
+|// Ditto for a hot frame transition: skip the stores while no shadow is
+|// published, so the next fetch does not wait for them.
+|.macro int3_bias_pc_hot, pcreg, skipn
+|.if INT3
+|  lbz INT3SCR, DISPATCH_GL(int3mounted)(DISPATCH)
+|  cmpwi INT3SCR, 0
+|  beq >skipn
+|  stw pcreg, DISPATCH_GL(int3pc)(DISPATCH)
+|  lwz INT3SCR, PC2PROTO(int3ofs)(pcreg)
+|  stw INT3SCR, DISPATCH_GL(int3bias)(DISPATCH)
+|skipn:
+|.endif
+|.endmacro
+
 |// Ditto for the Lua frame at BASE.
 |.macro int3_bias_base
 |.if INT3
 |  lwz LFUNC:INT3SCR, FRAME_FUNC(BASE)
 |  lwz INT3SCR, LFUNC:INT3SCR->pc
 |  int3_bias_pc INT3SCR
+|.endif
+|.endmacro
+
+|.macro int3_bias_base_hot, skipn
+|.if INT3
+|  lwz LFUNC:INT3SCR, FRAME_FUNC(BASE)
+|  lwz INT3SCR, LFUNC:INT3SCR->pc
+|  int3_bias_pc_hot INT3SCR, skipn
 |.endif
 |.endmacro
 
@@ -626,9 +648,13 @@ static void build_subroutines(BuildCtx *ctx)
   |.if INT3
   |  // Control leaves the interpreter: drop the fetch bias, so a C helper that
   |  // ran a Lua finalizer can never resume another prototype's shadow.
+  |  lbz TMP1, DISPATCH_GL(int3mounted)(DISPATCH)
+  |  cmpwi TMP1, 0
+  |  beq >6
   |  li TMP1, 0
   |  stw TMP1, DISPATCH_GL(int3bias)(DISPATCH)
   |  stw TMP1, DISPATCH_GL(int3pc)(DISPATCH)
+  |6:
   |.endif
   |  restoreregs
   |  blr
@@ -5786,7 +5812,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bgt >6
     |   sub BASE, TMP2, RA
     |  lwz LFUNC:TMP1, FRAME_FUNC(BASE)
-    |  int3_bias_base
+    |  int3_bias_base_hot 8
     |  ins_next1
     |  lwz TMP1, LFUNC:TMP1->pc
     |  lwz KBASE, PC2PROTO(k)(TMP1)
@@ -5836,7 +5862,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bgt >6
     |   sub BASE, TMP2, RA
     |  lwz LFUNC:TMP1, FRAME_FUNC(BASE)
-    |  int3_bias_base
+    |  int3_bias_base_hot 9
     |  ins_next1
     |  lwz TMP1, LFUNC:TMP1->pc
     |  lwz KBASE, PC2PROTO(k)(TMP1)
@@ -6149,7 +6175,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  bgt ->vm_growstack_l
     |.if INT3
     |  subi INT3SCR, PC, 4			// Canonical proto_bc(pt).
-    |  int3_bias_pc INT3SCR
+    |  int3_bias_pc_hot INT3SCR, 6
     |.endif
     if (op != BC_JFUNCF) {
       |  ins_next1
@@ -6193,7 +6219,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   mr RC, TMP1
     |.if INT3
     |  subi INT3SCR, PC, 4			// Canonical proto_bc(pt).
-    |  int3_bias_pc INT3SCR
+    |  int3_bias_pc_hot INT3SCR, 7
     |.endif
     |  ins_next1
     |  cmpwi TMP2, 0

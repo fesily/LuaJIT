@@ -2586,6 +2586,71 @@ static void defer_reset(const char *func, int bcpos, BpRec *rec)
   defer_rec = rec;
 }
 
+/* Arm a breakpoint of G.a from a C helper called by G.b: the running frame is
+** G.b, so publishing G.a's shadow must not re-bias it. The gated frame
+** transitions skip the publish while nothing is mounted, which is only sound
+** if releasing the last shadow also resets the cache key.
+*/
+static int stale_arm_res = -1;
+static int stale_bcpos = -1;
+static int stale_calls;
+static void stale_cb(void *data, lua_State *L, const void *proto,
+		     unsigned int bcpos)
+{
+  (void)data; (void)L; (void)proto; (void)bcpos;
+  stale_calls++;
+}
+static int stale_helper(lua_State *L)
+{
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "a");
+  stale_arm_res = luaJIT_int3_arm(L, -1, (unsigned int)stale_bcpos);
+  lua_pop(L, 2);
+  return 0;
+}
+
+static void test_stale_cache(void)
+{
+  lua_State *L = luaL_newstate();
+  int bcpos = -1;
+  double v;
+  luaL_openlibs(L);
+  run(L,
+    "G = {}\n"
+    "function G.a(n) local s = 0 for i = 1, n do s = s + i end return s end\n"
+    "function G.b(n) local s = 0 for i = 1, n do s = s + i * 2 "
+    "call_helper() end return s end\n");
+  lua_pushcfunction(L, stale_helper);
+  lua_setglobal(L, "call_helper");
+  stale_bcpos = find_bcpos_n(L, "G.a", "ADDVV", 0);
+  CHECK(stale_bcpos >= 0);
+  CHECK(luaJIT_int3_start(L, stale_cb, NULL) == LUAJIT_INT3_OK);
+  /* Mount G.a, run it, then drop the mapping but keep the session. */
+  bcpos = find_bcpos_n(L, "G.a", "ADDVV", 0);
+  CHECK(bcpos >= 0);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "a");
+  CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  CHECK(run_number(L, "return G.a(4)", &v) && v == 10);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  /* While G.b runs, a C helper arms G.a again: G.b's fetch bias must stay
+  ** canonical, otherwise it reads G.a's shadow from G.b's PCs.
+  */
+  stale_arm_res = -1;
+  stale_calls = 0;
+  CHECK(run_number(L, "return G.b(8)", &v) && v == 72);
+  printf("[16] stale cache: arm=%d a-hits=%d value=%g\n", stale_arm_res,
+	 stale_calls, v);
+  CHECK(stale_arm_res == LUAJIT_INT3_OK);
+  CHECK(stale_calls == 0);		/* G.a did not run here. */
+  CHECK(run_number(L, "return G.a(3)", &v) && v == 6);
+  printf("[16] stale cache: a(3)=%g a-hits=%d\n", v, stale_calls);
+  CHECK(stale_calls == 3);		/* And its own breakpoint still works. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+
 static void test_deferred_mount(void)
 {
   lua_State *L = luaL_newstate();
@@ -2750,6 +2815,7 @@ int main(int argc, char **argv)
   if (!only || only == 14) test_slowpaths();
   if (!only || only == 15) test_abi_probe();
   if (!only || only == 16) test_deferred_mount();
+  if (!only || only == 17) test_stale_cache();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

@@ -418,7 +418,17 @@ static void int3_release_owner(global_State *g, Int3Owner *o)
   int mounted = o->mounted;
   int owns_nojit = o->owns_nojit;
   int3_cache_clear(g, pt);
-  if (mounted) pt->int3ofs = 0;  /* Withdraw the mapping first. */
+  if (mounted) {
+    pt->int3ofs = 0;  /* Withdraw the mapping first. */
+    if (g->int3mounted > 0) g->int3mounted--;
+    if (g->int3mounted == 0) {
+      /* Nothing is published any more: make the cache canonical, so the hot
+      ** frame transitions may skip publishing until the next mount.
+      */
+      g->int3bias = 0;
+      setmref(g->int3pc, NULL);
+    }
+  }
   int3_release_shadow(g, o);  /* Then release the shadow it maps. */
   if (owns_nojit) {
     pt->flags &= ~PROTO_NOJIT;
@@ -497,6 +507,7 @@ static void int3_mount_owner(global_State *g, Int3Owner *o)
   if (!o->mounted) {
     uintptr_t ofs = (uintptr_t)o->shadow - (uintptr_t)proto_bc(pt);
     o->mounted = 1;
+    g->int3mounted++;
     pt->int3ofs = ofs;  /* Publish the mapping last. */
     if (mref(g->int3pc, const BCIns *) == (const BCIns *)proto_bc(pt))
       g->int3bias = ofs;  /* The running frame is this prototype. */
@@ -675,6 +686,7 @@ void lj_int3_close(global_State *g)
   Int3State *st = &int3_state;
   if (st->g != g) return;
   int3_cancel_all(g);  /* No callback, no JIT state changes on teardown. */
+  g->int3mounted = 0;
   g->int3bias = 0;
   setmref(g->int3pc, NULL);
   st->cb = NULL;
@@ -754,6 +766,9 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
   st->delivering = 0;
   memset(st->entry, 0, sizeof(st->entry));
   memset(st->owner, 0, sizeof(st->owner));
+  g->int3mounted = 0;
+  g->int3bias = 0;
+  setmref(g->int3pc, NULL);
   return LUAJIT_INT3_OK;
 }
 

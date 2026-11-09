@@ -252,6 +252,19 @@
 |.endif
 |.endmacro
 
+|// Ditto for a hot frame transition: skip the stores while no shadow is
+|// published, so the next fetch does not wait for them.
+|.macro int3_bias_pc_hot, pcreg, tmpreg, tmpw, skipn
+|.if INT3
+|  ldrb tmpw, GL->int3mounted
+|  cbz tmpw, >skipn
+|  str pcreg, GL->int3pc
+|  ldr tmpreg, [pcreg, #PC2PROTO(int3ofs)]
+|  str tmpreg, GL->int3bias
+|skipn:
+|.endif
+|.endmacro
+
 |// Instruction footer.
 |.if 1
 |  // Replicated dispatch. Less unpredictable branches, but higher I-Cache use.
@@ -436,8 +449,11 @@ static void build_subroutines(BuildCtx *ctx)
   |.if INT3
   |  // Control leaves the interpreter: drop the fetch bias, so a C helper that
   |  // ran a Lua finalizer can never resume another prototype's shadow.
+  |  ldrb TMP2w, GL->int3mounted
+  |  cbz TMP2w, >6
   |  str xzr, GL->int3bias
   |  str xzr, GL->int3pc
+  |6:
   |.endif
   |  restoreregs
   |  ret_auth
@@ -3885,7 +3901,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  and LFUNC:CARG1, CARG1, #LJ_GCVMASK
     |  mov BASE, CARG4
     |  ldr CARG2, LFUNC:CARG1->pc
-    |  int3_bias_pc CARG2, CARG3
+    |  int3_bias_pc_hot CARG2, CARG3, CARG3w, 8
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
     |   ins_next
     |
@@ -3931,7 +3947,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  blo >6
     |  and LFUNC:CARG1, CARG1, #LJ_GCVMASK
     |  ldr CARG2, LFUNC:CARG1->pc
-    |  int3_bias_pc CARG2, TMP2
+    |  int3_bias_pc_hot CARG2, TMP2, TMP2w, 9
     |  ldr KBASE, [CARG2, #PC2PROTO(k)]
     |  ins_next
     |
@@ -4139,7 +4155,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |    ldr KBASE, [PC, #-4+PC2PROTO(k)]
     |.if INT3
     |  sub TMP3, PC, #4			// Canonical proto_bc(pt).
-    |  int3_bias_pc TMP3, TMP3
+    |  int3_bias_pc_hot TMP3, TMP3, TMP3w, 6
     |.endif
     |  cmp RA, CARG1
     |  bhi ->vm_growstack_l
@@ -4196,7 +4212,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |2:
     |.if INT3
     |  sub TMP0, PC, #4			// Canonical proto_bc(pt).
-    |  int3_bias_pc TMP0, TMP0
+    |  int3_bias_pc_hot TMP0, TMP0, TMP0w, 7
     |.endif
     |  ins_next
     |

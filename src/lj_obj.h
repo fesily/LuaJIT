@@ -668,6 +668,7 @@ typedef struct global_State {
 #if LJ_HASPROFILE
   uintptr_t int3bias;	/* Shadow offset of the current interpreter frame. */
   MRef int3pc;		/* Canonical entry of that frame's prototype. */
+  uint8_t int3mounted;	/* Number of published shadows. */
 #endif
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */

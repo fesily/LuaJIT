@@ -275,6 +275,19 @@
 |.endif
 |.endmacro
 
+|// Ditto for a hot frame transition: skip the stores while no shadow is
+|// published, so the next fetch does not wait for them.
+|.macro int3_bias_pc_hot, pcreg, tmpreg, skipn
+|.if INT3
+|  lbu tmpreg, DISPATCH_GL(int3mounted)(DISPATCH)
+|  beqz tmpreg, >skipn
+|  sd pcreg, DISPATCH_GL(int3pc)(DISPATCH)
+|  ld tmpreg, PC2PROTO(int3ofs)(pcreg)
+|  sd tmpreg, DISPATCH_GL(int3bias)(DISPATCH)
+|skipn:
+|.endif
+|.endmacro
+
 |// Instruction footer.
 |.if 1
 |  // Replicated dispatch. Less unpredictable branches, but higher I-Cache use.
@@ -498,8 +511,11 @@ static void build_subroutines(BuildCtx *ctx)
   |.if INT3
   |  // Control leaves the interpreter: drop the fetch bias, so a C helper that
   |  // ran a Lua finalizer can never resume another prototype's shadow.
+  |  lbu TMP1, DISPATCH_GL(int3mounted)(DISPATCH)
+  |  beqz TMP1, >9
   |  sd r0, DISPATCH_GL(int3bias)(DISPATCH)
   |  sd r0, DISPATCH_GL(int3pc)(DISPATCH)
+  |9:
   |.endif
   |  restoreregs_ret
   |
@@ -5330,7 +5346,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |  cleartp LFUNC:TMP1
     |.if INT3
     |  ld CARG1, LFUNC:TMP1->pc
-    |  int3_bias_pc CARG1, CARG2
+    |  int3_bias_pc_hot CARG1, CARG2, 8
     |.endif
     |  ins_next1
     |  ld TMP1, LFUNC:TMP1->pc
@@ -5689,7 +5705,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |.  sll TMP1, TMP1, 3
     |.if INT3
     |  daddiu CARG1, PC, -4			// Canonical proto_bc(pt).
-    |  int3_bias_pc CARG1, CARG2
+    |  int3_bias_pc_hot CARG1, CARG2, 6
     |.endif
     if (op != BC_JFUNCF) {
       |  ins_next1
@@ -5738,7 +5754,7 @@ static void build_ins(BuildCtx *ctx, BCOp op, int defop)
     |   move RC, TMP1
     |.if INT3
     |  daddiu CARG2, PC, -4			// Canonical proto_bc(pt).
-    |  int3_bias_pc CARG2, CARG3
+    |  int3_bias_pc_hot CARG2, CARG3, 7
     |.endif
     |  ins_next1
     |  beqz TMP2, >3
