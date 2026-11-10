@@ -224,7 +224,12 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
 #endif
   }
   /* A physical BC_INT3 must never be dispatched through a hook or recorder
-  ** entry. This also covers the mode-unchanged fast path above.
+  ** entry: the trap is delivered on the dispatch of its own slot, before the
+  ** line or count hook of that instruction, and the handler then dispatches the
+  ** original opcode through the table, which is where those hooks run. This
+  ** also covers the mode-unchanged fast path above, and it must stay after the
+  ** ins-dispatch rewrite, whose loop covers every opcode below BC_FUNCF,
+  ** BC_INT3 included.
   */
   G2GG(g)->dispatch[BC_INT3] = makeasmfunc(lj_bc_ofs[BC_INT3]);
 #if LJ_HASPROFILE && !LJ_PROFILE_SIGPROF

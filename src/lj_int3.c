@@ -801,9 +801,10 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 ** still executes from the real bytecode, because the slot is only replaced
 ** after that dispatch.
 **
-** Every other operation (start, cancel, stop) is still refused inside a hook,
-** and the GC, profiler, foreign VM event and machine-code contexts are
-** refused for arming as well.
+** Inside a Lua debug hook start, cancel and stop are accepted, because the
+** hook's own dispatch re-reads every slot they touch. A GC or profiler hook, a
+** foreign VM event and machine code refuse every operation, and a recorder or
+** the compiler accepts a queued arm but refuses start, cancel and stop.
 */
 int lj_int3_arm(global_State *g, GCproto *pt, BCPos bcpos)
 {

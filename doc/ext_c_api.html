@@ -212,9 +212,9 @@ The JIT engine is left running and no trace is flushed; the session only
 records the callback and claims the process-wide profiler/breakpoint slot. The
 function returns <tt>LUAJIT_INT3_UNAVAILABLE</tt> if profiling support is
 compiled out, <tt>LUAJIT_INT3_INVALID</tt> if <tt>cb</tt> is <tt>NULL</tt>,
-and <tt>LUAJIT_INT3_BUSY</tt> if machine code is executing, a GC, hook or VM
-event is active, or this or another VM already owns a profiler or breakpoint
-session. Nothing is changed when the call is refused.
+and <tt>LUAJIT_INT3_BUSY</tt> if machine code is executing, a GC or profiler
+hook or a foreign VM event is active, or this or another VM already owns a
+profiler or breakpoint session. A Lua debug hook is not such a context. Nothing is changed when the call is refused.
 </p>
 <p>
 <b><tt>luaJIT_int3_arm</tt></b> arms the first breakpoint slot of source line
@@ -326,9 +326,10 @@ runs its instruction, and a request armed above mounts at the same safe point.
 A trap is delivered on the dispatch of its own slot, which happens before the
 line or count hook of that instruction, so a hook that cancels or stops takes
 effect from the next dispatch on and cannot suppress a callback that already
-ran, while a slot the hook runs before is preempted. The GC, profiler, foreign
-VM event and machine-code/recorder/compiler contexts still refuse every call
-with <tt>LUAJIT_INT3_BUSY</tt>.
+ran, while a slot the hook runs before is preempted. A GC or profiler hook, a
+foreign VM event and machine code still refuse start, cancel and stop with
+<tt>LUAJIT_INT3_BUSY</tt>, and so do the recorder and the compiler for those
+three calls; arming keeps its own rule and queues there.
 </p>
 <p>
 The callback is invoked once for every execution of the armed instruction,
