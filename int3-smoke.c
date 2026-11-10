@@ -2719,11 +2719,17 @@ static void test_errno(void)
 /* lua_close() releases the session before the finalizer run, so no callback
 ** can reach a finalizer of the VM that is being torn down, and the force
 ** restore has already happened when the finalizer observes the session.
+**
+** Observed through the public API only (this harness never links against the
+** internal symbols): the finalizer asks arm() about a function it kept in the
+** registry, which is LUAJIT_INT3_DISABLED once this VM has no session, and a
+** fresh VM afterwards can start one, which proves the process-wide slot was
+** released.
 */
-extern int lj_int3_active(void);
-
 static int close_calls;
-static int close_finalizer_active = -1;
+static int close_arm_res = -1000;	/* arm() result seen by the finalizer. */
+static unsigned int close_bcpos;	/* Slot that was armed. */
+static int close_ref = LUA_NOREF;	/* Registry ref of that function. */
 
 static void close_cb(void *data, lua_State *L, const void *proto,
 		     unsigned int bcpos)
@@ -2734,7 +2740,9 @@ static void close_cb(void *data, lua_State *L, const void *proto,
 
 static int close_finalizer(lua_State *L)
 {
-  close_finalizer_active = lj_int3_active();
+  lua_rawgeti(L, LUA_REGISTRYINDEX, close_ref);
+  close_arm_res = luaJIT_int3_arm(L, -1, close_bcpos);
+  lua_pop(L, 1);
   return 0;
 }
 
@@ -2747,7 +2755,10 @@ static void test_close_finalizer(void)
   run(L,
     "C = {}\n"
     "function C.a(n) local s = 0 for i = 1, n do s = s + i end return s end\n"
-    "G = setmetatable({}, {__gc = function() FIN() end})\n");
+    /* LuaJIT runs __gc for userdata only (Lua 5.1 semantics). */
+    "local u = newproxy(true)\n"
+    "getmetatable(u).__gc = function() FIN() end\n"
+    "G = u\n");
   lua_pushcfunction(L, close_finalizer);
   lua_setglobal(L, "FIN");
   bcpos = find_bcpos_n(L, "C.a", "ADDVV", 0);
@@ -2756,19 +2767,26 @@ static void test_close_finalizer(void)
   lua_getglobal(L, "C");
   lua_getfield(L, -1, "a");
   CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
-  lua_pop(L, 2);
+  close_bcpos = (unsigned int)bcpos;
+  close_ref = luaL_ref(L, LUA_REGISTRYINDEX);	/* Pops "a". */
+  lua_pop(L, 1);				/* Pops "C". */
   close_calls = 0;
   CHECK(run_number(L, "return C.a(4)", &v) && v == 10);
   CHECK(close_calls == 4);
   close_calls = 0;
+  close_arm_res = -1000;
   lua_close(L);			/* Runs the finalizer of G. */
-  printf("[19] close: finalizer-active=%d close-hits=%d\n",
-	 close_finalizer_active, close_calls);
-  close_finalizer_active = -1;
-  close_calls = 0;
-  CHECK(close_finalizer_active == -1);
+  printf("[19] close: finalizer-arm=%d close-hits=%d\n", close_arm_res,
+	 close_calls);
+  CHECK(close_arm_res == LUAJIT_INT3_DISABLED);	/* Session was released. */
   CHECK(close_calls == 0);
-  CHECK(!lj_int3_active());
+  {  /* The process-wide slot is free again. */
+    lua_State *L2 = luaL_newstate();
+    luaL_openlibs(L2);
+    CHECK(luaJIT_int3_start(L2, close_cb, NULL) == LUAJIT_INT3_OK);
+    CHECK(luaJIT_int3_stop(L2) == LUAJIT_INT3_OK);
+    lua_close(L2);
+  }
 }
 
 /* -- [16] Automatic deferred mounting ------------------------------------ */
