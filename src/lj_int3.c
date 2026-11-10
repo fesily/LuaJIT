@@ -47,7 +47,10 @@
 ** delivers one callback; the handler then executes the shadowed instruction
 ** from the entry instead of from the bytecode. Re-arming an armed slot is a
 ** no-op, so a callback can keep trapping its own slot without any per-hit
-** bookkeeping.
+** bookkeeping. The callback is handed the running closure (GCfunc *), not just
+** its prototype: two closures of one prototype are different identities, and
+** the closure is what a debugger needs to reach upvalues or the environment.
+** It is valid only for the duration of the call -- the frame anchors it.
 **
 ** Every request is a slot of the session's anchor table (the single GC root
 ** GCROOT_INT3, whose array part has one entry per request), so a prototype
@@ -706,6 +709,7 @@ LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   ERRNO_SAVE
   Int3State *st = G(L)->int3;
   global_State *g = G(L);
+  GCfunc *fn;
   GCproto *pt;
   BCIns ins;
   BCPos bcpos;
@@ -723,6 +727,9 @@ LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   pt = st->entry[i].pt;
   bcpos = st->entry[i].bcpos;
   ins = st->entry[i].ins;
+  fn = curr_func(L);  /* The frame the trapped instruction belongs to. */
+  lj_assertL(isluafunc(fn) && funcproto(fn) == pt,
+	     "INT3 hit in a foreign frame");
   /* Establish a consistent read-only view of the original instruction. The
   ** previous PC is saved: it is what lj_dispatch_ins() compares against when
   ** the instruction is re-dispatched, and leaving the current PC behind would
@@ -740,7 +747,7 @@ LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   g->hookmask = HOOK_VMEVENT;
   lj_dispatch_update(g, 0);
   setvmstate(g, C);  /* The callback is native code, not the interpreter. */
-  st->cb(st->data, L, pt, (unsigned int)bcpos);
+  st->cb(st->data, L, fn, (unsigned int)bcpos);
   g->vmstate = vmstate;
   g->hookmask = mask;
   lj_dispatch_update(g, 0);

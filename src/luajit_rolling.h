@@ -83,9 +83,10 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** comparison or test (ISLT..ISF) branches over. Loop slots, loop back edges
 ** and RET/RET0/RET1/RETM are armable: an armed prototype never
 ** traces: the JIT is excluded from it as soon as its first breakpoint is
-** mounted, so no trace can rewrite those slots while they carry a trap. The JIT stays enabled: mounting flushes only the traces that can
-** reach the armed instruction and excludes its prototype from compilation
-** until the last breakpoint of that prototype is cancelled. Only an exclusion
+** mounted, so no trace can rewrite those slots while they carry a trap. The
+** JIT stays enabled: mounting flushes only the traces that can reach the
+** armed instruction and excludes its prototype from compilation until the
+** last breakpoint of that prototype is cancelled. Only an exclusion
 ** that the breakpoint itself added is released: jit.off() stays in effect
 ** afterwards, whether it was issued before arming or while mounted.
 **
@@ -104,9 +105,14 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** A breakpoint is permanent: every execution of the slot delivers the
 ** callback once and then executes the original instruction, until the
 ** breakpoint is cancelled, the session is stopped or the VM is closed. The
-** callback is a read-only native observer: it must not run Lua code or change
-** any interpreter/JIT/hook state, but it may arm (re-arming the slot that is
-** being delivered is a no-op), cancel or stop the session. The other calls
+** callback receives the running closure as an opaque identity (the same value
+** lua_topointer() returns for that function, i.e. a GCfunc *), so a debugger
+** can tell two closures of one prototype apart and reach their upvalues
+** without reconstructing the frame; the pointer is only valid for the duration
+** of the call. The callback is a read-only native observer: it must not run
+** Lua code or change any interpreter/JIT/hook state, but it may arm (re-arming
+** the slot that is being delivered is a no-op), cancel or stop the session.
+** The other calls
 ** (start, cancel, stop) are refused inside a hook, as is arming inside a GC
 ** hook, the profiler, a foreign VM event or running machine code.
 **
@@ -122,7 +128,7 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** it shares the profiler's process-wide exclusivity.
 */
 typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
-				     const void *proto, unsigned int bcpos);
+				     const void *func, unsigned int bcpos);
 enum {
   LUAJIT_INT3_OK = 0,
   LUAJIT_INT3_BUSY = 1,		/* Unsafe context or conflicting owner. */

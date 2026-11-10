@@ -178,7 +178,7 @@ every execution, before it runs. The full prototypes are:
 </p>
 <pre class="code">
 typedef void (*luaJIT_int3_callback)(void *data, lua_State *L,
-                                     const void *proto, unsigned int bcpos);
+                                     const void *func, unsigned int bcpos);
 LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
                               void *data);
 LUA_API int luaJIT_int3_arm(lua_State *L, int func_index,
@@ -316,11 +316,14 @@ the side effects of the program. Line, count, call and return hooks observe
 the instruction normally.
 </p>
 <p>
-The callback receives the prototype
-as an opaque identity pointer that is only valid for the duration of the
-call, and <tt>bcpos</tt> as the index of the original instruction in that
-prototype. The interpreter state (<tt>lua_State</tt>, current frame, PC, top)
-is consistent and read-only.
+The callback receives <tt>func</tt>, the running closure as an opaque identity
+pointer (the same value <tt>lua_topointer</tt> returns for that function, i.e.
+its <tt>GCfunc *</tt>), and <tt>bcpos</tt> as the index of the original
+instruction in its prototype. Two closures of one prototype are therefore
+distinguishable, and the closure is what a debugger needs to read upvalues or
+the environment without reconstructing the frame; the pointer is only valid for
+the duration of the call. The interpreter state (<tt>lua_State</tt>, current
+frame, PC, top) is consistent and read-only.
 </p>
 <p>
 The callback <b>must not</b> run Lua code, yield, raise or catch errors,
@@ -349,7 +352,7 @@ A breakpoint keeps trapping until it is disarmed. Counting hits in the
 callback and disarming the session when the limit is reached is therefore:
 </p>
 <pre class="code">
-static void on_hit(void *data, lua_State *L, const void *proto,
+static void on_hit(void *data, lua_State *L, const void *func,
                    unsigned int bcpos)
 {
   if (++hits &gt;= limit)

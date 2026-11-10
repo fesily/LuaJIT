@@ -58,24 +58,24 @@ static void bp_guard(lua_State *L)
 
 typedef struct Int3Rec {
   int calls;
-  const void *proto;
+  const void *func;		/* Running closure of the last delivery. */
   unsigned int bcpos;
   lua_State *L;
   int depth;
 } Int3Rec;
 
-static void int3_cb(void *data, lua_State *L, const void *proto,
+static void int3_cb(void *data, lua_State *L, const void *func,
 		    unsigned int bcpos)
 {
   Int3Rec *r = (Int3Rec *)data;
   bp_guard(L);
   r->calls++;
-  r->proto = proto;
+  r->func = func;
   r->bcpos = bcpos;
   r->L = L;
   /* The callback is a read-only observer: only inspect, never change. */
   r->depth = lua_gettop(L) >= 0 ? lua_gettop(L) : -1;
-  if (proto == NULL || L == NULL) failures++;
+  if (func == NULL || L == NULL) failures++;
 }
 
 /* -- Small helpers ------------------------------------------------------- */
@@ -475,7 +475,7 @@ static void test_live_jit(void)
 	 counter(L, "abort"));
   CHECK(rec.calls == 1000);		/* One delivery per execution. */
   CHECK((int)rec.bcpos == bcpos);
-  CHECK(rec.proto != NULL);
+  CHECK(rec.func != NULL);
   CHECK(run_number(L, "return G.callf(10)", &v) && v == 175);
   CHECK(rec.calls == 1010);		/* The breakpoint stays armed. */
 
@@ -1712,7 +1712,7 @@ static void test_arm_hook_error(void)
 #if !defined(SMOKE_NO_PROFILE)
 typedef struct BpRec {
   int calls;			/* Deliveries so far. */
-  const void *proto;		/* Prototype of the last delivery. */
+  const void *func;		/* Running closure of the last delivery. */
   unsigned int bcpos;		/* bcpos of the last delivery. */
   int depth;			/* lua_gettop() inside the delivery. */
   /* Actions of the first delivery. */
@@ -1729,16 +1729,16 @@ typedef struct BpRec {
   int res_stop;
 } BpRec;
 
-static void bp_cb(void *data, lua_State *L, const void *proto,
+static void bp_cb(void *data, lua_State *L, const void *func,
 		  unsigned int bcpos)
 {
   BpRec *r = (BpRec *)data;
   bp_guard(L);
   r->calls++;
-  r->proto = proto;
+  r->func = func;
   r->bcpos = bcpos;
   r->depth = lua_gettop(L) >= 0 ? lua_gettop(L) : -1;
-  if (proto == NULL || L == NULL) failures++;
+  if (func == NULL || L == NULL) failures++;
   if (r->calls == 1) {
     /* The delivery context accepts the breakpoint operations: an out-of-range
     ** index must fail with INVALID instead of the unsafe-context error.
@@ -1812,7 +1812,7 @@ static void test_permanent(void)
 	 rec.calls, rec.bcpos, bcpos, rec.res_arm_self, rec.res_arm_bad);
   CHECK(rec.calls == 200);
   CHECK((int)rec.bcpos == bcpos);
-  CHECK(rec.proto != NULL);
+  CHECK(rec.func != NULL);
   CHECK(rec.depth >= 0);		/* The frame view was readable. */
   CHECK(rec.res_arm_bad == LUAJIT_INT3_INVALID);	/* Context accepted. */
   CHECK(rec.res_arm_self == LUAJIT_INT3_OK);		/* Idempotent. */
@@ -2699,10 +2699,10 @@ static void test_abi_probe(void)
 */
 static int errno_calls;
 
-static void errno_cb(void *data, lua_State *L, const void *proto,
+static void errno_cb(void *data, lua_State *L, const void *func,
 		     unsigned int bcpos)
 {
-  (void)data; (void)L; (void)proto; (void)bcpos;
+  (void)data; (void)L; (void)func; (void)bcpos;
   errno_calls++;
 }
 
@@ -2747,10 +2747,10 @@ static int close_arm_res = -1000;	/* arm() result seen by the finalizer. */
 static unsigned int close_bcpos;	/* Slot that was armed. */
 static int close_ref = LUA_NOREF;	/* Registry ref of that function. */
 
-static void close_cb(void *data, lua_State *L, const void *proto,
+static void close_cb(void *data, lua_State *L, const void *func,
 		     unsigned int bcpos)
 {
-  (void)data; (void)L; (void)proto; (void)bcpos;
+  (void)data; (void)L; (void)func; (void)bcpos;
   close_calls++;
 }
 
@@ -2942,6 +2942,56 @@ static void test_loop_slots(void)
 }
 #endif  /* !SMOKE_NO_PROFILE */
 
+/* -- [21] The callback reports the running closure ----------------------- */
+
+#if !defined(SMOKE_NO_PROFILE)
+static void test_callback_func(void)
+{
+  lua_State *L = luaL_newstate();
+  Int3Rec rec;
+  int bcpos = -1;
+  double v;
+  const void *p1, *p2;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  /* Two closures of one prototype: only the closure identity tells them
+  ** apart, and only the closure carries the upvalue a debugger would read.
+  */
+  run(L,
+    "G = {}\n"
+    "local function mk(k) return function(x) return x * k end end\n"
+    "G.f1 = mk(2)\n"
+    "G.f2 = mk(3)\n");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "f1", "MULVV", &bcpos) == 0);
+  /* lua_topointer() of a function is its GCfunc *: that is what the callback
+  ** must report.
+  */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "f1");
+  p1 = lua_topointer(L, -1);
+  lua_pop(L, 2);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "f2");
+  p2 = lua_topointer(L, -1);
+  lua_pop(L, 2);
+  CHECK(p1 != NULL && p2 != NULL && p1 != p2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.f1(5)", &v) && v == 10);
+  printf("[21] callback func: calls=%d func=%p want=%p bcpos=%u\n", rec.calls,
+	 rec.func, p1, rec.bcpos);
+  CHECK(rec.calls == 1);
+  CHECK(rec.func == p1);		/* The running closure, not the proto. */
+  CHECK((int)rec.bcpos == bcpos);
+  CHECK(run_number(L, "return G.f2(5)", &v) && v == 15);
+  CHECK(rec.calls == 2);
+  CHECK(rec.func == p2);		/* Same prototype, different closure. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
 /* -- [16] Automatic deferred mounting ------------------------------------ */
 
 #if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
@@ -3001,10 +3051,10 @@ static void defer_reset(const char *func, int bcpos, BpRec *rec)
 static int armc_arm_res = -1;
 static int armc_bcpos = -1;
 static int armc_calls;
-static void armc_cb(void *data, lua_State *L, const void *proto,
+static void armc_cb(void *data, lua_State *L, const void *func,
 		     unsigned int bcpos)
 {
-  (void)data; (void)L; (void)proto; (void)bcpos;
+  (void)data; (void)L; (void)func; (void)bcpos;
   armc_calls++;
 }
 static int armc_helper(lua_State *L)
@@ -3200,6 +3250,7 @@ int main(int argc, char **argv)
   if (!only || only == 18) test_errno();
   if (!only || only == 19) test_close_finalizer();
   if (!only || only == 20) test_loop_slots();
+  if (!only || only == 21) test_callback_func();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -3229,6 +3280,7 @@ int main(int argc, char **argv)
   if (!only || only == 18) test_errno();
   if (!only || only == 19) test_close_finalizer();
   if (!only || only == 20) test_loop_slots();
+  if (!only || only == 21) test_callback_func();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
