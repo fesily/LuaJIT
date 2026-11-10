@@ -166,33 +166,41 @@ static LJ_AINLINE int int3_delivering(global_State *g)
   return st != NULL && st->delivering != 0;
 }
 
-/* Non-zero for a bytecode slot that the JIT or the VM rewrites at run time:
-** lazy I/J patches (FORL/ITERL/LOOP/FUNCF), root-trace start patches
-** (FORL/ITERL/LOOP/ITERN/FUNCF and the whole instruction for RET), the
-** despecialization of ITERN and ISNEXT and the FORI companion of a JFORL.
-** A trap on such a slot would race with the patch, so these slots are never
-** armed.
+/* Non-zero for a bytecode slot that must never carry a breakpoint.
 **
-** BC_RETM is deliberately *not* listed even though bc_isret() includes
-** it: it is a legitimate trap site (the interpreter executes and delivers
-** it like any other opcode), and the tracer can never turn it into a
-** trace-start slot, so the temporary unpatch in lj_trace_exit() can never
-** write it into a JLOOP slot. That is guaranteed by trace_downrec()
-** refusing RETM and by trace_stop() patching only RET/RET0/RET1/ITERN to
-** BC_JLOOP. If either producer changes, RETM must move into the refused
-** set.
+** Almost every opcode the JIT rewrites is fine now: mounting a request flushes
+** the traces of its prototype and sets PROTO_NOJIT before the slot is patched,
+** and the prototype then never records or traces again (enabling JIT
+** compilation for it is refused), so trace_start()'s lazy I-patch, trace_stop(),
+** trace_unpatch(), the temporary substitution in trace_ins() and
+** blacklist_pc() cannot reach a mounted slot. Each of those writers asserts
+** that the slot it is about to rewrite is not trapped, so the invariant cannot
+** rot silently. What remains is rewritten by the interpreter itself:
+**
+** - BC_ISNEXT rewrites its own slot (BC_JMP) and its neighbour (ITERN ->
+**   ITERC, or a JLOOP slot back to ITERC) when its checks fail, so both the
+**   prep slot and the slot it points at are refused.
+** - Function headers are refused in every form (IFUNCF/JFUNCF/IFUNCV/JFUNCV
+**   are the patched variants of FUNCF/FUNCV): the frame and the vararg layout
+**   are not set up when the header runs, so the delivery could not give the
+**   callback a consistent view.
+**
+** BC_RETM is deliberately *not* listed: the tracer never rewrites it
+** (trace_downrec() refuses RETM and trace_stop() patches only
+** RET/RET0/RET1/ITERN to BC_JLOOP), so it is a trap site like any other
+** opcode. The dispatched jumps (loop back edges, UCLO, ISNEXT's prep, for-prep)
+** are armable; a jump slot that a comparison consumes is rejected separately by
+** int3_paired_jump(), because the interpreter never dispatches it.
 */
 static int int3_mutable_op(BCOp op)
 {
   switch (op) {
-  case BC_ISNEXT: case BC_ITERN: case BC_ITERL: case BC_LOOP:
-  case BC_FORI: case BC_FORL: case BC_FUNCF: case BC_FUNCV:
-  case BC_RET: case BC_RET0: case BC_RET1:
-  /* Already patched variants, e.g. when arming after a jit.off/on cycle. */
-  case BC_JFORI: case BC_JFORL: case BC_JITERL: case BC_JLOOP:
-  case BC_JFUNCF:
-  case BC_IFORL: case BC_IITERL: case BC_ILOOP: case BC_IFUNCF:
-  case BC_IFUNCV:
+  case BC_ISNEXT: case BC_ITERN:
+  case BC_FUNCF: case BC_FUNCV:
+  /* The patched forms of a function header, e.g. after a jit.off/on cycle or
+  ** a trace that started at the header.
+  */
+  case BC_IFUNCF: case BC_JFUNCF: case BC_IFUNCV: case BC_JFUNCV:
     return 1;
   default:
     return 0;
@@ -204,9 +212,9 @@ static int int3_mutable_op(BCOp op)
 ** BC_ISLT..BC_ISF range (comparisons, ORDER OPR, then the unary tests): the
 ** comparison reads its branch target from the D field of that slot and either
 ** branches to it or skips the slot entirely (see the `add PC, 4` in
-** build_ins()), so the JMP is never dispatched on its own and a trap there
-** could never fire. Such a slot is not a breakpoint site; the dispatched
-** jumps (loop back edges, UCLO, ISNEXT) are unaffected.
+** build_ins()), so that JMP is never dispatched on its own and a trap there
+** could never fire. The dispatched jumps (loop back edges, UCLO, ISNEXT's
+** prep) are unaffected.
 */
 static int int3_paired_jump(global_State *g, GCproto *pt, BCIns ins,
 			    BCPos bcpos)

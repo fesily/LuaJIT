@@ -259,17 +259,25 @@ itself added it. This holds whether compilation was disabled before the
 request was armed or while the prototype already carried the breakpoint.
 </p>
 <p>
-Only slots that the JIT does not rewrite at run time can be armed: function
-headers (<tt>FUNCF</tt>/<tt>FUNCV</tt>), the loop instructions
-(<tt>FORI</tt>, <tt>FORL</tt>, <tt>ITERL</tt>, <tt>LOOP</tt>), the generic-for
-slots (<tt>ITERN</tt>/<tt>ISNEXT</tt>) and <tt>RET</tt>/<tt>RET0</tt>/<tt>RET1</tt>
-are refused with <tt>LUAJIT_INT3_UNARMABLE</tt>. A <tt>JMP</tt> slot that the
-preceding comparison or test (<tt>ISLT</tt>..<tt>ISF</tt>) consumes is refused
-as well: the comparison branches over that slot, so it is never dispatched on
-its own and a trap there could never fire. <tt>RETM</tt> is not rewritten by
-the tracer and can be armed. Arm the first instruction of the function body or
-of the loop body instead: it delivers the same events and cannot race with a
-bytecode patch.
+Only the slots the interpreter never dispatches on its own are refused with
+<tt>LUAJIT_INT3_UNARMABLE</tt>: function headers (<tt>FUNCF</tt>/<tt>FUNCV</tt>,
+including their patched forms, whose frame is not set up when they run) and the
+generic-for prep pair (<tt>ISNEXT</tt> and the <tt>ITERN</tt> slot it points
+at, which the prep slot rewrites when it despecializes). A <tt>JMP</tt> slot
+that the preceding comparison or test (<tt>ISLT</tt>..<tt>ISF</tt>) consumes is
+refused as well: the comparison branches over that slot, so it is never
+dispatched on its own and a trap there could never fire.</p>
+<p>
+Every other slot is a breakpoint site, including the loop instructions
+(<tt>FORI</tt>, <tt>FORL</tt>, <tt>ITERL</tt>, <tt>LOOP</tt>), a loop back edge
+and <tt>RET</tt>/<tt>RET0</tt>/<tt>RET1</tt>/<tt>RETM</tt>. That is safe
+because arming flushes the traces that can reach the prototype and excludes it
+from JIT compilation for as long as it carries a breakpoint: no trace of it
+exists then, so the tracer can never rewrite an armed loop, prep or return
+slot. A slot that was traced or lazily blacklisted is rewritten back to its
+plain form when the request is mounted, and the trap is planted on that plain
+instruction; the reverse patch happens only after the last request is
+cancelled.
 </p>
 <p>
 The function returns <tt>LUAJIT_INT3_OK</tt> (accepted, mounted now or at the
@@ -277,7 +285,8 @@ next safe point), <tt>LUAJIT_INT3_DISABLED</tt> if no session is owned by this
 VM, <tt>LUAJIT_INT3_BUSY</tt> if a GC, a foreign VM event, the profiler or
 machine code is executing, <tt>LUAJIT_INT3_FULL</tt> if all
 <tt>LJ_INT3_MAX</tt> breakpoint slots are in use,
-<tt>LUAJIT_INT3_UNARMABLE</tt> for a slot the JIT rewrites at run time, or
+<tt>LUAJIT_INT3_UNARMABLE</tt> for a function header, a generic-for prep slot
+or a paired jump slot, or
 <tt>LUAJIT_INT3_INVALID</tt> for a non-Lua function or an out-of-range
 <tt>bcpos</tt>. It may also be called from the breakpoint callback, which then
 arms another slot (or re-arms the slot that is being delivered) while the

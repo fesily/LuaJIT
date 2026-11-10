@@ -29,6 +29,7 @@
 #include "lj_ircall.h"
 #include "lj_iropt.h"
 #include "lj_trace.h"
+#include "lj_int3.h"
 #include "lj_record.h"
 #include "lj_ffrecord.h"
 #include "lj_snap.h"
@@ -1351,7 +1352,10 @@ static void rec_idx_bump(jit_State *J, RecordIndex *ix)
 	asize = tb->asize <= 0x7ff ? tb->asize : 0x7ff;
       }
       if ((asize | (hbits<<11)) != ah) {  /* Has the size changed? */
-	/* Patch bytecode, but continue recording (for more patching). */
+	/* Patch bytecode, but continue recording (for more patching). An armed
+	** prototype never records, so this cannot reach a trapped slot.
+	*/
+	lj_assertJ(!lj_int3_pending(J2G(J), pc), "patching a trapped slot");
 	setbc_d(pc, (asize | (hbits<<11)));
 	/* Patching TNEW operands is only safe if the trace is aborted. */
 	ir->op1 = asize; ir->op2 = hbits;

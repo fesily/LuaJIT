@@ -1876,28 +1876,35 @@ static void test_permanent(void)
   }
   CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
 
-  /* Loop-back and header slots belong to the JIT: they must be refused. */
+  /* Function headers stay refused in every form: the frame is not set up when
+  ** the header runs. Loop and return slots are armable now -- mounting flushes
+  ** the traces of the prototype and excludes it from compilation, so no trace
+  ** of it can rewrite them; the delivery counts are checked in [20].
+  */
   memset(&rec, 0, sizeof(rec));
   CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
-  CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_UNARMABLE);
   CHECK(arm_pos(L, "G", "loop", 0) == LUAJIT_INT3_UNARMABLE);  /* FUNCF */
+  CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
   run(L, "function G.wloop(n) local i = 0 while i < n do i = i + 1 end "
 	 "return i end");
-  CHECK(arm_code(L, "G", "wloop", "LOOP", 0) == LUAJIT_INT3_UNARMABLE);
+  CHECK(arm_code(L, "G", "wloop", "LOOP", 0) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
   /* Numeric-for loops start with the fused loop-init instruction
-  ** (lj_parse.c:2862). It is never a trap site of its own: the JIT patches
-  ** it together with the loop-back slot when that slot starts a trace
-  ** (FORI->JFORI, lj_trace.c:517), and a prototype excluded from the JIT
-  ** gets its loop-back slot lazily rewritten (FORL->IFORL) instead. Pin the
-  ** unpatched header, its deliberately traced variant, and the lazily
-  ** blacklisted loop-back slot.
+  ** (lj_parse.c:2862). The tracer patches it together with the loop-back slot
+  ** when that slot starts a trace (FORI->JFORI, lj_trace.c:517), and a
+  ** prototype excluded from the JIT gets its loop-back slot lazily rewritten
+  ** (FORL->IFORL) instead. Both forms are accepted now: mounting flushes the
+  ** trace first and captures whatever the slot holds at that point, so a
+  ** JFUNCI/JFORL/I-variant is rewritten back before it is trapped.
   */
   run(L, "function G.fori(n) local s = 0 for i = 1, n do s = s + i end "
 	 "return s end\n");
   {
     int fori = find_bcpos_n(L, "G.fori", "FORI", 0);
     CHECK(fori >= 0);
-    CHECK(arm_code(L, "G", "fori", "FORI", 0) == LUAJIT_INT3_UNARMABLE);
+    CHECK(arm_code(L, "G", "fori", "FORI", 0) == LUAJIT_INT3_OK);
+    CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
 #if !defined(SMOKE_NO_JIT)
     {
       int op_fori = opcode_of(L, "FORI");
@@ -1911,7 +1918,9 @@ static void test_permanent(void)
       run(L, "jit.opt.start('hotloop=56')");
       CHECK(((unsigned)funcbc(L, "G.fori", fori) & 0xffu) ==
 	    (unsigned)op_jfori);
-      CHECK(arm_code(L, "G", "fori", "JFORI", 0) == LUAJIT_INT3_UNARMABLE);
+      /* The patched header is accepted; mounting rewrites it back to FORI. */
+      CHECK(arm_code(L, "G", "fori", "JFORI", 0) == LUAJIT_INT3_OK);
+      CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
     }
 #endif
   }
@@ -1933,14 +1942,16 @@ static void test_permanent(void)
     CHECK(run_number(L, "return G.ip(200)", &v) && v == 20100);
     run(L, "jit.opt.start('hotloop=56')");
     CHECK(((unsigned)funcbc(L, "G.ip", iforl) & 0xffu) == (unsigned)op_iforl);
-    CHECK(arm_code(L, "G", "ip", "IFORL", 0) == LUAJIT_INT3_UNARMABLE);
+    CHECK(arm_code(L, "G", "ip", "IFORL", 0) == LUAJIT_INT3_OK);
+    CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
   }
 #endif
-  /* The tracer rewrites the whole return instruction and the function header
-  ** wholesale, so a trap there would race with the rewrite.
+  /* Return slots are armable as well; the return hook still observes the
+  ** shadowed instruction (disp_ins() in lj_dispatch_ins()), see [20].
   */
   run(L, "function G.ret1(i) return i * 2 end\n");
-  CHECK(arm_code(L, "G", "ret1", "RET1", 0) == LUAJIT_INT3_UNARMABLE);
+  CHECK(arm_code(L, "G", "ret1", "RET1", 0) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
   run(L, "function G.va(...) local a = ... return a end\n");
   CHECK(arm_pos(L, "G", "va", 0) == LUAJIT_INT3_UNARMABLE);  /* FUNCV */
   /* The jump slot that a comparison or a unary test consumes is never
@@ -2119,7 +2130,11 @@ static void test_hook_and_hotcount(void)
   memset(&rec, 0, sizeof(rec));
   run(L, "function G.loop(n) local s = 0 for i = 1, n do s = s + i end "
 	 "return s end");
-  CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_UNARMABLE);
+  /* The loop-back slot is a site now; drop it again so the ADDVV count below
+  ** stays exact ([20] checks the loop slot itself).
+  */
+  CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
   CHECK(arm_slot(L, "G", "loop", "ADDVV", &bcpos) == 0);
 #if !defined(SMOKE_NO_JIT)
   run(L, "TR.start = 0");
@@ -2211,7 +2226,8 @@ static void test_hotcount_params(void)
     snprintf(code, sizeof(code), "jit.opt.start('%s')", params[i]);
     run(L, code);
     memset(&rec, 0, sizeof(rec));
-    CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_UNARMABLE);
+    CHECK(arm_code(L, "G", "loop", "FORL", 0) == LUAJIT_INT3_OK);
+    CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
     CHECK(arm_slot(L, "G", "loop", "ADDVV", &bcpos) == 0);
     snprintf(code, sizeof(code), "TR.start = 0");
     run(L, code);
@@ -2789,6 +2805,143 @@ static void test_close_finalizer(void)
   }
 }
 
+/* -- [20] Loop and return slots are breakpoint sites --------------------- */
+
+#if !defined(SMOKE_NO_PROFILE)
+static void test_loop_slots(void)
+{
+  lua_State *L = luaL_newstate();
+  Int3Rec rec;
+  int bcpos = -1;
+  double v;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L,
+    "G = {}\n"
+    "function G.loop(n) local s = 0 for i = 1, n do s = s + i end "
+    "return s end\n"
+    "function G.wloop(n) local i = 0 while i < n do i = i + 1 end "
+    "return i end\n"
+    "function G.ret1(i) return i * 2 end\n"
+    "local function mynext(t, k) return next(t, k) end\n"
+    "MYNEXT = mynext\n"
+    "function G.iter(n)\n"
+    "  local t = {}\n"
+    "  for i = 1, n do t[i] = i end\n"
+    "  local s = 0\n"
+    "  for k, x in MYNEXT, t do s = s + x end\n"
+    "  return s\n"
+    "end\n");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+
+  /* The numeric-for header runs once per loop entry; the loop-back slot runs
+  ** after every body execution, including the one that terminates the loop.
+  */
+  CHECK(arm_slot(L, "G", "loop", "FORI", &bcpos) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.loop(7)", &v) && v == 28);
+  printf("[20] FORI: hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 1);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "loop", "FORL", &bcpos) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.loop(7)", &v) && v == 28);
+  printf("[20] FORL: hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 7);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.loop(3)", &v) && v == 6);
+  CHECK(rec.calls == 3);		/* Permanent: keeps counting. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* A while loop: the LOOP slot runs once per iteration. */
+  CHECK(arm_slot(L, "G", "wloop", "LOOP", &bcpos) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.wloop(5)", &v) && v == 5);
+  printf("[20] LOOP: hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 5);
+  CHECK((int)rec.bcpos == bcpos);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* A generic for: ITERL and ITERC both run once per iterator call -- four
+  ** values plus the final nil call -- while the body runs four times.
+  */
+  CHECK(arm_slot(L, "G", "iter", "ITERL", &bcpos) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.iter(4)", &v) && v == 10);
+  printf("[20] ITERL: hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 5);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "iter", "ITERC", &bcpos) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.iter(4)", &v) && v == 10);
+  printf("[20] ITERC: hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 5);		/* Four values plus the final nil call. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* A trapped return slot with a return hook: the hook still observes the
+  ** shadowed instruction exactly once per return.
+  */
+  CHECK(arm_slot(L, "G", "ret1", "RET1", &bcpos) == 0);
+  rec.calls = 0;
+  ret_events = 0;
+  lua_sethook(L, count_ret_hook, LUA_MASKRET, 0);
+  CHECK(run_number(L, "return G.ret1(21)", &v) && v == 42);
+  lua_sethook(L, NULL, 0, 0);
+  printf("[20] RET1+ret hook: hits=%d events=%d value=%g\n", rec.calls,
+	 ret_events, v);
+  CHECK(rec.calls == 1);
+  CHECK(ret_events >= 1);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.ret1(3)", &v) && v == 6);
+  CHECK(rec.calls == 1);		/* One per return, permanently. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+#if !defined(SMOKE_NO_JIT)
+  /* A trapped loop slot in a hot loop: mounting flushed the trace of the
+  ** prototype and excluded it from compilation, so trace_start()'s lazy
+  ** I-patch and trace_stop() never touch the slot, and the delivery count is
+  ** exactly one per iteration however the JIT is configured.
+  */
+  attach_trace_counters(L);
+  run(L, "function G.hot(n) local s = 0 for i = 1, n do s = s + i end "
+	 "return s end");
+  run(L, "jit.opt.start('hotloop=1')");
+  CHECK(run_number(L, "return G.hot(200)", &v) && v == 20100);
+  run(L, "jit.opt.start('hotloop=56')");
+  {
+    int forl = find_bcpos_n(L, "G.hot", "FORL", 0);
+    int patched = forl >= 0 ? (int)((unsigned)funcbc(L, "G.hot", forl) & 0xffu)
+			    : -1;
+    printf("[20] hot FORL: traced opcode=%d\n", patched);
+    CHECK(patched == opcode_of(L, "JFORL"));
+    CHECK(arm_pos(L, "G", "hot", forl) == LUAJIT_INT3_OK);
+    /* The mounted slot holds the plain loop-back instruction, not the traced
+    ** form: mounting flushed the trace first.
+    */
+    CHECK((int)((unsigned)funcbc(L, "G.hot", forl) & 0xffu) ==
+	  opcode_of(L, "FORL"));
+    rec.calls = 0;
+    run(L, "TR.start = 0; TR.abort = 0");
+    CHECK(run_number(L, "return G.hot(5000)", &v) && v == 12502500);
+    printf("[20] hot FORL: hits=%d starts=%d abort=%d value=%g\n", rec.calls,
+	   counter(L, "start"), counter(L, "abort"), v);
+    CHECK(rec.calls == 5000);
+    CHECK(counter(L, "start") == 0);
+    /* After the cancel the prototype compiles again, so the loop slot is
+    ** rewritten by the tracer once more.
+    */
+    CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+    CHECK(run_number(L, "return G.hot(200)", &v) && v == 20100);
+    CHECK(run_number(L, "return G.hot(200)", &v) && v == 20100);
+    CHECK(counter(L, "start") > 0);
+    CHECK(rec.calls == 5000);
+  }
+#endif
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
 /* -- [16] Automatic deferred mounting ------------------------------------ */
 
 #if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
@@ -3046,6 +3199,7 @@ int main(int argc, char **argv)
   if (!only || only == 15) test_abi_probe();
   if (!only || only == 18) test_errno();
   if (!only || only == 19) test_close_finalizer();
+  if (!only || only == 20) test_loop_slots();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -3074,6 +3228,7 @@ int main(int argc, char **argv)
   if (!only || only == 17) test_arm_from_c();
   if (!only || only == 18) test_errno();
   if (!only || only == 19) test_close_finalizer();
+  if (!only || only == 20) test_loop_slots();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

@@ -209,6 +209,11 @@ static void trace_unpatch(jit_State *J, GCtrace *T)
   UNUSED(J);
   if (op == BC_JMP)
     return;  /* No need to unpatch branches in parent traces (yet). */
+  /* An armed prototype is flushed and excluded from compilation, so no trace
+  ** of it exists and this cannot reach a trapped slot. Pin that invariant:
+  ** the write below would destroy the trap.
+  */
+  lj_assertJ(!lj_int3_pending(J2G(J), pc), "unpatching a trapped slot");
   switch (bc_op(*pc)) {
   case BC_JFORL:
     lj_assertJ(traceref(J, bc_d(*pc)) == T, "JFORL references other trace");
@@ -378,9 +383,16 @@ void lj_trace_freestate(global_State *g)
 /* -- Penalties and blacklisting ------------------------------------------ */
 
 /* Blacklist a bytecode instruction. */
-static void blacklist_pc(GCproto *pt, BCIns *pc)
+static void blacklist_pc(jit_State *J, GCproto *pt, BCIns *pc)
 {
+  /* Nothing here can be trapped: a blacklisted prototype is one the JIT gave
+  ** up on, and an armed prototype never records, so its hot slots are never
+  ** penalized.
+  */
+  lj_assertJ(!lj_int3_pending(J2G(J), pc), "blacklisting a trapped slot");
   if (bc_op(*pc) == BC_ITERN) {
+    lj_assertJ(!lj_int3_pending(J2G(J), pc+1+bc_j(pc[1])),
+	       "blacklisting a trapped slot");
     setbc_op(pc, BC_ITERC);
     setbc_op(pc+1+bc_j(pc[1]), BC_JMP);
   } else {
@@ -399,7 +411,7 @@ static void penalty_pc(jit_State *J, GCproto *pt, BCIns *pc, TraceError e)
       val = ((uint32_t)J->penalty[i].val << 1) +
 	    (lj_prng_u64(&J2G(J)->prng) & ((1u<<PENALTY_RNDBITS)-1));
       if (val > PENALTY_MAX) {
-	blacklist_pc(pt, pc);  /* Blacklist it, if that didn't help. */
+	blacklist_pc(J, pt, pc);  /* Blacklist it, if that didn't help. */
 	return;
       }
       goto setpenalty;
@@ -514,13 +526,18 @@ static void trace_stop(jit_State *J)
   TraceNo traceno = J->cur.traceno;
   GCtrace *T = J->curfinal;
 
-  /* Only RET/RET0/RET1/ITERN are patched here. Keep that set inside
-  ** int3_mutable_op()'s refused opcodes: lj_trace_exit() temporarily
-  ** writes the trace's startins into a JLOOP slot, so a start opcode that
-  ** luaJIT_int3_arm() accepts would make that window trappable.
+  /* These slots are only ever rewritten for a trace of this prototype, and a
+  ** prototype with mounted breakpoints is flushed and excluded from the JIT,
+  ** so it owns no trace and this cannot reach a trapped slot. The asserts pin
+  ** that invariant: the writes below would destroy a trap, and the opcode
+  ** arithmetic is only valid for the real instruction (BC_INT3 + BC_JLOOP -
+  ** BC_LOOP is not a bytecode op).
   */
+  lj_assertJ(!lj_int3_pending(J2G(J), pc), "patching a trapped slot");
   switch (op) {
   case BC_FORL:
+    lj_assertJ(!lj_int3_pending(J2G(J), pc+bc_j(J->cur.startins)),
+	       "patching a trapped FORI");
     setbc_op(pc+bc_j(J->cur.startins), BC_JFORI);  /* Patch FORI, too. */
     /* fallthrough */
   case BC_LOOP:
@@ -984,11 +1001,13 @@ int LJ_FASTCALL lj_trace_exit(jit_State *J, void *exptr)
     if (bc_isret(bc_op(*retpc)) || bc_op(*retpc) == BC_ITERN) {
       /* Dispatch to original ins to ensure forward progress. */
       if (J->state != LJ_TRACE_RECORD) return -17;
-      /* Unpatch bytecode when recording. */
+      /* Unpatch bytecode when recording. A prototype with mounted breakpoints
+      ** never records, so this cannot reach a trapped slot.
+      */
+      lj_assertJ(!lj_int3_pending(J2G(J), pc), "substituting a trapped slot");
       J->patchins = *pc;
       J->patchpc = (BCIns *)pc;
       *J->patchpc = *retpc;
-      /* *retpc must be an int3_mutable_op() refused op (see trace_stop()). */
       J->bcskip = 1;
     }
     return 0;

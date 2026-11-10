@@ -76,13 +76,14 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 /* Interpreter breakpoint API.
 **
 ** While a breakpoint session is active, up to LJ_INT3_MAX bytecode
-** instructions (in any mix of prototypes) are replaced by BC_INT3. Slots
-** the JIT rewrites at run time (function headers, loop instructions,
-** ITERN/ISNEXT and RET/RET0/RET1) cannot be armed, and neither can a JMP slot
-** that the preceding comparison or test (ISLT..ISF) branches over. An armed
-** prototype never
+** instructions (in any mix of prototypes) are replaced by BC_INT3. Only the
+** slots the interpreter never dispatches on its own cannot be armed: function
+** headers (in every form, because the frame is not set up when they run), the
+** generic-for prep pair (ITERN/ISNEXT) and a JMP slot that the preceding
+** comparison or test (ISLT..ISF) branches over. Loop slots, loop back edges
+** and RET/RET0/RET1/RETM are armable: an armed prototype never
 ** traces: the JIT is excluded from it as soon as its first breakpoint is
-** mounted. The JIT stays enabled: mounting flushes only the traces that can
+** mounted, so no trace can rewrite those slots while they carry a trap. The JIT stays enabled: mounting flushes only the traces that can
 ** reach the armed instruction and excludes its prototype from compilation
 ** until the last breakpoint of that prototype is cancelled. Only an exclusion
 ** that the breakpoint itself added is released: jit.off() stays in effect
