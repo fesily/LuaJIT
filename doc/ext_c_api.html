@@ -251,9 +251,9 @@ replaced by the instruction it shadowed, the prototype GC root and the JIT
 exclusion are released with the last breakpoint of that prototype, and the
 session stays open. Disarming a slot that is not armed is a no-op (so clearing
 a breakpoint list is idempotent), while an out-of-range <tt>bcpos</tt>, a
-non-Lua function, a closed session or an unsafe context are reported as
-<tt>LUAJIT_INT3_INVALID</tt>, <tt>LUAJIT_INT3_DISABLED</tt> or
-<tt>LUAJIT_INT3_BUSY</tt> respectively.
+non-Lua function and a closed session are reported as
+<tt>LUAJIT_INT3_INVALID</tt> and <tt>LUAJIT_INT3_DISABLED</tt> respectively.
+There is no unsafe-context refusal: disarming is accepted everywhere.
 </p>
 <p>
 <b><tt>luaJIT_int3_arm_proto</tt></b> and
@@ -334,7 +334,8 @@ or a paired jump slot, or
 <tt>LUAJIT_INT3_INVALID</tt> for a non-Lua function or an out-of-range
 <tt>bcpos</tt>. It may also be called from the breakpoint callback, which then
 arms another slot (or re-arms the slot that is being delivered) while the
-current hit is being delivered.
+current hit is being delivered. It may also cancel or stop the session; it
+cannot start one, because a delivery is isolated like a VM event.
 </p>
 <p>
 <b><tt>luaJIT_int3_arm</tt> may also be called from a Lua debug hook</b>

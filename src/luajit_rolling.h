@@ -111,7 +111,8 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** without reconstructing the frame; the pointer is only valid for the duration
 ** of the call. The callback is a read-only native observer: it must not run
 ** Lua code or change any interpreter/JIT/hook state, but it may arm (re-arming
-** the slot that is being delivered is a no-op), cancel or stop the session.
+** the slot that is being delivered is a no-op), cancel or stop the session,
+** but it cannot start one: a delivery is isolated like a VM event.
 ** Starting, cancelling (one slot or all of them) and stopping the session is
 ** accepted from a Lua debug hook too: the hook's own dispatch re-reads every
 ** slot they touch, so a

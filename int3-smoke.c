@@ -1760,8 +1760,10 @@ typedef struct BpRec {
   /* Actions of the Nth delivery. */
   int cancel_at;		/* cancel() on this delivery (0 = never). */
   int stop_at;			/* stop() on this delivery (0 = never). */
+  int restart_at;		/* stop() then start() (0 = never). */
   int res_cancel;
   int res_stop;
+  int res_restart;
 } BpRec;
 
 static void bp_cb(void *data, lua_State *L, const void *func,
@@ -1794,6 +1796,13 @@ static void bp_cb(void *data, lua_State *L, const void *func,
     r->res_cancel = luaJIT_int3_cancel(L);
   if (r->stop_at != 0 && r->calls == r->stop_at)
     r->res_stop = luaJIT_int3_stop(L);
+  if (r->restart_at != 0 && r->calls == r->restart_at) {
+    /* Release the session that is delivering this hit and own a new one: the
+    ** delivery must not touch the released state afterwards.
+    */
+    r->res_stop = luaJIT_int3_stop(L);
+    r->res_restart = luaJIT_int3_start(L, bp_cb, r);
+  }
 }
 
 /* Registry reference of a global function, for the callback to arm. */
@@ -1888,6 +1897,30 @@ static void test_permanent(void)
   CHECK(v == 50);		/* The loop completed. */
   CHECK(run_number(L, "return N", &v) && v == 50);  /* Every side effect. */
   CHECK(luaJIT_int3_arm_bc(L, 1, 0) == LUAJIT_INT3_DISABLED);  /* Released. */
+
+  /* stop() and a start() attempt in the same delivery: the hit that did it
+  ** still runs its instruction, the released session is never touched again,
+  ** and a delivery cannot create the next one (a host call can).
+  */
+  memset(&rec, 0, sizeof(rec));
+  rec.restart_at = 3;
+  CHECK(luaJIT_int3_start(L, bp_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "drive", "CALL", &bcpos) == 0);
+  CHECK(run_number(L, "return G.drive(50)", &v) && v == 50);
+  printf("[9] restart in cb: calls=%d stop=%d start=%d value=%g\n",
+	 rec.calls, rec.res_stop, rec.res_restart, v);
+  CHECK(rec.calls == 3);
+  CHECK(rec.res_stop == LUAJIT_INT3_OK);
+  CHECK(rec.res_restart == LUAJIT_INT3_BUSY);
+  CHECK(v == 50);		/* The loop completed: nothing is trapped. */
+  CHECK(luaJIT_int3_arm_bc(L, 1, 0) == LUAJIT_INT3_DISABLED);
+  CHECK(luaJIT_int3_start(L, bp_cb, &rec) == LUAJIT_INT3_OK);
+  rec.restart_at = 0;		/* The new session delivers plainly. */
+  CHECK(arm_slot(L, "G", "drive", "CALL", &bcpos) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.drive(10)", &v) && v == 10);
+  CHECK(rec.calls == 10);	/* The new session delivers normally. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
 
   /* Arming another slot from the callback takes effect at once: the very
   ** next execution of that slot delivers.

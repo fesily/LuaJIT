@@ -737,8 +737,11 @@ LJ_FUNCA BCIns LJ_FASTCALL lj_int3_hit(lua_State *L, const BCIns *pc)
   st->cb(st->data, L, fn, (unsigned int)bcpos);
   g->vmstate = vmstate;
   g->hookmask = mask;
+  /* The callback may have stopped the session, which frees it: only a session
+  ** that is still the current one is ours to mark delivered.
+  */
+  if (g->int3 == st) st->delivering = 0;
   lj_dispatch_update(g, 0);
-  st->delivering = 0;
   /* Restore the previous PC: lj_dispatch_ins() of the re-dispatched
   ** instruction must see the same old PC as without a breakpoint.
   */
