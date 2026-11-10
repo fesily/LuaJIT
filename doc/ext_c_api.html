@@ -353,10 +353,17 @@ runs its instruction, and a request armed above mounts at the same safe point.
 A trap is delivered on the dispatch of its own slot, which happens before the
 line or count hook of that instruction, so a hook that cancels or stops takes
 effect from the next dispatch on and cannot suppress a callback that already
-ran, while a slot the hook runs before is preempted. A GC or profiler hook, a
-foreign VM event and machine code still refuse start, cancel and stop with
-<tt>LUAJIT_INT3_BUSY</tt>, and so do the recorder and the compiler for those
-three calls; arming keeps its own rule and queues there.
+ran, while a slot the hook runs before is preempted.
+</p>
+<p>
+Disarming, one slot or all of them, is accepted in every context: it flushes
+nothing, and a prototype that carries a breakpoint is excluded from the JIT, so
+no trace of it can be recording or running while its slot is restored. That
+makes the call usable from a finalizer (the GC hook) and from a recorder or
+trace callback, where a debugger cleans up. Starting and stopping the session
+are still refused with <tt>LUAJIT_INT3_BUSY</tt> while a GC or profiler hook, a
+foreign VM event, machine code, a recorder or the compiler is active; arming
+queues in those last two.
 </p>
 <p>
 The callback is invoked once for every execution of the armed instruction,

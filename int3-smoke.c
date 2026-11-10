@@ -1306,7 +1306,9 @@ static void hook_arm_dispatch(lua_State *L, lua_Debug *ar)
 }
 
 static int flush_start_res, flush_on_res, flush_arm_res, flush_eng_on_res;
-static int flush_cancel_res, flush_stop_res;
+static int flush_stop_res, flush_disarm_res;
+static const char *flush_disarm_func;	/* Disarm this slot in the event, if set. */
+static int flush_disarm_bcpos;
 static int flush_probe(lua_State *L)
 {
   flush_start_res = luaJIT_int3_start(L, int3_cb, &probe_rec);
@@ -1315,7 +1317,16 @@ static int flush_probe(lua_State *L)
   flush_on_res = luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_ON);
   lua_pop(L, 1);
   flush_arm_res = luaJIT_int3_arm_bc(L, 0, 0);
-  flush_cancel_res = luaJIT_int3_cancel(L);
+  /* Disarming needs no safe point, so a flush event accepts it. The test
+  ** disarms a slot of its own, so the breakpoint it counts stays armed.
+  */
+  if (flush_disarm_func != NULL) {
+    lua_getglobal(L, "G");
+    lua_getfield(L, -1, flush_disarm_func);
+    flush_disarm_res = luaJIT_int3_cancel_bc(L, -1,
+					     (unsigned int)flush_disarm_bcpos);
+    lua_pop(L, 2);
+  }
   flush_stop_res = luaJIT_int3_stop(L);
   return 0;
 }
@@ -1382,15 +1393,16 @@ static void test_unsafe(void)
   attach_probe(L, lua_gettop(L), "trace", "flush");
   lua_pop(L, 1);
   flush_start_res = flush_on_res = flush_arm_res = flush_eng_on_res = -1;
-  flush_cancel_res = flush_stop_res = -1;
+  flush_stop_res = flush_disarm_res = -1;
+  flush_disarm_func = NULL;
   run(L, "jit.flush()");
-  printf("[8] flush vmevent: start=%d on=%d arm=%d eng_on=%d\n",
-	 flush_start_res, flush_on_res, flush_arm_res, flush_eng_on_res);
+  printf("[8] flush vmevent: start=%d on=%d arm=%d eng_on=%d disarm=%d "
+	 "stop=%d\n", flush_start_res, flush_on_res, flush_arm_res,
+	 flush_eng_on_res, flush_disarm_res, flush_stop_res);
   CHECK(flush_start_res == LUAJIT_INT3_BUSY);
   CHECK(flush_on_res == 0);           /* The armed prototype stays NOJIT. */
   CHECK(flush_arm_res == LUAJIT_INT3_BUSY);
   CHECK(flush_eng_on_res == 1);       /* The engine is not ours to gate. */
-  CHECK(flush_cancel_res == LUAJIT_INT3_BUSY);
   CHECK(flush_stop_res == LUAJIT_INT3_BUSY);
   /* The session is still fully usable: the breakpoint survived the flush. */
   rec.calls = 0;
@@ -1468,22 +1480,37 @@ static void test_unsafe(void)
   memset(&rec, 0, sizeof(rec));
   memset(&probe_rec, 0, sizeof(probe_rec));
   luaL_openlibs(L);
-  run(L, "G = {} function G.sum(n) local s=0 for i=1,n do s=s+i end return s end");
+  run(L, "G = {}\n"
+	 "function G.sum(n) local s=0 for i=1,n do s=s+i end return s end\n"
+	 "function G.aux(x) local r = x + 1 return r end");
   run(L, "for i = 1, 2 do G.sum(1000) end");
   lua_pushcfunction(L, flush_probe);
   attach_probe(L, lua_gettop(L), "trace", "flush");
   lua_pop(L, 1);
   flush_start_res = flush_on_res = flush_arm_res = flush_eng_on_res = -1;
-  flush_cancel_res = flush_stop_res = -1;
+  flush_stop_res = flush_disarm_res = -1;
+  flush_disarm_func = NULL;
   {
     int traces = trace_count(L);
     CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+    CHECK(arm_slot(L, "G", "aux", "ADDVN", &flush_disarm_bcpos) == 0);
+    flush_disarm_func = "aux";
     printf("[8] start: traces=%d->%d probe=%d jit=%d\n", traces,
 	   trace_count(L), flush_start_res, run_bool(L, "return jit.status()"));
     CHECK(trace_count(L) == traces);
     CHECK(flush_start_res == -1);      /* No flush event on start. */
     CHECK(run_bool(L, "return jit.status()"));
   }
+  /* Disarming in a flush VM event: accepted, because it needs no safe point.
+  ** The slot is restored before the flush returns to the interpreter.
+  */
+  flush_disarm_res = -1;
+  run(L, "jit.flush()");
+  printf("[8] disarm in flush: res=%d\n", flush_disarm_res);
+  CHECK(flush_disarm_res == LUAJIT_INT3_OK);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.aux(1)", &v) && v == 2);
+  CHECK(rec.calls == 0);		/* Disarmed: no trap left in the slot. */
   /* Refusals inside a recording VM event: no interrupt state change while
   ** the recorder is active.
   */
@@ -3117,6 +3144,32 @@ static void test_arm_by_line(void)
 /* -- [24] Disarming one slot ---------------------------------------------- */
 
 #if !defined(SMOKE_NO_PROFILE)
+static int hint_bcpos;			/* Slot of G.h the probes disarm. */
+static int gcd_res;
+
+/* __gc runs under the GC hook: disarming there needs no safe point. */
+static int gc_disarm_cfunc(lua_State *L)
+{
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "h");
+  gcd_res = luaJIT_int3_cancel_bc(L, -1, (unsigned int)hint_bcpos);
+  lua_pop(L, 2);
+  return 0;
+}
+
+#if !defined(SMOKE_NO_JIT)
+static int rec_disarm_res;
+/* A trace callback runs inside the recorder; disarm a foreign prototype. */
+static int rec_disarm_probe(lua_State *L)
+{
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "h");
+  rec_disarm_res = luaJIT_int3_cancel_bc(L, -1, (unsigned int)hint_bcpos);
+  lua_pop(L, 2);
+  return 0;
+}
+#endif  /* !SMOKE_NO_JIT */
+
 static void test_cancel_bc(void)
 {
   lua_State *L = luaL_newstate();
@@ -3169,6 +3222,59 @@ static void test_cancel_bc(void)
 	== LUAJIT_INT3_DISABLED);
   lua_pop(L, 2);
   lua_close(L);
+
+  /* A finalizer runs under the GC hook: disarming needs no safe point, so it
+  ** is accepted there and the slot is restored before the finalizer returns.
+  */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {}\n"
+	 "function G.h(x) local a = x + 1 return a end\n"
+	 "local u = newproxy(true)\n"
+	 "getmetatable(u).__gc = function() _DISARM() end\n"
+	 "G.u = u");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "h", "ADDVN", &hint_bcpos) == 0);
+  lua_pushcfunction(L, gc_disarm_cfunc);
+  lua_setglobal(L, "_DISARM");
+  gcd_res = -1;
+  run(L, "G.u = nil; collectgarbage('collect'); collectgarbage('collect')");
+  printf("[24] disarm in __gc: res=%d\n", gcd_res);
+  CHECK(gcd_res == LUAJIT_INT3_OK);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 2);
+  CHECK(rec.calls == 0);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+
+#if !defined(SMOKE_NO_JIT)
+  /* A trace callback runs inside the recorder: disarming another prototype
+  ** there is accepted and applied when the event returns.
+  */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {}\n"
+	 "function G.h(x) local a = x + 1 return a end\n"
+	 "function G.hot(n) local s = 0 for i = 1, n do s = s + i end return s end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "h", "ADDVN", &hint_bcpos) == 0);
+  rec_disarm_res = -1;
+  lua_pushcfunction(L, rec_disarm_probe);
+  attach_probe(L, lua_gettop(L), "trace", "start");
+  lua_pop(L, 1);
+  run(L, "for i = 1, 2 do G.hot(1000) end");
+  printf("[24] disarm in recorder: res=%d traces=%d\n",
+	 rec_disarm_res, trace_count(L));
+  CHECK(rec_disarm_res == LUAJIT_INT3_OK);
+  CHECK(trace_count(L) > 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 2);
+  CHECK(rec.calls == 0);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+#endif  /* !SMOKE_NO_JIT */
 }
 #endif  /* !SMOKE_NO_PROFILE */
 

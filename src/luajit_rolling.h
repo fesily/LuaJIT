@@ -120,9 +120,12 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** which happens before the line or count hook of that instruction, so a hook
 ** that cancels or stops takes effect from the next dispatch on and cannot
 ** suppress a callback that already ran; a slot the hook runs before is
-** preempted. A GC or profiler hook, a foreign VM event and machine code still
-** refuse start, cancel and stop with LUAJIT_INT3_BUSY, and a recorder or the
-** compiler refuses those three as well, while arming still queues there.
+** preempted. Disarming, one slot or all of them, is accepted in every
+** context: it flushes nothing, and a prototype that carries a breakpoint is
+** excluded from the JIT, so no trace of it can be recording or running while
+** its slot is restored. Starting and stopping the session are refused with
+** LUAJIT_INT3_BUSY while a GC or profiler hook, a foreign VM event, machine
+** code, a recorder or the compiler is active; arming queues in the last two.
 **
 ** A breakpoint keeps its slot, its prototype GC root and the JIT exclusion
 ** until it is explicitly disarmed: luaJIT_int3_cancel() disarms every

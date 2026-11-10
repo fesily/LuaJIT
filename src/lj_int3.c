@@ -917,13 +917,18 @@ LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
 /* Disarm one slot of a prototype. Removing a slot that is not armed is a
 ** no-op, so clearing a breakpoint list stays idempotent, while an out-of-range
 ** bcpos is still a caller bug. Both disarm entry points share this tail.
+**
+** Unlike arming, disarming needs no safe point: it flushes nothing, and a
+** prototype that carries a breakpoint is excluded from the JIT, so no trace of
+** it can be recording or running while its slot is restored. It therefore
+** accepts every context, including a finalizer (the GC hook) and a recorder or
+** trace callback, where a debugger cleans up.
 */
 static int int3_disarm(global_State *g, GCproto *pt, BCPos bcpos)
 {
   Int3State *st = g->int3;
   int i, was_pending;
   if (st == NULL || st->state != INT3_ENABLED) return LUAJIT_INT3_DISABLED;
-  if (int3_locked(g)) return LUAJIT_INT3_BUSY;
   if (bcpos >= pt->sizebc) return LUAJIT_INT3_INVALID;
   i = int3_find_ins(st, pt, bcpos);
   if (i < 0) return LUAJIT_INT3_OK;  /* Not armed: nothing to restore. */
@@ -944,7 +949,6 @@ LUA_API int luaJIT_int3_cancel_bc(lua_State *L, int func_index,
   GCfunc *fn;
   if (g->int3 == NULL || g->int3->state != INT3_ENABLED)
     return LUAJIT_INT3_DISABLED;
-  if (int3_locked(g)) return LUAJIT_INT3_BUSY;
   if (lua_type(L, func_index) != LUA_TFUNCTION)
     return LUAJIT_INT3_INVALID;
   fn = (GCfunc *)lua_topointer(L, func_index);  /* GCfunc sits at GCobj. */
@@ -977,7 +981,6 @@ LUA_API int luaJIT_int3_cancel(lua_State *L)
   Int3State *st = g->int3;
   int pending;
   if (st == NULL) return LUAJIT_INT3_OK;  /* Nothing to cancel. */
-  if (int3_locked(g)) return LUAJIT_INT3_BUSY;
   pending = st->npending;
   int3_cancel_all(g);  /* The prototypes become compilable again. */
   if (pending != 0) lj_dispatch_update(g, 0);
