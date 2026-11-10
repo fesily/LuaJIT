@@ -12,6 +12,7 @@
 #include "lj_frame.h"
 #include "lj_func.h"
 #include "lj_gc.h"	/* lj_mem_newt/lj_mem_freet */
+#include "lj_tab.h"
 #include "lj_dispatch.h"
 #include "lj_int3.h"
 
@@ -48,13 +49,14 @@
 ** no-op, so a callback can keep trapping its own slot without any per-hit
 ** bookkeeping.
 **
-** Every request is a GC root (GCROOT_INT3+i), so a prototype that carries a
-** trap can never be collected: the root is taken before the slot is patched
-** and dropped only after it was restored, and lj_int3_close() does the same
-** before the finalizer run and lj_gc_freeall() of a VM teardown. That is why
-** no prototype-free hook is needed: apart from the armed breakpoints (rooted)
-** and the delivery in progress (the executing function's prototype), this
-** module holds no prototype pointer.
+** Every request is a slot of the session's anchor table (the single GC root
+** GCROOT_INT3, whose array part has one entry per request), so a prototype
+** that carries a trap can never be collected: the slot is filled before the
+** slot is patched and cleared only after it was restored, and lj_int3_close()
+** does the same before the finalizer run and lj_gc_freeall() of a VM teardown.
+** That is why no prototype-free hook is needed: apart from the armed
+** breakpoints (anchored) and the delivery in progress (the executing
+** function's prototype), this module holds no prototype pointer.
 **
 ** All requests of one prototype share one owner, which holds the request
 ** count and the PROTO_NOJIT ownership, so the last request releases the
@@ -154,6 +156,32 @@ static int int3_owner_pending(Int3State *st, GCproto *pt)
   for (i = 0; i < LJ_INT3_MAX; i++)
     if (st->entry[i].pt == pt && st->entry[i].state == INT3_PENDING) return 1;
   return 0;
+}
+
+/* The session's anchor table: one array slot per request, so the prototype of
+** every accepted request is reachable by the GC through the single root
+** GCROOT_INT3. Created by luaJIT_int3_start(), released by
+** luaJIT_int3_stop() and lj_int3_close() once the slots are cleared.
+*/
+static LJ_AINLINE GCtab *int3_roots(global_State *g)
+{
+  return tabref(g->gcroot[GCROOT_INT3]);
+}
+
+/* Fill (pt != NULL) or clear the anchor slot of request i. */
+static void int3_root_set(global_State *g, int i, GCproto *pt)
+{
+  GCtab *t = int3_roots(g);
+  TValue *tv;
+  lj_assertG(t != NULL && asize(t) > (uint32_t)i, "bad int3 anchor slot");
+  tv = &tvref(t->array)[i];
+  if (pt != NULL) {
+    setgcVraw(tv, obj2gco(pt), LJ_TPROTO);
+    /* The table lives across GC cycles, so the store needs a barrier. */
+    if (LJ_UNLIKELY(isblack(obj2gco(t)))) lj_gc_barrierback(g, t);
+  } else {
+    setnilV(tv);  /* Dropping a reference needs no barrier. */
+  }
 }
 
 /* Non-zero if lj_int3_hit() is delivering a callback for this VM. The
@@ -456,7 +484,7 @@ static void int3_remove_entry(global_State *g, int i)
   e->ins = 0;
   e->state = 0;
   st->count--;
-  setgcrefnull(g->gcroot[GCROOT_INT3+i]);
+  int3_root_set(g, i, NULL);
   {
     int oi = int3_find_owner(st, pt);
     if (oi >= 0 && --st->owner[oi].nreq == 0)
@@ -497,8 +525,8 @@ static int int3_arm_request(global_State *g, GCproto *pt, BCPos bcpos)
   } else {
     o = &st->owner[oi];
   }
-  /* Root the prototype before anything can patch its bytecode. */
-  setgcref(g->gcroot[GCROOT_INT3+i], obj2gco(pt));
+  /* Anchor the prototype before anything can patch its bytecode. */
+  int3_root_set(g, i, pt);
   st->entry[i].pt = pt;
   st->entry[i].bcpos = bcpos;
   st->entry[i].ins = 0;
@@ -658,6 +686,8 @@ void lj_int3_close(global_State *g)
   Int3State *st = g->int3;
   if (st == NULL) return;
   int3_cancel_all(g);  /* No callback, no JIT state changes on teardown. */
+  /* Every anchor slot was cleared by the cancel above; release the table. */
+  setgcrefnull(g->gcroot[GCROOT_INT3]);
   g->int3 = NULL;
   lj_mem_freet(g, st);
   int3_sessions--;
@@ -735,12 +765,22 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 {
   global_State *g = G(L);
   Int3State *st;
+  GCtab *roots;
   if (cb == NULL) return LUAJIT_INT3_INVALID;
   if (g->int3 != NULL || int3_sessions != 0) return LUAJIT_INT3_BUSY;
   if (lj_profile_active()) return LUAJIT_INT3_BUSY;  /* Profiler in use. */
   if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
+  /* One anchor table per session: one array slot per request, mounted under
+  ** the single root before a request can exist. NOBARRIER: the table is new
+  ** (marked white) and the array part is cleared to nil.
+  */
+  roots = lj_tab_new(L, LJ_INT3_MAX, 0);
+  lj_assertG(asize(roots) >= LJ_INT3_MAX, "int3 anchor table too small");
+  setgcref(g->gcroot[GCROOT_INT3], obj2gco(roots));
   /* The JIT engine is not touched: only mounting affects trace state. All
-  ** checks are done, so a refused start leaves no state behind.
+  ** checks are done, so a refused start leaves no state behind. Should the
+  ** session allocation fail, the anchored table stays unused until the next
+  ** start overwrites the root.
   */
   st = lj_mem_newt(L, sizeof(Int3State), Int3State);
   st->cb = cb;
@@ -822,6 +862,8 @@ LUA_API int luaJIT_int3_stop(lua_State *L)
   if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
   pending = st->npending;
   int3_cancel_all(g);
+  /* Every anchor slot was cleared by the cancel above; release the table. */
+  setgcrefnull(g->gcroot[GCROOT_INT3]);
   if (pending != 0) lj_dispatch_update(g, 0);
   g->int3 = NULL;
   lj_mem_freet(g, st);

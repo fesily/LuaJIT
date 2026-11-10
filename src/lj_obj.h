@@ -583,8 +583,7 @@ typedef enum {
 #if LJ_HASFFI
   GCROOT_FFI_FIN,	/* FFI finalizer table. */
 #endif
-  GCROOT_INT3,		/* Prototypes of the pending INT3 requests. */
-  GCROOT_INT3_LAST = GCROOT_INT3 + LJ_INT3_MAX-1,
+  GCROOT_INT3,		/* Table anchoring the pending INT3 prototypes. */
   GCROOT_MAX
 } GCRootID;
 
