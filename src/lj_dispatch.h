@@ -124,6 +124,14 @@ typedef struct GG_State {
 #define GG_DISP2HOT	(GG_OFS(hotcount) - GG_OFS(dispatch))
 #define GG_DISP2STATIC	(GG_LEN_DDISP*(int)sizeof(ASMFunction))
 
+/* The arm64 hot counter check adds GG_G2DISP+GG_DISP2HOT as an add immediate,
+** whose field holds 12 bits. Fail here, with a readable message, instead of
+** deep inside the assembler when the layout grows past it.
+*/
+#if LJ_TARGET_ARM64 && LJ_HASJIT
+LJ_STATIC_ASSERT(GG_G2DISP+GG_DISP2HOT <= 4095);
+#endif
+
 #define hotcount_get(gg, pc) \
   (gg)->hotcount[(u32ptr(pc)>>2) & (HOTCOUNT_SIZE-1)]
 #define hotcount_set(gg, pc, val) \

@@ -321,10 +321,7 @@
 |.macro hotcheck, delta
 |  lsr CARG1, PC, #1
 |  and CARG1, CARG1, #126
-|  // The hot counter table sits past +4095 from GL once global_State carries
-|  // the INT3 session state, so the offset cannot be an add immediate.
-|  mov CARG2, #GG_G2DISP+GG_DISP2HOT
-|  add CARG1, CARG1, CARG2
+|  add CARG1, CARG1, #GG_G2DISP+GG_DISP2HOT
 |  ldrh CARG2w, [GL, CARG1]
 |  subs CARG2, CARG2, #delta
 |  strh CARG2w, [GL, CARG1]
