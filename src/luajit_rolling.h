@@ -164,6 +164,16 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line);
 */
 LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
 			       unsigned int bcpos);
+/* Arm and disarm a slot of a prototype the caller already owns. `proto` is a
+** GCproto * passed as an opaque identity: the runtime does not validate it, and
+** no stack index or closure is resolved, so a debugger that maps its own source
+** positions to prototypes can work without either. The prototype must be alive
+** when the call is made; an armed request keeps it alive afterwards.
+*/
+LUA_API int luaJIT_int3_arm_proto(lua_State *L, const void *proto,
+				  unsigned int bcpos);
+LUA_API int luaJIT_int3_disarm_proto(lua_State *L, const void *proto,
+				     unsigned int bcpos);
 /* Disarm the slot at bcpos of the Lua function at stack index func_index: the
 ** mirror image of luaJIT_int3_arm_bc(). A slot that is not armed is a no-op.
 */

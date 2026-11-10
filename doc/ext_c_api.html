@@ -185,6 +185,10 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index,
                             unsigned int line);
 LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
                                unsigned int bcpos);
+LUA_API int luaJIT_int3_arm_proto(lua_State *L, const void *proto,
+                                  unsigned int bcpos);
+LUA_API int luaJIT_int3_disarm_proto(lua_State *L, const void *proto,
+                                     unsigned int bcpos);
 LUA_API int luaJIT_int3_cancel_bc(lua_State *L, int func_index,
                                   unsigned int bcpos);
 LUA_API int luaJIT_int3_cancel(lua_State *L);
@@ -250,6 +254,16 @@ a breakpoint list is idempotent), while an out-of-range <tt>bcpos</tt>, a
 non-Lua function, a closed session or an unsafe context are reported as
 <tt>LUAJIT_INT3_INVALID</tt>, <tt>LUAJIT_INT3_DISABLED</tt> or
 <tt>LUAJIT_INT3_BUSY</tt> respectively.
+</p>
+<p>
+<b><tt>luaJIT_int3_arm_proto</tt></b> and
+<b><tt>luaJIT_int3_disarm_proto</tt></b> take that same slot through the
+prototype instead of a stack index: <tt>proto</tt> is the prototype pointer as
+an opaque identity, which a debugger that maps its own source positions to
+prototypes already holds. Neither call validates the pointer or resolves a
+closure, so the caller guarantees that the prototype is alive; the armed
+request is what keeps it alive from then on. Their return codes are the same as
+those of the stack-index forms.
 </p>
 <p>
 Arming is <b>asynchronous</b>: <tt>LUAJIT_INT3_OK</tt> means that the request
