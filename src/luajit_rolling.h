@@ -112,8 +112,9 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** of the call. The callback is a read-only native observer: it must not run
 ** Lua code or change any interpreter/JIT/hook state, but it may arm (re-arming
 ** the slot that is being delivered is a no-op), cancel or stop the session.
-** Starting, cancelling and stopping the session is accepted from a Lua debug
-** hook too: the hook's own dispatch re-reads every slot they touch, so a
+** Starting, cancelling (one slot or all of them) and stopping the session is
+** accepted from a Lua debug hook too: the hook's own dispatch re-reads every
+** slot they touch, so a
 ** restored slot simply runs its instruction, and a request queued above mounts
 ** at the same safe point. A trap is delivered on the dispatch of its own slot,
 ** which happens before the line or count hook of that instruction, so a hook
@@ -125,8 +126,8 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 **
 ** A breakpoint keeps its slot, its prototype GC root and the JIT exclusion
 ** until it is explicitly disarmed: luaJIT_int3_cancel() disarms every
-** breakpoint but keeps the session, luaJIT_int3_stop() disarms them and
-** releases the session. There is no single-slot disarm call.
+** breakpoint but keeps the session, luaJIT_int3_cancel_bc() disarms one slot,
+** and luaJIT_int3_stop() disarms them all and releases the session.
 **
 ** The session belongs to the VM that started it: it is allocated from that
 ** VM's allocator and released by luaJIT_int3_stop() or, at the latest, when
@@ -163,6 +164,11 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line);
 */
 LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
 			       unsigned int bcpos);
+/* Disarm the slot at bcpos of the Lua function at stack index func_index: the
+** mirror image of luaJIT_int3_arm_bc(). A slot that is not armed is a no-op.
+*/
+LUA_API int luaJIT_int3_cancel_bc(lua_State *L, int func_index,
+				  unsigned int bcpos);
 LUA_API int luaJIT_int3_cancel(lua_State *L);
 LUA_API int luaJIT_int3_stop(lua_State *L);
 

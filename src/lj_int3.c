@@ -914,6 +914,37 @@ LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
   return lj_int3_arm(g, pt, (BCPos)bcpos);
 }
 
+/* Disarm one slot: the mirror image of luaJIT_int3_arm_bc(). Removing a slot
+** that is not armed is a no-op, so clearing a breakpoint list stays
+** idempotent, while an out-of-range bcpos is still a caller bug.
+*/
+LUA_API int luaJIT_int3_cancel_bc(lua_State *L, int func_index,
+				  unsigned int bcpos)
+{
+  global_State *g = G(L);
+  Int3State *st = g->int3;
+  GCfunc *fn;
+  GCproto *pt;
+  int i, was_pending;
+  if (st == NULL || st->state != INT3_ENABLED) return LUAJIT_INT3_DISABLED;
+  if (int3_locked(g)) return LUAJIT_INT3_BUSY;
+  if (lua_type(L, func_index) != LUA_TFUNCTION)
+    return LUAJIT_INT3_INVALID;
+  fn = (GCfunc *)lua_topointer(L, func_index);  /* GCfunc sits at GCobj. */
+  if (fn == NULL || !isluafunc(fn)) return LUAJIT_INT3_INVALID;
+  pt = funcproto(fn);
+  if (bcpos >= pt->sizebc) return LUAJIT_INT3_INVALID;
+  i = int3_find_ins(st, pt, (BCPos)bcpos);
+  if (i < 0) return LUAJIT_INT3_OK;  /* Not armed: nothing to restore. */
+  was_pending = st->entry[i].state == INT3_PENDING;
+  int3_remove_entry(g, i);
+  /* The last queued request is gone: drop the forced C dispatch. A mounted
+  ** slot needs no update, its dispatch entry is permanent.
+  */
+  if (was_pending && st->npending == 0) lj_dispatch_update(g, 0);
+  return LUAJIT_INT3_OK;
+}
+
 LUA_API int luaJIT_int3_cancel(lua_State *L)
 {
   global_State *g = G(L);
@@ -1035,6 +1066,13 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line)
 
 LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
 			       unsigned int bcpos)
+{
+  UNUSED(L); UNUSED(func_index); UNUSED(bcpos);
+  return LUAJIT_INT3_UNAVAILABLE;
+}
+
+LUA_API int luaJIT_int3_cancel_bc(lua_State *L, int func_index,
+				  unsigned int bcpos)
 {
   UNUSED(L); UNUSED(func_index); UNUSED(bcpos);
   return LUAJIT_INT3_UNAVAILABLE;

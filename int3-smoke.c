@@ -3114,6 +3114,64 @@ static void test_arm_by_line(void)
 }
 #endif  /* !SMOKE_NO_PROFILE */
 
+/* -- [24] Disarming one slot ---------------------------------------------- */
+
+#if !defined(SMOKE_NO_PROFILE)
+static void test_cancel_bc(void)
+{
+  lua_State *L = luaL_newstate();
+  Int3Rec rec;
+  double v;
+  int bc_a = -1, bc_b = -1;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {}\n"
+	 "function G.a(x) local r = x + 1 return r end\n"
+	 "function G.b(x) local r = x + 2 return r end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot(L, "G", "a", "ADDVN", &bc_a) == 0);
+  CHECK(arm_slot(L, "G", "b", "ADDVN", &bc_b) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.a(1) + G.b(1)", &v) && v == 5);
+  CHECK(rec.calls == 2);
+  /* Disarm one: the other keeps firing, the session stays open. */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "a");
+  CHECK(luaJIT_int3_cancel_bc(L, -1, (unsigned int)bc_a) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.a(1) + G.b(1)", &v) && v == 5);
+  printf("[24] one slot disarmed: hits=%d\n", rec.calls);
+  CHECK(rec.calls == 1);
+  /* Idempotent: disarming it again is a no-op. */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "a");
+  CHECK(luaJIT_int3_cancel_bc(L, -1, (unsigned int)bc_a) == LUAJIT_INT3_OK);
+  /* Out of range and non-Lua functions are caller errors. */
+  CHECK(luaJIT_int3_cancel_bc(L, -1, 4096) == LUAJIT_INT3_INVALID);
+  lua_pop(L, 2);
+  lua_getglobal(L, "print");
+  CHECK(luaJIT_int3_cancel_bc(L, -1, 0) == LUAJIT_INT3_INVALID);
+  lua_pop(L, 1);
+  /* The last armed slot of a prototype releases its JIT exclusion. */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "b");
+  CHECK(luaJIT_int3_cancel_bc(L, -1, (unsigned int)bc_b) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.a(1) + G.b(1)", &v) && v == 5);
+  CHECK(rec.calls == 0);
+  /* A session that is gone reports DISABLED. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "b");
+  CHECK(luaJIT_int3_cancel_bc(L, -1, (unsigned int)bc_b)
+	== LUAJIT_INT3_DISABLED);
+  lua_pop(L, 2);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
 /* -- [23] Session control from a Lua debug hook -------------------------- */
 
 #if !defined(SMOKE_NO_PROFILE)
@@ -3151,6 +3209,19 @@ static void hookctl_stop_hook(lua_State *L, lua_Debug *ar)
 {
   if (!hookctl_enter(L, ar)) return;
   hookctl_res = luaJIT_int3_stop(L);
+  lua_pop(L, 1);
+}
+
+static int hookctl_cancel_res;
+
+/* Arm a slot and disarm it again inside the same hook: the request never
+** reaches a safe point, so the slot must never be mounted.
+*/
+static void hookctl_armcancel_hook(lua_State *L, lua_Debug *ar)
+{
+  if (!hookctl_enter(L, ar)) return;
+  hookctl_res = luaJIT_int3_arm_bc(L, -1, 1);
+  hookctl_cancel_res = luaJIT_int3_cancel_bc(L, -1, 1);
   lua_pop(L, 1);
 }
 
@@ -3235,6 +3306,27 @@ static void test_hook_control(void)
   CHECK(luaJIT_int3_arm_bc(L, -1, 1) == LUAJIT_INT3_DISABLED);
   lua_pop(L, 2);
   CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+
+  /* A queued request disarmed before the mount never patches the slot. */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {} function G.h(x) local a = x + 1 return a end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  hookctl_res = hookctl_cancel_res = -1;
+  hookctl_done = 0;
+  lua_sethook(L, hookctl_armcancel_hook, LUA_MASKLINE, 0);
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 2);
+  lua_sethook(L, NULL, 0, 0);
+  printf("[23] arm+disarm in hook: arm=%d disarm=%d hits=%d\n",
+	 hookctl_res, hookctl_cancel_res, rec.calls);
+  CHECK(hookctl_res == LUAJIT_INT3_OK);
+  CHECK(hookctl_cancel_res == LUAJIT_INT3_OK);
+  CHECK(rec.calls == 0);
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 2);
+  CHECK(rec.calls == 0);	/* Never mounted: no trap in the slot. */
   CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
   lua_close(L);
 
@@ -3525,6 +3617,7 @@ int main(int argc, char **argv)
   if (!only || only == 21) test_callback_func();
   if (!only || only == 22) test_arm_by_line();
   if (!only || only == 23) test_hook_control();
+  if (!only || only == 24) test_cancel_bc();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -3557,6 +3650,7 @@ int main(int argc, char **argv)
   if (!only || only == 21) test_callback_func();
   if (!only || only == 22) test_arm_by_line();
   if (!only || only == 23) test_hook_control();
+  if (!only || only == 24) test_cancel_bc();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

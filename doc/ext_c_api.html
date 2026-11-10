@@ -185,6 +185,8 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index,
                             unsigned int line);
 LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
                                unsigned int bcpos);
+LUA_API int luaJIT_int3_cancel_bc(lua_State *L, int func_index,
+                                  unsigned int bcpos);
 LUA_API int luaJIT_int3_cancel(lua_State *L);
 LUA_API int luaJIT_int3_stop(lua_State *L);
 </pre>
@@ -238,6 +240,16 @@ arms nothing; <tt>luaJIT_int3_arm_bc</tt> still works for those chunks. A debugg
 or that maps its breakpoints itself (the slot numbering of a prototype follows
 from its bytecode, so code minified onto a single line cannot be addressed by
 line alone), uses <tt>luaJIT_int3_arm_bc</tt>.
+</p>
+<p>
+<b><tt>luaJIT_int3_cancel_bc</tt></b> disarms that one slot again: the trap is
+replaced by the instruction it shadowed, the prototype GC root and the JIT
+exclusion are released with the last breakpoint of that prototype, and the
+session stays open. Disarming a slot that is not armed is a no-op (so clearing
+a breakpoint list is idempotent), while an out-of-range <tt>bcpos</tt>, a
+non-Lua function, a closed session or an unsafe context are reported as
+<tt>LUAJIT_INT3_INVALID</tt>, <tt>LUAJIT_INT3_DISABLED</tt> or
+<tt>LUAJIT_INT3_BUSY</tt> respectively.
 </p>
 <p>
 Arming is <b>asynchronous</b>: <tt>LUAJIT_INT3_OK</tt> means that the request
@@ -319,8 +331,9 @@ breakpoint then fires from the next dispatch of that slot on: arming the
 current slot does not deliver a callback for the execution that is already
 being dispatched, while arming a later slot (or the body of a callee from a
 call hook, which mounts at the call dispatch) fires as soon as execution
-reaches it. <tt>luaJIT_int3_start</tt>, <tt>luaJIT_int3_cancel</tt> and
-<tt>luaJIT_int3_stop</tt> are accepted from a Lua debug hook as well: that
+reaches it. <tt>luaJIT_int3_start</tt>, <tt>luaJIT_int3_cancel_bc</tt>,
+<tt>luaJIT_int3_cancel</tt> and <tt>luaJIT_int3_stop</tt> are accepted from a
+Lua debug hook as well: that
 hook's own dispatch re-reads every slot they touch, so a restored slot simply
 runs its instruction, and a request armed above mounts at the same safe point.
 A trap is delivered on the dispatch of its own slot, which happens before the
