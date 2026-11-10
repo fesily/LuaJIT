@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+#
+# Cross-compilation image. It runs natively on the *host* architecture and
+# builds every target in docker/matrix.txt with Debian's cross toolchains, so
+# no emulation is involved in compiling - including the big-endian and 32-bit
+# MIPS targets that have no runnable Debian image.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    SRC=/src \
+    WORK=/work
+
+# Toolchains that Debian packages for every host architecture.  Recommends are
+# kept on purpose: they pull libc6-dev-<target>-cross, i.e. the target's libc
+# headers and linker script.  Without them the cross gcc silently falls back to
+# the *host* /usr/include and the build dies on bits/libc-header-start.h.
+#
+# The full set costs roughly 2 GB of image; override the build arg to trim it
+# on a small Docker VM, e.g.
+#   docker compose build --build-arg CROSS_TOOLCHAINS="gcc-x86-64-linux-gnu gcc-mips64el-linux-gnuabi64" cross
+ARG CROSS_TOOLCHAINS="gcc-x86-64-linux-gnu gcc-i686-linux-gnu gcc-arm-linux-gnueabi gcc-arm-linux-gnueabihf gcc-mips-linux-gnu gcc-mipsel-linux-gnu gcc-mips64-linux-gnuabi64 gcc-mips64el-linux-gnuabi64 gcc-mipsisa32r6-linux-gnu gcc-mipsisa32r6el-linux-gnu gcc-mipsisa64r6-linux-gnuabi64 gcc-mipsisa64r6el-linux-gnuabi64"
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates file tar \
+ && apt-get install -y ${CROSS_TOOLCHAINS} \
+ && rm -rf /var/lib/apt/lists/*
+
+# Optional toolchains: powerpc-linux-gnu is only built for amd64 hosts, and
+# aarch64-linux-gnu only exists as a cross package on non-arm64 hosts (on an
+# arm64 host the native compiler already carries that triple).
+RUN apt-get update \
+ && { apt-get install -y gcc-powerpc-linux-gnu gcc-aarch64-linux-gnu gcc-multilib \
+      || echo "optional cross toolchains not packaged for this host"; } \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY docker/ci.sh /usr/local/bin/ci.sh
+RUN chmod 0755 /usr/local/bin/ci.sh
+
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/ci.sh"]
+CMD ["cross"]

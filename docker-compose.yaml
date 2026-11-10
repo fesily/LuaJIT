@@ -1,0 +1,105 @@
+# Multi-architecture build/test entry point for LuaJIT.
+#
+#   make -f docker/Makefile arm64      # one target: build + smoke + tests
+#   make -f docker/Makefile cross      # every LuaJIT target, build (+run under qemu)
+#   make -f docker/Makefile all        # binfmt, arm64, armhf, cross
+#   make -f docker/Makefile clean      # drop images, containers, build cache
+#
+# The equivalent compose commands, if you prefer them directly:
+#
+#   docker compose run --rm binfmt     # once per boot: register qemu-user
+#   docker compose run --rm arm64      # one target: build + smoke + tests
+#   docker compose run --rm cross      # every LuaJIT target, build (+run under qemu)
+#   docker compose up --build          # the default set, sequential
+#
+# The source tree is bind-mounted, so edits to src/ need no image rebuild.
+# Edits to docker/ (Dockerfile, ci.sh, matrix.txt) need `--build`:
+#   docker compose run --build --rm arm64
+#
+# Architecture coverage of this tree (lj_arch.h): x86, x64, arm (softfp and
+# hardfp), arm64, ppc32 big-endian, mips/mipsel, mips64/mips64el and the MIPSR6
+# variants.  PPC64 is rejected by lj_arch.h, s390x/riscv64 have no backend, so
+# they are absent on purpose.
+#
+# Two complementary strategies:
+#
+#   native-*  the container is that architecture, its distro toolchain builds
+#             the tree, the interpreter then runs there (qemu-user when the
+#             architecture differs from the host).
+#   cross     one host-architecture container with the Debian cross toolchains:
+#             builds the whole matrix at host speed and runs every result that
+#             qemu-user can execute.  This is the only path for big-endian and
+#             32-bit MIPS, and it is the reliable path for x86 when the host is
+#             not x86 (qemu-x86_64 + gcc-12 ICEs intermittently there).
+#
+# Disk: the native images are 0.4-0.6 GB each, the full cross image ~2 GB.  On a
+# small Docker VM trim the toolchain set instead of dropping targets:
+#   docker compose build --build-arg CROSS_TOOLCHAINS="gcc-x86-64-linux-gnu gcc-mips64el-linux-gnuabi64" cross
+# Targets whose compiler is missing are reported as SKIP-NOTOOLCHAIN.
+name: luajit-multiarch
+
+x-volumes: &volumes
+  - .:/src:ro
+
+x-native: &native
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  volumes: *volumes
+  depends_on:
+    binfmt:
+      condition: service_completed_successfully
+  restart: "no"
+
+services:
+  # qemu-user binfmt handlers, required by every non-native platform.
+  # Idempotent: safe to run repeatedly.
+  binfmt:
+    image: tonistiigi/binfmt:latest
+    privileged: true
+    command: ["--install", "all"]
+    restart: "no"
+
+  arm64:
+    <<: *native
+    platform: linux/arm64
+    environment:
+      EXPECT_ARCH: arm64
+
+  armhf:
+    <<: *native
+    platform: linux/arm/v7
+    environment:
+      EXPECT_ARCH: arm
+
+  # x86 inside an x86 container is only sane when the host is x86 as well:
+  # running a gcc-12 toolchain under qemu-x86_64 crashes (observed cc1
+  # SIGSEGV on roughly every fifth file) on arm64 hosts.  Enable with
+  #   docker compose --profile qemu-x86 run --rm amd64
+  # or rely on the `cross` service, which builds x86/x64 and runs them under
+  # qemu-user without compiling through the emulator.
+  amd64:
+    <<: *native
+    platform: linux/amd64
+    profiles: ["qemu-x86"]
+    environment:
+      EXPECT_ARCH: x64
+
+  i386:
+    <<: *native
+    platform: linux/386
+    profiles: ["qemu-x86"]
+    environment:
+      EXPECT_ARCH: x86
+
+  # Host-architecture container with the Debian cross toolchains: builds every
+  # target in docker/matrix.txt and runs the ones qemu-user can execute.
+  cross:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cross
+    volumes: *volumes
+    depends_on:
+      binfmt:
+        condition: service_completed_successfully
+    restart: "no"

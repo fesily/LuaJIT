@@ -1,0 +1,35 @@
+# LuaJIT cross-build matrix: one target per line, fields separated by '|'.
+#
+#   name|cross-prefix|target-cflags|ELF class|endianness|ELF machine|sysroot|jit.arch
+#
+#   target-cflags  '-' : no extra flags (ABI/ISA comes from the cross compiler)
+#   sysroot        '-' : not runnable here, otherwise the QEMU_LD_PREFIX used to
+#                        run the freshly built binary under qemu-user
+#   jit.arch       expected jit.arch of that run (LJ_ARCH_NAME)
+#
+# Supported LuaJIT backends in this tree: x86/x64, arm (softfp/hardfp), arm64,
+# ppc32 BE, mips/mipsel, mips64/mips64el and the MIPSR6 variants.  There is no
+# PPC64 backend (lj_arch.h: `#error "No support for PPC64"`), and s390x/riscv64
+# have no backend at all, so they are intentionally absent.
+#
+# A target whose cross toolchain is not packaged for the host architecture is
+# reported as SKIP-NOTOOLCHAIN (e.g. powerpc-linux-gnu is only built for
+# amd64 hosts).  A 32-bit target additionally needs a 32-bit buildvm host tool
+# (src/host/buildvm.c checks the pointer size); without -m32 support it is
+# reported as SKIP-HOSTBITS - use the per-architecture containers for those.
+# A target whose emulator is not registered is reported as SKIP-RUN: the build
+# and its ELF header are still verified.
+x64|x86_64-linux-gnu-|-|ELF64|little|X86-64|/usr/x86_64-linux-gnu|x64
+x86|i686-linux-gnu-|-|ELF32|little|80386|/usr/i686-linux-gnu|x86
+armv7|arm-linux-gnueabihf-|-|ELF32|little|ARM|/usr/arm-linux-gnueabihf|arm
+armv5|arm-linux-gnueabi-|-|ELF32|little|ARM|/usr/arm-linux-gnueabi|arm
+aarch64|aarch64-linux-gnu-|-|ELF64|little|AArch64|/usr/aarch64-linux-gnu|arm64
+ppc|powerpc-linux-gnu-|-|ELF32|big|PowerPC|-|-
+mips|mips-linux-gnu-|-|ELF32|big|MIPS|-|-
+mipsel|mipsel-linux-gnu-|-|ELF32|little|MIPS|-|-
+mips64|mips64-linux-gnuabi64-|-|ELF64|big|MIPS|/usr/mips64-linux-gnuabi64|mips64
+mips64el|mips64el-linux-gnuabi64-|-|ELF64|little|MIPS|/usr/mips64el-linux-gnuabi64|mips64el
+mips32r6|mipsisa32r6-linux-gnu-|-|ELF32|big|MIPS|-|-
+mips32r6el|mipsisa32r6el-linux-gnu-|-|ELF32|little|MIPS|-|-
+mips64r6|mipsisa64r6-linux-gnuabi64-|-|ELF64|big|MIPS|/usr/mipsisa64r6-linux-gnuabi64|mips64r6
+mips64r6el|mipsisa64r6el-linux-gnuabi64-|-|ELF64|little|MIPS|/usr/mipsisa64r6el-linux-gnuabi64|mips64r6el
