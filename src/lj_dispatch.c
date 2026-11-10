@@ -102,6 +102,7 @@ void lj_dispatch_init_hotcount(global_State *g)
 #define DISPMODE_JIT	0x10	/* JIT compiler on. */
 #define DISPMODE_REC	0x20	/* Recording active. */
 #define DISPMODE_PROF	0x40	/* Profiling active. */
+#define DISPMODE_INT3	0x80	/* Pending interrupt requests. */
 
 /* Update dispatch table depending on various flags. */
 void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
@@ -123,6 +124,11 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
 	    DISPMODE_INS : 0;
   mode |= (g->hookmask & LUA_MASKCALL) ? DISPMODE_CALL : 0;
   mode |= (g->hookmask & LUA_MASKRET) ? DISPMODE_RET : 0;
+  /* A pending request only mounts at a C safe point. lj_vm_inshook skips the
+  ** C dispatch when there is no line/count hook, so force the recorder
+  ** dispatch skeleton that always enters lj_dispatch_ins().
+  */
+  mode |= lj_int3_has_pending(g) ? (DISPMODE_INT3|DISPMODE_INS|DISPMODE_CALL) : 0;
   if (oldmode != mode) {  /* Mode changed? */
     ASMFunction *disp = G2GG(g)->dispatch;
     ASMFunction f_forl, f_iterl, f_itern, f_loop, f_funcf, f_funcv;
@@ -151,7 +157,8 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
     disp[GG_LEN_DDISP+BC_LOOP] = f_loop;
 
     /* Set dynamic instruction dispatch. */
-    if ((oldmode ^ mode) & (DISPMODE_PROF|DISPMODE_REC|DISPMODE_INS)) {
+    if ((oldmode ^ mode) &
+	(DISPMODE_PROF|DISPMODE_REC|DISPMODE_INS|DISPMODE_INT3)) {
       /* Need to update the whole table. */
       if (!(mode & DISPMODE_INS)) {  /* No ins dispatch? */
 	/* Copy static dispatch table to dynamic dispatch table. */
@@ -164,9 +171,12 @@ void LJ_FASTCALL lj_dispatch_update(global_State *g, int nolock)
 	  disp[BC_RET1] = lj_vm_rethook;
 	}
       } else {
-	/* The recording dispatch also checks for hooks. */
+	/* The recording dispatch also checks for hooks. A pending request needs
+	** the same always-C skeleton: lj_vm_inshook may skip the C dispatch.
+	*/
 	ASMFunction f = (mode & DISPMODE_PROF) ? lj_vm_profhook :
-			(mode & DISPMODE_REC) ? lj_vm_record : lj_vm_inshook;
+			(mode & DISPMODE_REC) ? lj_vm_record :
+			(mode & DISPMODE_INT3) ? lj_vm_record : lj_vm_inshook;
 	uint32_t i;
 	for (i = 0; i < GG_LEN_SDISP; i++)
 	  disp[i] = f;
@@ -234,8 +244,13 @@ static void setptmode(global_State *g, GCproto *pt, int mode)
     pt->flags &= ~PROTO_NOJIT;
     lj_trace_reenableproto(pt);  /* Unpatch all ILOOP etc. bytecodes. */
   } else {  /* Flush and/or disable JIT compilation. */
-    if (!(mode & LUAJIT_MODE_FLUSH))
+    if (!(mode & LUAJIT_MODE_FLUSH)) {
       pt->flags |= PROTO_NOJIT;
+      /* The caller owns the flag from now on: an armed prototype must not
+      ** re-enable compilation when its last request is released.
+      */
+      lj_int3_nojit_release(g, pt);
+    }
     lj_trace_flushproto(g, pt);  /* Flush all traces of prototype. */
   }
 }
@@ -491,6 +506,8 @@ void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc)
   if ((g->hookmask & LUA_MASKRET) &&
       bc_isret(bc_op(disp_ins(g, pt, pc-1))))
     callhook(L, LUA_HOOKRET, -1);
+  /* Mount pending requests at this safe point, after the hook work. */
+  lj_int3_commit(L);
   ERRNO_RESTORE
 }
 
@@ -557,6 +574,10 @@ ASMFunction LJ_FASTCALL lj_dispatch_call(lua_State *L, const BCIns *pc)
 #if LJ_HASJIT
 out:
 #endif
+  /* Mount pending requests before the header is read, so a breakpoint armed
+  ** from a call hook fires on the first execution of the callee.
+  */
+  lj_int3_commit(L);
   /* No trapped header can reach this point: function headers are not
   ** armable, see int3_mutable_op().
   */

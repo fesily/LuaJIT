@@ -9,6 +9,7 @@
 **   gcc -I src int3-smoke.c src/libluajit-5.1.dll.a -o src/int3-smoke.exe
 */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1326,6 +1327,26 @@ static int record_probe(lua_State *L)
   return 0;
 }
 
+/* A hook that removes itself, arms a breakpoint and raises: the dispatch it
+** would have returned to never runs the commit at its exit, so the accepted
+** request must install the forced C dispatch itself.
+*/
+static int selfarm_res = -1;
+static const char *selfarm_func;
+static int selfarm_bcpos;
+
+static void selfarm_hook(lua_State *L, lua_Debug *ar)
+{
+  (void)ar;
+  lua_sethook(L, NULL, 0, 0);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, selfarm_func);
+  selfarm_res = luaJIT_int3_arm(L, -1, (unsigned int)selfarm_bcpos);
+  lua_pop(L, 2);
+  lua_pushliteral(L, "hook error");
+  (void)lua_error(L);
+}
+
 static void test_unsafe(void)
 {
   lua_State *L = luaL_newstate();
@@ -1405,6 +1426,33 @@ static void test_unsafe(void)
   CHECK(run_number(L, "return G.hookarm(10)", &v) && v == 31);
   CHECK(rec.calls == 1);	/* Permanent: no disarm, no re-arm. */
   CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+
+  /* A request accepted by a one-shot hook that then raises must still be
+  ** mounted: nothing else rebuilds the dispatch table afterwards here (the
+  ** JIT is off and no hook remains), so the pending request has to do it.
+  */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {} function G.sa(n) local s = 0 "
+	 "for i = 1, n do s = s + i end return s end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  selfarm_bcpos = find_bcpos_n(L, "G.sa", "ADDVV", 0);
+  CHECK(selfarm_bcpos >= 0);
+  selfarm_res = -1;
+  selfarm_func = "sa";
+  lua_sethook(L, selfarm_hook, LUA_MASKCOUNT, 1);
+  CHECK(run_fails(L, "local s = 0 for i = 1, 500 do s = s + i end"));
+  /* The hook removed itself before arming, so nothing rebuilds the dispatch
+  ** table from here on: the accepted request has to do it. */
+  printf("[8] arm in unhooking hook: res=%d hits=", selfarm_res);
+  CHECK(selfarm_res == LUAJIT_INT3_OK);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.sa(50)", &v) && v == 1275);
+  printf("%d\n", rec.calls);
+  CHECK(rec.calls == 50);		/* Mounted and delivered. */
   CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
   lua_close(L);
 
@@ -2243,6 +2291,27 @@ static void test_nojit_ownership(void)
   CHECK(run_number(L, "return G.f(2000)", &v) && v == 4002000);
   printf("[13] jit.off preserved: starts=%d\n", counter(L, "start"));
   CHECK(counter(L, "start") == 0);		/* Still disabled. */
+
+  /* A jit.off() applied *after* the request was mounted is the caller's
+  ** property too: cancelling must not re-enable the prototype.
+  */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "h");
+  CHECK(luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_ON) == 1);
+  lua_pop(L, 2);
+  CHECK(arm_slot(L, "G", "h", "ADDVV", &bc2) == 0);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.h(4)", &v) && v == 30);   /* Mount it. */
+  CHECK(rec.calls == 4);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "h");
+  CHECK(luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_OFF) == 1);
+  lua_pop(L, 2);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  run(L, "TR.start = 0");
+  CHECK(run_number(L, "return G.h(1000)", &v) && v == 1501500);
+  printf("[13] jit.off during mount: starts=%d\n", counter(L, "start"));
+  CHECK(counter(L, "start") == 0);		/* Still disabled. */
   CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
   lua_close(L);
 }
@@ -2606,6 +2675,289 @@ static void test_abi_probe(void)
 }
 
 #endif  /* !SMOKE_NO_PROFILE */
+
+/* -- [18] errno preservation --------------------------------------------- */
+
+/* A delivery runs inside the VM dispatch, so the whole hit path must behave
+** like any other opcode: no hook, no GC step and no change to errno.
+*/
+static int errno_calls;
+
+static void errno_cb(void *data, lua_State *L, const void *proto,
+		     unsigned int bcpos)
+{
+  (void)data; (void)L; (void)proto; (void)bcpos;
+  errno_calls++;
+}
+
+static void test_errno(void)
+{
+  lua_State *L = luaL_newstate();
+  int bcpos;
+  double v;
+  luaL_openlibs(L);
+  run(L, "E = {}\nfunction E.a(n) local s = 0 for i = 1, n do s = s + i end return s end\n");
+  bcpos = find_bcpos_n(L, "E.a", "ADDVV", 0);
+  CHECK(bcpos >= 0);
+  CHECK(luaJIT_int3_start(L, errno_cb, NULL) == LUAJIT_INT3_OK);
+  lua_getglobal(L, "E");
+  lua_getfield(L, -1, "a");
+  CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  errno_calls = 0;
+  errno = EDOM;
+  CHECK(run_number(L, "return E.a(5)", &v) && v == 15);
+  printf("[18] errno: hits=%d errno=%d value=%g\n", errno_calls, errno, v);
+  CHECK(errno_calls == 5);
+  CHECK(errno == EDOM);		/* The delivery must not clobber errno. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+
+/* -- [19] close during finalizers ---------------------------------------- */
+
+/* lua_close() releases the session before the finalizer run, so no callback
+** can reach a finalizer of the VM that is being torn down, and the force
+** restore has already happened when the finalizer observes the session.
+*/
+extern int lj_int3_active(void);
+
+static int close_calls;
+static int close_finalizer_active = -1;
+
+static void close_cb(void *data, lua_State *L, const void *proto,
+		     unsigned int bcpos)
+{
+  (void)data; (void)L; (void)proto; (void)bcpos;
+  close_calls++;
+}
+
+static int close_finalizer(lua_State *L)
+{
+  close_finalizer_active = lj_int3_active();
+  return 0;
+}
+
+static void test_close_finalizer(void)
+{
+  lua_State *L = luaL_newstate();
+  int bcpos;
+  double v;
+  luaL_openlibs(L);
+  run(L,
+    "C = {}\n"
+    "function C.a(n) local s = 0 for i = 1, n do s = s + i end return s end\n"
+    "G = setmetatable({}, {__gc = function() FIN() end})\n");
+  lua_pushcfunction(L, close_finalizer);
+  lua_setglobal(L, "FIN");
+  bcpos = find_bcpos_n(L, "C.a", "ADDVV", 0);
+  CHECK(bcpos >= 0);
+  CHECK(luaJIT_int3_start(L, close_cb, NULL) == LUAJIT_INT3_OK);
+  lua_getglobal(L, "C");
+  lua_getfield(L, -1, "a");
+  CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  close_calls = 0;
+  CHECK(run_number(L, "return C.a(4)", &v) && v == 10);
+  CHECK(close_calls == 4);
+  close_calls = 0;
+  lua_close(L);			/* Runs the finalizer of G. */
+  printf("[19] close: finalizer-active=%d close-hits=%d\n",
+	 close_finalizer_active, close_calls);
+  close_finalizer_active = -1;
+  close_calls = 0;
+  CHECK(close_finalizer_active == -1);
+  CHECK(close_calls == 0);
+  CHECK(!lj_int3_active());
+}
+
+/* -- [16] Automatic deferred mounting ------------------------------------ */
+
+#if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
+
+/* Arm a slot while the recorder owns the VM. The request is only accepted
+** with OK, it must not be published inside the event (the prototype stays
+** compilable), and it is mounted at the next safe point.
+*/
+static int defer_bcpos = -1;		/* Slot to arm from the record event. */
+static const char *defer_func;		/* Global function to arm. */
+static int defer_arm_res;		/* arm() result, -1 = probe never ran. */
+static int defer_setmode_res;		/* jit.on inside the event, -1 = n/a. */
+static int defer_events;		/* Record events seen. */
+static const BpRec *defer_rec;		/* Delivery counter of the session. */
+static int defer_hits_at_arm;		/* Deliveries before the arm. */
+
+static int defer_record_probe(lua_State *L)
+{
+  defer_events++;
+  if (defer_arm_res == -1 && defer_bcpos >= 0) {
+    defer_hits_at_arm = defer_rec ? defer_rec->calls : 0;
+    lua_getglobal(L, "G");
+    lua_getfield(L, -1, defer_func);
+    defer_arm_res = luaJIT_int3_arm(L, -1, (unsigned int)defer_bcpos);
+    if (defer_arm_res == LUAJIT_INT3_OK) {
+      /* A pending request has not excluded the prototype from the JIT yet. */
+      defer_setmode_res =
+	luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_ON);
+    }
+    lua_pop(L, 2);
+  }
+  return 0;
+}
+
+static void defer_attach(lua_State *L)
+{
+  lua_pushcfunction(L, defer_record_probe);
+  lua_setglobal(L, "_DEFER_REC");
+  run(L, "jit.attach(function() _DEFER_REC() end, 'trace', 'start')");
+}
+
+static void defer_reset(const char *func, int bcpos, BpRec *rec)
+{
+  defer_func = func;
+  defer_bcpos = bcpos;
+  defer_arm_res = -1;
+  defer_setmode_res = -1;
+  defer_events = 0;
+  defer_hits_at_arm = 0;
+  defer_rec = rec;
+}
+
+/* Arm a breakpoint of G.a from a C helper called by G.b: the running frame is
+** G.b, the armed prototype is another one. The request must mount before the
+** helper returns (a C function is a safe context) and must not disturb G.b.
+*/
+static int armc_arm_res = -1;
+static int armc_bcpos = -1;
+static int armc_calls;
+static void armc_cb(void *data, lua_State *L, const void *proto,
+		     unsigned int bcpos)
+{
+  (void)data; (void)L; (void)proto; (void)bcpos;
+  armc_calls++;
+}
+static int armc_helper(lua_State *L)
+{
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "a");
+  armc_arm_res = luaJIT_int3_arm(L, -1, (unsigned int)armc_bcpos);
+  lua_pop(L, 2);
+  return 0;
+}
+
+static void test_arm_from_c(void)
+{
+  lua_State *L = luaL_newstate();
+  int bcpos = -1;
+  double v;
+  luaL_openlibs(L);
+  run(L,
+    "G = {}\n"
+    "function G.a(n) local s = 0 for i = 1, n do s = s + i end return s end\n"
+    "function G.b(n) local s = 0 for i = 1, n do s = s + i * 2 "
+    "call_helper() end return s end\n");
+  lua_pushcfunction(L, armc_helper);
+  lua_setglobal(L, "call_helper");
+  armc_bcpos = find_bcpos_n(L, "G.a", "ADDVV", 0);
+  CHECK(armc_bcpos >= 0);
+  CHECK(luaJIT_int3_start(L, armc_cb, NULL) == LUAJIT_INT3_OK);
+  /* Mount G.a, run it, then drop the mapping but keep the session. */
+  bcpos = find_bcpos_n(L, "G.a", "ADDVV", 0);
+  CHECK(bcpos >= 0);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "a");
+  CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  CHECK(run_number(L, "return G.a(4)", &v) && v == 10);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  /* While G.b runs, a C helper arms G.a again: the trap is planted in G.a,
+  ** and G.b keeps executing its own bytecode.
+  */
+  armc_arm_res = -1;
+  armc_calls = 0;
+  CHECK(run_number(L, "return G.b(8)", &v) && v == 72);
+  printf("[17] arm from C: arm=%d a-hits=%d value=%g\n", armc_arm_res,
+	 armc_calls, v);
+  CHECK(armc_arm_res == LUAJIT_INT3_OK);
+  CHECK(armc_calls == 0);		/* G.a did not run here. */
+  CHECK(run_number(L, "return G.a(3)", &v) && v == 6);
+  printf("[17] arm from C: a(3)=%g a-hits=%d\n", v, armc_calls);
+  CHECK(armc_calls == 3);		/* And its own breakpoint still works. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+
+static void test_deferred_mount(void)
+{
+  lua_State *L = luaL_newstate();
+  BpRec rec;
+  int bcpos = -1;
+  double v;
+
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L,
+    "G = {}\n"
+    "function G.df(n) local s=0 for i=1,n do s=s+i end return s end\n"
+    "function G.other(n) local s=0 for i=1,n do s=s+n end return s end\n"
+    "function G.self(n) local s=0 for i=1,n do s=s+i end return s end\n");
+  CHECK(luaJIT_int3_start(L, bp_cb, &rec) == LUAJIT_INT3_OK);
+  defer_attach(L);
+  /* Warm the target so that it owns traces a mount has to flush. */
+  run(L, "jit.opt.start('hotloop=1')");
+  CHECK(run_number(L, "return G.df(200)", &v) && v == 20100);
+  run(L, "jit.opt.start('hotloop=56')");
+  CHECK(trace_count(L) > 0);
+  bcpos = find_bcpos_n(L, "G.df", "ADDVV", 0);
+  CHECK(bcpos >= 0);
+  defer_reset("df", bcpos, &rec);
+  /* Record another prototype: its record event arms G.df. */
+  run(L, "jit.opt.start('hotloop=1'); for i=1,4 do G.other(300) end; "
+	 "jit.opt.start('hotloop=56')");
+  printf("[16] record event: arm=%d events=%d setmode=%d hits-at-arm=%d\n",
+	 defer_arm_res, defer_events, defer_setmode_res, defer_hits_at_arm);
+  CHECK(defer_events >= 1);		/* A real record event armed it. */
+  CHECK(defer_arm_res == LUAJIT_INT3_OK);	/* Accepted, not BUSY. */
+  CHECK(defer_hits_at_arm == 0);	/* Nothing delivered in the event. */
+  CHECK(defer_setmode_res == 1);	/* Still pending, not mounted. */
+  CHECK(set_jit_on(L, "G", "df") == 0);	/* Mounted: excluded now. */
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.df(50)", &v) && v == 1275);
+  printf("[16] deferred hits: %d\n", rec.calls);
+  CHECK(rec.calls == 50);		/* Permanent and repeatable. */
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.df(50)", &v) && v == 1275);
+  CHECK(rec.calls == 50);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* Arm a slot of the prototype the recorder is recording itself. The commit
+  ** refuses to work while the recorder owns the VM, so the request stays
+  ** pending, the finished trace is flushed when it is mounted at the next safe
+  ** point, and the next activation delivers.
+  */
+  memset(&rec, 0, sizeof(rec));
+  bcpos = find_bcpos_n(L, "G.self", "ADDVV", 0);
+  CHECK(bcpos >= 0);
+  defer_reset("self", bcpos, &rec);
+  rec.calls = 0;
+  CHECK(run_number(L, "jit.opt.start('hotloop=1'); return G.self(200)", &v) &&
+	v == 20100);
+  run(L, "jit.opt.start('hotloop=56')");
+  CHECK(defer_arm_res == LUAJIT_INT3_OK);	/* Accepted, not BUSY. */
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.self(30)", &v) && v == 465);
+  printf("[16] self record event: arm=%d hits=%d value=%g\n", defer_arm_res,
+	 rec.calls, v);
+  CHECK(rec.calls == 30);	/* Mounted, and the trace was flushed. */
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.self(30)", &v) && v == 465);
+  CHECK(rec.calls == 30);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+
+#endif  /* !SMOKE_NO_PROFILE && !SMOKE_NO_JIT */
+
 /* -- [9] Conditional builds ---------------------------------------------- */
 
 #if defined(SMOKE_NO_PROFILE)
@@ -2674,6 +3026,8 @@ int main(int argc, char **argv)
   if (!only || only == 10) test_multi();
   if (!only || only == 11) test_hook_and_hotcount();
   if (!only || only == 15) test_abi_probe();
+  if (!only || only == 18) test_errno();
+  if (!only || only == 19) test_close_finalizer();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -2698,6 +3052,10 @@ int main(int argc, char **argv)
   if (!only || only == 13) test_nojit_ownership();
   if (!only || only == 14) test_slowpaths();
   if (!only || only == 15) test_abi_probe();
+  if (!only || only == 16) test_deferred_mount();
+  if (!only || only == 17) test_arm_from_c();
+  if (!only || only == 18) test_errno();
+  if (!only || only == 19) test_close_finalizer();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

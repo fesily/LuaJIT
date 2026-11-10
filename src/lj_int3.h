@@ -9,6 +9,15 @@
 #include "lj_obj.h"
 #include "lj_bc.h"
 
+/* Non-zero if a request has been accepted but not mounted yet. The dispatch
+** mode forces a C dispatch while this is true, so the next safe point can
+** mount it.
+*/
+LJ_FUNC int lj_int3_has_pending(global_State *g);
+/* Mount every pending request if this is a safe point. Leaf function: no
+** allocation, no Lua, no GC, no hook delivery.
+*/
+LJ_FUNC void lj_int3_commit(lua_State *L);
 /* Logical view of the bytecode: an armed slot reads and writes as the
 ** original instruction, everything else reads and writes the real slot.
 */
@@ -21,6 +30,10 @@ LJ_FUNC int lj_int3_pending(global_State *g, const BCIns *pc);
 LJ_FUNC void lj_int3_bcwrite_view(global_State *g, const GCproto *pt, BCIns *bc);
 /* Non-zero if JIT compilation must not be enabled for this prototype. */
 LJ_FUNC int lj_int3_jit_on_blocked(global_State *g, GCproto *pt);
+/* A caller disabled JIT compilation for this prototype itself: the request
+** must keep the PROTO_NOJIT bit when it is released.
+*/
+LJ_FUNC void lj_int3_nojit_release(global_State *g, GCproto *pt);
 /* Non-zero if any VM owns an INT3 session. */
 LJ_FUNC int lj_int3_active(void);
 /* Force-restore every armed slot and release the session (VM teardown). */

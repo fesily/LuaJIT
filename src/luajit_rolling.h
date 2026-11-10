@@ -76,25 +76,38 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 /* Interpreter breakpoint API.
 **
 ** While a breakpoint session is active, up to LJ_INT3_MAX bytecode
-** instructions (in any mix of prototypes) may be replaced by BC_INT3. Slots
+** instructions (in any mix of prototypes) are replaced by BC_INT3. Slots
 ** the JIT rewrites at run time (function headers, loop instructions,
-** ITERN/ISNEXT and RET/RET0/RET1) cannot be armed. An armed prototype never
-** traces: the JIT is excluded from it as soon as a breakpoint is armed. The
-** JIT stays enabled: arming flushes only the traces that can reach the armed
-** instruction and excludes its prototype from compilation until the last
-** breakpoint of that prototype is cancelled.
+** ITERN/ISNEXT and RET/RET0/RET1) cannot be armed, and neither can a JMP slot
+** that the preceding comparison or test (ISLT..ISF) branches over. An armed
+** prototype never
+** traces: the JIT is excluded from it as soon as its first breakpoint is
+** mounted. The JIT stays enabled: mounting flushes only the traces that can
+** reach the armed instruction and excludes its prototype from compilation
+** until the last breakpoint of that prototype is cancelled. Only an exclusion
+** that the breakpoint itself added is released: jit.off() stays in effect
+** afterwards, whether it was issued before arming or while mounted.
+**
+** Arming is asynchronous: LUAJIT_INT3_OK means the request was accepted, not
+** that the slot already holds the trap. A call from the host, from a C
+** function or from the callback mounts it before returning; a call from a Lua
+** debug hook or from the recorder/compiler only queues it, because replacing
+** the slot there would race the dispatch or the bytecode patch in progress.
+** The next dispatch then mounts every queued request at a safe point: the
+** prototype is flushed and excluded from the JIT first, and only then is its
+** slot replaced. A queued request holds its GC root and forces the C
+** dispatch, so it is never lost and never observed as armed before it is; an
+** instruction that is already being dispatched always executes once with its
+** own opcode.
 **
 ** A breakpoint is permanent: every execution of the slot delivers the
 ** callback once and then executes the original instruction, until the
 ** breakpoint is cancelled, the session is stopped or the VM is closed. The
 ** callback is a read-only native observer: it must not run Lua code or change
 ** any interpreter/JIT/hook state, but it may arm (re-arming the slot that is
-** being delivered is a no-op), cancel or stop the session. Arming from a Lua
-** debug hook is allowed and takes effect immediately: the instruction the
-** hook belongs to still executes with its own opcode exactly once, and the
-** breakpoint fires from the next dispatch of that slot on. The other calls
-** (start, cancel, stop) are still refused inside a hook, as are the GC, VM
-** event, profiler, recorder and machine-code contexts.
+** being delivered is a no-op), cancel or stop the session. The other calls
+** (start, cancel, stop) are refused inside a hook, as is arming inside a GC
+** hook, the profiler, a foreign VM event or running machine code.
 **
 ** A breakpoint keeps its slot, its prototype GC root and the JIT exclusion
 ** until it is explicitly disarmed: luaJIT_int3_cancel() disarms every

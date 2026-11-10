@@ -215,14 +215,28 @@ event is active, or this or another VM already owns a profiler or breakpoint
 session. Nothing is changed when the call is refused.
 </p>
 <p>
-<b><tt>luaJIT_int3_arm</tt></b> replaces the opcode of the instruction at
-<tt>bcpos</tt> (a 0-based bytecode index, <tt>bcpos &lt; sizebc</tt>) in the
-prototype of the Lua function at stack index <tt>func_index</tt> by
+<b><tt>luaJIT_int3_arm</tt></b> arms the instruction at <tt>bcpos</tt> (a
+0-based bytecode index, <tt>bcpos &lt; sizebc</tt>) in the prototype of the
+Lua function at stack index <tt>func_index</tt>: its opcode becomes
 <tt>BC_INT3</tt>. The other operand fields, PC, jump offsets and line numbers
 stay intact, and the prototype is kept alive.
 </p>
 <p>
-Only the traces that can reach this bytecode are dropped: a trace is flushed
+Arming is <b>asynchronous</b>: <tt>LUAJIT_INT3_OK</tt> means that the request
+was accepted, not that the slot already holds the trap. A call from the host,
+from a C function or from the breakpoint callback mounts the request before
+returning. A call from a Lua debug hook or from the recorder/compiler only
+queues it: replacing the slot there would race the dispatch or the bytecode
+patch in progress, and flushing would drop the trace that is being recorded.
+The next dispatch mounts every queued request at a safe point, after the hook
+and recorder work and before the next instruction executes. A queued request
+already holds its GC root and forces the C dispatch, so it can neither be lost
+nor be observed as armed before it is; the JIT may still compile the prototype
+until then.
+</p>
+<p>
+Mounting a breakpoint drops only the traces that can reach this bytecode: a
+trace is flushed
 if it starts in the prototype, if it inlined it (the recorder specializes
 every recorded Lua call on a GC constant for the prototype or for one of its
 closures), or if one of its snapshots points into the prototype. All other
@@ -239,40 +253,49 @@ compilation for that prototype (or for a subtree containing it) through
 is gone.
 </p>
 <p>
+A prototype that the host disabled with <tt>jit.off</tt> keeps that state
+across the breakpoint: the exclusion is only released when the breakpoint
+itself added it. This holds whether compilation was disabled before the
+request was armed or while the prototype already carried the breakpoint.
+</p>
+<p>
 Only slots that the JIT does not rewrite at run time can be armed: function
 headers (<tt>FUNCF</tt>/<tt>FUNCV</tt>), the loop instructions
 (<tt>FORI</tt>, <tt>FORL</tt>, <tt>ITERL</tt>, <tt>LOOP</tt>), the generic-for
 slots (<tt>ITERN</tt>/<tt>ISNEXT</tt>) and <tt>RET</tt>/<tt>RET0</tt>/<tt>RET1</tt>
-are refused with <tt>LUAJIT_INT3_UNARMABLE</tt>. <tt>RETM</tt> is not
-rewritten by the tracer and can be armed. Arm the first instruction of the
-function body or of the loop body instead: it delivers the same events and
-cannot race with a bytecode patch.
+are refused with <tt>LUAJIT_INT3_UNARMABLE</tt>. A <tt>JMP</tt> slot that the
+preceding comparison or test (<tt>ISLT</tt>..<tt>ISF</tt>) consumes is refused
+as well: the comparison branches over that slot, so it is never dispatched on
+its own and a trap there could never fire. <tt>RETM</tt> is not rewritten by
+the tracer and can be armed. Arm the first instruction of the function body or
+of the loop body instead: it delivers the same events and cannot race with a
+bytecode patch.
 </p>
 <p>
-The function returns <tt>LUAJIT_INT3_OK</tt>, <tt>LUAJIT_INT3_DISABLED</tt>
-if no session is owned by this VM, <tt>LUAJIT_INT3_BUSY</tt> if the recorder
-is active, machine code is executing or the context is unsafe,
-<tt>LUAJIT_INT3_FULL</tt> if all <tt>LJ_INT3_MAX</tt> breakpoint slots are in
-use, <tt>LUAJIT_INT3_UNARMABLE</tt> for a slot the JIT rewrites at run time,
-or <tt>LUAJIT_INT3_INVALID</tt> for a non-Lua function or an out-of-range
+The function returns <tt>LUAJIT_INT3_OK</tt> (accepted, mounted now or at the
+next safe point), <tt>LUAJIT_INT3_DISABLED</tt> if no session is owned by this
+VM, <tt>LUAJIT_INT3_BUSY</tt> if a GC, a foreign VM event, the profiler or
+machine code is executing, <tt>LUAJIT_INT3_FULL</tt> if all
+<tt>LJ_INT3_MAX</tt> breakpoint slots are in use,
+<tt>LUAJIT_INT3_UNARMABLE</tt> for a slot the JIT rewrites at run time, or
+<tt>LUAJIT_INT3_INVALID</tt> for a non-Lua function or an out-of-range
 <tt>bcpos</tt>. It may also be called from the breakpoint callback, which then
 arms another slot (or re-arms the slot that is being delivered) while the
 current hit is being delivered.
 </p>
 <p>
 <b><tt>luaJIT_int3_arm</tt> may also be called from a Lua debug hook</b>
-(<tt>lua_sethook</tt>). Inside a hook the breakpoint is planted immediately:
-the instruction the hook belongs to still executes with its own opcode
-exactly once, because the continuation that re-dispatches it takes the
-original instruction from the breakpoint instead of re-reading the bytecode.
-The breakpoint then fires from the next dispatch of that slot on: arming the
+(<tt>lua_sethook</tt>) and from a recorder or trace callback. Inside a hook the
+request is queued and mounted at the end of that dispatch, so the instruction
+the hook belongs to still executes with its own opcode exactly once. The
+breakpoint then fires from the next dispatch of that slot on: arming the
 current slot does not deliver a callback for the execution that is already
 being dispatched, while arming a later slot (or the body of a callee from a
-call hook) fires as soon as execution reaches it. Every other call
-(<tt>luaJIT_int3_start</tt>, <tt>luaJIT_int3_cancel</tt>,
-<tt>luaJIT_int3_stop</tt>) is still refused with <tt>LUAJIT_INT3_BUSY</tt>
-inside a hook, as are the GC, VM event, profiler, recorder and machine-code
-contexts.
+call hook, which mounts at the call dispatch) fires as soon as execution
+reaches it. Every other call (<tt>luaJIT_int3_start</tt>,
+<tt>luaJIT_int3_cancel</tt>, <tt>luaJIT_int3_stop</tt>) is still refused with
+<tt>LUAJIT_INT3_BUSY</tt> inside a hook, as are the GC, profiler, foreign VM
+event and machine-code contexts for arming as well.
 </p>
 <p>
 The callback is invoked once for every execution of the armed instruction,

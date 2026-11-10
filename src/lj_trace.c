@@ -434,6 +434,8 @@ static void trace_start(jit_State *J)
       lj_assertJ(bc_op(ins) == BC_FORL || bc_op(ins) == BC_ITERL ||
 		 bc_op(ins) == BC_LOOP || bc_op(ins) == BC_FUNCF,
 		 "bad hot bytecode %d", bc_op(ins));
+      lj_assertJ(!lj_int3_pending(J2G(J), J->pc),
+		 "patching a trapped slot");
       setbc_op(J->pc, (int)bc_op(ins)+(int)BC_ILOOP-(int)BC_LOOP);
       J->pt->flags |= PROTO_ILOOP;
     }
