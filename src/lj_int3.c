@@ -173,7 +173,7 @@ static void int3_root_set(global_State *g, int i, GCproto *pt)
 {
   GCtab *t = int3_roots(g);
   TValue *tv;
-  lj_assertG(t != NULL && asize(t) > (uint32_t)i, "bad int3 anchor slot");
+  lj_assertG(t != NULL && t->asize > (uint32_t)i, "bad int3 anchor slot");
   tv = &tvref(t->array)[i];
   if (pt != NULL) {
     setgcVraw(tv, obj2gco(pt), LJ_TPROTO);
@@ -775,7 +775,7 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
   ** (marked white) and the array part is cleared to nil.
   */
   roots = lj_tab_new(L, LJ_INT3_MAX, 0);
-  lj_assertG(asize(roots) >= LJ_INT3_MAX, "int3 anchor table too small");
+  lj_assertG(roots->asize >= LJ_INT3_MAX, "int3 anchor table too small");
   setgcref(g->gcroot[GCROOT_INT3], obj2gco(roots));
   /* The JIT engine is not touched: only mounting affects trace state. All
   ** checks are done, so a refused start leaves no state behind. Should the
