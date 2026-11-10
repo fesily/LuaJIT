@@ -112,9 +112,15 @@ LUA_API const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
 ** of the call. The callback is a read-only native observer: it must not run
 ** Lua code or change any interpreter/JIT/hook state, but it may arm (re-arming
 ** the slot that is being delivered is a no-op), cancel or stop the session.
-** The other calls
-** (start, cancel, stop) are refused inside a hook, as is arming inside a GC
-** hook, the profiler, a foreign VM event or running machine code.
+** Starting, cancelling and stopping the session is accepted from a Lua debug
+** hook too: the hook's own dispatch re-reads every slot they touch, so a
+** restored slot simply runs its instruction, and a request queued above mounts
+** at the same safe point. A trap is delivered on the dispatch of its own slot,
+** which happens before the line or count hook of that instruction, so a hook
+** that cancels or stops takes effect from the next dispatch on and cannot
+** suppress a callback that already ran; a slot the hook runs before is
+** preempted. A GC hook, the profiler, a foreign VM event and machine code, a
+** recorder or the compiler still refuse every call with LUAJIT_INT3_BUSY.
 **
 ** A breakpoint keeps its slot, its prototype GC root and the JIT exclusion
 ** until it is explicitly disarmed: luaJIT_int3_cancel() disarms every

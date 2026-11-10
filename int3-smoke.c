@@ -1306,6 +1306,7 @@ static void hook_arm_dispatch(lua_State *L, lua_Debug *ar)
 }
 
 static int flush_start_res, flush_on_res, flush_arm_res, flush_eng_on_res;
+static int flush_cancel_res, flush_stop_res;
 static int flush_probe(lua_State *L)
 {
   flush_start_res = luaJIT_int3_start(L, int3_cb, &probe_rec);
@@ -1314,6 +1315,8 @@ static int flush_probe(lua_State *L)
   flush_on_res = luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_ON);
   lua_pop(L, 1);
   flush_arm_res = luaJIT_int3_arm_bc(L, 0, 0);
+  flush_cancel_res = luaJIT_int3_cancel(L);
+  flush_stop_res = luaJIT_int3_stop(L);
   return 0;
 }
 
@@ -1358,7 +1361,8 @@ static void test_unsafe(void)
   luaL_openlibs(L);
   run(L, "G = {} function G.sum(n) local s=0 for i=1,n do s=s+i end return s end");
   CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
-  /* Inside a Lua hook the interrupt API must refuse to change state. */
+  /* A session already owns the process, so a second start is refused even
+  ** from the hook (see [23] for a start that a hook is allowed to make). */
   hook_start_res = -1;
   lua_sethook(L, start_in_hook, LUA_MASKCOUNT, 1);
   run(L, "local x = 0 for i = 1, 2000 do x = x + i end return x");
@@ -1378,6 +1382,7 @@ static void test_unsafe(void)
   attach_probe(L, lua_gettop(L), "trace", "flush");
   lua_pop(L, 1);
   flush_start_res = flush_on_res = flush_arm_res = flush_eng_on_res = -1;
+  flush_cancel_res = flush_stop_res = -1;
   run(L, "jit.flush()");
   printf("[8] flush vmevent: start=%d on=%d arm=%d eng_on=%d\n",
 	 flush_start_res, flush_on_res, flush_arm_res, flush_eng_on_res);
@@ -1385,6 +1390,8 @@ static void test_unsafe(void)
   CHECK(flush_on_res == 0);           /* The armed prototype stays NOJIT. */
   CHECK(flush_arm_res == LUAJIT_INT3_BUSY);
   CHECK(flush_eng_on_res == 1);       /* The engine is not ours to gate. */
+  CHECK(flush_cancel_res == LUAJIT_INT3_BUSY);
+  CHECK(flush_stop_res == LUAJIT_INT3_BUSY);
   /* The session is still fully usable: the breakpoint survived the flush. */
   rec.calls = 0;
   CHECK(run_number(L, "return G.sum(100)", &v) && v == 5050);
@@ -1467,6 +1474,7 @@ static void test_unsafe(void)
   attach_probe(L, lua_gettop(L), "trace", "flush");
   lua_pop(L, 1);
   flush_start_res = flush_on_res = flush_arm_res = flush_eng_on_res = -1;
+  flush_cancel_res = flush_stop_res = -1;
   {
     int traces = trace_count(L);
     CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
@@ -3106,6 +3114,156 @@ static void test_arm_by_line(void)
 }
 #endif  /* !SMOKE_NO_PROFILE */
 
+/* -- [23] Session control from a Lua debug hook -------------------------- */
+
+#if !defined(SMOKE_NO_PROFILE)
+static int hookctl_res, hookctl_arm_res, hookctl_done;
+static Int3Rec hookctl_rec;
+
+/* Run the hook body only inside G.h, so the call is deterministic: every
+** scenario installs a line hook, and its first events belong to the chunk that
+** calls the function.
+*/
+static int hookctl_enter(lua_State *L, lua_Debug *ar)
+{
+  lua_Debug info = *ar;
+  if (hookctl_done) return 0;
+  if (!lua_getinfo(L, "f", &info)) return 0;	/* Pushes the running function. */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "h");
+  if (!lua_rawequal(L, -3, -1)) {
+    lua_pop(L, 3);
+    return 0;
+  }
+  lua_pop(L, 2);				/* G, G.h. */
+  hookctl_done = 1;
+  return 1;
+}
+
+static void hookctl_cancel_hook(lua_State *L, lua_Debug *ar)
+{
+  if (!hookctl_enter(L, ar)) return;
+  hookctl_res = luaJIT_int3_cancel(L);
+  lua_pop(L, 1);
+}
+
+static void hookctl_stop_hook(lua_State *L, lua_Debug *ar)
+{
+  if (!hookctl_enter(L, ar)) return;
+  hookctl_res = luaJIT_int3_stop(L);
+  lua_pop(L, 1);
+}
+
+static void hookctl_start_hook(lua_State *L, lua_Debug *ar)
+{
+  if (!hookctl_enter(L, ar)) return;
+  hookctl_res = luaJIT_int3_start(L, int3_cb, &hookctl_rec);
+  if (hookctl_res == LUAJIT_INT3_OK)
+    hookctl_arm_res = luaJIT_int3_arm_bc(L, -1, 1);	/* First body slot. */
+  lua_pop(L, 1);
+}
+
+static void test_hook_control(void)
+{
+  lua_State *L;
+  Int3Rec rec;
+  double v;
+  int bcpos = -1;
+
+  /* A trap is delivered on the dispatch entry of its slot, i.e. before the
+  ** line hook of the instruction it belongs to: cancelling from that hook
+  ** cannot suppress the callback that already ran, but it takes effect for
+  ** every later dispatch, and for a slot that has not been reached yet.
+  */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {}\n"
+	 "function G.h(x) local a = x + 1 local b = a + 2 return b end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot_n(L, "G", "h", "ADDVN", 0, &bcpos) == 0);
+  rec.calls = 0;
+  hookctl_res = -1;
+  hookctl_done = 0;
+  lua_sethook(L, hookctl_cancel_hook, LUA_MASKLINE, 0);
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 4);
+  lua_sethook(L, NULL, 0, 0);
+  printf("[23] cancel in hook: res=%d hits=%d value=%g\n",
+	 hookctl_res, rec.calls, v);
+  CHECK(hookctl_res == LUAJIT_INT3_OK);
+  CHECK(rec.calls == 1);	/* Trap delivered before the line hook. */
+  /* Cancelled: the session lives on, nothing is armed, no more hits. */
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 4);
+  CHECK(rec.calls == 1);
+  /* A slot the hook reaches before its dispatch is preempted. */
+  CHECK(arm_slot_n(L, "G", "h", "ADDVN", 1, &bcpos) == 0);
+  hookctl_res = -1;
+  hookctl_done = 0;
+  lua_sethook(L, hookctl_cancel_hook, LUA_MASKLINE, 0);
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 4);
+  lua_sethook(L, NULL, 0, 0);
+  printf("[23] cancel before the slot: res=%d hits=%d\n",
+	 hookctl_res, rec.calls);
+  CHECK(hookctl_res == LUAJIT_INT3_OK);
+  CHECK(rec.calls == 1);	/* Slot 1 ran untrapped: no new hit. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+
+  /* Stop from a hook: the session is released inside the hook, the slot that
+  ** has not been reached yet is restored before its dispatch, and the API
+  ** reports DISABLED afterwards.
+  */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  run(L, "G = {}\n"
+	 "function G.h(x) local a = x + 1 local b = a + 2 return b end");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(arm_slot_n(L, "G", "h", "ADDVN", 1, &bcpos) == 0);
+  rec.calls = 0;
+  hookctl_res = -1;
+  hookctl_done = 0;
+  lua_sethook(L, hookctl_stop_hook, LUA_MASKLINE, 0);
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 4);
+  lua_sethook(L, NULL, 0, 0);
+  printf("[23] stop in hook: res=%d hits=%d value=%g\n",
+	 hookctl_res, rec.calls, v);
+  CHECK(hookctl_res == LUAJIT_INT3_OK);
+  CHECK(rec.calls == 0);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "h");
+  CHECK(luaJIT_int3_arm_bc(L, -1, 1) == LUAJIT_INT3_DISABLED);
+  lua_pop(L, 2);
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+
+  /* Start and arm from a hook without a session: both are accepted, the
+  ** request mounts at the next safe point, so the instruction that is being
+  ** dispatched right now still runs untrapped and the next call hits.
+  */
+  L = luaL_newstate();
+  memset(&rec, 0, sizeof(rec));
+  memset(&hookctl_rec, 0, sizeof(hookctl_rec));
+  luaL_openlibs(L);
+  run(L, "G = {} function G.h(x) local a = x + 1 return a end");
+  hookctl_res = hookctl_arm_res = -1;
+  hookctl_done = 0;
+  lua_sethook(L, hookctl_start_hook, LUA_MASKLINE, 0);
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 2);
+  printf("[23] start+arm in hook: start=%d arm=%d hits=%d\n",
+	 hookctl_res, hookctl_arm_res, hookctl_rec.calls);
+  CHECK(hookctl_res == LUAJIT_INT3_OK);
+  CHECK(hookctl_arm_res == LUAJIT_INT3_OK);
+  CHECK(hookctl_rec.calls == 0);	/* The current dispatch is untrapped. */
+  CHECK(run_number(L, "return G.h(1)", &v) && v == 2);
+  lua_sethook(L, NULL, 0, 0);
+  CHECK(hookctl_rec.calls == 1);	/* Mounted at the next safe point. */
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
 /* -- [16] Automatic deferred mounting ------------------------------------ */
 
 #if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
@@ -3366,6 +3524,7 @@ int main(int argc, char **argv)
   if (!only || only == 20) test_loop_slots();
   if (!only || only == 21) test_callback_func();
   if (!only || only == 22) test_arm_by_line();
+  if (!only || only == 23) test_hook_control();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -3397,6 +3556,7 @@ int main(int argc, char **argv)
   if (!only || only == 20) test_loop_slots();
   if (!only || only == 21) test_callback_func();
   if (!only || only == 22) test_arm_by_line();
+  if (!only || only == 23) test_hook_control();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

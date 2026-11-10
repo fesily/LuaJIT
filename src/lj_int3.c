@@ -257,14 +257,6 @@ static int int3_paired_jump(global_State *g, GCproto *pt, BCIns ins,
   return prev >= BC_ISLT && prev <= BC_ISF;
 }
 
-/* Unsafe context flags, one bit per condition. Arming is allowed from a Lua
-** debug hook and from the recorder/compiler, every other operation treats all
-** of them as fatal.
-*/
-#define INT3_CTX_HOOK		0x01	/* Inside a Lua debug hook. */
-#define INT3_CTX_HARD		0x02	/* GC hook, VM event or profiler. */
-#define INT3_CTX_VMSTATE	0x04	/* Machine code, recording or compiling. */
-
 /* Non-zero while the recorder, the optimizing compiler or the assembler is
 ** running. A VM event emitted from this code is its own bookkeeping and may
 ** accept a pending request. The state machine covers the events that are sent
@@ -284,37 +276,32 @@ static LJ_AINLINE int int3_recording(global_State *g)
 #endif
 }
 
-/* Classify the context of the interrupting thread. Our own callback delivery
-** masks the VM event it raises and switches the VM state to C, so those two
-** are self-inflicted and must not be classified.
+/* Non-zero if the context forbids changing the breakpoint set: a GC or
+** profiler hook, a foreign VM event, or machine code, a recorder or the
+** compiler.
+**
+** Our own callback delivery masks the VM event it raises and switches the VM
+** state to C, so those two are self-inflicted and are not classified. Neither
+** is a Lua debug hook: starting a session only allocates, and cancelling or
+** stopping restores slots and JIT flags that the hook's own dispatch re-reads
+** afterwards, while the dispatch update they need is the same call
+** lua_sethook() makes when Lua code resets a hook from inside a hook.
 */
-static int int3_context(global_State *g)
+static int int3_locked(global_State *g)
 {
   uint32_t hooks = g->hookmask & (HOOK_ACTIVE|HOOK_GC|HOOK_VMEVENT|HOOK_PROFILE);
-  int ctx = 0;
   if (int3_delivering(g)) hooks &= ~(uint32_t)HOOK_VMEVENT;
-  if (hooks & HOOK_ACTIVE) ctx |= INT3_CTX_HOOK;
-  /* A GC hook sets HOOK_ACTIVE, too, so this is the hard subset. */
-  if (hooks & (HOOK_GC|HOOK_VMEVENT|HOOK_PROFILE)) ctx |= INT3_CTX_HARD;
+  /* A GC hook sets HOOK_ACTIVE, too, so this test covers both. */
+  if (hooks & (HOOK_GC|HOOK_VMEVENT|HOOK_PROFILE)) return 1;
 #if LJ_HASJIT
   {
     int vmst = g->vmstate;
     if (vmst == ~LJ_VMST_EXIT || vmst == ~LJ_VMST_RECORD ||
 	vmst == ~LJ_VMST_OPT || vmst == ~LJ_VMST_ASM)
-      ctx |= INT3_CTX_VMSTATE;  /* Machine code, recording or compiling. */
+      return 1;  /* Machine code, recording or compiling. */
   }
 #endif
-  return ctx;
-}
-
-/* Reject unsafe contexts: GC, a foreign hook or VM event, a profiler
-** callback, the recorder, the compiler or running machine code. Our own
-** callback delivery is a safe context: it only allows one operation at a time
-** and lj_int3_hit() re-establishes the VM context around it.
-*/
-static int int3_unsafe(global_State *g)
-{
-  return int3_context(g) != 0;
+  return 0;
 }
 
 /* How arm() may treat its calling context. */
@@ -353,7 +340,7 @@ static int int3_arm_context(global_State *g)
 */
 static int int3_commit_ready(global_State *g)
 {
-  if (int3_context(g) & (INT3_CTX_HARD|INT3_CTX_VMSTATE)) return 0;
+  if (int3_locked(g)) return 0;
 #if LJ_HASJIT
   {
     jit_State *J = G2J(g);
@@ -776,7 +763,7 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
   if (cb == NULL) return LUAJIT_INT3_INVALID;
   if (g->int3 != NULL || int3_sessions != 0) return LUAJIT_INT3_BUSY;
   if (lj_profile_active()) return LUAJIT_INT3_BUSY;  /* Profiler in use. */
-  if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
+  if (int3_locked(g)) return LUAJIT_INT3_BUSY;
   /* One anchor table per session: one array slot per request, mounted under
   ** the single root before a request can exist. NOBARRIER: the table is new
   ** (marked white) and the array part is cleared to nil.
@@ -932,7 +919,7 @@ LUA_API int luaJIT_int3_cancel(lua_State *L)
   Int3State *st = g->int3;
   int pending;
   if (st == NULL) return LUAJIT_INT3_OK;  /* Nothing to cancel. */
-  if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
+  if (int3_locked(g)) return LUAJIT_INT3_BUSY;
   pending = st->npending;
   int3_cancel_all(g);  /* The prototypes become compilable again. */
   if (pending != 0) lj_dispatch_update(g, 0);
@@ -945,7 +932,7 @@ LUA_API int luaJIT_int3_stop(lua_State *L)
   Int3State *st = g->int3;
   int pending;
   if (st == NULL) return LUAJIT_INT3_OK;  /* No session in this VM. */
-  if (int3_unsafe(g)) return LUAJIT_INT3_BUSY;
+  if (int3_locked(g)) return LUAJIT_INT3_BUSY;
   pending = st->npending;
   int3_cancel_all(g);
   /* Every anchor slot was cleared by the cancel above; release the table. */

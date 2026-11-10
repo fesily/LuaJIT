@@ -319,10 +319,16 @@ breakpoint then fires from the next dispatch of that slot on: arming the
 current slot does not deliver a callback for the execution that is already
 being dispatched, while arming a later slot (or the body of a callee from a
 call hook, which mounts at the call dispatch) fires as soon as execution
-reaches it. Every other call (<tt>luaJIT_int3_start</tt>,
-<tt>luaJIT_int3_cancel</tt>, <tt>luaJIT_int3_stop</tt>) is still refused with
-<tt>LUAJIT_INT3_BUSY</tt> inside a hook, as are the GC, profiler, foreign VM
-event and machine-code contexts for arming as well.
+reaches it. <tt>luaJIT_int3_start</tt>, <tt>luaJIT_int3_cancel</tt> and
+<tt>luaJIT_int3_stop</tt> are accepted from a Lua debug hook as well: that
+hook's own dispatch re-reads every slot they touch, so a restored slot simply
+runs its instruction, and a request armed above mounts at the same safe point.
+A trap is delivered on the dispatch of its own slot, which happens before the
+line or count hook of that instruction, so a hook that cancels or stops takes
+effect from the next dispatch on and cannot suppress a callback that already
+ran, while a slot the hook runs before is preempted. The GC, profiler, foreign
+VM event and machine-code/recorder/compiler contexts still refuse every call
+with <tt>LUAJIT_INT3_BUSY</tt>.
 </p>
 <p>
 The callback is invoked once for every execution of the armed instruction,
