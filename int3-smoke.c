@@ -3000,66 +3000,101 @@ static void test_arm_by_line(void)
   lua_State *L = luaL_newstate();
   Int3Rec rec;
   double v;
-  int bcpos;
+  int bcpos, isnext;
   memset(&rec, 0, sizeof(rec));
   luaL_openlibs(L);
-  /* Lines of this chunk: 1 G={}, 2 G.multi, 3 G.genfor, 4-7 G.two(x). */
+  /* Lines of this chunk: 1 G={}, 2-5 G.hdr(x), 6 G.multi, 7 G.genfor,
+  ** 8 G.strip, 9 G.stripped.
+  */
   run(L,
     "G = {}\n"
+    "function G.hdr(x)\n"
+    "  local a = x + 1\n"
+    "  return a * 2\n"
+    "end\n"
     "function G.multi(x) local a = x + 1 local b = a + 1 return b end\n"
     "function G.genfor(t) local s = 0 for k, x in next, t do s = s + x end "
     "return s end\n"
-    "function G.two(x)\n"
-    "  local a = x + 1\n"
-    "  return a * 2\n"
-    "end\n");
+    "function G.strip(x) return x + 1 end\n"
+    "G.stripped = assert(loadstring(string.dump(G.strip, true)))\n");
   CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
 
-  /* Several slots on one line: the first body slot, not the function header
-  ** (which shares the line but is not a slot).
+  /* Several slots on one line: the first body slot. The function header sits
+  ** on the same line (it shares linedefined) but is never a slot, so a scan
+  ** that started at slot 0 would arm it and fail with UNARMABLE.
   */
   bcpos = find_bcpos_n(L, "G.multi", "ADDVN", 0);
   CHECK(bcpos == 1);
   lua_getglobal(L, "G");
   lua_getfield(L, -1, "multi");
-  CHECK(luaJIT_int3_arm(L, -1, 2) == LUAJIT_INT3_OK);
-  CHECK(luaJIT_int3_arm(L, -1, 99) == LUAJIT_INT3_NOTFOUND);  /* No code. */
+  CHECK(luaJIT_int3_arm(L, -1, 6) == LUAJIT_INT3_OK);
   lua_pop(L, 2);
   rec.calls = 0;
   CHECK(run_number(L, "return G.multi(5)", &v) && v == 7);
-  printf("[22] line 2: hits=%d value=%g bcpos=%d\n", rec.calls, v, bcpos);
+  printf("[22] line 6: hits=%d value=%g bcpos=%d\n", rec.calls, v, bcpos);
   CHECK(rec.calls == 1);
   CHECK((int)rec.bcpos == bcpos);
   CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
 
-  /* A line whose first instructions are not slots: the prep pair ISNEXT and
-  ** the ITERN it points at are skipped, so the KSHORT body slot is armed.
+  /* A line that only holds the function header has no slot, and neither has a
+  ** line without code.
   */
   lua_getglobal(L, "G");
-  lua_getfield(L, -1, "genfor");
+  lua_getfield(L, -1, "hdr");
+  CHECK(luaJIT_int3_arm(L, -1, 2) == LUAJIT_INT3_NOTFOUND);	/* Header only. */
+  CHECK(luaJIT_int3_arm(L, -1, 99) == LUAJIT_INT3_NOTFOUND);	/* No code. */
   CHECK(luaJIT_int3_arm(L, -1, 3) == LUAJIT_INT3_OK);
   lua_pop(L, 2);
   rec.calls = 0;
-  CHECK(run_number(L, "return G.genfor({a=1,b=2,c=3})", &v) && v == 6);
-  printf("[22] line 3 (ISNEXT skipped): hits=%d value=%g\n", rec.calls, v);
-  CHECK(rec.calls == 1);		/* KSHORT runs once per call. */
+  CHECK(run_number(L, "return G.hdr(3)", &v) && v == 8);
+  printf("[22] line 3 (body of hdr): hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 1);
   CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
 
-  /* Each line of a multi-line function resolves to its own first slot. */
-  {
-    int a1 = find_bcpos_n(L, "G.two", "ADDVN", 0);
-    int m1 = find_bcpos_n(L, "G.two", "MULVN", 0);
-    CHECK(a1 > 0 && m1 > a1);
-    lua_getglobal(L, "G");
-    lua_getfield(L, -1, "two");
-    CHECK(luaJIT_int3_arm(L, -1, 6) == LUAJIT_INT3_OK);	/* return line */
-    lua_pop(L, 2);
-    rec.calls = 0;
-    CHECK(run_number(L, "return G.two(3)", &v) && v == 8);
-    CHECK(rec.calls == 1);
-    CHECK((int)rec.bcpos == m1);
-    CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
-  }
+  /* A single-line generic-for: the prep pair (ISNEXT and the ITERN slot it
+  ** points at) cannot carry a trap (refused below), so the earliest slot the
+  ** line entry point can arm is the pre-loop KSHORT, once per call. The same
+  ** line also proves the scan keeps bytecode order: a later slot is not chosen.
+  */
+  isnext = find_bcpos_n(L, "G.genfor", "ISNEXT", 0);
+  bcpos = find_bcpos_n(L, "G.genfor", "KSHORT", 0);
+  CHECK(bcpos > 0 && isnext > bcpos);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "genfor");
+  CHECK(luaJIT_int3_arm_bc(L, -1, isnext) == LUAJIT_INT3_UNARMABLE);
+  CHECK(luaJIT_int3_arm(L, -1, 7) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.genfor({a=1,b=2,c=3})", &v) && v == 6);
+  printf("[22] line 7 (ISNEXT at %d refused): hits=%d value=%g bcpos=%d\n",
+	 isnext, rec.calls, v, (int)rec.bcpos);
+  CHECK(rec.calls == 1);
+  CHECK((int)rec.bcpos == bcpos);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* A stripped chunk carries no line map: every slot reports line 0, which is
+  ** the debug interface's "no line information", not a source line. The line
+  ** entry point must find nothing and arm nothing; the slot entry point still
+  ** works, because it needs no line info.
+  */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "stripped");
+  CHECK(luaJIT_int3_arm(L, -1, 0) == LUAJIT_INT3_NOTFOUND);
+  CHECK(luaJIT_int3_arm(L, -1, 1) == LUAJIT_INT3_NOTFOUND);
+  lua_pop(L, 2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.stripped(1)", &v) && v == 2);
+  printf("[22] stripped line 0/1: hits=%d (nothing armed)\n", rec.calls);
+  CHECK(rec.calls == 0);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "stripped");
+  CHECK(luaJIT_int3_arm_bc(L, -1, 1) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.stripped(1)", &v) && v == 2);
+  CHECK(rec.calls == 1);
+  CHECK((int)rec.bcpos == 1);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
 
   /* A C function has no bytecode: both entry points refuse it. */
   lua_getglobal(L, "print");

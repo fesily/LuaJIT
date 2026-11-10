@@ -231,7 +231,10 @@ The line entry point resolves the first slot of that line that can carry a
 trap, in bytecode order, starting after the function header (it shares the line
 of the first body statement and is never a slot): instructions that cannot be
 trapped are skipped, so a one-line loop still yields a slot, and a line without
-one returns <tt>LUAJIT_INT3_NOTFOUND</tt>. A debugger that needs an exact slot,
+one returns <tt>LUAJIT_INT3_NOTFOUND</tt>. A prototype with no line information
+(a stripped bytecode chunk) reports line 0 for every slot: line 0 is not a
+source line, so such a request also returns <tt>LUAJIT_INT3_NOTFOUND</tt> and
+arms nothing; <tt>luaJIT_int3_arm_bc</tt> still works for those chunks. A debugger that needs an exact slot,
 or that maps its breakpoints itself (the slot numbering of a prototype follows
 from its bytecode, so code minified onto a single line cannot be addressed by
 line alone), uses <tt>luaJIT_int3_arm_bc</tt>.

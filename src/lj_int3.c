@@ -851,6 +851,11 @@ int lj_int3_arm(global_State *g, GCproto *pt, BCPos bcpos)
 static BCPos int3_line_site(global_State *g, GCproto *pt, BCLine line)
 {
   BCPos bcpos;
+  /* Line 0 is what the debug interface reports when a prototype carries no
+  ** line map, i.e. a stripped bytecode chunk. It is not a source line, so a
+  ** request for it must not decay into "the first slot of the function".
+  */
+  if (line <= 0 || proto_lineinfo(pt) == NULL) return LJ_INT3_NO_BCPOS;
   for (bcpos = 1; bcpos < pt->sizebc; bcpos++) {
     BCIns ins;
     if (lj_debug_line(pt, bcpos) != line) continue;
@@ -901,6 +906,8 @@ LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line)
   BCPos bcpos;
   int res = int3_public_proto(L, g, func_index, &pt);
   if (res != LUAJIT_INT3_OK) return res;
+  /* A source line is 1-based and fits a signed 32-bit BCLine. */
+  if (line == 0 || line > 0x7fffffffu) return LUAJIT_INT3_NOTFOUND;
   bcpos = int3_line_site(g, pt, (BCLine)line);
   if (bcpos == LJ_INT3_NO_BCPOS) return LUAJIT_INT3_NOTFOUND;
   return lj_int3_arm(g, pt, bcpos);

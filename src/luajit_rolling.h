@@ -143,7 +143,9 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 			      void *data);
 /* Arm the first breakpoint slot of source line `line` (1-based, as the debug
 ** interface reports it) of the Lua function at stack index func_index. Returns
-** LUAJIT_INT3_NOTFOUND when the line carries no breakpoint slot.
+** LUAJIT_INT3_NOTFOUND when the line carries no breakpoint slot, and when the
+** prototype has no line information at all (a stripped bytecode chunk): line 0
+** is the debug interface's "no line information", not a source line.
 */
 LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line);
 /* Arm the bytecode slot at bcpos (0-based, bcpos < sizebc) of the Lua function
