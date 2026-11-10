@@ -12,6 +12,7 @@
 #include "lj_frame.h"
 #include "lj_func.h"
 #include "lj_gc.h"	/* lj_mem_newt/lj_mem_freet */
+#include "lj_debug.h"	/* lj_debug_line */
 #include "lj_tab.h"
 #include "lj_dispatch.h"
 #include "lj_int3.h"
@@ -591,10 +592,9 @@ static void int3_mount_owner(global_State *g, Int3Owner *o)
 }
 
 /* Mount every pending request if this is a safe point. */
-void lj_int3_commit(lua_State *L)
+void lj_int3_commit(global_State *g)
 {
-  Int3State *st = G(L)->int3;
-  global_State *g = G(L);
+  Int3State *st = g->int3;
   int i;
   if (st == NULL || st->state != INT3_ENABLED || st->npending == 0) return;
   if (!int3_commit_ready(g)) return;
@@ -818,33 +818,105 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 ** and the GC, profiler, foreign VM event and machine-code contexts are
 ** refused for arming as well.
 */
-LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos)
+int lj_int3_arm(global_State *g, GCproto *pt, BCPos bcpos)
 {
-  Int3State *st = G(L)->int3;
-  global_State *g = G(L);
-  GCfunc *fn;
-  GCproto *pt;
+  Int3State *st = g->int3;
   BCIns ins;
   int ctx;
   if (st == NULL || st->state != INT3_ENABLED) return LUAJIT_INT3_DISABLED;
   ctx = int3_arm_context(g);
   if (ctx == INT3_ARM_BUSY) return LUAJIT_INT3_BUSY;
+  if (bcpos >= pt->sizebc) return LUAJIT_INT3_INVALID;
+  ins = lj_int3_bcins(g, &proto_bc(pt)[bcpos]);
+  if (int3_mutable_op(bc_op(ins)) ||
+      int3_paired_jump(g, pt, ins, bcpos))
+    return LUAJIT_INT3_UNARMABLE;
+  {
+    int res = int3_arm_request(g, pt, bcpos);
+    if (res == LUAJIT_INT3_OK && ctx == INT3_ARM_SAFE)
+      lj_int3_commit(g);  /* Mount right away if this is a safe point. */
+    return res;
+  }
+}
+
+/* The slot luaJIT_int3_arm() arms for a source line, or LJ_INT3_NO_BCPOS.
+**
+** The first slot of the line that can carry a trap, in bytecode order. The
+** scan starts after the function header: its line is linedefined, i.e. it
+** shares the line of the first body statement, and the header is never a
+** site. Instructions that are not sites (see int3_mutable_op() and
+** int3_paired_jump()) are skipped, so a one-line loop still yields a slot.
+*/
+#define LJ_INT3_NO_BCPOS	(~(BCPos)0)
+static BCPos int3_line_site(global_State *g, GCproto *pt, BCLine line)
+{
+  BCPos bcpos;
+  for (bcpos = 1; bcpos < pt->sizebc; bcpos++) {
+    BCIns ins;
+    if (lj_debug_line(pt, bcpos) != line) continue;
+    ins = lj_int3_bcins(g, &proto_bc(pt)[bcpos]);
+    if (int3_mutable_op(bc_op(ins)) ||
+	int3_paired_jump(g, pt, ins, bcpos))
+      continue;
+    return bcpos;
+  }
+  return LJ_INT3_NO_BCPOS;
+}
+
+/* Resolve the closure at func_index to its prototype. A GCproto is
+** deliberately not a public identity: the public entry points take a function
+** index, and every prototype-based arm goes through lj_int3_arm().
+*/
+static int int3_public_proto(lua_State *L, global_State *g, int func_index,
+			     GCproto **ptp)
+{
+  Int3State *st = g->int3;
+  GCfunc *fn;
+  if (st == NULL || st->state != INT3_ENABLED) return LUAJIT_INT3_DISABLED;
+  /* The context is checked first, so an unsafe caller gets BUSY, never
+  ** INVALID, whatever it passed.
+  */
+  if (int3_arm_context(g) == INT3_ARM_BUSY) return LUAJIT_INT3_BUSY;
   if (lua_type(L, func_index) != LUA_TFUNCTION)
     return LUAJIT_INT3_INVALID;
   fn = (GCfunc *)lua_topointer(L, func_index);  /* GCfunc sits at GCobj. */
   if (fn == NULL || !isluafunc(fn)) return LUAJIT_INT3_INVALID;
-  pt = funcproto(fn);
-  if (bcpos >= pt->sizebc) return LUAJIT_INT3_INVALID;
-  ins = lj_int3_bcins(g, &proto_bc(pt)[bcpos]);
-  if (int3_mutable_op(bc_op(ins)) ||
-      int3_paired_jump(g, pt, ins, (BCPos)bcpos))
-    return LUAJIT_INT3_UNARMABLE;
-  {
-    int res = int3_arm_request(g, pt, (BCPos)bcpos);
-    if (res == LUAJIT_INT3_OK && ctx == INT3_ARM_SAFE)
-      lj_int3_commit(L);  /* Mount right away if this is a safe point. */
-    return res;
-  }
+  *ptp = funcproto(fn);
+  return LUAJIT_INT3_OK;
+}
+
+/* Arm the first breakpoint slot of source line `line` (1-based, as the debug
+** interface reports it) of the Lua function at stack index func_index.
+**
+** This is the convenience entry point for source-level callers. A debugger
+** that needs an exact slot, or that maps its breakpoints itself, uses
+** luaJIT_int3_arm_bc(): the slot numbering of a prototype follows from its
+** bytecode, so code that is minified onto one line cannot be addressed by
+** line alone.
+*/
+LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line)
+{
+  global_State *g = G(L);
+  GCproto *pt;
+  BCPos bcpos;
+  int res = int3_public_proto(L, g, func_index, &pt);
+  if (res != LUAJIT_INT3_OK) return res;
+  bcpos = int3_line_site(g, pt, (BCLine)line);
+  if (bcpos == LJ_INT3_NO_BCPOS) return LUAJIT_INT3_NOTFOUND;
+  return lj_int3_arm(g, pt, bcpos);
+}
+
+/* Arm the bytecode slot at bcpos (0-based, bcpos < sizebc): the identity the
+** callback reports.
+*/
+LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
+			       unsigned int bcpos)
+{
+  global_State *g = G(L);
+  GCproto *pt;
+  int res = int3_public_proto(L, g, func_index, &pt);
+  if (res != LUAJIT_INT3_OK) return res;
+  return lj_int3_arm(g, pt, (BCPos)bcpos);
 }
 
 LUA_API int luaJIT_int3_cancel(lua_State *L)
@@ -891,9 +963,15 @@ int lj_int3_has_pending(global_State *g)
   return 0;
 }
 
-void lj_int3_commit(lua_State *L)
+void lj_int3_commit(global_State *g)
 {
-  UNUSED(L);
+  UNUSED(g);
+}
+
+int lj_int3_arm(global_State *g, GCproto *pt, BCPos bcpos)
+{
+  UNUSED(g); UNUSED(pt); UNUSED(bcpos);
+  return LUAJIT_INT3_UNAVAILABLE;
 }
 
 BCIns lj_int3_bcins(global_State *g, const BCIns *pc)
@@ -954,7 +1032,14 @@ LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
   return LUAJIT_INT3_UNAVAILABLE;
 }
 
-LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos)
+LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line)
+{
+  UNUSED(L); UNUSED(func_index); UNUSED(line);
+  return LUAJIT_INT3_UNAVAILABLE;
+}
+
+LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
+			       unsigned int bcpos)
 {
   UNUSED(L); UNUSED(func_index); UNUSED(bcpos);
   return LUAJIT_INT3_UNAVAILABLE;

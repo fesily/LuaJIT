@@ -507,7 +507,7 @@ void LJ_FASTCALL lj_dispatch_ins(lua_State *L, const BCIns *pc)
       bc_isret(bc_op(disp_ins(g, pt, pc-1))))
     callhook(L, LUA_HOOKRET, -1);
   /* Mount pending requests at this safe point, after the hook work. */
-  lj_int3_commit(L);
+  lj_int3_commit(g);
   ERRNO_RESTORE
 }
 
@@ -577,7 +577,7 @@ out:
   /* Mount pending requests before the header is read, so a breakpoint armed
   ** from a call hook fires on the first execution of the callee.
   */
-  lj_int3_commit(L);
+  lj_int3_commit(g);
   /* No trapped header can reach this point: function headers are not
   ** armable, see int3_mutable_op().
   */

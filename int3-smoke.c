@@ -342,7 +342,7 @@ static int arm_slot_n(lua_State *L, const char *tbl, const char *fname,
   }
   lua_getglobal(L, tbl);
   lua_getfield(L, -1, fname);
-  res = luaJIT_int3_arm(L, -1, (unsigned int)bcpos);
+  res = luaJIT_int3_arm_bc(L, -1, (unsigned int)bcpos);
   lua_pop(L, 2);
   if (res != LUAJIT_INT3_OK) {
     fprintf(stderr, "FAIL arm %s at %s#%d (%d): %d\n", path, opname, nth,
@@ -380,7 +380,7 @@ static int arm_pos(lua_State *L, const char *tbl, const char *fname,
   int res;
   lua_getglobal(L, tbl);
   lua_getfield(L, -1, fname);
-  res = luaJIT_int3_arm(L, -1, (unsigned int)bcpos);
+  res = luaJIT_int3_arm_bc(L, -1, (unsigned int)bcpos);
   lua_pop(L, 2);
   return res;
 }
@@ -397,7 +397,7 @@ static int arm_code(lua_State *L, const char *tbl, const char *fname,
   lua_getglobal(L, tbl);
   lua_getfield(L, -1, fname);
   {
-    int res = luaJIT_int3_arm(L, -1, (unsigned int)bcpos);
+    int res = luaJIT_int3_arm_bc(L, -1, (unsigned int)bcpos);
     lua_pop(L, 2);
     return res;
   }
@@ -1011,7 +1011,7 @@ static void test_gc_and_teardown(void)
   CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
   lua_getglobal(L, "G");
   lua_getfield(L, -1, "probe");
-  CHECK(luaJIT_int3_arm(L, -1, 1) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_arm_bc(L, -1, 1) == LUAJIT_INT3_OK);
   lua_pop(L, 2);
   /* Drop the last Lua reference and collect: only the request holds it. */
   run(L, "G.probe = nil; collectgarbage('collect'); collectgarbage('collect')");
@@ -1281,7 +1281,7 @@ static void hook_arm_reset(const char *func, int bcpos)
 /* Arm G.<func> at hook_arm.bcpos, with the function at funcidx. */
 static void hook_arm_do(lua_State *L, int funcidx)
 {
-  hook_arm.res = luaJIT_int3_arm(L, funcidx, (unsigned int)hook_arm.bcpos);
+  hook_arm.res = luaJIT_int3_arm_bc(L, funcidx, (unsigned int)hook_arm.bcpos);
 }
 
 /* Counted hook: arm G.func once, either at the call of that function
@@ -1313,7 +1313,7 @@ static int flush_probe(lua_State *L)
   lua_getglobal(L, "_PENDING_F");
   flush_on_res = luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC|LUAJIT_MODE_ON);
   lua_pop(L, 1);
-  flush_arm_res = luaJIT_int3_arm(L, 0, 0);
+  flush_arm_res = luaJIT_int3_arm_bc(L, 0, 0);
   return 0;
 }
 
@@ -1341,7 +1341,7 @@ static void selfarm_hook(lua_State *L, lua_Debug *ar)
   lua_sethook(L, NULL, 0, 0);
   lua_getglobal(L, "G");
   lua_getfield(L, -1, selfarm_func);
-  selfarm_res = luaJIT_int3_arm(L, -1, (unsigned int)selfarm_bcpos);
+  selfarm_res = luaJIT_int3_arm_bc(L, -1, (unsigned int)selfarm_bcpos);
   lua_pop(L, 2);
   lua_pushliteral(L, "hook error");
   (void)lua_error(L);
@@ -1652,7 +1652,7 @@ static void hook_arm_error(lua_State *L, lua_Debug *ar)
   lua_getglobal(L, "G");
   lua_getfield(L, -1, "errfunc");
   hook_error_res =
-    luaJIT_int3_arm(L, lua_gettop(L), (unsigned int)hook_error_bcpos);
+    luaJIT_int3_arm_bc(L, lua_gettop(L), (unsigned int)hook_error_bcpos);
   lua_pop(L, 2);
   lua_pushliteral(L, "arm hook error");
   lua_error(L);  /* Unwind the call through lua_pcall. */
@@ -1718,7 +1718,7 @@ typedef struct BpRec {
   /* Actions of the first delivery. */
   int res_arm_bad;		/* arm() with an out-of-range index. */
   int res_arm_self;		/* arm() of the delivering slot. */
-  int res_arm_other;		/* arm() of arm_bcpos of arm_ref. */
+  int res_arm_other;		/* arm() of the other slot of arm_ref. */
   int do_arm_other;
   int arm_ref;			/* Registry reference of that function. */
   unsigned int arm_bcpos;
@@ -1743,15 +1743,15 @@ static void bp_cb(void *data, lua_State *L, const void *func,
     /* The delivery context accepts the breakpoint operations: an out-of-range
     ** index must fail with INVALID instead of the unsafe-context error.
     */
-    r->res_arm_bad = luaJIT_int3_arm(L, 4096, 0);
+    r->res_arm_bad = luaJIT_int3_arm_bc(L, 4096, 0);
     if (r->arm_ref != 0) {
       /* One registry read: the function is already rooted, and no allocation,
       ** GC step or Lua code is involved.
       */
       lua_rawgeti(L, LUA_REGISTRYINDEX, r->arm_ref);
-      r->res_arm_self = luaJIT_int3_arm(L, -1, bcpos);
+      r->res_arm_self = luaJIT_int3_arm_bc(L, -1, bcpos);
       if (r->do_arm_other)
-	r->res_arm_other = luaJIT_int3_arm(L, -1, r->arm_bcpos);
+	r->res_arm_other = luaJIT_int3_arm_bc(L, -1, r->arm_bcpos);
       lua_pop(L, 1);
     }
   }
@@ -1836,7 +1836,7 @@ static void test_permanent(void)
   rec.calls = 0;
   CHECK(run_number(L, "return G.loop(100)", &v) && v == 5050);
   CHECK(rec.calls == 0);	/* Disarmed. */
-  CHECK(luaJIT_int3_arm(L, 1, 0) == LUAJIT_INT3_INVALID);  /* Session open. */
+  CHECK(luaJIT_int3_arm_bc(L, 1, 0) == LUAJIT_INT3_INVALID);  /* Session open. */
 
   /* stop() from the callback: the Nth hit still runs its instruction, so
   ** every side effect of the trapped call happens, and the session is
@@ -1852,7 +1852,7 @@ static void test_permanent(void)
   CHECK(rec.res_stop == LUAJIT_INT3_OK);
   CHECK(v == 50);		/* The loop completed. */
   CHECK(run_number(L, "return N", &v) && v == 50);  /* Every side effect. */
-  CHECK(luaJIT_int3_arm(L, 1, 0) == LUAJIT_INT3_DISABLED);  /* Released. */
+  CHECK(luaJIT_int3_arm_bc(L, 1, 0) == LUAJIT_INT3_DISABLED);  /* Released. */
 
   /* Arming another slot from the callback takes effect at once: the very
   ** next execution of that slot delivers.
@@ -2050,7 +2050,7 @@ static void test_multi(void)
   lua_getfield(L, -1, "big");
   narmed = 0;
   for (i = 0; i < 200; i++) {
-    res = luaJIT_int3_arm(L, -1, (unsigned int)i);
+    res = luaJIT_int3_arm_bc(L, -1, (unsigned int)i);
     if (res == LUAJIT_INT3_FULL) break;
     if (res == LUAJIT_INT3_OK) narmed++;
     else if (res != LUAJIT_INT3_UNARMABLE)	/* Header slot. */
@@ -2085,7 +2085,7 @@ static void test_multi(void)
 #endif
   lua_getglobal(L, "G");
   lua_getfield(L, -1, "big");
-  CHECK(luaJIT_int3_arm(L, -1, 1) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_arm_bc(L, -1, 1) == LUAJIT_INT3_OK);
   lua_pop(L, 2);
   CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
   lua_close(L);
@@ -2718,7 +2718,7 @@ static void test_errno(void)
   CHECK(luaJIT_int3_start(L, errno_cb, NULL) == LUAJIT_INT3_OK);
   lua_getglobal(L, "E");
   lua_getfield(L, -1, "a");
-  CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_arm_bc(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
   lua_pop(L, 2);
   errno_calls = 0;
   errno = EDOM;
@@ -2757,7 +2757,7 @@ static void close_cb(void *data, lua_State *L, const void *func,
 static int close_finalizer(lua_State *L)
 {
   lua_rawgeti(L, LUA_REGISTRYINDEX, close_ref);
-  close_arm_res = luaJIT_int3_arm(L, -1, close_bcpos);
+  close_arm_res = luaJIT_int3_arm_bc(L, -1, close_bcpos);
   lua_pop(L, 1);
   return 0;
 }
@@ -2782,7 +2782,7 @@ static void test_close_finalizer(void)
   CHECK(luaJIT_int3_start(L, close_cb, NULL) == LUAJIT_INT3_OK);
   lua_getglobal(L, "C");
   lua_getfield(L, -1, "a");
-  CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_arm_bc(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
   close_bcpos = (unsigned int)bcpos;
   close_ref = luaL_ref(L, LUA_REGISTRYINDEX);	/* Pops "a". */
   lua_pop(L, 1);				/* Pops "C". */
@@ -2992,6 +2992,85 @@ static void test_callback_func(void)
 }
 #endif  /* !SMOKE_NO_PROFILE */
 
+/* -- [22] Arming by source line ------------------------------------------ */
+
+#if !defined(SMOKE_NO_PROFILE)
+static void test_arm_by_line(void)
+{
+  lua_State *L = luaL_newstate();
+  Int3Rec rec;
+  double v;
+  int bcpos;
+  memset(&rec, 0, sizeof(rec));
+  luaL_openlibs(L);
+  /* Lines of this chunk: 1 G={}, 2 G.multi, 3 G.genfor, 4-7 G.two(x). */
+  run(L,
+    "G = {}\n"
+    "function G.multi(x) local a = x + 1 local b = a + 1 return b end\n"
+    "function G.genfor(t) local s = 0 for k, x in next, t do s = s + x end "
+    "return s end\n"
+    "function G.two(x)\n"
+    "  local a = x + 1\n"
+    "  return a * 2\n"
+    "end\n");
+  CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_OK);
+
+  /* Several slots on one line: the first body slot, not the function header
+  ** (which shares the line but is not a slot).
+  */
+  bcpos = find_bcpos_n(L, "G.multi", "ADDVN", 0);
+  CHECK(bcpos == 1);
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "multi");
+  CHECK(luaJIT_int3_arm(L, -1, 2) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_arm(L, -1, 99) == LUAJIT_INT3_NOTFOUND);  /* No code. */
+  lua_pop(L, 2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.multi(5)", &v) && v == 7);
+  printf("[22] line 2: hits=%d value=%g bcpos=%d\n", rec.calls, v, bcpos);
+  CHECK(rec.calls == 1);
+  CHECK((int)rec.bcpos == bcpos);
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* A line whose first instructions are not slots: the prep pair ISNEXT and
+  ** the ITERN it points at are skipped, so the KSHORT body slot is armed.
+  */
+  lua_getglobal(L, "G");
+  lua_getfield(L, -1, "genfor");
+  CHECK(luaJIT_int3_arm(L, -1, 3) == LUAJIT_INT3_OK);
+  lua_pop(L, 2);
+  rec.calls = 0;
+  CHECK(run_number(L, "return G.genfor({a=1,b=2,c=3})", &v) && v == 6);
+  printf("[22] line 3 (ISNEXT skipped): hits=%d value=%g\n", rec.calls, v);
+  CHECK(rec.calls == 1);		/* KSHORT runs once per call. */
+  CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+
+  /* Each line of a multi-line function resolves to its own first slot. */
+  {
+    int a1 = find_bcpos_n(L, "G.two", "ADDVN", 0);
+    int m1 = find_bcpos_n(L, "G.two", "MULVN", 0);
+    CHECK(a1 > 0 && m1 > a1);
+    lua_getglobal(L, "G");
+    lua_getfield(L, -1, "two");
+    CHECK(luaJIT_int3_arm(L, -1, 6) == LUAJIT_INT3_OK);	/* return line */
+    lua_pop(L, 2);
+    rec.calls = 0;
+    CHECK(run_number(L, "return G.two(3)", &v) && v == 8);
+    CHECK(rec.calls == 1);
+    CHECK((int)rec.bcpos == m1);
+    CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
+  }
+
+  /* A C function has no bytecode: both entry points refuse it. */
+  lua_getglobal(L, "print");
+  CHECK(luaJIT_int3_arm(L, -1, 1) == LUAJIT_INT3_INVALID);
+  CHECK(luaJIT_int3_arm_bc(L, -1, 1) == LUAJIT_INT3_INVALID);
+  lua_pop(L, 1);
+  CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_OK);
+  lua_close(L);
+}
+#endif  /* !SMOKE_NO_PROFILE */
+
 /* -- [16] Automatic deferred mounting ------------------------------------ */
 
 #if !defined(SMOKE_NO_PROFILE) && !defined(SMOKE_NO_JIT)
@@ -3015,7 +3094,7 @@ static int defer_record_probe(lua_State *L)
     defer_hits_at_arm = defer_rec ? defer_rec->calls : 0;
     lua_getglobal(L, "G");
     lua_getfield(L, -1, defer_func);
-    defer_arm_res = luaJIT_int3_arm(L, -1, (unsigned int)defer_bcpos);
+    defer_arm_res = luaJIT_int3_arm_bc(L, -1, (unsigned int)defer_bcpos);
     if (defer_arm_res == LUAJIT_INT3_OK) {
       /* A pending request has not excluded the prototype from the JIT yet. */
       defer_setmode_res =
@@ -3061,7 +3140,7 @@ static int armc_helper(lua_State *L)
 {
   lua_getglobal(L, "G");
   lua_getfield(L, -1, "a");
-  armc_arm_res = luaJIT_int3_arm(L, -1, (unsigned int)armc_bcpos);
+  armc_arm_res = luaJIT_int3_arm_bc(L, -1, (unsigned int)armc_bcpos);
   lua_pop(L, 2);
   return 0;
 }
@@ -3087,7 +3166,7 @@ static void test_arm_from_c(void)
   CHECK(bcpos >= 0);
   lua_getglobal(L, "G");
   lua_getfield(L, -1, "a");
-  CHECK(luaJIT_int3_arm(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
+  CHECK(luaJIT_int3_arm_bc(L, -1, (unsigned int)bcpos) == LUAJIT_INT3_OK);
   lua_pop(L, 2);
   CHECK(run_number(L, "return G.a(4)", &v) && v == 10);
   CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_OK);
@@ -3191,7 +3270,7 @@ static void test_no_profile_api(void)
   memset(&rec, 0, sizeof(rec));
   luaL_openlibs(L);
   CHECK(luaJIT_int3_start(L, int3_cb, &rec) == LUAJIT_INT3_UNAVAILABLE);
-  CHECK(luaJIT_int3_arm(L, 0, 0) == LUAJIT_INT3_UNAVAILABLE);
+  CHECK(luaJIT_int3_arm_bc(L, 0, 0) == LUAJIT_INT3_UNAVAILABLE);
   CHECK(luaJIT_int3_cancel(L) == LUAJIT_INT3_UNAVAILABLE);
   CHECK(luaJIT_int3_stop(L) == LUAJIT_INT3_UNAVAILABLE);
   CHECK(rec.calls == 0);
@@ -3251,6 +3330,7 @@ int main(int argc, char **argv)
   if (!only || only == 19) test_close_finalizer();
   if (!only || only == 20) test_loop_slots();
   if (!only || only == 21) test_callback_func();
+  if (!only || only == 22) test_arm_by_line();
 #else
   if (!only || only == 1) {
     test_live_jit();
@@ -3281,6 +3361,7 @@ int main(int argc, char **argv)
   if (!only || only == 19) test_close_finalizer();
   if (!only || only == 20) test_loop_slots();
   if (!only || only == 21) test_callback_func();
+  if (!only || only == 22) test_arm_by_line();
 #endif
 #endif
   printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);

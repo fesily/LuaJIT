@@ -17,7 +17,14 @@ LJ_FUNC int lj_int3_has_pending(global_State *g);
 /* Mount every pending request if this is a safe point. Leaf function: no
 ** allocation, no Lua, no GC, no hook delivery.
 */
-LJ_FUNC void lj_int3_commit(lua_State *L);
+LJ_FUNC void lj_int3_commit(global_State *g);
+/* Arm a bytecode slot of a prototype. This is the internal entry point of the
+** module: the public API resolves a function index to its prototype first, and
+** an ABI layer that owns prototype identities (a debugger inside the process)
+** may call it directly. Not LUA_API: a GCproto is deliberately not part of the
+** supported C API surface.
+*/
+LJ_FUNC int lj_int3_arm(global_State *g, GCproto *pt, BCPos bcpos);
 /* Logical view of the bytecode: an armed slot reads and writes as the
 ** original instruction, everything else reads and writes the real slot.
 */

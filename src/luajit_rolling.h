@@ -136,11 +136,24 @@ enum {
   LUAJIT_INT3_DISABLED = 3,	/* No session owned by this VM. */
   LUAJIT_INT3_UNAVAILABLE = 4,	/* Profiling support compiled out. */
   LUAJIT_INT3_FULL = 5,		/* All breakpoint slots are in use. */
-  LUAJIT_INT3_UNARMABLE = 6	/* Slot is rewritten by the JIT or the VM. */
+  LUAJIT_INT3_UNARMABLE = 6,	/* Slot is rewritten by the JIT or the VM. */
+  LUAJIT_INT3_NOTFOUND = 7	/* No breakpoint slot on that source line. */
 };
 LUA_API int luaJIT_int3_start(lua_State *L, luaJIT_int3_callback cb,
 			      void *data);
-LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int bcpos);
+/* Arm the first breakpoint slot of source line `line` (1-based, as the debug
+** interface reports it) of the Lua function at stack index func_index. Returns
+** LUAJIT_INT3_NOTFOUND when the line carries no breakpoint slot.
+*/
+LUA_API int luaJIT_int3_arm(lua_State *L, int func_index, unsigned int line);
+/* Arm the bytecode slot at bcpos (0-based, bcpos < sizebc) of the Lua function
+** at stack index func_index: the same (func, bcpos) identity the callback
+** reports. A debugger that maps source positions itself uses this entry, since
+** the slot numbering of a prototype follows from its bytecode and a line alone
+** cannot address code that is minified onto one line.
+*/
+LUA_API int luaJIT_int3_arm_bc(lua_State *L, int func_index,
+			       unsigned int bcpos);
 LUA_API int luaJIT_int3_cancel(lua_State *L);
 LUA_API int luaJIT_int3_stop(lua_State *L);
 
