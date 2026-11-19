@@ -870,6 +870,14 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
+#if LJ_DS_REJECT_BINARY_CHUNKS
+  /* Rides in the byte-flag run above, whose padding to the 8-byte-aligned
+  ** StrInternState absorbs it: offsetof(global_State, str) and sizeof() are
+  ** identical with and without the field, so DISPATCH_GL offsets baked into
+  ** the generated interpreter stay valid either way. Do not grow this run
+  ** past the slot without regenerating buildvm with the same defines. */
+  uint8_t dsallowljbc;	/* lua_ds_allow_lj_bytecode: native LJ bytecode mode. */
+#endif
   /* DS: optional second, private registry. It is a GC root like registrytv, and the C API
   ** reaches it through LUA_REGISTRYINDEX2 / registry2(L) only when LJ_DS_REGISTRY2 is on;
   ** otherwise both macros alias the public registry and this field does not exist. The
@@ -882,6 +890,14 @@ typedef struct global_State {
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)
+
+/* Native LuaJIT bytecode mode for one state (lua_ds_allow_lj_bytecode). Only
+** exists in builds that compile the reject in; elsewhere it folds to 0. */
+#if LJ_DS_REJECT_BINARY_CHUNKS
+#define ds_allow_lj_bytecode(L)	(G(L)->dsallowljbc != 0)
+#else
+#define ds_allow_lj_bytecode(L)	0
+#endif
 #define vmthread(g)	(&gcref(g->vmthref)->th)
 #define niltv(L) \
   check_exp(tvisnil(&G(L)->nilnode.val), &G(L)->nilnode.val)

@@ -1013,6 +1013,26 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_CHUNKNAME_MARKER	LJ_DS
 #endif
 
+/* PUC 5.1 f_parser probes the first byte with luaZ_lookahead(); when that probe
+** hits EOF, luaY_parser/luaX_setinput calls luaZ_fill() again.  LuaJIT's
+** lj_lex_setup() reads once and treats EOF as an empty chunk, so a stateful
+** load(reader) sees one call where PUC 5.1 sees two.  Retry once on the initial
+** EOF so the reader call count matches PUC 5.1.
+** Override with -DLJ_DS_PUC51_LOAD_EOF_RETRY=0 for stock LuaJIT behaviour. */
+#ifndef LJ_DS_PUC51_LOAD_EOF_RETRY
+#define LJ_DS_PUC51_LOAD_EOF_RETRY	LJ_DS
+#endif
+
+/* Bytecode policy: compile-time reject every chunk starting with \x1b, i.e.
+** PUC and LuaJIT bytecode.  Default LJ_DS (the game VM).  An outer C API may
+** switch one state to native LuaJIT bytecode semantics
+** (lua_ds_allow_lj_bytecode: lifts this reject and keeps string.dump native),
+** which is how the CLI, tools and private injector states work.
+** Builds that never want the reject code pass -DLJ_DS_REJECT_BINARY_CHUNKS=0. */
+#ifndef LJ_DS_REJECT_BINARY_CHUNKS
+#define LJ_DS_REJECT_BINARY_CHUNKS	LJ_DS
+#endif
+
 #if LJ_DS
 #undef LUAJIT_ENABLE_FIN_UDATA_COMPAT
 #define LUAJIT_ENABLE_FIN_UDATA_COMPAT	1

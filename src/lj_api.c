@@ -1531,3 +1531,23 @@ LUA_API const char *lua_getfuncchunkname(lua_State *L, int idx)
 }
 
 #endif /* LJ_DS_CHUNKNAME_MARKER */
+
+/* lua_ds_allow_lj_bytecode(L, allow)
+**
+** Outer-API switch for native LuaJIT bytecode semantics on one state. It lifts
+** two game-VM policies at once: lj_lex_setup's compile-time reject of every
+** \x1b chunk (LJ_DS_REJECT_BINARY_CHUNKS) and string.dump's conversion to PUC
+** 5.1 (LJ_DS_PUC51_DUMP). Hosts that need native dumps and reloads (CLI, tools,
+** private injector states) call it; the game state and every mod-visible path
+** keep the masked behaviour. PUC 5.1 bytecode (\x1bLua) stays rejected.
+** The state flag only exists with LJ_DS_REJECT_BINARY_CHUNKS, so in a build
+** that drops the reject this entry point is a no-op (the symbol stays exported).
+*/
+LUA_API void lua_ds_allow_lj_bytecode(lua_State *L, int allow)
+{
+#if LJ_DS_REJECT_BINARY_CHUNKS
+  G(L)->dsallowljbc = allow != 0;
+#else
+  UNUSED(L); UNUSED(allow);
+#endif
+}

@@ -233,6 +233,15 @@ extern LUA_DATA_API const char **extern_had_execution_error;
 LUA_API void        (lua_setfuncchunkname) (lua_State *L, int idx, const char *name);
 LUA_API const char *(lua_getfuncchunkname) (lua_State *L, int idx);
 #endif
+
+/* DST: switch one state to native LuaJIT bytecode semantics. Non-zero lifts the
+** compile-time binary-chunk reject (LJ_DS_REJECT_BINARY_CHUNKS) and keeps
+** string.dump native instead of converting to PUC 5.1; PUC 5.1 bytecode
+** (\x1bLua) stays rejected. Default is the masked game behaviour. The state
+** flag only exists with LJ_DS_REJECT_BINARY_CHUNKS, so this is a no-op in a
+** build that drops the reject. Declared unconditionally: lua.h is included
+** before lj_arch.h. */
+LUA_API void        (lua_ds_allow_lj_bytecode) (lua_State *L, int allow);
 LUA_API int   (lua_getmetatable) (lua_State *L, int objindex);
 LUA_API void  (lua_getfenv) (lua_State *L, int idx);
 
