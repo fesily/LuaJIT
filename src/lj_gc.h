@@ -333,6 +333,11 @@ LJ_FUNC int LJ_FASTCALL lj_gc_step_jit(global_State *g, MSize steps);
 LJ_FUNC int lj_gc_step_timelimit(lua_State *L);
 #endif
 LJ_FUNC void lj_gc_fullgc(lua_State *L);
+#if LJ_DS_PUC51_DUMP
+/* Drop every live prototype's saved compile source (jit.puc_dump_clear).
+** Returns the number of prototypes that held a source reference. */
+LJ_FUNC MSize lj_gc_clear_dssource(global_State *g);
+#endif
 #if LJ_HASGCARENA
 LJ_FUNC int lj_gc_checkheap(global_State *g);
 LJ_FUNC void lj_gc_stats_push(lua_State *L);

@@ -9,6 +9,7 @@
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
+#include <string.h>
 
 #include "lj_obj.h"
 #include "lj_gc.h"
@@ -36,6 +37,7 @@
 #include "lj_lib.h"
 
 #include "luajit.h"
+
 
 /* -- jit.* functions ----------------------------------------------------- */
 
@@ -118,6 +120,26 @@ LJLIB_CF(jit_security)
 {
   int idx = lj_lib_checkopt(L, 1, -1, LJ_SECURITY_MODESTRING);
   setintV(L->top++, ((LJ_SECURITY_MODE >> (2*idx)) & 3));
+  return 1;
+}
+
+/* DS: drop the source text this VM keeps for PUC 5.1 string.dump conversions.
+** Every text compile saves its own bytes for the whole prototype tree so a mod's
+** string.dump can be answered with real Lua 5.1 bytecode; this releases those
+** references on demand and the text is collected by the next GC. Returns the
+** number of prototypes that held a source. A mod schedules it once the load-time
+** probes are done (Mod/modmain.lua, sim post-init + 30 s) - after that, a dump of
+** a function compiled before the clear reports "source unavailable", while any
+** new compile captures its own source again. No-op returning 0 when the capture
+** is compiled out, so callers never need a switch. */
+LJLIB_CF(jit_puc_dump_clear)
+{
+#if LJ_DS_PUC51_DUMP
+  MSize n = lj_gc_clear_dssource(G(L));
+#else
+  MSize n = 0;
+#endif
+  setnumV(L->top++, (lua_Number)n);
   return 1;
 }
 

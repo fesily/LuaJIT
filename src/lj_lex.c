@@ -498,7 +498,7 @@ static LexToken lex_scan(LexState *ls, TValue *tv)
 
 /* -- Lexer API ----------------------------------------------------------- */
 
-#if LJ_DS_REJECT_BINARY_CHUNKS
+#if LJ_DS_REJECT_BINARY_CHUNKS | LJ_DS_PUC51_DUMP
 /* Setup lexer state. */
 /* Stock PUC 5.1 rejects every precompiled chunk from luaU_undump with
 ** "<name>: Disallowed functionality in precompiled chunk" (LUA_ERRSYNTAX),
@@ -581,8 +581,16 @@ int lj_lex_setup(lua_State *L, LexState *ls)
     }
 #if LJ_DS_REJECT_BINARY_CHUNKS
     /* Compile-time policy: reject every \x1b chunk (PUC and LuaJIT). An outer
-    ** API may lift it per state (lua_ds_allow_lj_bytecode). */
+    ** API may lift it per state (lua_ds_allow_lj_bytecode); the
+    ** LJ_DS_PUC51_DUMP check below then still rejects PUC 5.1 bytecode. */
     if (!ds_allow_lj_bytecode(L))
+      ds_reject_binary_chunk(L, ls);
+#endif
+#if LJ_DS_PUC51_DUMP
+    /* PUC 5.1 bytecode is rejected by the stock engine. The lexer already
+    ** consumed the leading \x1b; the signature bytes follow in ls->p. */
+    if (ls->p + 3 <= ls->pe && ls->p[0] == 'L' && ls->p[1] == 'u' &&
+        ls->p[2] == 'a')
       ds_reject_binary_chunk(L, ls);
 #endif
     return 1;

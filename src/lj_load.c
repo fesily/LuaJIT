@@ -15,6 +15,7 @@
 #include "lj_obj.h"
 #include "lj_gc.h"
 #include "lj_err.h"
+#include "lj_state.h"  /* incr_top: not implicit in a non-amalgamated build */
 #include "lj_buf.h"
 #include "lj_func.h"
 #include "lj_frame.h"
@@ -26,6 +27,70 @@
 #include "lj_io_patch.h"
 
 /* -- Load Lua source code and bytecode ----------------------------------- */
+
+#if LJ_DS_PUC51_DUMP
+/* DS: keep the exact bytes this parse consumes, and give every prototype a
+** pre-order identity, so the host can later produce genuine PUC 5.1 bytecode for
+** one function of this compile. Nothing is captured while lj_ds_puc_dump is NULL
+** (standalone interpreter, tests, any host that never wired the service).
+*/
+
+typedef struct DSCaptureCtx {
+  lua_Reader r;
+  void *d;
+  SBuf *sb;		/* The LexState's capture buffer, not a shared buffer. */
+} DSCaptureCtx;
+
+/* Same reader, same call count, same returned bytes: the parser sees exactly what
+** the original reader produced, and the copy is a side effect only. */
+static const char *ds_capture_reader(lua_State *L, void *ud, size_t *size)
+{
+  DSCaptureCtx *c = (DSCaptureCtx *)ud;
+  const char *chunk = c->r(L, c->d, size);
+  if (chunk != NULL && size != NULL && *size > 0) {
+    size_t used = (size_t)sbuflen(c->sb);
+    /* Check before narrowing to MSize: neither the 32 bit size nor the VM string
+    ** limit may be crossed, and a partial capture must never look complete. */
+    if (*size > (size_t)LJ_MAX_STR - used)
+      lj_err_mem(L);
+    lj_buf_putmem(c->sb, chunk, (MSize)*size);
+  }
+  return chunk;
+}
+
+/* Walks the prototype tree in the parser's pre-order and stores the shared source
+** reference plus the compile's total node count. */
+static void ds_attach_source(lua_State *L, GCproto *pt, GCstr *src, uint32_t count)
+{
+  setgcref(pt->dssource, obj2gco(src));
+  lj_gc_objbarrier(L, pt, src);
+  pt->dsnodecount = count;
+  if (pt->flags & PROTO_CHILD) {
+    ptrdiff_t i;
+    for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++) {
+      GCobj *o = proto_kgc(pt, i);
+      if (o && o->gch.gct == ~LJ_TPROTO)
+	ds_attach_source(L, gco2pt(o), src, count);
+    }
+  }
+}
+
+/* Interning the source text allocates, and the freshly parsed prototype tree is
+** not referenced yet, so the root is anchored first. */
+static void ds_capture_source(lua_State *L, LexState *ls, GCproto *pt)
+{
+  GCstr *src;
+  const char *body;
+  if (!ls->dscapture)
+    return;
+  setprotoV(L, L->top, pt);
+  incr_top(L);
+  body = ls->dssource.b;
+  src = lj_str_new(L, body ? body : "", (size_t)sbuflen(&ls->dssource));
+  ds_attach_source(L, pt, src, ls->dsnextnode);
+  L->top--;
+}
+#endif
 
 static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
 {
@@ -53,6 +118,9 @@ static TValue *cpparser(lua_State *L, lua_CFunction dummy, void *ud)
     pt = lj_bcread(ls);
   } else {
     pt = lj_parse(ls);
+#if LJ_DS_PUC51_DUMP
+    ds_capture_source(L, ls, pt);
+#endif
   }
   if (ls->fr2 == LJ_FR2) {
     fn = lj_func_newL_empty(L, pt, tabref(L->env));
@@ -105,6 +173,9 @@ LUA_API int lua_loadx(lua_State *L, lua_Reader reader, void *data,
 {
   LexState ls;
   int status;
+#if LJ_DS_PUC51_DUMP
+  DSCaptureCtx dscap;
+#endif
 #if LJ_DS_LOADLOG
   DSLogCtx dsctx;
   if (ds_loadlog_on()) { dsctx.r = reader; dsctx.d = data; dsctx.cn = chunkname;
@@ -116,8 +187,25 @@ LUA_API int lua_loadx(lua_State *L, lua_Reader reader, void *data,
   ls.chunkarg = chunkname ? chunkname : "?";
   ls.mode = mode;
   lj_buf_init(L, &ls.sb);
+#if LJ_DS_PUC51_DUMP
+  /* Snapshot the host slot once: a nested load inside the reader has its own
+  ** LexState and must not change this parse's capture decision. */
+  lj_buf_init(L, &ls.dssource);
+  ls.dsnextnode = 0;
+  ls.dscapture = lj_ds_puc_dump != NULL;
+  if (ls.dscapture) {
+    dscap.r = reader; dscap.d = data; dscap.sb = &ls.dssource;
+    ls.rfunc = ds_capture_reader;
+    ls.rdata = &dscap;
+  }
+#endif
   status = lj_vm_cpcall(L, NULL, &ls, cpparser);
   lj_lex_cleanup(L, &ls);
+#if LJ_DS_PUC51_DUMP
+  /* Released on every path (parse error, reader error, OOM), unlike the loadlog
+  ** buffer above which only frees at EOF. */
+  lj_buf_free(G(L), &ls.dssource);
+#endif
   lj_gc_check(L);
   return status;
 }

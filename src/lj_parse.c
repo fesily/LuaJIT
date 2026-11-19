@@ -167,6 +167,9 @@ typedef struct FuncState {
   VarIndex argvidx;		/* Variable index of the implicit 'arg'. */
   BCPos argpc, argpcend;	/* Bytecode range that builds the 'arg' table. */
 #endif
+#if LJ_DS_PUC51_DUMP
+  uint32_t dsnodeidx;		/* DS: pre-order index of this function's proto. */
+#endif
 } FuncState;
 
 /* Binary and unary operators. ORDER OPR */
@@ -1766,6 +1769,11 @@ static GCproto *fs_finish(LexState *ls)
 #if LJ_DS_CHUNKNAME_MARKER
   setgcrefnull(pt->dschunkname);  /* DS: not engine-loaded yet. */
 #endif
+#if LJ_DS_PUC51_DUMP
+  setgcrefnull(pt->dssource);  /* DS: attached by lj_load after the parse. */
+  pt->dsnodecount = 0;
+  pt->dsnodeidx = fs->dsnodeidx;
+#endif
 
   /* Close potentially uninitialized gap between bc and kgc. */
   *(uint32_t *)((char *)pt + ofsk - sizeof(GCRef)*(fs->nkgc+1)) = 0;
@@ -1805,6 +1813,14 @@ static void fs_init(LexState *ls, FuncState *fs)
   fs->flags = 0;
   fs->framesize = 1;  /* Minimum frame size. */
   fs->kt = lj_tab_new(L, 0, 0);
+#if LJ_DS_PUC51_DUMP
+  /* Pre-order identity: the root chunk is 0 and every nested function takes the
+  ** next number as its FuncState is created. Never wrap: an index the host could
+  ** not express is a load failure, not a silent collision. */
+  if (ls->dsnextnode == 0xffffffffu)
+    lj_err_mem(L);
+  fs->dsnodeidx = ls->dsnextnode++;
+#endif
 #if LUA_COMPAT_VARARG
   fs->need_vararg = 0;
   fs->has_compat_arg = 0;
@@ -3299,6 +3315,9 @@ GCproto *lj_parse(LexState *ls)
   setstrV(L, L->top, ls->chunkname);  /* Anchor chunkname string. */
   incr_top(L);
   ls->level = 0;
+#if LJ_DS_PUC51_DUMP
+  ls->dsnextnode = 0;  /* DS: pre-order prototype numbering starts at the root. */
+#endif
   memset(ls->vhash, 0xff, sizeof(ls->vhash));
   fs_init(ls, &fs);
   fs.maxline = fs.minline = 0;

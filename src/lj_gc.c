@@ -277,6 +277,12 @@ static void gc_traverse_proto(global_State *g, GCproto *pt)
 {
   ptrdiff_t i;
   gc_mark_str(g, proto_chunkname(pt));
+#if LJ_DS_PUC51_DUMP
+  {  /* DS: keep the saved compile source alive with its prototype tree. */
+    GCstr *dssrc = strref(pt->dssource);
+    if (dssrc) gc_mark_str(g, dssrc);
+  }
+#endif
 #if LJ_DS_CHUNKNAME_MARKER
   {  /* DS: keep the engine-loaded chunkname marker alive. */
     GCstr *dsname = strref(pt->dschunkname);
@@ -431,6 +437,35 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
   }
   return p;
 }
+
+#if LJ_DS_PUC51_DUMP
+/* Drop every live prototype's saved compile source.
+**
+** One compile shares a single GCstr across its whole prototype tree, so clearing
+** the references is exactly what makes the text collectable - no other owner
+** exists and no per-path cache is involved. Only prototype fields are rewritten:
+** nothing is allocated, nothing moves, and storing NULL needs no GC barrier.
+** Must be called from ordinary Lua/C execution (never from inside a GC step), so
+** the root chain is walked outside any sweep slice.
+*/
+MSize lj_gc_clear_dssource(global_State *g)
+{
+  GCobj *o = gcref(g->gc.root);
+  MSize n = 0;
+  while (o != NULL) {
+    if (o->gch.gct == ~LJ_TPROTO) {
+      GCproto *pt = gco2pt(o);
+      if (gcref(pt->dssource) != NULL) {
+	setgcrefnull(pt->dssource);
+	pt->dsnodecount = 0;
+	n++;
+      }
+    }
+    o = gcref(o->gch.nextgc);
+  }
+  return n;
+}
+#endif
 
 /* Sweep one string interning table chain. Preserves hashalg bit. */
 static void gc_sweepstr(global_State *g, GCRef *chain)

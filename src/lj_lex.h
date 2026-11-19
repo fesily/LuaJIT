@@ -86,6 +86,11 @@ typedef struct LexState {
   int endmark;		/* Trust bytecode end marker, even if not at EOF. */
   int fr2;		/* Generate bytecode for LJ_FR2 mode. */
   VarIndex vhash[LJ_VINDEX_HSIZE];	/* Variable hash chain anchors. */
+#if LJ_DS_PUC51_DUMP
+  SBuf dssource;	/* DS: exact bytes this parse consumed (empty if no host). */
+  uint32_t dsnextnode;	/* DS: next pre-order prototype index in this parse. */
+  int dscapture;	/* DS: 1 when the host dump slot was present at entry. */
+#endif
 } LexState;
 
 LJ_FUNC int lj_lex_setup(lua_State *L, LexState *ls);

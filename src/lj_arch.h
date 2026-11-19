@@ -1013,6 +1013,25 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_CHUNKNAME_MARKER	LJ_DS
 #endif
 
+/* Real PUC Lua 5.1 string.dump for mods.
+**
+** Every successful text compile keeps its exact source bytes (one GCstr per
+** compile, shared by the whole prototype tree) plus a pre-order prototype index,
+** so the host can ask an out-of-process PUC 5.1 state for genuine Lua 5.1
+** bytecode for one function. The host publishes the dump entry point through the
+** lj_ds_puc_dump data slot (declared in lj_obj.h, defined in lib_string.c);
+** with no host attached nothing is captured and the conversion refuses the dump
+** instead of leaking native LuaJIT bytes.
+**
+** The reader capture, the policy branch in lib_string.c and the data slot all
+** disappear with -DLJ_DS_PUC51_DUMP=0. The GCproto fields stay in every build:
+** the generated interpreter bakes offsetof(GCproto, f)-sizeof(GCproto) when
+** buildvm is compiled, and buildvm never sees LJ_DS_* overrides, so a struct
+** size that followed this macro would make every baked displacement wrong. */
+#ifndef LJ_DS_PUC51_DUMP
+#define LJ_DS_PUC51_DUMP	LJ_DS
+#endif
+
 /* PUC 5.1 f_parser probes the first byte with luaZ_lookahead(); when that probe
 ** hits EOF, luaY_parser/luaX_setinput calls luaZ_fill() again.  LuaJIT's
 ** lj_lex_setup() reads once and treats EOF as an empty chunk, so a stateful
@@ -1027,7 +1046,8 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 ** PUC and LuaJIT bytecode.  Default LJ_DS (the game VM).  An outer C API may
 ** switch one state to native LuaJIT bytecode semantics
 ** (lua_ds_allow_lj_bytecode: lifts this reject and keeps string.dump native),
-** which is how the CLI, tools and private injector states work.
+** which is how the CLI, tools and private injector states work; PUC 5.1
+** bytecode stays rejected by LJ_DS_PUC51_DUMP either way.
 ** Builds that never want the reject code pass -DLJ_DS_REJECT_BINARY_CHUNKS=0. */
 #ifndef LJ_DS_REJECT_BINARY_CHUNKS
 #define LJ_DS_REJECT_BINARY_CHUNKS	LJ_DS
