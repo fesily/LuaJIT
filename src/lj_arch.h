@@ -958,10 +958,6 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 #define LJ_DS_LOADLOG 0
 #endif
 
-#ifndef LJ_DS_NEW_PROXY_PATCH
-#define LJ_DS_NEW_PROXY_PATCH LJ_DS
-#endif
-
 /* Engine-parity debug.traceback/luaL_traceback text: the db_errorfb shape of
 ** the win/mac/linux engine-embedded Lua ("LUA ERROR stack traceback:" header,
 ** "\n" + 8 spaces indent, "%s" short_src + "(line,1)", and no "<%s:%d>"
