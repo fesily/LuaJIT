@@ -20,7 +20,7 @@ ptrdiff_t lj_vmevent_prepare(lua_State *L, VMEvent ev)
 {
   global_State *g = G(L);
   GCstr *s = lj_str_newlit(L, LJ_VMEVENTS_REGKEY);
-  cTValue *tv = lj_tab_getstr(tabV(registry(L)), s);
+  cTValue *tv = lj_tab_getstr(tabV(registry2(L)), s);
   if (tvistab(tv)) {
     int hash = VMEVENT_HASH(ev);
     tv = lj_tab_getint(tabV(tv), hash);

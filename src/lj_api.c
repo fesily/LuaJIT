@@ -46,6 +46,10 @@ static TValue *index2adr(lua_State *L, int idx)
     return o;
   } else if (idx == LUA_REGISTRYINDEX) {
     return registry(L);
+#if LJ_DS_REGISTRY2
+  } else if (idx == LUA_REGISTRYINDEX2) {
+    return registry2(L);
+#endif
   } else {
     GCfunc *fn = curr_func(L);
     lj_checkapi(fn->c.gct == ~LJ_TFUNC && !isluafunc(fn),
@@ -191,6 +195,12 @@ static void copy_slot(lua_State *L, TValue *f, int idx)
     lj_checkapi(tvistab(f), "stack slot %d is not a table", idx);
     setgcref(fn->c.env, obj2gco(tabV(f)));
     lj_gc_barrier(L, fn, f);
+#if LJ_DS_REGISTRY2
+  } else if (idx == LUA_REGISTRYINDEX2) {
+    /* Same contract as LUA_REGISTRYINDEX: the slot takes any value and is a GC
+    ** root, so it needs no barrier (and must not take the upvalue branch). */
+    copyTV(L, registry2(L), f);
+#endif
   } else {
     TValue *o = index2adr_check(L, idx);
     copyTV(L, o, f);

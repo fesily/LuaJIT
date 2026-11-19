@@ -253,6 +253,9 @@ static TValue *cpluaopen(lua_State *L, lua_CFunction dummy, void *ud)
   /* NOBARRIER: State initialization, all objects are white. */
   setgcref(L->env, obj2gco(lj_tab_new(L, 0, LJ_MIN_GLOBAL)));
   settabV(L, registry(L), lj_tab_new(L, 0, LJ_MIN_REGISTRY));
+#if LJ_DS_REGISTRY2
+  settabV(L, registry2(L), lj_tab_new(L, 0, LJ_MIN_REGISTRY));
+#endif
   lj_str_init(L);
   lj_meta_init(L);
   lj_lex_init(L);
@@ -385,6 +388,9 @@ LUA_API lua_State *lua_newstate(lua_Alloc allocf, void *allocd)
   setgcref(g->mainthref, obj2gco(L));
   g->str.mask = ~(MSize)0;
   setnilV(registry(L));
+#if LJ_DS_REGISTRY2
+  setnilV(registry2(L));
+#endif
   setnilV(&g->nilnode.val);
   setnilV(&g->nilnode.key);
 #if !LJ_GC64

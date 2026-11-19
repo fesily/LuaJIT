@@ -835,6 +835,10 @@ static void mp_enum_root_refs(global_State *g, void *ctx, MpRefCb cb)
     cb(ctx, obj2gco(vmthread(g)));
   if (tvisgcv(&g->registrytv))
     cb(ctx, gcV(&g->registrytv));
+#if LJ_DS_REGISTRY2
+  if (tvisgcv(&g->registry2tv))
+    cb(ctx, gcV(&g->registry2tv));
+#endif
   {
     ptrdiff_t i;
     for (i = 0; i < (ptrdiff_t)GCROOT_MAX; i++) {

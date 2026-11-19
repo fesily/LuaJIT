@@ -34,6 +34,22 @@
 ** pseudo-indices
 */
 #define LUA_REGISTRYINDEX	(-10000)
+/* DS: optional second, private registry (global_State.registry2tv). With
+** LJ_DS_REGISTRY2=0 it is an alias for LUA_REGISTRYINDEX, so the injector's
+** private state lives in the public registry and the feature adds no storage.
+** With LJ_DS_REGISTRY2=1 it is a distinct pseudo-index accepted by the same
+** index2adr paths, but not reachable from Lua: the debug library only ever
+** returns LUA_REGISTRYINDEX. The value is below every valid upvalue
+** pseudo-index (LUA_GLOBALSINDEX - 1 .. -LJ_MAX_UPVAL), so it cannot be
+** confused with lua_upvalueindex(i). */
+#ifndef LJ_DS_REGISTRY2
+#define LJ_DS_REGISTRY2	1
+#endif
+#if LJ_DS_REGISTRY2
+#define LUA_REGISTRYINDEX2	(-11000)
+#else
+#define LUA_REGISTRYINDEX2	LUA_REGISTRYINDEX
+#endif
 #define LUA_ENVIRONINDEX	(-10001)
 #define LUA_GLOBALSINDEX	(-10002)
 #define lua_upvalueindex(i)	(LUA_GLOBALSINDEX-(i))

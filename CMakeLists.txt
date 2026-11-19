@@ -19,6 +19,12 @@ SET(CMAKE_REQUIRED_INCLUDES
 OPTION(WITH_AMALG "Build eveything in one shot (needs memory)" ON)
 option(WITH_SHARED_LUA "build shared lua" ON)
 option(LUAJIT_TEST_TAILCALL "Build native tail-call and hook tests." OFF)
+option(LJ_DS_REGISTRY2 "Use the separate DS second registry (default: alias)" ON)
+if(LJ_DS_REGISTRY2)
+  ADD_DEFINITIONS(-DLJ_DS_REGISTRY2=1)
+else()
+  ADD_DEFINITIONS(-DLJ_DS_REGISTRY2=0)
+endif()
 
 # Ugly warnings
 IF(MSVC)

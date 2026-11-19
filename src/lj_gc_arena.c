@@ -384,6 +384,9 @@ static void gc_mark_start(global_State *g)
   gc_markobj(g, tabref(mainthread(g)->env));
   gc_markobj(g, vmthread(g));
   gc_marktv(g, &g->registrytv);
+#if LJ_DS_REGISTRY2
+  gc_marktv(g, &g->registry2tv);
+#endif
   gc_mark_gcroot(g);
   gc_traverse_mainthread(g);
   /* Pending finals are not in the registry; re-root before propagate. */

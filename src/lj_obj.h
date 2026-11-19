@@ -870,6 +870,15 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
+  /* DS: optional second, private registry. It is a GC root like registrytv, and the C API
+  ** reaches it through LUA_REGISTRYINDEX2 / registry2(L) only when LJ_DS_REGISTRY2 is on;
+  ** otherwise both macros alias the public registry and this field does not exist. The
+  ** field is appended at the end on purpose: every offset baked into the generated
+  ** interpreter (DISPATCH_GL, PC2PROTO, ...) stays unchanged.
+  */
+#if LJ_DS_REGISTRY2
+  TValue registry2tv;	/* Anchor for the private registry. */
+#endif
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)
@@ -957,6 +966,11 @@ LJ_STATIC_ASSERT(offsetof(lua_State, userdata) == LJ_DST_LUA_STATE_USERDATA);
 
 #define G(L)			(mref(L->glref, global_State))
 #define registry(L)		(&G(L)->registrytv)
+#if LJ_DS_REGISTRY2
+#define registry2(L)		(&G(L)->registry2tv)
+#else
+#define registry2(L)		registry(L)
+#endif
 
 /* Macros to access the currently executing (Lua) function. */
 #if LJ_GC64
