@@ -195,6 +195,7 @@ FILE(GLOB jit_files ${LUAJIT_DIR}/src/jit/*.lua)
 
 SET(DASM_ARCH ${TARGET_LJARCH})
 SET(DASM_FLAGS)
+SET(DASM_EXTRAS)
 SET(TARGET_ARCH)
 LIST(APPEND TARGET_ARCH "LUAJIT_TARGET=LUAJIT_ARCH_${TARGET_LJARCH}")
 LJ_TEST_ARCH_VALUE(LJ_LE 1)
@@ -261,21 +262,25 @@ int main() { return 0; }
 " LUA_COMPAT_TAILCALL_CFRAME_ON)
 IF(WIN32)
   SET(DASM_FLAGS ${DASM_FLAGS} -LN -D WIN)
+  SET(DASM_EXTRAS ${DASM_EXTRAS} -LN -D WIN)
 ENDIF()
 IF(TARGET_LJARCH STREQUAL "x86")
   LJ_TEST_ARCH_VALUE(__SSE2__ 1)
   IF(__SSE2__1)
     SET(DASM_FLAGS ${DASM_FLAGS} -D SSE)
+  SET(DASM_EXTRAS ${DASM_EXTRAS} -D SSE)
   ENDIF()
 ENDIF()
 IF(TARGET_LJARCH STREQUAL "ppc")
   LJ_TEST_ARCH_VALUE(LJ_ARCH_SQRT 1)
   IF(NOT LJ_ARCH_SQRT_1)
     SET(DASM_FLAGS ${DASM_FLAGS} -D SQRT)
+  SET(DASM_EXTRAS ${DASM_EXTRAS} -D SQRT)
   ENDIF()
   LJ_TEST_ARCH_VALUE(LJ_ARCH_PPC64 1)
   IF(NOT LJ_ARCH_PPC64_1)
     SET(DASM_FLAGS ${DASM_FLAGS} -D GPR64)
+  SET(DASM_EXTRAS ${DASM_EXTRAS} -D GPR64)
   ENDIF()
 ENDIF()
 
@@ -379,12 +384,172 @@ add_custom_target(luajit-clear-stale-host-buildvm-arch
   VERBATIM
 )
 
+# The same trap applies to the six generated tables: `#include "lj_bcdef.h"` is
+# quoted, so ${LUAJIT_DIR}/src wins over the variant directory. Per-variant guard
+# (see cmake/clear_stale_generated_headers.cmake) removes a copy left by a manual
+# `make -C luajit/src` and touches the variant tables so affected objects rebuild.
+function(add_stale_generated_header_guard guard_target variant_binary_dir)
+  add_custom_target(${guard_target}
+    COMMAND ${CMAKE_COMMAND}
+      "-DLUAJIT_DIR=${LUAJIT_DIR}"
+      "-DVARIANT_DIR=${variant_binary_dir}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/clear_stale_generated_headers.cmake"
+    COMMENT "Guard: no stale in-tree generated LuaJIT headers"
+    VERBATIM)
+endfunction()
+
 function(add_buildvm_target_for_variant buildvm_target variant_binary_dir output_name mode)
   add_custom_command(OUTPUT "${variant_binary_dir}/${output_name}"
     COMMAND ${BUILDVM_HOST_ENV} $<TARGET_FILE:${buildvm_target}> -m ${mode} -o "${variant_binary_dir}/${output_name}" ${ARGN}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS ${buildvm_target} ${ARGN}
   )
+endfunction()
+
+# Derive the DynASM defines the way src/Makefile does (TARGET_TESTARCH ->
+# DASM_AFLAGS), but per variant: the probe is compiled with the variant's own
+# definitions, so LJ_HASGCMARK follows whatever lj_arch.h decided (an arena
+# variant built with SYSMALLOC is not GCMARK) and the ABI flags follow the
+# toolchain. The old hardcoded list also missed LJ_ABI_PAUTH,
+# LJ_ABI_BRANCH_TRACK and LJ_ABI_SHADOW_STACK entirely.
+#
+# Outputs: <flags_var> (list of -D arguments) and <arch_var> (dasc base name:
+# "x86" for a 64-bit target that does not use FR2 frames, like the Makefile's
+# DASM_ARCH). Both are empty when the probe cannot run (cross-compiling), which
+# makes the caller fall back to the previous static list.
+function(luajit_probe_variant_dasm flags_var arch_var)
+  set(_dir "${CMAKE_CURRENT_BINARY_DIR}/archprobe/${LJVAR_NAME}")
+  file(MAKE_DIRECTORY "${_dir}")
+  set(_src "${_dir}/dasm_probe.c")
+  file(WRITE "${_src}" "
+#include \"lj_obj.h\"  /* also pulls lj_arch.h; the layout values need the structs */
+#include <stdio.h>
+int main(void)
+{
+  printf(\"%s\", LJ_LE ? \"-D ENDIAN_LE\" : \"-D ENDIAN_BE\");
+  if (LJ_ARCH_BITS == 64) printf(\" -D P64\");
+#if LJ_HASJIT
+  printf(\" -D JIT\");
+#endif
+#if LJ_HASFFI
+  printf(\" -D FFI\");
+#endif
+#if LJ_DUALNUM
+  printf(\" -D DUALNUM\");
+#endif
+#if LJ_ARCH_HASFPU
+  printf(\" -D FPU\");
+#endif
+#if !LJ_ABI_SOFTFP
+  printf(\" -D HFABI\");
+#endif
+#if LJ_NO_UNWIND
+  printf(\" -D NO_UNWIND\");
+#endif
+#if LJ_ABI_PAUTH
+  printf(\" -D PAUTH\");
+#endif
+#if LJ_ABI_BRANCH_TRACK
+  printf(\" -D BRANCH_TRACK\");
+#endif
+#if LJ_ABI_SHADOW_STACK
+  printf(\" -D SHADOW_STACK\");
+#endif
+#if LJ_HASGCMARK
+  printf(\" -D LJ_HASGCMARK\");
+#endif
+#if LUA_COMPAT_TAILCALL_COUNT
+  printf(\" -D LUA_COMPAT_TAILCALL_COUNT\");
+#endif
+#if LJ_TARGET_MIPSR6
+  printf(\" -D MIPSR6\");
+#endif
+#if LJ_TARGET_IOS
+  printf(\" -D IOS\");
+#endif
+  printf(\"\\n\");
+  printf(\"ARCH=%s\\n\", (LJ_ARCH_BITS == 64 && !LJ_FR2) ? \"x86\" : \"\");
+  /* Layout values the DynASM output bakes in (PC2PROTO/DISPATCH_GL). */
+  printf(\"LAYOUT=%u,%u,%u,%u,%u\\n\",
+         (unsigned)sizeof(GCproto), (unsigned)offsetof(GCproto, k),
+         (unsigned)offsetof(GCproto, chunkname),
+         (unsigned)sizeof(global_State),
+         (unsigned)offsetof(global_State, str));
+  return 0;
+}
+")
+  if(CMAKE_CROSSCOMPILING)
+    message(STATUS "luajit_probe_variant_dasm: cross-compiling, keeping the static DynASM list")
+    set(${flags_var} "" PARENT_SCOPE)
+    set(${arch_var} "" PARENT_SCOPE)
+    return()
+  endif()
+  # try_run's COMPILE_DEFINITIONS takes -D arguments, not bare names like
+  # target_compile_definitions does. Two sets, matching the two targets:
+  #   lib  : ${LJVAR_COMPILE_DEFINITIONS}          (see target_compile_definitions)
+  #   host : ${TARGET_ARCH} + variant defs         (buildvm, and inside buildvm_arch.h)
+  function(_luajit_dash_d defs_out)
+    set(_out_defs "")
+    foreach(_def IN LISTS ARGN)
+      if(_def MATCHES "^[-/]D")
+        list(APPEND _out_defs "${_def}")
+      else()
+        list(APPEND _out_defs "-D${_def}")
+      endif()
+    endforeach()
+    set(${defs_out} "${_out_defs}" PARENT_SCOPE)
+  endfunction()
+  _luajit_dash_d(_lib_defs ${LJVAR_COMPILE_DEFINITIONS})
+  _luajit_dash_d(_host_defs ${TARGET_ARCH} ${LJVAR_COMPILE_DEFINITIONS})
+  function(_luajit_run_probe probe_out probe_layout probe_ok)
+    try_run(_run_rc _compile_ok "${_dir}/build-${probe_out}"
+      SOURCES "${_src}"
+      COMPILE_DEFINITIONS ${ARGN}
+      CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${LUAJIT_DIR}/src"
+      COMPILE_OUTPUT_VARIABLE _cout
+      RUN_OUTPUT_VARIABLE _out)
+    if(NOT _compile_ok)
+      # The probe uses the same definitions as the real targets: if it cannot
+      # compile, the variant cannot either.
+      message(FATAL_ERROR "luajit_probe_variant_dasm: probe does not compile for variant "
+                          "'${LJVAR_NAME}' with ${ARGN}\n${_cout}")
+    endif()
+    if(NOT _run_rc EQUAL 0)
+      message(WARNING "luajit_probe_variant_dasm: probe '${probe_out}' did not run for variant "
+                      "'${LJVAR_NAME}' (rc='${_run_rc}'); keeping the static DynASM list")
+      set(${probe_ok} FALSE PARENT_SCOPE)
+      return()
+    endif()
+    string(REGEX MATCH "LAYOUT=([0-9,]+)" _lm "${_out}")
+    set(${probe_out} "${_out}" PARENT_SCOPE)
+    set(${probe_layout} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+    set(${probe_ok} TRUE PARENT_SCOPE)
+  endfunction()
+
+  _luajit_run_probe(_out _lib_layout _ok ${_lib_defs})
+  if(NOT _ok)
+    set(${flags_var} "" PARENT_SCOPE)
+    set(${arch_var} "" PARENT_SCOPE)
+    return()
+  endif()
+  # buildvm is compiled with TARGET_ARCH + the variant definitions; the layout it
+  # bakes into the generated interpreter must equal the one the target C build
+  # uses, otherwise every PC2PROTO/DISPATCH_GL displacement is off (this is the
+  # failure that used to show up as a SIGSEGV in lj_BC_GGET for
+  # -DLJ_DS_PUC51_DUMP=0, when GCproto shrank with the macro).
+  _luajit_run_probe(_host_out _host_layout _host_ok ${_host_defs})
+  if(_host_ok AND NOT _host_layout STREQUAL _lib_layout)
+    message(FATAL_ERROR
+      "luajit variant '${LJVAR_NAME}': buildvm layout ${_host_layout} != target layout "
+      "${_lib_layout} (GCproto/global_State sizes or baked field offsets). The generated "
+      "interpreter bakes these values, so a macro that changes them must be enabled for "
+      "buildvm and the target alike.")
+  endif()
+  string(REGEX MATCH "-D [^\n]*" _flagline "${_out}")
+  separate_arguments(_flags NATIVE_COMMAND "${_flagline}")
+  string(REGEX MATCH "ARCH=([a-z0-9]*)" _archmatch "${_out}")
+  set(${flags_var} "${_flags}" PARENT_SCOPE)
+  set(${arch_var} "${CMAKE_MATCH_1}" PARENT_SCOPE)
 endfunction()
 
 function(add_luajit_variant)
@@ -402,13 +567,25 @@ function(add_luajit_variant)
   set(variant_binary_dir "${CMAKE_CURRENT_BINARY_DIR}/variants/${LJVAR_NAME}")
   set(variant_jit_dir "${variant_binary_dir}/jit")
   set(variant_dasm_flags ${DASM_FLAGS})
+  set(variant_dasm_arch ${DASM_ARCH})
   file(MAKE_DIRECTORY "${variant_binary_dir}")
   file(MAKE_DIRECTORY "${variant_jit_dir}")
   file(COPY ${jit_files} DESTINATION "${variant_jit_dir}")
 
-  list(FIND LJVAR_COMPILE_DEFINITIONS "LUAJIT_ENABLE_GCARENA" variant_uses_gc_arena)
-  if(NOT variant_uses_gc_arena EQUAL -1)
-    list(APPEND variant_dasm_flags -D LJ_HASGCMARK)
+  luajit_probe_variant_dasm(_probe_dasm_flags _probe_dasm_arch)
+  if(_probe_dasm_flags)
+    # The probe is the complete Makefile-equivalent list; the arch extras
+    # (WIN/SSE/SQRT/GPR64) are not macro-derived and stay on top.
+    set(variant_dasm_flags ${_probe_dasm_flags} ${DASM_EXTRAS})
+  else()
+    # Probe unavailable (cross-compiling): previous heuristic.
+    list(FIND LJVAR_COMPILE_DEFINITIONS "LUAJIT_ENABLE_GCARENA" variant_uses_gc_arena)
+    if(NOT variant_uses_gc_arena EQUAL -1)
+      list(APPEND variant_dasm_flags -D LJ_HASGCMARK)
+    endif()
+  endif()
+  if(_probe_dasm_arch)
+    set(variant_dasm_arch "${_probe_dasm_arch}")
   endif()
 
   if(LJVAR_INSTALL_SUPPORT_FILES)
@@ -434,10 +611,10 @@ function(add_luajit_variant)
     # Drop make-tree host/buildvm_arch.h so #include "buildvm_arch.h" cannot
     # pick the wrong (GCMARK) artifact when compiling this variant's buildvm.
     COMMAND ${CMAKE_COMMAND} -E rm -f "${LUAJIT_STALE_HOST_BUILDVM_ARCH}"
-    COMMAND ${minilua_target} ${LUAJIT_DIR}/dynasm/dynasm.lua ${variant_dasm_flags} -o "${variant_buildvm_arch_h}" ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+    COMMAND ${minilua_target} ${LUAJIT_DIR}/dynasm/dynasm.lua ${variant_dasm_flags} -o "${variant_buildvm_arch_h}" ${LUAJIT_DIR}/src/vm_${variant_dasm_arch}.dasc
     DEPENDS
       ${LUAJIT_DIR}/dynasm/dynasm.lua
-      ${LUAJIT_DIR}/src/vm_${DASM_ARCH}.dasc
+      ${LUAJIT_DIR}/src/vm_${variant_dasm_arch}.dasc
       ${LUAJIT_DIR}/src/lj_arch.h
       ${LUAJIT_DIR}/src/lj_bc.h
       ${minilua_target}
@@ -483,6 +660,8 @@ function(add_luajit_variant)
   add_buildvm_target_for_variant(${buildvm_target} "${variant_binary_dir}" vmdef.lua vmdef ${SRC_LJLIB})
 
   set(variant_vmdef_lua "${variant_binary_dir}/vmdef.lua")
+  add_stale_generated_header_guard("clear-stale-headers-${LJVAR_NAME}" "${variant_binary_dir}")
+
   set(variant_deps
     ${variant_lj_vm_src}
     "${variant_binary_dir}/lj_ffdef.h"
@@ -518,6 +697,7 @@ function(add_luajit_variant)
       PREFIX "lib" IMPORT_PREFIX "lib" OUTPUT_NAME "${variant_static_output_name}")
   endif()
 
+  add_dependencies(${LJVAR_LIB_TARGET} clear-stale-headers-${LJVAR_NAME})
   target_compile_definitions(${LJVAR_LIB_TARGET} PRIVATE DO_LUA_INIT ${LJVAR_COMPILE_DEFINITIONS})
   target_include_directories(${LJVAR_LIB_TARGET} PRIVATE
     "${variant_binary_dir}"
@@ -559,6 +739,7 @@ function(add_luajit_variant)
     set_target_properties(${LJVAR_EXE_TARGET} PROPERTIES ENABLE_EXPORTS ON)
   endif()
 
+  add_dependencies(${LJVAR_EXE_TARGET} clear-stale-headers-${LJVAR_NAME})
   target_compile_definitions(${LJVAR_EXE_TARGET} PRIVATE LJ_DS_DEBUG_GETINFO_PATCH=0 ${LJVAR_COMPILE_DEFINITIONS})
   target_include_directories(${LJVAR_EXE_TARGET} PRIVATE
     "${variant_binary_dir}"
