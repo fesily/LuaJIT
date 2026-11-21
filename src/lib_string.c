@@ -132,67 +132,21 @@ static int writer_buf(lua_State *L, const void *p, size_t size, void *sb)
 #if LJ_DS_PUC51_DUMP
 /* -- DS: real PUC Lua 5.1 bytecode for mod callers ------------------------ */
 
-/* A mod installs private_root.LJ_DS_PUC51_DUMP_POLICY = function() return modname end
-** once per state (Mod/scripts/luajit_mod_blacklist.lua). Attribution must stay in
-** Lua: only Lua can walk its own caller stack. This C side only asks the policy
-** who is dumping and then serializes the function through the host's PUC 5.1
-** service, so the bytes a mod receives are genuine Lua 5.1 bytecode.
+/* Attribution lives outside this file: the injector installs a C-function hook (a
+** closure implementation rewrite, no entry patch and no Lua frame) on
+** `string.dump`, and the hook's policy asks the blacklist manager who is
+** calling before it calls the original implementation. This C side therefore
+** only serializes the function through the host's PUC 5.1 service, so the
+** bytes a mod receives are genuine Lua 5.1 bytecode; it never re-enters Lua.
 **
-** No policy, a nil answer (engine/unowned caller), or a non-mod caller all keep
-** the native LuaJIT dump, so the interpreter and the bytecode tooling are
-** unchanged.
+** The native bytecode mode (lua_ds_allow_lj_bytecode: CLI, tools, private
+** states) keeps the native LuaJIT dump, exactly like before.
 */
-#define DS_DUMP_POLICY_KEY	"LJ_DS_PUC51_DUMP_POLICY"
-#define DS_DUMP_INVALID_TEXT	"invalid dump policy"
-
-/* Raises without a source location: the text names the mod, not the C frame. */
-static LJ_NORET void ds_dump_raise(lua_State *L, const char *text)
+static LJ_NORET void ds_dump_fail(lua_State *L, const char *reason)
 {
-  lua_pushstring(L, text);
+  lua_pushfstring(L, "[luajit] PUC 5.1 string.dump failed: %s",
+		  reason ? reason : "unknown error");
   lj_err_run(L);
-}
-
-static LJ_NORET void ds_dump_fail(lua_State *L, GCstr *owner, const char *reason)
-{
-  lua_pushfstring(L, "[luajit] Mod '%s': PUC 5.1 string.dump failed: %s",
-		  owner ? strdata(owner) : "?", reason ? reason : "unknown error");
-  lj_err_run(L);
-}
-
-/* The policy only names the caller for the blacklist record and error text.
-** The return format is not a policy decision: when the host bridge exists,
-** every Lua function dump is converted to PUC 5.1, exactly like stock PUC 5.1.
-** Always returns 1 with a name string (empty for unowned callers) at L->top-1.
-*/
-static int ds_dump_policy(lua_State *L)
-{
-  cTValue *o;
-  lua_pushstring(L, DS_DUMP_POLICY_KEY);
-  lua_rawget(L, LUA_REGISTRYINDEX2);
-  o = L->top-1;
-  if (tvisnil(o)) {
-    L->top--;
-    lua_pushliteral(L, "");
-    return 1;
-  }
-  if (!tvisfunc(o)) {
-    L->top--;
-    ds_dump_raise(L, DS_DUMP_INVALID_TEXT);
-  }
-  /* Called once, with no arguments, before the native tmpbuf is taken: a policy
-  ** that formats strings must not clobber the dump output buffer. */
-  lua_call(L, 0, 1);
-  o = L->top-1;
-  if (tvisnil(o) || tvisfalse(o)) {
-    L->top--;
-    lua_pushliteral(L, "");
-    return 1;
-  }
-  if (!tvisstr(o)) {
-    L->top--;
-    ds_dump_raise(L, DS_DUMP_INVALID_TEXT);
-  }
-  return 1;
 }
 
 typedef struct DSCopyCtx {
@@ -210,10 +164,10 @@ static TValue *ds_dump_copy_cb(lua_State *L, lua_CFunction dummy, void *ud)
   return NULL;
 }
 
-/* Replaces the native dump of one mod-owned function with real PUC 5.1 bytecode.
+/* Replaces the native dump of a Lua function with real PUC 5.1 bytecode.
 ** The prototype identity (pre-order index, compile node count, shape) is checked
 ** by the service, so a mismatch is reported instead of dumping a neighbour. */
-static void ds_dump_convert(lua_State *L, GCproto *pt, GCstr *owner, int strip)
+static void ds_dump_convert(lua_State *L, GCproto *pt, int strip)
 {
   lua_DsPucDumpRequest request;
   lua_DsPucDumpResult result;
@@ -224,9 +178,9 @@ static void ds_dump_convert(lua_State *L, GCproto *pt, GCstr *owner, int strip)
   DSCopyCtx copy;
 
   if (lj_ds_puc_dump == NULL)
-    ds_dump_fail(L, owner, "bridge unavailable");
+    ds_dump_fail(L, "bridge unavailable");
   if (source == NULL)  /* Bytecode reload, or a compile from before the host. */
-    ds_dump_fail(L, owner, "source unavailable");
+    ds_dump_fail(L, "source unavailable");
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++) {  /* Count, never select. */
     GCobj *o = proto_kgc(pt, i);
     if (o && o->gch.gct == ~LJ_TPROTO)
@@ -245,7 +199,7 @@ static void ds_dump_convert(lua_State *L, GCproto *pt, GCstr *owner, int strip)
   request.strip = strip;
 
   if (!lj_ds_puc_dump(&request, &result))
-    ds_dump_fail(L, owner, result.error[0] ? result.error : "service failed");
+    ds_dump_fail(L, result.error[0] ? result.error : "service failed");
 
   copy.data = result.data;
   copy.size = result.size;
@@ -278,19 +232,15 @@ LJLIB_CF(string_dump)
   }
 #if LJ_DS_PUC51_DUMP
   /* A C function or a blocked prototype keeps its original error. Every other
-  ** Lua function dumps PUC 5.1 whenever the conversion is compiled in; the
-  ** policy only supplies the caller name for the blacklist/error text. A missing
+  ** Lua function dumps PUC 5.1 whenever the conversion is compiled in. A missing
   ** host bridge is an error, not a silent downgrade to native LuaJIT bytes
   ** (ds_dump_convert reports "bridge unavailable"), so a mod can never observe
   ** the VM's own bytecode format through string.dump. A state in native LJ
   ** bytecode mode (lua_ds_allow_lj_bytecode: CLI, tools, private states) keeps
-  ** the native dump instead. */
+  ** the native dump instead. Caller attribution is the injector's C-function
+  ** hook on this closure, not part of the VM path. */
   if (pt != NULL && pt->firstline != ~(BCLine)0 && !ds_allow_lj_bytecode(L)) {
-    GCstr *owner = NULL;
-    ds_dump_policy(L);
-    if (tvisstr(L->top-1) && strV(L->top-1)->len != 0)
-      owner = strV(L->top-1);
-    ds_dump_convert(L, pt, owner, (flags & BCDUMP_F_STRIP) ? 1 : 0);
+    ds_dump_convert(L, pt, (flags & BCDUMP_F_STRIP) ? 1 : 0);
     lj_gc_check(L);
     return 1;
   }
