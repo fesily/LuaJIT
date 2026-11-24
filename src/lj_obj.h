@@ -386,7 +386,14 @@ typedef struct GCproto {
   uint8_t framesize;	/* Fixed frame size. */
   MSize sizebc;		/* Number of bytecode instructions. */
 #if LJ_GC64
+#if LJ_DS_PUC51_DUMP
+  uint32_t dsnodecount;	/* DS: total prototypes in this compile (0: unknown). */
+  uint32_t dsnodeidx;	/* DS: reuses the GC64 padding slot (see the static assert
+			** that pins gclist's offset). Non-GC64 has no such hole,
+			** so the field moves to the debug section there. */
+#else
   uint32_t unused_gc64;
+#endif
 #endif
 #if !LJ_HASGCMARK
   GCRef gclist;
@@ -401,6 +408,18 @@ typedef struct GCproto {
   uint16_t trace;	/* Anchor for chain of root traces. */
   /* ------ The following fields are for debugging/tracebacks only ------ */
   GCRef chunkname;	/* Name of the chunk this function was defined in. */
+  BCLine firstline;	/* First line of the function definition. */
+  BCLine numline;	/* Number of lines for the function definition. */
+  MRef lineinfo;	/* Compressed map from bytecode ins. to source line. */
+  MRef uvinfo;		/* Upvalue names. */
+  MRef varinfo;		/* Names and compressed extents of local variables. */
+  #if LJ_DS_PUC51_DUMP
+  GCRef dssource;	/* DS: exact source text of this compile, shared by the
+			** whole prototype tree (one GCstr per compile). Only the
+			** host-side PUC 5.1 dump service consumes it; never
+			** serialized by string.dump and never set by a bytecode
+			** reload. NULL when the compile was not captured. */
+#endif
 #if LJ_DS_CHUNKNAME_MARKER
   GCRef dschunkname;	/* DS: engine-loaded chunk marker. Only the game's file
 			** loaders may set it (lua_setfuncchunkname); plain Lua code can
@@ -408,11 +427,6 @@ typedef struct GCproto {
 			** "trusted" for the item-server call-stack guard. Never serialized
 			** by string.dump/load: reloaded chunks have it NULL. */
 #endif
-  BCLine firstline;	/* First line of the function definition. */
-  BCLine numline;	/* Number of lines for the function definition. */
-  MRef lineinfo;	/* Compressed map from bytecode ins. to source line. */
-  MRef uvinfo;		/* Upvalue names. */
-  MRef varinfo;		/* Names and compressed extents of local variables. */
 } GCproto;
 
 /* Flags for prototype. */
@@ -870,9 +884,34 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
+#if LJ_DS_REJECT_BINARY_CHUNKS
+  /* Rides in the byte-flag run above, whose padding to the 8-byte-aligned
+  ** StrInternState absorbs it: offsetof(global_State, str) and sizeof() are
+  ** identical with and without the field, so DISPATCH_GL offsets baked into
+  ** the generated interpreter stay valid either way. Do not grow this run
+  ** past the slot without regenerating buildvm with the same defines. */
+  uint8_t dsallowljbc;	/* lua_ds_allow_lj_bytecode: native LJ bytecode mode. */
+#endif
+  /* DS: optional second, private registry. It is a GC root like registrytv, and the C API
+  ** reaches it through LUA_REGISTRYINDEX2 / registry2(L) only when LJ_DS_REGISTRY2 is on;
+  ** otherwise both macros alias the public registry and this field does not exist. The
+  ** field is appended at the end on purpose: every offset baked into the generated
+  ** interpreter (DISPATCH_GL, PC2PROTO, ...) stays unchanged.
+  */
+#if LJ_DS_REGISTRY2
+  TValue registry2tv;	/* Anchor for the private registry. */
+#endif
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)
+
+/* Native LuaJIT bytecode mode for one state (lua_ds_allow_lj_bytecode). Only
+** exists in builds that compile the reject in; elsewhere it folds to 0. */
+#if LJ_DS_REJECT_BINARY_CHUNKS
+#define ds_allow_lj_bytecode(L)	(G(L)->dsallowljbc != 0)
+#else
+#define ds_allow_lj_bytecode(L)	0
+#endif
 #define vmthread(g)	(&gcref(g->vmthref)->th)
 #define niltv(L) \
   check_exp(tvisnil(&G(L)->nilnode.val), &G(L)->nilnode.val)
@@ -957,6 +996,11 @@ LJ_STATIC_ASSERT(offsetof(lua_State, userdata) == LJ_DST_LUA_STATE_USERDATA);
 
 #define G(L)			(mref(L->glref, global_State))
 #define registry(L)		(&G(L)->registrytv)
+#if LJ_DS_REGISTRY2
+#define registry2(L)		(&G(L)->registry2tv)
+#else
+#define registry2(L)		registry(L)
+#endif
 
 /* Macros to access the currently executing (Lua) function. */
 #if LJ_GC64
@@ -1364,6 +1408,15 @@ LJ_DATA const char *const lj_obj_itypename[~LJ_TNUMX+1];
 /* Compare two objects without calling metamethods. */
 LJ_FUNC int LJ_FASTCALL lj_obj_equal(cTValue *o1, cTValue *o2);
 LJ_FUNC const void * LJ_FASTCALL lj_obj_ptr(global_State *g, cTValue *o);
+
+#if LJ_DS_PUC51_DUMP
+#include "lua_ds_pucdump.h"
+/* Host-filled PUC 5.1 dump entry point (defined in lib_string.c as a data
+** symbol, so a host replaces the slot instead of preempting a same-named
+** function). NULL keeps string.dump native for every caller, which is also the
+** standalone interpreter's permanent state: nothing outside the game wires it. */
+extern LUA_DATA_API lua_DsPucDumpFn lj_ds_puc_dump;
+#endif
 
 #if LJ_ABI_PAUTH
 #if LJ_TARGET_ARM64

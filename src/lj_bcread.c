@@ -363,6 +363,13 @@ GCproto *lj_bcread_proto(LexState *ls)
 #if LJ_DS_CHUNKNAME_MARKER
   setgcrefnull(pt->dschunkname);  /* DS: bytecode reload is never trusted. */
 #endif
+#if LJ_DS_PUC51_DUMP
+  /* Reloading bytecode cannot restore a source identity: the text was never
+  ** loaded here, so string.dump for it must fail rather than guess. */
+  setgcrefnull(pt->dssource);
+  pt->dsnodecount = 0;
+  pt->dsnodeidx = 0;
+#endif
 
   /* Close potentially uninitialized gap between bc and kgc. */
   *(uint32_t *)((char *)pt + ofsk - sizeof(GCRef)*(sizekgc+1)) = 0;

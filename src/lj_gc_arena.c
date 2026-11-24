@@ -384,6 +384,9 @@ static void gc_mark_start(global_State *g)
   gc_markobj(g, tabref(mainthread(g)->env));
   gc_markobj(g, vmthread(g));
   gc_marktv(g, &g->registrytv);
+#if LJ_DS_REGISTRY2
+  gc_marktv(g, &g->registry2tv);
+#endif
   gc_mark_gcroot(g);
   gc_traverse_mainthread(g);
   /* Pending finals are not in the registry; re-root before propagate. */
@@ -805,6 +808,64 @@ int lj_gc_fin_queue_empty(global_State *g)
   return g->gc.fin_qhead == g->gc.fin_qtail;
 }
 
+#if LJ_DS_PUC51_DUMP
+/* Drop every live prototype's saved compile source.
+**
+** g->gc.root is retired in this collector, so the enumeration is the POD arena
+** bitmaps: prototypes and closures are the only objects routed to a
+** ArenaFlag_PODOnly arena (the full-GC purity check asserts exactly that), and
+** `block & mark` yields allocated-and-marked-live cells - binned free cells keep
+** block=1 but carry mark=0, so they cannot be mistaken for a prototype. A POD
+** object never becomes a huge block, so the huge set needs no scan. Only
+** prototype fields are rewritten: nothing is allocated and storing NULL needs no
+** GC barrier. Must be called from ordinary Lua/C execution, never inside a GC
+** step, so no arena is mid-sweep while this reads it.
+*/
+MSize lj_gc_clear_dssource(global_State *g)
+{
+  GCArena **arenas = mref(g->gc.arenas, GCArena *);
+  MSize i, n = 0;
+  for (i = 0; i < g->gc.arenastop; i++) {
+    GCArena *a = arenas[i];
+    uint32_t w, wtop;
+    if (!(a->flags & ArenaFlag_PODOnly))
+      continue;
+    if ((GCCellID)a->celltop <= MinCellId)
+      continue;
+    /* Bin caches keep block=1 on free cells, which would be indistinguishable
+    ** from an allocated white object. Flushing them is what those caches
+    ** require before any bitmap walk (same precondition as
+    ** lj_arena_visit_unmarked / the sweep slices); it releases free blocks and
+    ** moves no live object. In the mutator phase an allocated object is
+    ** (block=1, mark=0), so `a->block[]` - not `block & mark` - is the
+    ** allocated set here. */
+    lj_arena_flushbins(a);
+    wtop = arena_blockidx((GCCellID)a->celltop - 1);
+    for (w = UnusedBlockWords; w <= wtop; w++) {
+      GCBlockword alive = a->block[w];
+      while (alive) {
+	uint32_t bitidx = lj_ffs(alive);
+	GCCellID c = (w << 5) + bitidx;
+	GCobj *o;
+	alive &= alive - 1;
+	if (arena_cellstate(a, c) < CellState_White)
+	  continue;  /* defensive: never read a header from a free cell */
+	o = (GCobj *)arena_cellptr(a, c);
+	if (o->gch.gct == ~LJ_TPROTO) {
+	  GCproto *pt = gco2pt(o);
+	  if (gcref(pt->dssource) != NULL) {
+	    setgcrefnull(pt->dssource);
+	    pt->dsnodecount = 0;
+	    n++;
+	  }
+	}
+      }
+    }
+  }
+  return n;
+}
+#endif
+
 /* F3 complete: after separate, dead finalizables leave the registry and sit
 ** on fin_queue with FINALIZED. Registry survivors must not be white+needs-fin
 ** (they would have been enqueued). Queue members must carry FINALIZED.
@@ -1033,6 +1094,12 @@ static void gc_traverse_proto(global_State *g, GCproto *pt)
 {
   ptrdiff_t i;
   gc_mark_str(g, proto_chunkname(pt));
+#if LJ_DS_PUC51_DUMP
+  {  /* DS: keep the saved compile source alive with its prototype tree. */
+    GCstr *dssrc = strref(pt->dssource);
+    if (dssrc) gc_mark_str(g, dssrc);
+  }
+#endif
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT

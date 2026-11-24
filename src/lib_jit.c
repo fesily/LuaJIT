@@ -9,6 +9,7 @@
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
+#include <string.h>
 
 #include "lj_obj.h"
 #include "lj_gc.h"
@@ -36,6 +37,7 @@
 #include "lj_lib.h"
 
 #include "luajit.h"
+
 
 /* -- jit.* functions ----------------------------------------------------- */
 
@@ -121,6 +123,26 @@ LJLIB_CF(jit_security)
   return 1;
 }
 
+/* DS: drop the source text this VM keeps for PUC 5.1 string.dump conversions.
+** Every text compile saves its own bytes for the whole prototype tree so a mod's
+** string.dump can be answered with real Lua 5.1 bytecode; this releases those
+** references on demand and the text is collected by the next GC. Returns the
+** number of prototypes that held a source. A mod schedules it once the load-time
+** probes are done (Mod/modmain.lua, sim post-init + 30 s) - after that, a dump of
+** a function compiled before the clear reports "source unavailable", while any
+** new compile captures its own source again. No-op returning 0 when the capture
+** is compiled out, so callers never need a switch. */
+LJLIB_CF(jit_puc_dump_clear)
+{
+#if LJ_DS_PUC51_DUMP
+  MSize n = lj_gc_clear_dssource(G(L));
+#else
+  MSize n = 0;
+#endif
+  setnumV(L->top++, (lua_Number)n);
+  return 1;
+}
+
 LJLIB_CF(jit_attach)
 {
 #ifdef LUAJIT_DISABLE_VMEVENT
@@ -128,7 +150,7 @@ LJLIB_CF(jit_attach)
 #else
   GCfunc *fn = lj_lib_checkfunc(L, 1);
   GCstr *s = lj_lib_optstr(L, 2);
-  luaL_findtable(L, LUA_REGISTRYINDEX, LJ_VMEVENTS_REGKEY, LJ_VMEVENTS_HSIZE);
+  luaL_findtable(L, LUA_REGISTRYINDEX2, LJ_VMEVENTS_REGKEY, LJ_VMEVENTS_HSIZE);
   if (s) {  /* Attach to given event. */
     const uint8_t *p = (const uint8_t *)strdata(s);
     uint32_t h = s->len;
@@ -552,7 +574,7 @@ static void jit_profile_callback(lua_State *L2, lua_State *L, int samples,
   TValue key;
   cTValue *tv;
   key.u64 = KEY_PROFILE_FUNC;
-  tv = lj_tab_get(L, tabV(registry(L)), &key);
+  tv = lj_tab_get(L, tabV(registry2(L)), &key);
   if (tvisfunc(tv)) {
     char vmst = (char)vmstate;
     int status;
@@ -572,7 +594,7 @@ static void jit_profile_callback(lua_State *L2, lua_State *L, int samples,
 /* profile.start(mode, cb) */
 LJLIB_CF(jit_profile_start)
 {
-  GCtab *registry = tabV(registry(L));
+  GCtab *registry = tabV(registry2(L));
   GCstr *mode = lj_lib_optstr(L, 1);
   GCfunc *func = lj_lib_checkfunc(L, 2);
   lua_State *L2 = lua_newthread(L);  /* Thread that runs profiler callback. */
@@ -594,7 +616,7 @@ LJLIB_CF(jit_profile_stop)
   GCtab *registry;
   TValue key;
   luaJIT_profile_stop(L);
-  registry = tabV(registry(L));
+  registry = tabV(registry2(L));
   key.u64 = KEY_PROFILE_THREAD;
   setnilV(lj_tab_set(L, registry, &key));
   key.u64 = KEY_PROFILE_FUNC;

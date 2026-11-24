@@ -46,6 +46,10 @@ static TValue *index2adr(lua_State *L, int idx)
     return o;
   } else if (idx == LUA_REGISTRYINDEX) {
     return registry(L);
+#if LJ_DS_REGISTRY2
+  } else if (idx == LUA_REGISTRYINDEX2) {
+    return registry2(L);
+#endif
   } else {
     GCfunc *fn = curr_func(L);
     lj_checkapi(fn->c.gct == ~LJ_TFUNC && !isluafunc(fn),
@@ -191,6 +195,12 @@ static void copy_slot(lua_State *L, TValue *f, int idx)
     lj_checkapi(tvistab(f), "stack slot %d is not a table", idx);
     setgcref(fn->c.env, obj2gco(tabV(f)));
     lj_gc_barrier(L, fn, f);
+#if LJ_DS_REGISTRY2
+  } else if (idx == LUA_REGISTRYINDEX2) {
+    /* Same contract as LUA_REGISTRYINDEX: the slot takes any value and is a GC
+    ** root, so it needs no barrier (and must not take the upvalue branch). */
+    copyTV(L, registry2(L), f);
+#endif
   } else {
     TValue *o = index2adr_check(L, idx);
     copyTV(L, o, f);
@@ -1521,3 +1531,23 @@ LUA_API const char *lua_getfuncchunkname(lua_State *L, int idx)
 }
 
 #endif /* LJ_DS_CHUNKNAME_MARKER */
+
+/* lua_ds_allow_lj_bytecode(L, allow)
+**
+** Outer-API switch for native LuaJIT bytecode semantics on one state. It lifts
+** two game-VM policies at once: lj_lex_setup's compile-time reject of every
+** \x1b chunk (LJ_DS_REJECT_BINARY_CHUNKS) and string.dump's conversion to PUC
+** 5.1 (LJ_DS_PUC51_DUMP). Hosts that need native dumps and reloads (CLI, tools,
+** private injector states) call it; the game state and every mod-visible path
+** keep the masked behaviour. PUC 5.1 bytecode (\x1bLua) stays rejected.
+** The state flag only exists with LJ_DS_REJECT_BINARY_CHUNKS, so in a build
+** that drops the reject this entry point is a no-op (the symbol stays exported).
+*/
+LUA_API void lua_ds_allow_lj_bytecode(lua_State *L, int allow)
+{
+#if LJ_DS_REJECT_BINARY_CHUNKS
+  G(L)->dsallowljbc = allow != 0;
+#else
+  UNUSED(L); UNUSED(allow);
+#endif
+}

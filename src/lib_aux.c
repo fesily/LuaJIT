@@ -355,7 +355,7 @@ LUALIB_API lua_State *luaL_newstate(void)
   if (L) {
     G(L)->panic = panic;
 #ifndef LUAJIT_DISABLE_VMEVENT
-    luaL_findtable(L, LUA_REGISTRYINDEX, LJ_VMEVENTS_REGKEY, LJ_VMEVENTS_HSIZE);
+    luaL_findtable(L, LUA_REGISTRYINDEX2, LJ_VMEVENTS_REGKEY, LJ_VMEVENTS_HSIZE);
     lua_pushcfunction(L, error_finalizer);
     lua_rawseti(L, -2, VMEVENT_HASH(LJ_VMEVENT_ERRFIN));
     G(L)->vmevmask = VMEVENT_MASK(LJ_VMEVENT_ERRFIN);
@@ -378,7 +378,7 @@ LUALIB_API lua_State *luaL_newstate(void)
   if (L) {
     G(L)->panic = panic;
 #ifndef LUAJIT_DISABLE_VMEVENT
-    luaL_findtable(L, LUA_REGISTRYINDEX, LJ_VMEVENTS_REGKEY, LJ_VMEVENTS_HSIZE);
+    luaL_findtable(L, LUA_REGISTRYINDEX2, LJ_VMEVENTS_REGKEY, LJ_VMEVENTS_HSIZE);
     lua_pushcfunction(L, error_finalizer);
     lua_rawseti(L, -2, VMEVENT_HASH(LJ_VMEVENT_ERRFIN));
     G(L)->vmevmask = VMEVENT_MASK(LJ_VMEVENT_ERRFIN);

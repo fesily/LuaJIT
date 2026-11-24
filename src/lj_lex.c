@@ -14,6 +14,7 @@
 #include "lj_err.h"
 #include "lj_buf.h"
 #include "lj_str.h"
+#include "lj_strfmt.h"
 #if LJ_HASFFI
 #include "lj_tab.h"
 #include "lj_ctype.h"
@@ -497,7 +498,30 @@ static LexToken lex_scan(LexState *ls, TValue *tv)
 
 /* -- Lexer API ----------------------------------------------------------- */
 
+#if LJ_DS_REJECT_BINARY_CHUNKS | LJ_DS_PUC51_DUMP
 /* Setup lexer state. */
+/* Stock PUC 5.1 rejects every precompiled chunk from luaU_undump with
+** "<name>: Disallowed functionality in precompiled chunk" (LUA_ERRSYNTAX),
+** where <name> is the chunk name normalized the way PUC does it: a leading
+** '@' or '=' is stripped, and a name that starts with the bytecode signature
+** (the caller passed the chunk itself as the name, i.e. loadstring without a
+** chunk name) becomes "binary string". A fixed "binary string" for every call
+** is a VM fingerprint: loadstring(dump, "=mymod") must name mymod.
+*/
+static LJ_NORET void ds_reject_binary_chunk(lua_State *L, LexState *ls)
+{
+  const char *name = ls->chunkarg;  /* "?" when lua_load got no name (PUC alike) */
+  if (name != NULL && (*name == '@' || *name == '='))
+    name++;
+  else if (name != NULL && *name == LUA_SIGNATURE[0])
+    name = "binary string";
+  if (name == NULL)
+    name = "?";
+  lj_strfmt_pushf(L, "%s: Disallowed functionality in precompiled chunk", name);
+  lj_err_throw(L, LUA_ERRSYNTAX);
+}
+#endif
+
 int lj_lex_setup(lua_State *L, LexState *ls)
 {
   int header = 0;
@@ -516,6 +540,13 @@ int lj_lex_setup(lua_State *L, LexState *ls)
   ls->endmark = 0;
   ls->fr2 = LJ_FR2;  /* Generate native bytecode by default. */
   lex_next(ls);  /* Read-ahead first char. */
+#if LJ_DS_PUC51_LOAD_EOF_RETRY
+  /* PUC 5.1: luaZ_lookahead() returns EOZ without buffering, then the source
+  ** parser's luaX_setinput/next calls luaZ_fill() again.  Match that second
+  ** call for stateful readers (load(reader)); if it yields data, parse it. */
+  if (ls->c == LEX_EOF)
+    lex_next(ls);
+#endif
   if (ls->c == 0xef && ls->p + 2 <= ls->pe && (uint8_t)ls->p[0] == 0xbb &&
       (uint8_t)ls->p[1] == 0xbf) {  /* Skip UTF-8 BOM (if buffered). */
     ls->p += 2;
@@ -548,6 +579,20 @@ int lj_lex_setup(lua_State *L, LexState *ls)
       setstrV(L, L->top++, lj_err_str(L, LJ_ERR_BCBAD));
       lj_err_throw(L, LUA_ERRSYNTAX);
     }
+#if LJ_DS_REJECT_BINARY_CHUNKS
+    /* Compile-time policy: reject every \x1b chunk (PUC and LuaJIT). An outer
+    ** API may lift it per state (lua_ds_allow_lj_bytecode); the
+    ** LJ_DS_PUC51_DUMP check below then still rejects PUC 5.1 bytecode. */
+    if (!ds_allow_lj_bytecode(L))
+      ds_reject_binary_chunk(L, ls);
+#endif
+#if LJ_DS_PUC51_DUMP
+    /* PUC 5.1 bytecode is rejected by the stock engine. The lexer already
+    ** consumed the leading \x1b; the signature bytes follow in ls->p. */
+    if (ls->p + 3 <= ls->pe && ls->p[0] == 'L' && ls->p[1] == 'u' &&
+        ls->p[2] == 'a')
+      ds_reject_binary_chunk(L, ls);
+#endif
     return 1;
   }
   return 0;

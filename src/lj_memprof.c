@@ -734,6 +734,11 @@ static void mp_enum_refs(global_State *g, GCobj *o, void *ctx, MpRefCb cb)
     /* chunkname (gc_traverse_proto: proto_chunkname). */
     if (gcrefu(pt->chunkname) != 0)
       cb(ctx, obj2gco(strref(pt->chunkname)));
+#if LJ_DS_PUC51_DUMP
+    /* DS: saved compile source (gc_traverse_proto marks it as well). */
+    if (gcrefu(pt->dssource) != 0)
+      cb(ctx, obj2gco(strref(pt->dssource)));
+#endif
     /* collectable constants (proto_kgc for i in [-sizekgc,0)). */
     for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++) {
       GCobj *k = proto_kgc(pt, (size_t)i);
@@ -835,6 +840,10 @@ static void mp_enum_root_refs(global_State *g, void *ctx, MpRefCb cb)
     cb(ctx, obj2gco(vmthread(g)));
   if (tvisgcv(&g->registrytv))
     cb(ctx, gcV(&g->registrytv));
+#if LJ_DS_REGISTRY2
+  if (tvisgcv(&g->registry2tv))
+    cb(ctx, gcV(&g->registry2tv));
+#endif
   {
     ptrdiff_t i;
     for (i = 0; i < (ptrdiff_t)GCROOT_MAX; i++) {

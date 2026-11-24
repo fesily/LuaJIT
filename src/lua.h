@@ -34,6 +34,22 @@
 ** pseudo-indices
 */
 #define LUA_REGISTRYINDEX	(-10000)
+/* DS: optional second, private registry (global_State.registry2tv). With
+** LJ_DS_REGISTRY2=0 it is an alias for LUA_REGISTRYINDEX, so the injector's
+** private state lives in the public registry and the feature adds no storage.
+** With LJ_DS_REGISTRY2=1 it is a distinct pseudo-index accepted by the same
+** index2adr paths, but not reachable from Lua: the debug library only ever
+** returns LUA_REGISTRYINDEX. The value is below every valid upvalue
+** pseudo-index (LUA_GLOBALSINDEX - 1 .. -LJ_MAX_UPVAL), so it cannot be
+** confused with lua_upvalueindex(i). */
+#ifndef LJ_DS_REGISTRY2
+#define LJ_DS_REGISTRY2	1
+#endif
+#if LJ_DS_REGISTRY2
+#define LUA_REGISTRYINDEX2	(-11000)
+#else
+#define LUA_REGISTRYINDEX2	LUA_REGISTRYINDEX
+#endif
 #define LUA_ENVIRONINDEX	(-10001)
 #define LUA_GLOBALSINDEX	(-10002)
 #define lua_upvalueindex(i)	(LUA_GLOBALSINDEX-(i))
@@ -217,6 +233,15 @@ extern LUA_DATA_API const char **extern_had_execution_error;
 LUA_API void        (lua_setfuncchunkname) (lua_State *L, int idx, const char *name);
 LUA_API const char *(lua_getfuncchunkname) (lua_State *L, int idx);
 #endif
+
+/* DST: switch one state to native LuaJIT bytecode semantics. Non-zero lifts the
+** compile-time binary-chunk reject (LJ_DS_REJECT_BINARY_CHUNKS) and keeps
+** string.dump native instead of converting to PUC 5.1; PUC 5.1 bytecode
+** (\x1bLua) stays rejected. Default is the masked game behaviour. The state
+** flag only exists with LJ_DS_REJECT_BINARY_CHUNKS, so this is a no-op in a
+** build that drops the reject. Declared unconditionally: lua.h is included
+** before lj_arch.h. */
+LUA_API void        (lua_ds_allow_lj_bytecode) (lua_State *L, int allow);
 LUA_API int   (lua_getmetatable) (lua_State *L, int objindex);
 LUA_API void  (lua_getfenv) (lua_State *L, int idx);
 

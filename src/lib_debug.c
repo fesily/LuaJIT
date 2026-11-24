@@ -206,29 +206,16 @@ LJLIB_CF(debug_setlocal)
   return 1;
 }
 
-#if LJ_DS_NEW_PROXY_PATCH
-extern LUA_DATA_API lua_CFunction lua_newproxy;
-#endif
-
 static int debug_getupvalue(lua_State *L, int get)
 {
   int32_t n = lj_lib_checkint(L, 2);
   const char *name;
   lj_lib_checkfunc(L, 1);
-#if LJ_DS_NEW_PROXY_PATCH
-  if (lua_iscfunction(L, 1)) {
-    TValue *val = NULL;
-    GCobj *o;
-    int index = 2;
-    name = lj_debug_uvnamev(lj_lib_checkany(L, 1), (uint32_t)(index-1), &val, &o);
-    if (val && tvisfunc(val) && (!name || strlen(name) == 0)) {
-      GCfunc *fn = funcV(val);
-      if (iscfunc(fn)) {
-        if (fn->c.f == lua_newproxy)
-          return 0;  /* don't allow access newproxy closure*/
-      }
-    }
-  }
+#if !LJ_52
+  /* Lua 5.1 (and the engine's PUC): the debug library never exposes C
+  ** closure upvalues. The 5.2 compatibility mode keeps its 5.2 behaviour.
+  */
+  if (lua_iscfunction(L, 1)) return 0;
 #endif
   name = get ? lua_getupvalue(L, 1, n) : lua_setupvalue(L, 1, n);
   if (name) {
