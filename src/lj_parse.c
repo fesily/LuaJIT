@@ -2479,6 +2479,7 @@ static void expr(LexState *ls, ExpDesc *v, int eflags)
     FuncState *fs = ls->fs;
     BCPos escapelist = NO_JMP, cond;
     BCReg reg;
+    synlevel_begin(ls);
     bcemit_branch_t(fs, v);
     cond = v->f;
     expr(ls, v, EXPR_F_NOCOLON);  /* Prevent method parsing. Use parentheses. */
@@ -2491,6 +2492,7 @@ static void expr(LexState *ls, ExpDesc *v, int eflags)
     expr(ls, v, 0);
     expr_tonextreg(fs, v);
     jmp_tohere(fs, escapelist);
+    synlevel_end(ls);
   }
 }
 
