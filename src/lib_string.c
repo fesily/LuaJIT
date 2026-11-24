@@ -166,8 +166,11 @@ static TValue *ds_dump_copy_cb(lua_State *L, lua_CFunction dummy, void *ud)
 
 /* Replaces the native dump of a Lua function with real PUC 5.1 bytecode.
 ** The prototype identity (pre-order index, compile node count, shape) is checked
-** by the service, so a mismatch is reported instead of dumping a neighbour. */
-static void ds_dump_convert(lua_State *L, GCproto *pt, int strip)
+** by the service, so a mismatch is reported instead of dumping a neighbour.
+** PUC 5.1's string.dump has no strip argument: lua_settop(L,1) drops extra
+** arguments and lua_dump always writes the debug info, so the service is never
+** asked to strip. */
+static void ds_dump_convert(lua_State *L, GCproto *pt)
 {
   lua_DsPucDumpRequest request;
   lua_DsPucDumpResult result;
@@ -196,19 +199,23 @@ static void ds_dump_convert(lua_State *L, GCproto *pt, int strip)
   request.nups = pt->sizeuv;
   request.is_vararg = (pt->flags & PROTO_VARARG) ? 1u : 0u;
   request.child_count = children;
-  request.strip = strip;
 
+  result.error[0] = '\0';
+  result.release = NULL;
   if (!lj_ds_puc_dump(&request, &result))
     ds_dump_fail(L, result.error[0] ? result.error : "service failed");
+  if (result.data == NULL || result.release == NULL) {
+    /* Ownership is transferred only through release(); nothing to free here. */
+    ds_dump_fail(L, "service returned an invalid buffer");
+  }
 
   copy.data = result.data;
   copy.size = result.size;
   status = lj_vm_cpcall(L, NULL, &copy, ds_dump_copy_cb);
   /* Exactly once, on both outcomes, and before anything can raise again. */
-  if (result.release != NULL)
-    result.release(result.owner);
+  result.release(result.owner);
   if (status != 0)
-    lj_err_run(L);  /* Re-raise the VM's own out-of-memory error value. */
+    lj_err_throw(L, status);  /* Preserve LUA_ERRMEM instead of LUA_ERRRUN. */
 }
 #endif
 
@@ -240,7 +247,7 @@ LJLIB_CF(string_dump)
   ** the native dump instead. Caller attribution is the injector's C-function
   ** hook on this closure, not part of the VM path. */
   if (pt != NULL && pt->firstline != ~(BCLine)0 && !ds_allow_lj_bytecode(L)) {
-    ds_dump_convert(L, pt, (flags & BCDUMP_F_STRIP) ? 1 : 0);
+    ds_dump_convert(L, pt);
     lj_gc_check(L);
     return 1;
   }

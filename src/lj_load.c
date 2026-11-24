@@ -47,7 +47,11 @@ static const char *ds_capture_reader(lua_State *L, void *ud, size_t *size)
 {
   DSCaptureCtx *c = (DSCaptureCtx *)ud;
   const char *chunk = c->r(L, c->d, size);
-  if (chunk != NULL && size != NULL && *size > 0) {
+  /* ~(size_t)0 is luaL_loadbuffer's "embedded bytecode of unknown length"
+  ** sentinel (lib_package.c uses it for luaJIT_BC_* modules); lex_more handles
+  ** it, but it must never enter the text capture. */
+  if (chunk != NULL && size != NULL && *size > 0 &&
+      *size != ~(size_t)0) {
     size_t used = (size_t)sbuflen(c->sb);
     /* Check before narrowing to MSize: neither the 32 bit size nor the VM string
     ** limit may be crossed, and a partial capture must never look complete. */
@@ -75,6 +79,19 @@ static void ds_attach_source(lua_State *L, GCproto *pt, GCstr *src, uint32_t cou
   }
 }
 
+/* PUC 5.1's luaL_loadfile keeps the leading #! line in the line numbering, but
+** luaL_loadbuffer does not skip it. The VM lexer skips the line, so replace it
+** with spaces (keeping the newline) before the host recompiles the source. */
+static void ds_capture_normalize_shebang(SBuf *sb)
+{
+  char *p = sb->b;
+  MSize n = sbuflen(sb), i;
+  if (p == NULL || n < 2 || p[0] != '#' || p[1] != '!')
+    return;
+  for (i = 0; i < n && p[i] != '\n'; i++)
+    p[i] = ' ';
+}
+
 /* Interning the source text allocates, and the freshly parsed prototype tree is
 ** not referenced yet, so the root is anchored first. */
 static void ds_capture_source(lua_State *L, LexState *ls, GCproto *pt)
@@ -85,6 +102,7 @@ static void ds_capture_source(lua_State *L, LexState *ls, GCproto *pt)
     return;
   setprotoV(L, L->top, pt);
   incr_top(L);
+  ds_capture_normalize_shebang(&ls->dssource);
   body = ls->dssource.b;
   src = lj_str_new(L, body ? body : "", (size_t)sbuflen(&ls->dssource));
   ds_attach_source(L, pt, src, ls->dsnextnode);

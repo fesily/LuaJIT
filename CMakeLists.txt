@@ -469,12 +469,18 @@ int main(void)
 #endif
   printf(\"\\n\");
   printf(\"ARCH=%s\\n\", (LJ_ARCH_BITS == 64 && !LJ_FR2) ? \"x86\" : \"\");
-  /* Layout values the DynASM output bakes in (PC2PROTO/DISPATCH_GL). */
-  printf(\"LAYOUT=%u,%u,%u,%u,%u\\n\",
+  /* Layout values the DynASM output bakes in (PC2PROTO/DISPATCH_GL/GG_G2DISP). */
+  printf(\"LAYOUT=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\\n\",
          (unsigned)sizeof(GCproto), (unsigned)offsetof(GCproto, k),
          (unsigned)offsetof(GCproto, chunkname),
+         (unsigned)offsetof(GCproto, sizekgc),
+         (unsigned)offsetof(GCproto, sizekn),
+         (unsigned)offsetof(GCproto, uv),
+         (unsigned)offsetof(GCproto, flags),
          (unsigned)sizeof(global_State),
-         (unsigned)offsetof(global_State, str));
+         (unsigned)offsetof(global_State, str),
+         (unsigned)offsetof(global_State, cur_L),
+         (unsigned)offsetof(global_State, jit_base));
   return 0;
 }
 ")
@@ -484,10 +490,13 @@ int main(void)
     set(${arch_var} "" PARENT_SCOPE)
     return()
   endif()
-  # try_run's COMPILE_DEFINITIONS takes -D arguments, not bare names like
-  # target_compile_definitions does. Two sets, matching the two targets:
-  #   lib  : ${LJVAR_COMPILE_DEFINITIONS}          (see target_compile_definitions)
-  #   host : ${TARGET_ARCH} + variant defs         (buildvm, and inside buildvm_arch.h)
+  # try_run inherits CMAKE_C_FLAGS but NOT the directory ADD_DEFINITIONS /
+  # add_compile_definitions property (verified with a minimal CMake project),
+  # so carry the effective directory definitions explicitly. Two sets, matching
+  # the two real targets:
+  #   lib  : directory defs + variant defs      (see target_compile_definitions)
+  #   host : directory defs + TARGET_ARCH + variant defs (buildvm)
+  get_directory_property(_probe_dir_defs COMPILE_DEFINITIONS)
   function(_luajit_dash_d defs_out)
     set(_out_defs "")
     foreach(_def IN LISTS ARGN)
@@ -499,8 +508,10 @@ int main(void)
     endforeach()
     set(${defs_out} "${_out_defs}" PARENT_SCOPE)
   endfunction()
-  _luajit_dash_d(_lib_defs ${LJVAR_COMPILE_DEFINITIONS})
-  _luajit_dash_d(_host_defs ${TARGET_ARCH} ${LJVAR_COMPILE_DEFINITIONS})
+  _luajit_dash_d(_lib_defs ${_probe_dir_defs} ${CMAKE_REQUIRED_DEFINITIONS}
+                 ${LJVAR_COMPILE_DEFINITIONS})
+  _luajit_dash_d(_host_defs ${_probe_dir_defs} ${CMAKE_REQUIRED_DEFINITIONS}
+                 ${TARGET_ARCH} ${LJVAR_COMPILE_DEFINITIONS})
   function(_luajit_run_probe probe_out probe_layout probe_ok)
     try_run(_run_rc _compile_ok "${_dir}/build-${probe_out}"
       SOURCES "${_src}"
@@ -545,7 +556,12 @@ int main(void)
       "interpreter bakes these values, so a macro that changes them must be enabled for "
       "buildvm and the target alike.")
   endif()
-  string(REGEX MATCH "-D [^\n]*" _flagline "${_out}")
+  string(FIND "${_out}" "\n" _probe_nl)
+  if(_probe_nl GREATER -1)
+    string(SUBSTRING "${_out}" 0 ${_probe_nl} _flagline)
+  else()
+    set(_flagline "${_out}")
+  endif()
   separate_arguments(_flags NATIVE_COMMAND "${_flagline}")
   string(REGEX MATCH "ARCH=([a-z0-9]*)" _archmatch "${_out}")
   set(${flags_var} "${_flags}" PARENT_SCOPE)
@@ -785,8 +801,8 @@ add_luajit_variant(
 # off), and an out-of-range decimal escape reports the 5.1 wording.
 foreach(_lj_compat51_case arg_bug function_args function_args_alloc
         function_args_closure function_args_debug function_args_main_chunk
-        getlocal_tail_frame str_escapes str_order51 str_intern_collide
-        tailcall_debug)
+        getlocal_tail_frame load_eof_retry str_escapes str_order51
+        str_intern_collide tailcall_debug)
   if(LUAJIT_DISABLE_JIT AND
       _lj_compat51_case MATCHES "^(function_args_alloc|str_order51)$")
     continue() # These unrelated scripts explicitly enable the JIT engine.

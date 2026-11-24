@@ -544,9 +544,10 @@ static int pmain(lua_State *L)
     lua_setfield(L, LUA_REGISTRYINDEX, "LUA_NOENV");
   }
 
-#if LJ_DS_REJECT_BINARY_CHUNKS
-  /* DST: the game VM rejects every \x1b chunk at compile time; the CLI is a
-  ** host that needs native LuaJIT dumps, so switch this state to native mode. */
+#if LJ_DS_REJECT_BINARY_CHUNKS || LJ_DS_PUC51_DUMP
+  /* DST: the game VM rejects every \x1b chunk at compile time and converts
+  ** string.dump to PUC 5.1; the CLI is a host that needs native LuaJIT
+  ** bytecode, so switch this state to native mode. */
   lua_ds_allow_lj_bytecode(L, 1);
 #endif
 

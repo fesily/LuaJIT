@@ -1540,12 +1540,12 @@ LUA_API const char *lua_getfuncchunkname(lua_State *L, int idx)
 ** 5.1 (LJ_DS_PUC51_DUMP). Hosts that need native dumps and reloads (CLI, tools,
 ** private injector states) call it; the game state and every mod-visible path
 ** keep the masked behaviour. PUC 5.1 bytecode (\x1bLua) stays rejected.
-** The state flag only exists with LJ_DS_REJECT_BINARY_CHUNKS, so in a build
-** that drops the reject this entry point is a no-op (the symbol stays exported).
+** The state flag exists when either policy is compiled in, so a build that
+** drops only the reject still keeps native dumps for the CLI and tools.
 */
 LUA_API void lua_ds_allow_lj_bytecode(lua_State *L, int allow)
 {
-#if LJ_DS_REJECT_BINARY_CHUNKS
+#if LJ_DS_REJECT_BINARY_CHUNKS || LJ_DS_PUC51_DUMP
   G(L)->dsallowljbc = allow != 0;
 #else
   UNUSED(L); UNUSED(allow);

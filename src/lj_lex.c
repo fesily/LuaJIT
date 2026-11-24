@@ -525,6 +525,7 @@ static LJ_NORET void ds_reject_binary_chunk(lua_State *L, LexState *ls)
 int lj_lex_setup(lua_State *L, LexState *ls)
 {
   int header = 0;
+  int firsteof = 0;
   ls->L = L;
   ls->fs = NULL;
   ls->pe = ls->p = NULL;
@@ -543,8 +544,12 @@ int lj_lex_setup(lua_State *L, LexState *ls)
 #if LJ_DS_PUC51_LOAD_EOF_RETRY
   /* PUC 5.1: luaZ_lookahead() returns EOZ without buffering, then the source
   ** parser's luaX_setinput/next calls luaZ_fill() again.  Match that second
-  ** call for stateful readers (load(reader)); if it yields data, parse it. */
-  if (ls->c == LEX_EOF)
+  ** call for stateful readers (load(reader)); if it yields data, parse it.
+  ** The parser was already chosen by the first lookahead: an initial EOF means
+  ** f_parser selected luaY_parser, so the retried bytes are text even when they
+  ** start with the bytecode signature. */
+  firsteof = (ls->c == LEX_EOF);
+  if (firsteof)
     lex_next(ls);
 #endif
   if (ls->c == 0xef && ls->p + 2 <= ls->pe && (uint8_t)ls->p[0] == 0xbb &&
@@ -568,7 +573,7 @@ int lj_lex_setup(lua_State *L, LexState *ls)
       ls->c = '\n';
     }
   }
-  if (ls->c == LUA_SIGNATURE[0]) {  /* Bytecode dump. */
+  if (!firsteof && ls->c == LUA_SIGNATURE[0]) {  /* Bytecode dump. */
     if (header) {
       /*
       ** Loading bytecode with an extra header is disabled for security

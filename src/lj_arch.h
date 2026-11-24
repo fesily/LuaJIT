@@ -1023,13 +1023,23 @@ extern void *LJ_WIN_LOADLIBA(const char *path);
 ** with no host attached nothing is captured and the conversion refuses the dump
 ** instead of leaking native LuaJIT bytes.
 **
-** The reader capture, the policy branch in lib_string.c and the data slot all
-** disappear with -DLJ_DS_PUC51_DUMP=0. The GCproto fields stay in every build:
-** the generated interpreter bakes offsetof(GCproto, f)-sizeof(GCproto) when
-** buildvm is compiled, and buildvm never sees LJ_DS_* overrides, so a struct
-** size that followed this macro would make every baked displacement wrong. */
+** The reader capture and the data slot disappear with -DLJ_DS_PUC51_DUMP=0.
+** GCproto.dssource is compiled out too and shrinks the struct, so buildvm and
+** every target TU must see the same layout-affecting definitions: CMake feeds
+** the effective directory definitions to the layout probe and to buildvm, and
+** the Makefile forwards the -D subset of TARGET_CFLAGS to HOST_ACFLAGS
+** (XCFLAGS already reaches both). */
 #ifndef LJ_DS_PUC51_DUMP
 #define LJ_DS_PUC51_DUMP	LJ_DS
+#endif
+
+/* The dump service derives every request from GCproto.firstline, and
+** LUAJIT_DISABLE_DEBUGINFO forces every prototype's firstline to 0, so a build
+** with the dump feature cannot answer string.dump with engine-identical
+** bytecode. Refuse the combination instead of failing the shape check at run
+** time. */
+#if (LJ_DS || LJ_DS_PUC51_DUMP) && defined(LUAJIT_DISABLE_DEBUGINFO) && LUAJIT_DISABLE_DEBUGINFO
+#error "LJ_DS builds require debug info (do not define LUAJIT_DISABLE_DEBUGINFO)"
 #endif
 
 /* PUC 5.1 f_parser probes the first byte with luaZ_lookahead(); when that probe

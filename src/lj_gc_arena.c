@@ -815,11 +815,12 @@ int lj_gc_fin_queue_empty(global_State *g)
 ** bitmaps: prototypes and closures are the only objects routed to a
 ** ArenaFlag_PODOnly arena (the full-GC purity check asserts exactly that), and
 ** `block & mark` yields allocated-and-marked-live cells - binned free cells keep
-** block=1 but carry mark=0, so they cannot be mistaken for a prototype. A POD
-** object never becomes a huge block, so the huge set needs no scan. Only
-** prototype fields are rewritten: nothing is allocated and storing NULL needs no
-** GC barrier. Must be called from ordinary Lua/C execution, never inside a GC
-** step, so no arena is mid-sweep while this reads it.
+** block=1 but carry mark=0, so they cannot be mistaken for a prototype. A
+** prototype whose sizept reaches ArenaHugeThreshold moves to the huge set and
+** has no arena bitmap, so the hugeset is scanned as well. Only prototype fields
+** are rewritten: nothing is allocated and storing NULL needs no GC barrier.
+** Must be called from ordinary Lua/C execution, never inside a GC step, so no
+** arena is mid-sweep while this reads it.
 */
 MSize lj_gc_clear_dssource(global_State *g)
 {
@@ -851,6 +852,30 @@ MSize lj_gc_clear_dssource(global_State *g)
 	if (arena_cellstate(a, c) < CellState_White)
 	  continue;  /* defensive: never read a header from a free cell */
 	o = (GCobj *)arena_cellptr(a, c);
+	if (o->gch.gct == ~LJ_TPROTO) {
+	  GCproto *pt = gco2pt(o);
+	  if (gcref(pt->dssource) != NULL) {
+	    setgcrefnull(pt->dssource);
+	    pt->dsnodecount = 0;
+	    n++;
+	  }
+	}
+      }
+    }
+  }
+  {
+    /* Huge prototypes have no cell bitmap; the address-keyed set is their
+    ** enumeration. A slot can carry a VLA cdata prefix (HUGESET_CDATAV), so
+    ** translate it to the GCobj before reading gct. */
+    GCRef *slots = mref(g->gc.hugeset, GCRef);
+    if (slots != NULL) {
+      MSize hi, hmask = g->gc.hugesetmask;
+      for (hi = 0; hi <= hmask; hi++) {
+	uintptr_t u = gcrefu(slots[hi]);
+	GCobj *o;
+	if (!hugeset_slot_live(u))
+	  continue;
+	o = hugeset_slot_obj(u);
 	if (o->gch.gct == ~LJ_TPROTO) {
 	  GCproto *pt = gco2pt(o);
 	  if (gcref(pt->dssource) != NULL) {

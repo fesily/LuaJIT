@@ -388,9 +388,10 @@ typedef struct GCproto {
 #if LJ_GC64
 #if LJ_DS_PUC51_DUMP
   uint32_t dsnodecount;	/* DS: total prototypes in this compile (0: unknown). */
-  uint32_t dsnodeidx;	/* DS: reuses the GC64 padding slot (see the static assert
-			** that pins gclist's offset). Non-GC64 has no such hole,
-			** so the field moves to the debug section there. */
+  uint32_t dsnodeidx;	/* DS: reuses the GC64 padding slot (see the static
+			** assert that pins gclist's offset). LJ_DS_PUC51_DUMP
+			** currently requires LJ_GC64: non-GC64 builds do not
+			** define these fields. */
 #else
   uint32_t unused_gc64;
 #endif
@@ -884,13 +885,14 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
-#if LJ_DS_REJECT_BINARY_CHUNKS
-  /* Rides in the byte-flag run above, whose padding to the 8-byte-aligned
-  ** StrInternState absorbs it: offsetof(global_State, str) and sizeof() are
-  ** identical with and without the field, so DISPATCH_GL offsets baked into
-  ** the generated interpreter stay valid either way. Do not grow this run
-  ** past the slot without regenerating buildvm with the same defines. */
-  uint8_t dsallowljbc;	/* lua_ds_allow_lj_bytecode: native LJ bytecode mode. */
+#if LJ_DS_REJECT_BINARY_CHUNKS || LJ_DS_PUC51_DUMP
+  /* lua_ds_allow_lj_bytecode: native LJ bytecode mode. It exists whenever
+  ** either policy is compiled in, so a build with only one of them can still
+  ** give the CLI/tools/private states native dumps and reloads. It is appended
+  ** after gcroot[]: offsets before it (DISPATCH_GL) are unchanged, but
+  ** sizeof(global_State) grows, and GG_G2DISP is derived from that size, so
+  ** buildvm and every target TU must see the same definitions. */
+  uint8_t dsallowljbc;
 #endif
   /* DS: optional second, private registry. It is a GC root like registrytv, and the C API
   ** reaches it through LUA_REGISTRYINDEX2 / registry2(L) only when LJ_DS_REGISTRY2 is on;
@@ -906,8 +908,9 @@ typedef struct global_State {
 #define mainthread(g)	(&gcref(g->mainthref)->th)
 
 /* Native LuaJIT bytecode mode for one state (lua_ds_allow_lj_bytecode). Only
-** exists in builds that compile the reject in; elsewhere it folds to 0. */
-#if LJ_DS_REJECT_BINARY_CHUNKS
+** exists in builds that compile one of the two policies in; elsewhere it
+** folds to 0. */
+#if LJ_DS_REJECT_BINARY_CHUNKS || LJ_DS_PUC51_DUMP
 #define ds_allow_lj_bytecode(L)	(G(L)->dsallowljbc != 0)
 #else
 #define ds_allow_lj_bytecode(L)	0

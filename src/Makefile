@@ -224,6 +224,11 @@ HOST_XCFLAGS= -I.
 HOST_XLDFLAGS=
 HOST_XLIBS=
 HOST_ACFLAGS= $(CCOPTIONS) $(HOST_XCFLAGS) $(TARGET_ARCH) $(HOST_CFLAGS)
+# buildvm bakes GCproto/global_State offsets into the generated interpreter.
+# XCFLAGS already reaches HOST_ACFLAGS through CCOPTIONS; forward the
+# layout-affecting -D subset of TARGET_CFLAGS too (e.g.
+# -DLJ_DS_PUC51_DUMP=0) so host and target macros never diverge.
+HOST_ACFLAGS+= $(filter -DLJ_DS_% -DLUAJIT_% -DLUA_COMPAT_%,$(TARGET_CFLAGS))
 HOST_ALDFLAGS= $(LDOPTIONS) $(HOST_XLDFLAGS) $(HOST_LDFLAGS)
 HOST_ALIBS= $(HOST_XLIBS) $(LIBS) $(HOST_LIBS)
 

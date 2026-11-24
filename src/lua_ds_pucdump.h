@@ -35,7 +35,6 @@ typedef struct lua_DsPucDumpRequest {
   uint32_t nups;	/* Proto.nups */
   uint32_t is_vararg;	/* 0/1: normalized VARARG_ISVARARG of the target. */
   uint32_t child_count;	/* direct child protos (Proto.sizep). */
-  int strip;		/* Lua 5.1 string.dump second-argument semantics. */
 } lua_DsPucDumpRequest;
 
 typedef struct lua_DsPucDumpResult {
