@@ -730,6 +730,25 @@ static int vm_call_work(lua_State *L, double *out)
   return *out == WORK_CHECKSUM ? 0 : -1;
 }
 
+/* LJ_DS builds answer string.dump through the host's PUC 5.1 bridge
+** (lj_ds_puc_dump, lib_string.c); a standalone VM has no host, and the VM
+** refuses the dump with "bridge unavailable" rather than handing back LuaJIT
+** bytecode. Cases that dump probe for the service and skip instead of
+** asserting something this binary cannot do.
+*/
+static int has_dump_bridge(lua_State *L)
+{
+  static const char probe[] =
+    "local f = function() return 1 end\n"
+    "return type(string.dump(f)) == 'string'\n";
+  int top = lua_gettop(L), ok = 0;
+  if (luaL_loadbuffer(L, probe, sizeof(probe) - 1, "@dump-probe.lua") == 0 &&
+      lua_pcall(L, 0, 1, 0) == 0)
+    ok = lua_toboolean(L, -1);
+  lua_settop(L, top);
+  return ok;
+}
+
 /* Load `chunkname`, run it `reps` times and check every result. */
 static int vm_prewarm(lua_State *L, const char *chunkname, int reps,
 		      const char *scenario)
@@ -1700,7 +1719,9 @@ static void scenario_names_and_lines(void)
     }
   }
   /* Stripped chunk: no line info, so Line must be 0. */
-  {
+  if (!has_dump_bridge(L)) {
+    fprintf(stderr, "skip: stripped chunk (no PUC 5.1 dump bridge)\n");
+  } else {
     static const char strip_src[] =
       "local f = function() local s=0\n"
       "for i=1,100000 do s=s+i end\nreturn s end\n"
